@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="73dd89c4161a8f49c86be5fd9d4e9742463fe658">
+<index version="1" name="Fancy Scripts" commit="18cf8d322b34467a9d74d856d712e292b27dbeeb">
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
@@ -7,7 +7,7 @@
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \sa180 \li0 \fi0 Links FX parameters between tracks: Follow or Inverse with adjustable strength. Features: shared pickers for all workflows, quick single-param add, auto group-scan for same plugin, global presets (save from active links, apply to create links instantly), live inspector, and settings modal. Requirements: ReaImGui extension (install via ReaPack)\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Links FX parameters between tracks: Follow or Inverse with adjustable strength. Features: multi-track selector, auto group-scan for same plugin, full-mesh linking, bidirectional engine (move any linked knob), global presets, live inspector, and settings modal. Requirements: ReaImGui extension (install via ReaPack)\par}
 }
 ]]></description>
         <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
@@ -23,6 +23,16 @@
         <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/73dd89c4161a8f49c86be5fd9d4e9742463fe658/_lib/json.lua</source>
         <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/73dd89c4161a8f49c86be5fd9d4e9742463fe658/_lib/theme.lua</source>
         <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/73dd89c4161a8f49c86be5fd9d4e9742463fe658/_lib/utils.lua</source>
+      </version>
+      <version name="5.0.0" author="Fancy Scripts" time="2026-08-27T23:31:31Z">
+        <changelog><![CDATA[+ Bidirectional links: either side can drive the other
++ Multi-track selection: link the same plugin across N tracks at once
++ Full-mesh topology: every pair of tracks is linked
++ Active links table grouped by parameter]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/FX/Fancy_Parameter%20Link.lua</source>
+        <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/_lib/json.lua</source>
+        <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/_lib/theme.lua</source>
+        <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/_lib/utils.lua</source>
       </version>
     </reapack>
   </category>
