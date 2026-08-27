@@ -14,16 +14,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Lua
-        uses: hishamhm/gh-actions-lua@v2
-        with:
-          luaVersion: "5.4"
-
-      - name: Setup Luarocks
-        uses: hishamhm/gh-actions-luarocks@v1
-
       - name: Install Luacheck
-        run: luarocks install luacheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua-check
 
       - name: Run Luacheck
         run: luacheck .
