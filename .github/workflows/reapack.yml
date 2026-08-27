@@ -1,0 +1,62 @@
+name: ReaPack Index
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    name: Lint Lua Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Lua
+        uses: hishamhm/gh-actions-lua@v2
+        with:
+          luaVersion: "5.4"
+
+      - name: Setup Luarocks
+        uses: hishamhm/gh-actions-luarocks@v1
+
+      - name: Install Luacheck
+        run: luarocks install luacheck
+
+      - name: Run Luacheck
+        run: luacheck .
+        continue-on-error: true
+
+  index:
+    name: Generate ReaPack Index
+    needs: lint
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.2'
+
+      - name: Install reapack-index
+        run: gem install reapack-index
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Build ReaPack Index
+        run: reapack-index --scan --commit -m "chore: update index.xml [skip ci]"
+
+      - name: Push updated index
+        run: git push

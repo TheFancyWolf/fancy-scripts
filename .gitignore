@@ -1,0 +1,21 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# REAPER per-user runtime data
+_fancy_*.json
+
+# Editor / IDE
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Temporary
+*.tmp
+*.bak
+
+# Antigravity / Agent files (managed externally)
+agents.md
+AGENTS.md
