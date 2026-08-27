@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="8810c9c72fcbb378a1c60628096a9537ee6cbd52">
+<index version="1" name="Fancy Scripts" commit="bab5cb3c2b60c70dc3ca4dcd7a4167bf69765f86">
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
@@ -7,7 +7,7 @@
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 Links FX parameters between tracks: Follow or Inverse with adjustable strength. Features: shared pickers for all workflows, quick single-param add, auto group-scan for same plugin, global presets (save from active links, apply to create links instantly), live inspector, and settings modal. Requirements: ReaImGui extension (install via ReaPack)\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Links FX parameters between tracks: Follow or Inverse with adjustable strength. Features: shared pickers for all workflows, quick single-param add, auto group-scan for same plugin, global presets (save from active links, apply to create links instantly), live inspector, and settings modal. Requirements: ReaImGui extension (install via ReaPack)\par}
 }
 ]]></description>
         <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
@@ -26,7 +26,7 @@
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 Real-time visual metering display for selected tracks. Features customizable colors, peak hold, and docking support. Requirements: ReaImGui extension (install via ReaPack)\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Real-time visual metering display for selected tracks. Features customizable colors, peak hold, and docking support. Requirements: ReaImGui extension (install via ReaPack)\par}
 }
 ]]></description>
         <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
@@ -45,7 +45,7 @@
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 Sets specified Send volume to match the Main Track Fader. Useful for copying your current Main Mix to a Pre-Fader Headphone Send.\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Sets specified Send volume to match the Main Track Fader. Useful for copying your current Main Mix to a Pre-Fader Headphone Send.\par}
 }
 ]]></description>
         <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
@@ -60,62 +60,56 @@
   <metadata>
     <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
 {\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
-{\*\listtable{\list\listtemplateid1{\listlevel\levelnfc0\levelnfcn0\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelindent0{\leveltext\'01\u8226 ?;}{\levelnumbers;}\fi-360\li360\lin360 }{\listname ;}\listid1}
-{\list\listtemplateid2{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelindent0{\leveltext\'01\u8226 ?;}{\levelnumbers;}\fi-360\li360\lin360 }{\listname ;}\listid2}
-{\list\listtemplateid3{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelindent0{\leveltext\'01\u8226 ?;}{\levelnumbers;}\fi-360\li360\lin360 }{\listname ;}\listid3}
-{\list\listtemplateid4{\listlevel\levelnfc23\levelnfcn23\leveljc0\leveljcn0\levelfollow0\levelstartat1\levelindent0{\leveltext\'01\u8226 ?;}{\levelnumbers;}\fi-360\li360\lin360 }{\listname ;}\listid4}
-}
-{\*\listoverridetable{\listoverride\listid1\listoverridecount0\ls1}{\listoverride\listid2\listoverridecount0\ls2}{\listoverride\listid3\listoverridecount0\ls3}{\listoverride\listid4\listoverridecount0\ls4}}
 \widowctrl\hyphauto
 
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel0 \b \fs34 \u55356 ?\u57243 ?\u65039 ? Fancy Scripts for REAPER\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 {\b A collection of workflow-enhancing scripts for {\field{\*\fldinst{HYPERLINK "https://www.reaper.fm/"}}{\fldrslt{\ul
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel0 \b \fs36 \u55356 ?\u57243 ?\u65039 ? Fancy Scripts for REAPER\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 {\b A collection of workflow-enhancing scripts for {\field{\*\fldinst{HYPERLINK "https://www.reaper.fm/"}}{\fldrslt{\ul
 REAPER
 }}}
  by {\field{\*\fldinst{HYPERLINK "https://github.com/TheFancyWolf"}}{\fldrslt{\ul
 Fancy Wolf Audio
 }}}
 .}\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 {\field{\*\fldinst{HYPERLINK "https://www.gnu.org/licenses/gpl-3.0"}}{\fldrslt{\ul
+{\pard \ql \f0 \sa180 \li0 \fi0 {\field{\*\fldinst{HYPERLINK "https://www.gnu.org/licenses/gpl-3.0"}}{\fldrslt{\ul
 {\cf1 [image: https://img.shields.io/badge/License-GPLv3-blue.svg]\cf0}
 }}}
  {\field{\*\fldinst{HYPERLINK "https://reapack.com"}}{\fldrslt{\ul
 {\cf1 [image: https://img.shields.io/badge/ReaPack-Compatible-brightgreen.svg]\cf0}
 }}}
 \par}
-{\pard \qc \f0 \fs24 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55357 ?\u56550 ? Installation via ReaPack\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 The easiest way to install and stay updated:\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls1\ilvl0\tx360 {\listtext\tab 1.\tab} In REAPER, go to {\b Extensions > ReaPack > Import Repositories...}\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls1\ilvl0\tx360 {\listtext\tab 2.\tab} Paste the following URL:\par}
-{\pard \ql \f0 \fs24 \sa180 \li360 \ls1\ilvl0\fi0 \f1 \fs24 https://github.com/TheFancyWolf/fancy-scripts/raw/main/index.xml\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls1\ilvl0\tx360 {\listtext\tab 3.\tab} Go to {\b Extensions > ReaPack > Browse Packages...}\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls1\ilvl0\tx360 {\listtext\tab 4.\tab} Search for {\b "Fancy"}, right-click \u8594 ? {\b Install}, and click {\b Apply}.\sa180\par}
-{\pard \qc \f0 \fs24 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55356 ?\u57242 ?\u65039 ? Scripts\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel2 \b \fs30 Fancy ParameterLink\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 Link FX parameters between tracks with Follow or Inverse modes and adjustable strength. Full ReaImGui interface with shared pickers, auto group-scan, global presets, live inspector, and settings modal.\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls2\ilvl0\tx360 {\listtext\tab \bullet \tab} {\b Requirements:} REAPER 7.0+, ReaImGui\sa180\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel2 \b \fs30 Fancy Selected Track Meter\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 Real-time visual metering display for selected tracks with customizable colors, peak hold, and docking support.\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls3\ilvl0\tx360 {\listtext\tab \bullet \tab} {\b Requirements:} REAPER 7.0+, ReaImGui\sa180\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel2 \b \fs30 Fancy Copy Fader to Send\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 Sets a Send volume to match the Main Track Fader. Useful for copying your Main Mix level to a Pre-Fader Headphone Send.\par}
-{\pard \ql \f0 \fs24 \sa0 \li360 \fi-360\ls4\ilvl0\tx360 {\listtext\tab \bullet \tab} {\b Requirements:} REAPER 7.0+\sa180\par}
-{\pard \qc \f0 \fs24 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55357 ?\u56470 ? Support Development\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 If these scripts save you time, consider sponsoring development:\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 {\field{\*\fldinst{HYPERLINK "https://github.com/sponsors/TheFancyWolf"}}{\fldrslt{\ul
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55357 ?\u56550 ? Installation via ReaPack\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 The easiest way to install and stay updated:\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 1.\tx360\tab In REAPER, go to {\b Extensions > ReaPack > Import Repositories...}\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 2.\tx360\tab Paste the following URL:\par}
+{\pard \ql \f0 \sa180 \li360 \fi0 \f1 https://github.com/TheFancyWolf/fancy-scripts/raw/main/index.xml\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 3.\tx360\tab Go to {\b Extensions > ReaPack > Browse Packages...}\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 4.\tx360\tab Search for {\b "Fancy"}, right-click \u8594 ? {\b Install}, and click {\b Apply}.\sa180\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55356 ?\u57242 ?\u65039 ? Scripts\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Fancy ParameterLink\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Link FX parameters between tracks with Follow or Inverse modes and adjustable strength. Full ReaImGui interface with shared pickers, auto group-scan, global presets, live inspector, and settings modal.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab {\b Requirements:} REAPER 7.0+, ReaImGui\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Fancy Selected Track Meter\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Real-time visual metering display for selected tracks with customizable colors, peak hold, and docking support.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab {\b Requirements:} REAPER 7.0+, ReaImGui\sa180\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel2 \b \fs28 Fancy Copy Fader to Send\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 Sets a Send volume to match the Main Track Fader. Useful for copying your Main Mix level to a Pre-Fader Headphone Send.\par}
+{\pard \ql \f0 \sa0 \li360 \fi-360 \bullet \tx360\tab {\b Requirements:} REAPER 7.0+\sa180\par}
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55357 ?\u56470 ? Support Development\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 If these scripts save you time, consider sponsoring development:\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 {\field{\*\fldinst{HYPERLINK "https://github.com/sponsors/TheFancyWolf"}}{\fldrslt{\ul
 {\cf1 [image: https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?logo=github]\cf0}
 }}}
 \par}
-{\pard \qc \f0 \fs24 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55357 ?\u56540 ? License\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 This project is licensed under the {\field{\*\fldinst{HYPERLINK "LICENSE"}}{\fldrslt{\ul
+{\pard \qc \f0 \sa180 \li0 \fi0 \emdash\emdash\emdash\emdash\emdash\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \outlinelevel1 \b \fs32 \u55357 ?\u56540 ? License\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 This project is licensed under the {\field{\*\fldinst{HYPERLINK "LICENSE"}}{\fldrslt{\ul
 GNU General Public License v3.0
 }}}
 .\par}
-{\pard \ql \f0 \fs24 \sa180 \li0 \fi0 \u169 ? Fancy Wolf Audio\par}
+{\pard \ql \f0 \sa180 \li0 \fi0 \u169 ? Fancy Wolf Audio\par}
 }
 ]]></description>
   </metadata>
