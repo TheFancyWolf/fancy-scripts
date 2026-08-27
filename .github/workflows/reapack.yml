@@ -51,7 +51,7 @@ jobs:
 
       - name: Build ReaPack Index
         run: |
-          reapack-index --scan --commit -m "chore: update index.xml [skip ci]"
+          reapack-index --rebuild --commit -m "chore: update index.xml [skip ci]"
 
       - name: Push updated index
         run: git push
