@@ -10,6 +10,15 @@ All notable changes to Fancy Scripts will be documented here.
   - `json.lua` — lightweight JSON encoder/decoder (consolidated from inline copies)
   - `utils.lua` — dependency checks, undo block wrapper, track helpers, math utilities
 
+### Changed
+- **Fancy Parameter Link v5.0.0** — Major redesign
+  - **Bidirectional links**: either side of a link can drive the other (no more source/target distinction)
+  - **Multi-track selection**: select N tracks and link them all at once (full-mesh topology)
+  - **Grouped active links**: links in the table are grouped by plugin/parameter for cleaner display
+  - Presets now apply across all selected tracks (not just 2)
+  - Last Touched adds tracks to selection instead of overwriting source/target
+  - Data model changed from src/dst to symmetric a/b naming
+
 ## [1.0.0] - 2026-08-27
 
 ### Added
