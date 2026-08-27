@@ -1610,11 +1610,13 @@ local function draw_link_builder()
   if total == 0 then reaper.ImGui_BeginDisabled(ctx) end
   local lbl = string.format("Add %d Link%s", total, total == 1 and "" or "s")
   if reaper.ImGui_Button(ctx, lbl, -1, 0) and total > 0 then
+    reaper.Undo_BeginBlock()
     create_links_from_match()
     save_links()
     for _, grp in ipairs(M.groups) do
       for _, item in ipairs(grp.params) do item.checked = false end
     end
+    reaper.Undo_EndBlock("Create parameter links", -1)
   end
   if total == 0 then reaper.ImGui_EndDisabled(ctx) end
 
@@ -2182,10 +2184,12 @@ local function draw_main()
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.red_h)
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.red)
       if reaper.ImGui_Button(ctx, "Clear All") and not no_links then
+        reaper.Undo_BeginBlock()
         links = {}
         lsrc  = {}
         link_sel = {}
         save_links()
+        reaper.Undo_EndBlock("Clear all parameter links", -1)
       end
       reaper.ImGui_PopStyleColor(ctx, 3)
       if no_links then reaper.ImGui_EndDisabled(ctx) end
@@ -2485,10 +2489,12 @@ local function draw_main()
         end
 
         if to_del then
+          reaper.Undo_BeginBlock()
           table.remove(links, to_del)
           lsrc = {}
           link_sel = {}
           save_links()
+          reaper.Undo_EndBlock("Remove parameter link", -1)
         end
         reaper.ImGui_EndTable(ctx)
       end
@@ -2523,32 +2529,36 @@ end
 -------------------------------------------------------------------------------
 -- 14. ENTRY POINT
 -------------------------------------------------------------------------------
-load_links()
-load_presets()
-load_settings()
+function main()
+  load_links()
+  load_presets()
+  load_settings()
 
-local dock_flag = (reaper.ImGui_ConfigFlags_DockingEnable and reaper.ImGui_ConfigFlags_DockingEnable()) or 0
-ctx = reaper.ImGui_CreateContext("Fancy Parameter Link", dock_flag)
+  local dock_flag = (reaper.ImGui_ConfigFlags_DockingEnable and reaper.ImGui_ConfigFlags_DockingEnable()) or 0
+  ctx = reaper.ImGui_CreateContext("Fancy Parameter Link", dock_flag)
 
-local function safe_create_font(family, size)
-  if not reaper.ImGui_CreateFont then return nil end
-  local ok, font = pcall(reaper.ImGui_CreateFont, family, size)
-  if ok and font then return font end
-  local ok2, font2 = pcall(reaper.ImGui_CreateFont, 'sans-serif', size)
-  if ok2 and font2 then return font2 end
-  return nil
+  local function safe_create_font(family, size)
+    if not reaper.ImGui_CreateFont then return nil end
+    local ok, font = pcall(reaper.ImGui_CreateFont, family, size)
+    if ok and font then return font end
+    local ok2, font2 = pcall(reaper.ImGui_CreateFont, 'sans-serif', size)
+    if ok2 and font2 then return font2 end
+    return nil
+  end
+
+  font_brand_bold = safe_create_font('sans-serif Bold', 15)
+  font_brand_reg  = safe_create_font('sans-serif', 15)
+
+  if font_brand_bold and reaper.ImGui_Attach then reaper.ImGui_Attach(ctx, font_brand_bold) end
+  if font_brand_reg  and reaper.ImGui_Attach then reaper.ImGui_Attach(ctx, font_brand_reg) end
+
+  reaper.atexit(function()
+    save_links()
+    save_presets()
+    save_settings()
+  end)
+
+  reaper.defer(loop)
 end
 
-font_brand_bold = safe_create_font('sans-serif Bold', 15)
-font_brand_reg  = safe_create_font('sans-serif', 15)
-
-if font_brand_bold and reaper.ImGui_Attach then reaper.ImGui_Attach(ctx, font_brand_bold) end
-if font_brand_reg  and reaper.ImGui_Attach then reaper.ImGui_Attach(ctx, font_brand_reg) end
-
-reaper.atexit(function()
-  save_links()
-  save_presets()
-  save_settings()
-end)
-
-reaper.defer(loop)
+main()

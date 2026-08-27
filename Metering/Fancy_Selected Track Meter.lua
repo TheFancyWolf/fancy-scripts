@@ -12,19 +12,22 @@
 -- @provides
 --   [main] .
 
-local r = reaper
-
--- Check for ReaImGui
-if not r.ImGui_CreateContext then
-    r.MB("Please install ReaImGui from ReaPack.", "Missing Dependency", 0)
-    return
+-------------------------------------------------------------------------------
+-- 1. DEPENDENCY CHECK
+-------------------------------------------------------------------------------
+if not reaper.ImGui_CreateContext then
+  reaper.ShowMessageBox(
+    "This script requires the ReaImGui extension.\n\n"
+    .. "Install via Extensions > ReaPack > Browse Packages > 'ReaImGui'.",
+    "Fancy Selected Track Meter -- Missing ReaImGui", 0)
+  return
 end
 
-local ctx = r.ImGui_CreateContext('Selected Track Meter', r.ImGui_ConfigFlags_DockingEnable())
+local ctx = reaper.ImGui_CreateContext('Selected Track Meter', reaper.ImGui_ConfigFlags_DockingEnable())
 
--- ==========================================
--- 🎨 VISUAL SETTINGS
--- ==========================================
+-------------------------------------------------------------------------------
+-- 2. VISUAL SETTINGS
+-------------------------------------------------------------------------------
 local VisualSettings = {
     Window_Padding   = 15,   
     
@@ -72,9 +75,9 @@ local VisualSettings = {
     Tooltip_Padding        = 12,       
 }
 
--- ==========================================
--- ⚙️ FUNCTIONAL STATE & DEFAULTS
--- ==========================================
+-------------------------------------------------------------------------------
+-- 3. FUNCTIONAL STATE & DEFAULTS
+-------------------------------------------------------------------------------
 local State = {
     show_settings       = false,
     show_balance_meter  = true, 
@@ -138,7 +141,7 @@ local State = {
     
     play_state         = 0,
     play_start_time    = 0,
-    last_time          = r.time_precise()
+    last_time          = reaper.time_precise()
 }
 
 local PersistStateKeys = {
@@ -158,13 +161,13 @@ local PersistVisualKeys = {
     "Tab_Inactive", "Tab_Hovered", "Tab_Active"
 }
 
--- ==========================================
--- 💾 STATE PERSISTENCE
--- ==========================================
+-------------------------------------------------------------------------------
+-- 4. STATE PERSISTENCE
+-------------------------------------------------------------------------------
 local function LoadSettings()
     -- Load Functional State
     for _, k in ipairs(PersistStateKeys) do
-        local val = r.GetExtState("FW_TrackMeter", "S_"..k)
+        local val = reaper.GetExtState("FW_TrackMeter", "S_"..k)
         if val ~= "" then
             if type(State[k]) == "boolean" then State[k] = (val == "true")
             elseif type(State[k]) == "number" then State[k] = tonumber(val) or State[k]
@@ -174,7 +177,7 @@ local function LoadSettings()
     -- Load Visual Settings (Colors and Sizes)
     for _, k in ipairs(PersistVisualKeys) do
         local v = VisualSettings[k]
-        local val = r.GetExtState("FW_TrackMeter", "V_"..k)
+        local val = reaper.GetExtState("FW_TrackMeter", "V_"..k)
         if val ~= "" then
             if type(v) == "boolean" then VisualSettings[k] = (val == "true")
             elseif type(v) == "number" then VisualSettings[k] = tonumber(val) or v
@@ -186,38 +189,38 @@ end
 local function SaveSettings()
     -- Save Functional State
     for _, k in ipairs(PersistStateKeys) do
-        r.SetExtState("FW_TrackMeter", "S_"..k, tostring(State[k]), true)
+        reaper.SetExtState("FW_TrackMeter", "S_"..k, tostring(State[k]), true)
     end
     -- Save Visual Settings
     for _, k in ipairs(PersistVisualKeys) do
         local v = VisualSettings[k]
-        r.SetExtState("FW_TrackMeter", "V_"..k, tostring(v), true)
+        reaper.SetExtState("FW_TrackMeter", "V_"..k, tostring(v), true)
     end
 end
 
 -- Force save on script exit
-r.atexit(SaveSettings)
+reaper.atexit(SaveSettings)
 
 -- Load previously saved settings before generating fonts
 LoadSettings()
 
 -- Attach the dynamic font objects using the user's preferred sizes
-local base_font = r.ImGui_CreateFont(VisualSettings.Global_Font_Family, 16)
-local bold_font = r.ImGui_CreateFont(VisualSettings.Global_Font_Family .. ' Bold', 13)
-local tooltip_font = r.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Tooltip_Font_Size)
-local settings_font = r.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Settings_Font_Size)
+local base_font = reaper.ImGui_CreateFont(VisualSettings.Global_Font_Family, 16)
+local bold_font = reaper.ImGui_CreateFont(VisualSettings.Global_Font_Family .. ' Bold', 13)
+local tooltip_font = reaper.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Tooltip_Font_Size)
+local settings_font = reaper.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Settings_Font_Size)
 
-r.ImGui_Attach(ctx, base_font)
-r.ImGui_Attach(ctx, bold_font)
-r.ImGui_Attach(ctx, tooltip_font)
-r.ImGui_Attach(ctx, settings_font)
+reaper.ImGui_Attach(ctx, base_font)
+reaper.ImGui_Attach(ctx, bold_font)
+reaper.ImGui_Attach(ctx, tooltip_font)
+reaper.ImGui_Attach(ctx, settings_font)
 
 local cached_tooltip_size = VisualSettings.Tooltip_Font_Size
 local cached_settings_size = VisualSettings.Settings_Font_Size
 
--- ==========================================
--- 🧮 MATH & UTILITY FUNCTIONS
--- ==========================================
+-------------------------------------------------------------------------------
+-- 5. MATH & UTILITY FUNCTIONS
+-------------------------------------------------------------------------------
 local function AmpToDb(amp)
     if not amp or amp <= 0.0000001 then return -150.0 end
     return 20.0 * math.log(amp, 10)
@@ -258,7 +261,7 @@ end
 
 local function NativeToImGuiColor(native_col, dim)
     if native_col == 0 then return VisualSettings.Color_DefaultTrk end
-    local r_val, g_val, b_val = r.ColorFromNative(native_col)
+    local r_val, g_val, b_val = reaper.ColorFromNative(native_col)
     r_val = math.floor(r_val * dim)
     g_val = math.floor(g_val * dim)
     b_val = math.floor(b_val * dim)
@@ -272,15 +275,15 @@ local function GetReadoutStr(val)
 end
 
 local function DrawTooltip(ctx, text)
-    if r.ImGui_IsItemHovered(ctx) then
-        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), VisualSettings.Tooltip_Padding, VisualSettings.Tooltip_Padding)
-        r.ImGui_PushFont(ctx, tooltip_font, VisualSettings.Tooltip_Font_Size)
-        if r.ImGui_BeginTooltip(ctx) then
-            r.ImGui_Text(ctx, text)
-            r.ImGui_EndTooltip(ctx)
+    if reaper.ImGui_IsItemHovered(ctx) then
+        reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), VisualSettings.Tooltip_Padding, VisualSettings.Tooltip_Padding)
+        reaper.ImGui_PushFont(ctx, tooltip_font, VisualSettings.Tooltip_Font_Size)
+        if reaper.ImGui_BeginTooltip(ctx) then
+            reaper.ImGui_Text(ctx, text)
+            reaper.ImGui_EndTooltip(ctx)
         end
-        r.ImGui_PopFont(ctx)
-        r.ImGui_PopStyleVar(ctx, 1)
+        reaper.ImGui_PopFont(ctx)
+        reaper.ImGui_PopStyleVar(ctx, 1)
     end
 end
 
@@ -288,32 +291,32 @@ local function DrawThickText(draw_list, font, size, x, y, color, text, shadow_co
     kerning = kerning or 0
     if kerning <= 0 then
         if shadow_color then
-            r.ImGui_DrawList_AddTextEx(draw_list, font, size, x + 1, y + 1, shadow_color, text)
-            r.ImGui_DrawList_AddTextEx(draw_list, font, size, x + 2, y + 1, shadow_color, text)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, x + 1, y + 1, shadow_color, text)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, x + 2, y + 1, shadow_color, text)
         end
-        r.ImGui_DrawList_AddTextEx(draw_list, font, size, x, y, color, text)
-        r.ImGui_DrawList_AddTextEx(draw_list, font, size, x + 1, y, color, text)
+        reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, x, y, color, text)
+        reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, x + 1, y, color, text)
     else
         local cx = x
-        r.ImGui_PushFont(ctx, font, size)
+        reaper.ImGui_PushFont(ctx, font, size)
         for i = 1, #text do
             local char = text:sub(i, i)
             if shadow_color then
-                r.ImGui_DrawList_AddTextEx(draw_list, font, size, cx + 1, y + 1, shadow_color, char)
-                r.ImGui_DrawList_AddTextEx(draw_list, font, size, cx + 2, y + 1, shadow_color, char)
+                reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, cx + 1, y + 1, shadow_color, char)
+                reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, cx + 2, y + 1, shadow_color, char)
             end
-            r.ImGui_DrawList_AddTextEx(draw_list, font, size, cx, y, color, char)
-            r.ImGui_DrawList_AddTextEx(draw_list, font, size, cx + 1, y, color, char)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, cx, y, color, char)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, font, size, cx + 1, y, color, char)
             
-            local cw = r.ImGui_CalcTextSize(ctx, char)
+            local cw = reaper.ImGui_CalcTextSize(ctx, char)
             cx = cx + cw + kerning
         end
-        r.ImGui_PopFont(ctx)
+        reaper.ImGui_PopFont(ctx)
     end
 end
 
 local function DrawBalanceMeter(draw_list, width, x_pos, y_pos, balance_val, balance_val_fast, current_height)
-    r.ImGui_DrawList_AddRectFilled(draw_list, x_pos, y_pos, x_pos + width, y_pos + current_height + 10, VisualSettings.Color_MeterBG, 6.0)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos, y_pos, x_pos + width, y_pos + current_height + 10, VisualSettings.Color_MeterBG, 6.0)
 
     local center_x = x_pos + (width / 2)
     local center_y = y_pos + (current_height / 2 + 2)
@@ -322,8 +325,8 @@ local function DrawBalanceMeter(draw_list, width, x_pos, y_pos, balance_val, bal
     local track_x1 = center_x - (track_w / 2)
     local track_x2 = center_x + (track_w / 2)
     
-    r.ImGui_DrawList_AddLine(draw_list, track_x1, center_y, track_x2, center_y, VisualSettings.Color_GridLine, 2.0)
-    r.ImGui_DrawList_AddLine(draw_list, center_x, center_y - 8, center_x, center_y + 8, VisualSettings.Color_TextDim, 2.0)
+    reaper.ImGui_DrawList_AddLine(draw_list, track_x1, center_y, track_x2, center_y, VisualSettings.Color_GridLine, 2.0)
+    reaper.ImGui_DrawList_AddLine(draw_list, center_x, center_y - 8, center_x, center_y + 8, VisualSettings.Color_TextDim, 2.0)
     
     local max_db = State.balance_db_scale or 12.0
     local half_db = max_db / 2.0
@@ -331,24 +334,24 @@ local function DrawBalanceMeter(draw_list, width, x_pos, y_pos, balance_val, bal
     
     for _, db in ipairs(ticks) do
         local px = center_x + (db / max_db) * (track_w / 2)
-        r.ImGui_DrawList_AddLine(draw_list, px, center_y - 4, px, center_y + 4, VisualSettings.Color_GridLine, 1.5)
+        reaper.ImGui_DrawList_AddLine(draw_list, px, center_y - 4, px, center_y + 4, VisualSettings.Color_GridLine, 1.5)
         
         local txt = ""
         if math.floor(db) == db then txt = tostring(math.abs(db))
         else txt = string.format("%.1f", math.abs(db)) end
         
-        r.ImGui_PushFont(ctx, bold_font, 11)
-        local tw, th = r.ImGui_CalcTextSize(ctx, txt)
-        r.ImGui_PopFont(ctx)
-        r.ImGui_DrawList_AddTextEx(draw_list, bold_font, 11, px - (tw/2), center_y + 10, VisualSettings.Color_TextDim, txt)
+        reaper.ImGui_PushFont(ctx, bold_font, 11)
+        local tw, th = reaper.ImGui_CalcTextSize(ctx, txt)
+        reaper.ImGui_PopFont(ctx)
+        reaper.ImGui_DrawList_AddTextEx(draw_list, bold_font, 11, px - (tw/2), center_y + 10, VisualSettings.Color_TextDim, txt)
     end
 
-    local title_tw, title_th = r.ImGui_CalcTextSize(ctx, "STEREO BALANCE DRIFT")
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 12, center_x - (title_tw/2), y_pos + 10, VisualSettings.Color_Text, "STEREO BALANCE DRIFT")
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 12, track_x1, y_pos + 10, VisualSettings.Color_TextDim, "L")
+    local title_tw, title_th = reaper.ImGui_CalcTextSize(ctx, "STEREO BALANCE DRIFT")
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 12, center_x - (title_tw/2), y_pos + 10, VisualSettings.Color_Text, "STEREO BALANCE DRIFT")
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 12, track_x1, y_pos + 10, VisualSettings.Color_TextDim, "L")
     
-    local r_tw, r_th = r.ImGui_CalcTextSize(ctx, "R")
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 12, track_x2 - r_tw, y_pos + 10, VisualSettings.Color_TextDim, "R")
+    local r_tw, r_th = reaper.ImGui_CalcTextSize(ctx, "R")
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 12, track_x2 - r_tw, y_pos + 10, VisualSettings.Color_TextDim, "R")
 
     local safe_slow = balance_val or 0.0
     local safe_fast = balance_val_fast or 0.0
@@ -358,20 +361,20 @@ local function DrawBalanceMeter(draw_list, width, x_pos, y_pos, balance_val, bal
     local bubble_x_slow = center_x + (clamped_val_slow / max_db) * (track_w / 2)
     local bubble_x_fast = center_x + (clamped_val_fast / max_db) * (track_w / 2)
     
-    r.ImGui_DrawList_AddCircle(draw_list, bubble_x_fast, center_y, 9, 0xFFFFFF44, 12, 1.5)
-    r.ImGui_DrawList_AddCircleFilled(draw_list, bubble_x_slow, center_y, 6, VisualSettings.Color_Safe)
-    r.ImGui_DrawList_AddCircleFilled(draw_list, bubble_x_slow, center_y, 2, VisualSettings.Color_Background)
+    reaper.ImGui_DrawList_AddCircle(draw_list, bubble_x_fast, center_y, 9, 0xFFFFFF44, 12, 1.5)
+    reaper.ImGui_DrawList_AddCircleFilled(draw_list, bubble_x_slow, center_y, 6, VisualSettings.Color_Safe)
+    reaper.ImGui_DrawList_AddCircleFilled(draw_list, bubble_x_slow, center_y, 2, VisualSettings.Color_Background)
     
     local diff_str = ""
     if math.abs(safe_slow) < 0.1 then diff_str = "Perfectly Centered"
     elseif safe_slow < 0 then diff_str = string.format("Left leaning by %.1f dB", math.abs(safe_slow))
     else diff_str = string.format("Right leaning by %.1f dB", math.abs(safe_slow)) end
     
-    local diff_tw, diff_th = r.ImGui_CalcTextSize(ctx, diff_str)
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 12, center_x - (diff_tw/2), y_pos + current_height - 10, VisualSettings.Color_TextDim, diff_str)
+    local diff_tw, diff_th = reaper.ImGui_CalcTextSize(ctx, diff_str)
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 12, center_x - (diff_tw/2), y_pos + current_height - 10, VisualSettings.Color_TextDim, diff_str)
 
-    r.ImGui_SetCursorScreenPos(ctx, x_pos, y_pos)
-    r.ImGui_InvisibleButton(ctx, "balance_tt", width, current_height)
+    reaper.ImGui_SetCursorScreenPos(ctx, x_pos, y_pos)
+    reaper.ImGui_InvisibleButton(ctx, "balance_tt", width, current_height)
     DrawTooltip(ctx, "Stereo Balance Drift\n\nShows the spatial center of mass for the mix.\nCalculated by taking the difference between Left and Right RMS,\nthen passing it through dual RC integration filters\n(Slow for gravity, Fast for transients).\n\nShortcut: B")
 end
 
@@ -389,16 +392,16 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     local box_h = 36
     local box_w = math.floor((total_w - s) / 2)
 
-    local lw, lh = r.ImGui_CalcTextSize(ctx, label)
+    local lw, lh = reaper.ImGui_CalcTextSize(ctx, label)
     local btn_size = 14
     local btn_spacing = 6
     local group_w = lw + btn_spacing + btn_size
     local start_x = x_pos + (total_w / 2) - (group_w / 2)
     
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 14, start_x, label_y, VisualSettings.Color_Text, label)
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 14, start_x, label_y, VisualSettings.Color_Text, label)
     
-    r.ImGui_SetCursorScreenPos(ctx, start_x, label_y)
-    r.ImGui_InvisibleButton(ctx, label.."_lbl_tt", lw, lh)
+    reaper.ImGui_SetCursorScreenPos(ctx, start_x, label_y)
+    reaper.ImGui_InvisibleButton(ctx, label.."_lbl_tt", lw, lh)
     local tt_text = nil
     if label == "PEAK" then
         tt_text = "Peak Amplitude\n\nShows the absolute highest instantaneous digital volume.\nCalculated by querying REAPER's raw audio-rate peak telemetry."
@@ -409,8 +412,8 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     
     local btn_x = start_x + lw + btn_spacing
     local btn_y = label_y
-    r.ImGui_SetCursorScreenPos(ctx, btn_x, btn_y)
-    if r.ImGui_InvisibleButton(ctx, label.."_tgt_toggle", btn_size, btn_size) then
+    reaper.ImGui_SetCursorScreenPos(ctx, btn_x, btn_y)
+    if reaper.ImGui_InvisibleButton(ctx, label.."_tgt_toggle", btn_size, btn_size) then
         new_tgt_active = not new_tgt_active
     end
     DrawTooltip(ctx, "Gain Stage Target Marker\n\nA visual reference line for gain staging.\nClick anywhere on the meter track to set the level.\nUse this to match your signal to a specific dB target.\nClick this icon to toggle visibility.")
@@ -418,8 +421,8 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     local icon_col = new_tgt_active and VisualSettings.Color_TargetLine or VisualSettings.Color_TargetDim
     local center_px = btn_x + (btn_size / 2)
     local center_py = btn_y + (btn_size / 2)
-    r.ImGui_DrawList_AddCircle(draw_list, center_px + 2, center_py + 2, (btn_size/2) - 1, icon_col, 12, 1.5)
-    r.ImGui_DrawList_AddCircleFilled(draw_list, center_px + 2, center_py + 2, 2, icon_col)
+    reaper.ImGui_DrawList_AddCircle(draw_list, center_px + 2, center_py + 2, (btn_size/2) - 1, icon_col, 12, 1.5)
+    reaper.ImGui_DrawList_AddCircleFilled(draw_list, center_px + 2, center_py + 2, 2, icon_col)
 
     -- 🔴 ALERT BLOCK STYLING: INFINITY HOLD
     local inf_is_clipping = inf_val >= 0.0
@@ -427,20 +430,20 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     local inf_txt_col = inf_is_clipping and 0x000000FF or VisualSettings.Color_Text
     local inf_icn_col = inf_is_clipping and 0x000000FF or VisualSettings.Color_TextDim
     
-    r.ImGui_DrawList_AddRectFilled(draw_list, x_pos, box_y, x_pos + box_w, box_y + box_h + 4, inf_bg_col, 2.0)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos, box_y, x_pos + box_w, box_y + box_h + 4, inf_bg_col, 2.0)
     
     local inf_title = "∞"
-    local inf_tw, inf_th = r.ImGui_CalcTextSize(ctx, inf_title)
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 15, x_pos + (box_w/2) - (inf_tw/2), box_y + 1, inf_icn_col, inf_title)
+    local inf_tw, inf_th = reaper.ImGui_CalcTextSize(ctx, inf_title)
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 15, x_pos + (box_w/2) - (inf_tw/2), box_y + 1, inf_icn_col, inf_title)
     
     local inf_str = GetReadoutStr(inf_val)
-    r.ImGui_PushFont(ctx, bold_font, 14)
-    local isw, ish = r.ImGui_CalcTextSize(ctx, inf_str)
-    r.ImGui_PopFont(ctx)
-    r.ImGui_DrawList_AddTextEx(draw_list, bold_font, 14, x_pos + (box_w/2) - (isw/2) - 2, box_y + 18, inf_txt_col, inf_str)
+    reaper.ImGui_PushFont(ctx, bold_font, 14)
+    local isw, ish = reaper.ImGui_CalcTextSize(ctx, inf_str)
+    reaper.ImGui_PopFont(ctx)
+    reaper.ImGui_DrawList_AddTextEx(draw_list, bold_font, 14, x_pos + (box_w/2) - (isw/2) - 2, box_y + 18, inf_txt_col, inf_str)
     
-    r.ImGui_SetCursorScreenPos(ctx, x_pos, box_y)
-    if r.ImGui_InvisibleButton(ctx, label.."_inf_btn", box_w, box_h) then clicked_inf_reset = true end
+    reaper.ImGui_SetCursorScreenPos(ctx, x_pos, box_y)
+    if reaper.ImGui_InvisibleButton(ctx, label.."_inf_btn", box_w, box_h) then clicked_inf_reset = true end
     DrawTooltip(ctx, "Infinite Hold.\nLogs the absolute highest value.\nClick or press 'R' to reset.\nPress 'C' to clear clips and reset.")
     
     -- 🔴 ALERT BLOCK STYLING: ROLLING HOLD
@@ -450,44 +453,44 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     local roll_icn_col = roll_is_clipping and 0x000000FF or VisualSettings.Color_TextDim
 
     local b2_x = x_pos + box_w + s
-    r.ImGui_DrawList_AddRectFilled(draw_list, b2_x, box_y, b2_x + box_w, box_y + box_h + 4, roll_bg_col, 2.0)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, b2_x, box_y, b2_x + box_w, box_y + box_h + 4, roll_bg_col, 2.0)
     
     local roll_title = "↻"
-    local roll_tw, roll_th = r.ImGui_CalcTextSize(ctx, roll_title)
-    r.ImGui_DrawList_AddTextEx(draw_list, nil, 14, b2_x + (box_w/2) - (roll_tw/2), box_y + 2, roll_icn_col, roll_title)
+    local roll_tw, roll_th = reaper.ImGui_CalcTextSize(ctx, roll_title)
+    reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 14, b2_x + (box_w/2) - (roll_tw/2), box_y + 2, roll_icn_col, roll_title)
     
     local roll_str = GetReadoutStr(roll_val)
     local roll_col = roll_val >= 0.0 and VisualSettings.Color_Clip or VisualSettings.Color_Text
-    r.ImGui_PushFont(ctx, bold_font, 14)
-    local rsw, rsh = r.ImGui_CalcTextSize(ctx, roll_str)
-    r.ImGui_PopFont(ctx)
-    r.ImGui_DrawList_AddTextEx(draw_list, bold_font, 14, b2_x + (box_w/2) - (rsw/2) - 2, box_y + 18, roll_txt_col, roll_str)
+    reaper.ImGui_PushFont(ctx, bold_font, 14)
+    local rsw, rsh = reaper.ImGui_CalcTextSize(ctx, roll_str)
+    reaper.ImGui_PopFont(ctx)
+    reaper.ImGui_DrawList_AddTextEx(draw_list, bold_font, 14, b2_x + (box_w/2) - (rsw/2) - 2, box_y + 18, roll_txt_col, roll_str)
     
-    r.ImGui_SetCursorScreenPos(ctx, b2_x, box_y)
-    if r.ImGui_InvisibleButton(ctx, label.."_roll_btn", box_w, box_h) then clicked_roll_reset = true end
+    reaper.ImGui_SetCursorScreenPos(ctx, b2_x, box_y)
+    if reaper.ImGui_InvisibleButton(ctx, label.."_roll_btn", box_w, box_h) then clicked_roll_reset = true end
     DrawTooltip(ctx, string.format("Rolling Window.\nHighest value recorded in the last %.1f seconds.\nClick or press 'R' to reset.\nPress 'C' to clear clips and reset.", State.rolling_window_sec))
 
-    r.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y, x_pos + w, meter_y + h, VisualSettings.Color_MeterBG)
-    r.ImGui_DrawList_AddRectFilled(draw_list, x_pos + w + s, meter_y, x_pos + total_w, meter_y + h, VisualSettings.Color_MeterBG)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y, x_pos + w, meter_y + h, VisualSettings.Color_MeterBG)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos + w + s, meter_y, x_pos + total_w, meter_y + h, VisualSettings.Color_MeterBG)
     
     -- 🧲 METER HITBOX (Click anywhere to activate and set Target)
-    r.ImGui_SetCursorScreenPos(ctx, x_pos, meter_y)
-    r.ImGui_InvisibleButton(ctx, label.."_meter_hitbox", total_w, h)
+    reaper.ImGui_SetCursorScreenPos(ctx, x_pos, meter_y)
+    reaper.ImGui_InvisibleButton(ctx, label.."_meter_hitbox", total_w, h)
     
     local is_meter_hovered = false
     local hover_mx, hover_my = 0, 0
     
-    if r.ImGui_IsItemActive(ctx) then
+    if reaper.ImGui_IsItemActive(ctx) then
         new_tgt_active = true 
-        local mx, my = r.ImGui_GetMousePos(ctx)
+        local mx, my = reaper.ImGui_GetMousePos(ctx)
         local local_y = my - meter_y
         new_tgt_db = GetDbForY(local_y, h, scale_mode, db_min, db_max)
         if new_tgt_db > db_max then new_tgt_db = db_max end
         if new_tgt_db < db_min then new_tgt_db = db_min end
     end
-    if r.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx) then
         is_meter_hovered = true
-        hover_mx, hover_my = r.ImGui_GetMousePos(ctx)
+        hover_mx, hover_my = reaper.ImGui_GetMousePos(ctx)
     end
     
     -- 🎨 Threshold Logic 
@@ -508,17 +511,17 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     if y_l < h then
         local safe_top = math.max(y_l, y_warn)
         if safe_top < h then
-            r.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y + safe_top, x_pos + w, meter_y + h, VisualSettings.Color_Safe)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y + safe_top, x_pos + w, meter_y + h, VisualSettings.Color_Safe)
         end
         if val_l > current_warn_db then
             local warn_top = math.max(y_l, y_clip)
             if warn_top < y_warn then
-                r.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y + warn_top, x_pos + w, meter_y + y_warn, VisualSettings.Color_Warn)
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y + warn_top, x_pos + w, meter_y + y_warn, VisualSettings.Color_Warn)
             end
         end
         if val_l > current_clip_db then
             if y_l < y_clip then
-                r.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y + y_l, x_pos + w, meter_y + y_clip, VisualSettings.Color_Clip)
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, x_pos, meter_y + y_l, x_pos + w, meter_y + y_clip, VisualSettings.Color_Clip)
             end
         end
     end
@@ -529,17 +532,17 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     if y_r < h then
         local safe_top = math.max(y_r, y_warn)
         if safe_top < h then
-            r.ImGui_DrawList_AddRectFilled(draw_list, rx1, meter_y + safe_top, rx2, meter_y + h, VisualSettings.Color_Safe)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, rx1, meter_y + safe_top, rx2, meter_y + h, VisualSettings.Color_Safe)
         end
         if val_r > current_warn_db then
             local warn_top = math.max(y_r, y_clip)
             if warn_top < y_warn then
-                r.ImGui_DrawList_AddRectFilled(draw_list, rx1, meter_y + warn_top, rx2, meter_y + y_warn, VisualSettings.Color_Warn)
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, rx1, meter_y + warn_top, rx2, meter_y + y_warn, VisualSettings.Color_Warn)
             end
         end
         if val_r > current_clip_db then
             if y_r < y_clip then
-                r.ImGui_DrawList_AddRectFilled(draw_list, rx1, meter_y + y_r, rx2, meter_y + y_clip, VisualSettings.Color_Clip)
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, rx1, meter_y + y_r, rx2, meter_y + y_clip, VisualSettings.Color_Clip)
             end
         end
     end
@@ -558,12 +561,12 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
         if db <= db_max and db >= db_min then
             local y_offset = GetYForDb(db, h, scale_mode, db_min, db_max)
             local line_y = meter_y + y_offset
-            r.ImGui_DrawList_AddLine(draw_list, x_pos, line_y, x_pos + total_w, line_y, VisualSettings.Color_GridLine, 1.0)
+            reaper.ImGui_DrawList_AddLine(draw_list, x_pos, line_y, x_pos + total_w, line_y, VisualSettings.Color_GridLine, 1.0)
             
             local db_str = db == 0 and "-0-" or "-" .. tostring(math.abs(db)) .. "-"
-            r.ImGui_PushFont(ctx, bold_font, 13)
-            local str_w, str_h = r.ImGui_CalcTextSize(ctx, db_str)
-            r.ImGui_PopFont(ctx)
+            reaper.ImGui_PushFont(ctx, bold_font, 13)
+            local str_w, str_h = reaper.ImGui_CalcTextSize(ctx, db_str)
+            reaper.ImGui_PopFont(ctx)
             
             local kerned_w = str_w + (#db_str - 1) * VisualSettings.Meter_Kerning
             local str_x = x_pos + (total_w / 2) - (kerned_w / 2)
@@ -586,7 +589,7 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
         local ty = meter_y + ty_offset
         
         -- Full width base line spanning the entire meter column
-        r.ImGui_DrawList_AddLine(draw_list, x_pos, ty, x_pos + total_w, ty, VisualSettings.Color_TargetLine, 2.0)
+        reaper.ImGui_DrawList_AddLine(draw_list, x_pos, ty, x_pos + total_w, ty, VisualSettings.Color_TargetLine, 2.0)
         
         local inf_delta_str = "---"
         if inf_val and inf_val > -140 then
@@ -618,22 +621,22 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
         
         if State.tgt_marker_size == 1 then
             -- LARGE (Stacked Layout via Math Scaling)
-            r.ImGui_PushFont(ctx, base_font, 18)
+            reaper.ImGui_PushFont(ctx, base_font, 18)
             
             local inf_sz = 18 * icon_scale_inf
             local roll_sz = 18 * icon_scale_roll
             local val_sz = 18
             
-            local li_tw, li_th = r.ImGui_CalcTextSize(ctx, l_icon)
+            local li_tw, li_th = reaper.ImGui_CalcTextSize(ctx, l_icon)
             li_tw, li_th = li_tw * (inf_sz/16.0), li_th * (inf_sz/16.0)
             
-            local ri_tw, ri_th = r.ImGui_CalcTextSize(ctx, r_icon)
+            local ri_tw, ri_th = reaper.ImGui_CalcTextSize(ctx, r_icon)
             ri_tw, ri_th = ri_tw * (roll_sz/16.0), ri_th * (roll_sz/16.0)
             
-            local lv_tw, lv_th = r.ImGui_CalcTextSize(ctx, l_val)
+            local lv_tw, lv_th = reaper.ImGui_CalcTextSize(ctx, l_val)
             lv_tw, lv_th = lv_tw * (val_sz/16.0), lv_th * (val_sz/16.0)
             
-            local rv_tw, rv_th = r.ImGui_CalcTextSize(ctx, r_val)
+            local rv_tw, rv_th = reaper.ImGui_CalcTextSize(ctx, r_val)
             rv_tw, rv_th = rv_tw * (val_sz/16.0), rv_th * (val_sz/16.0)
             
             local pad_y = 4
@@ -648,43 +651,43 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
             local handle_h = icon_h + val_h + (pad_y * 3)
             local handle_y = ty - (handle_h / 2)
             
-            r.ImGui_DrawList_AddRectFilled(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, bg_col, 4.0)
-            r.ImGui_DrawList_AddRect(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, VisualSettings.Color_TargetLine, 4.0, 0, 1.5)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, bg_col, 4.0)
+            reaper.ImGui_DrawList_AddRect(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, VisualSettings.Color_TargetLine, 4.0, 0, 1.5)
             
             local div_x = handle_x + (handle_w / 2)
-            r.ImGui_DrawList_AddLine(draw_list, div_x, handle_y, div_x, handle_y + handle_h, VisualSettings.Color_TargetLine, 1.0)
+            reaper.ImGui_DrawList_AddLine(draw_list, div_x, handle_y, div_x, handle_y + handle_h, VisualSettings.Color_TargetLine, 1.0)
             
             local q1_x = handle_x + (handle_w / 4)
             local q3_x = div_x + (handle_w / 4)
             
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, inf_sz, q1_x - (li_tw/2) + 4, handle_y + pad_y + (icon_h/2 - li_th/2) + 2, VisualSettings.Color_TargetLine, l_icon)
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, q1_x - (lv_tw/2) + 2, handle_y + pad_y*2 + icon_h + (val_h/2 - lv_th/2), VisualSettings.Color_TargetLine, l_val)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, inf_sz, q1_x - (li_tw/2) + 4, handle_y + pad_y + (icon_h/2 - li_th/2) + 2, VisualSettings.Color_TargetLine, l_icon)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, q1_x - (lv_tw/2) + 2, handle_y + pad_y*2 + icon_h + (val_h/2 - lv_th/2), VisualSettings.Color_TargetLine, l_val)
             
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, roll_sz, q3_x - (ri_tw/2)+ 2, handle_y + pad_y + (icon_h/2 - ri_th/2), VisualSettings.Color_TargetLine, r_icon)
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, q3_x - (rv_tw/2) + 2, handle_y + pad_y*2 + icon_h + (val_h/2 - rv_th/2), VisualSettings.Color_TargetLine, r_val)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, roll_sz, q3_x - (ri_tw/2)+ 2, handle_y + pad_y + (icon_h/2 - ri_th/2), VisualSettings.Color_TargetLine, r_icon)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, q3_x - (rv_tw/2) + 2, handle_y + pad_y*2 + icon_h + (val_h/2 - rv_th/2), VisualSettings.Color_TargetLine, r_val)
             
-            r.ImGui_PopFont(ctx)
+            reaper.ImGui_PopFont(ctx)
         else
             -- SMALL (Inline Layout)
-            r.ImGui_PushFont(ctx, base_font, 13)
+            reaper.ImGui_PushFont(ctx, base_font, 13)
             
             local inf_sz = 13 * icon_scale_inf
             local roll_sz = 13 * icon_scale_roll
             local val_sz = 13
             
-            local li_tw, li_th = r.ImGui_CalcTextSize(ctx, l_icon)
+            local li_tw, li_th = reaper.ImGui_CalcTextSize(ctx, l_icon)
             li_tw, li_th = li_tw * (inf_sz/16.0), li_th * (inf_sz/16.0)
             
-            local ri_tw, ri_th = r.ImGui_CalcTextSize(ctx, r_icon)
+            local ri_tw, ri_th = reaper.ImGui_CalcTextSize(ctx, r_icon)
             ri_tw, ri_th = ri_tw * (roll_sz/16.0), ri_th * (roll_sz/16.0)
             
-            local lv_tw, lv_th = r.ImGui_CalcTextSize(ctx, l_val)
+            local lv_tw, lv_th = reaper.ImGui_CalcTextSize(ctx, l_val)
             lv_tw, lv_th = lv_tw * (val_sz/16.0), lv_th * (val_sz/16.0)
             
-            local rv_tw, rv_th = r.ImGui_CalcTextSize(ctx, r_val)
+            local rv_tw, rv_th = reaper.ImGui_CalcTextSize(ctx, r_val)
             rv_tw, rv_th = rv_tw * (val_sz/16.0), rv_th * (val_sz/16.0)
             
-            r.ImGui_PopFont(ctx)
+            reaper.ImGui_PopFont(ctx)
             
             local icon_val_gap = 4
             local l_total_w = li_tw + icon_val_gap + lv_tw
@@ -699,20 +702,20 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
             local handle_h = math.max(li_th, ri_th, lv_th, rv_th) + (pad_y * 2)
             local handle_y = ty - (handle_h / 2)
             
-            r.ImGui_DrawList_AddRectFilled(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, bg_col, 4.0)
-            r.ImGui_DrawList_AddRect(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, VisualSettings.Color_TargetLine, 4.0, 0, 1.5)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, bg_col, 4.0)
+            reaper.ImGui_DrawList_AddRect(draw_list, handle_x, handle_y, handle_x + handle_w, handle_y + handle_h, VisualSettings.Color_TargetLine, 4.0, 0, 1.5)
             
             local div_x = handle_x + (handle_w / 2)
-            r.ImGui_DrawList_AddLine(draw_list, div_x, handle_y, div_x, handle_y + handle_h, VisualSettings.Color_TargetLine, 1.0)
+            reaper.ImGui_DrawList_AddLine(draw_list, div_x, handle_y, div_x, handle_y + handle_h, VisualSettings.Color_TargetLine, 1.0)
             
             local left_text_x = handle_x + (handle_w / 4) - (l_total_w / 2)
             local right_text_x = div_x + (handle_w / 4) - (r_total_w / 2)
             
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, inf_sz, left_text_x, handle_y + pad_y + (handle_h - pad_y*2 - li_th)/2, VisualSettings.Color_TargetLine, l_icon)
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, left_text_x + li_tw + icon_val_gap, handle_y + pad_y + (handle_h - pad_y*2 - lv_th)/2, VisualSettings.Color_TargetLine, l_val)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, inf_sz, left_text_x, handle_y + pad_y + (handle_h - pad_y*2 - li_th)/2, VisualSettings.Color_TargetLine, l_icon)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, left_text_x + li_tw + icon_val_gap, handle_y + pad_y + (handle_h - pad_y*2 - lv_th)/2, VisualSettings.Color_TargetLine, l_val)
             
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, roll_sz, right_text_x, handle_y + pad_y + (handle_h - pad_y*2 - ri_th)/2, VisualSettings.Color_TargetLine, r_icon)
-            r.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, right_text_x + ri_tw + icon_val_gap, handle_y + pad_y + (handle_h - pad_y*2 - rv_th)/2, VisualSettings.Color_TargetLine, r_val)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, roll_sz, right_text_x, handle_y + pad_y + (handle_h - pad_y*2 - ri_th)/2, VisualSettings.Color_TargetLine, r_icon)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, base_font, val_sz, right_text_x + ri_tw + icon_val_gap, handle_y + pad_y + (handle_h - pad_y*2 - rv_th)/2, VisualSettings.Color_TargetLine, r_val)
         end
     end
     
@@ -720,24 +723,24 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
     if is_meter_hovered then
         local icon_x = hover_mx + 10
         local icon_y = hover_my - 10
-        r.ImGui_DrawList_AddCircleFilled(draw_list, icon_x, icon_y, 7, VisualSettings.Color_Background)
-        r.ImGui_DrawList_AddCircle(draw_list, icon_x, icon_y, 6, VisualSettings.Color_TargetLine, 12, 1.5)
-        r.ImGui_DrawList_AddCircleFilled(draw_list, icon_x, icon_y, 2, VisualSettings.Color_TargetLine)
+        reaper.ImGui_DrawList_AddCircleFilled(draw_list, icon_x, icon_y, 7, VisualSettings.Color_Background)
+        reaper.ImGui_DrawList_AddCircle(draw_list, icon_x, icon_y, 6, VisualSettings.Color_TargetLine, 12, 1.5)
+        reaper.ImGui_DrawList_AddCircleFilled(draw_list, icon_x, icon_y, 2, VisualSettings.Color_TargetLine)
     end
     
     return clicked_inf_reset, clicked_roll_reset, new_tgt_active, new_tgt_db
 end
 
--- ==========================================
--- 🔄 MAIN LOOP
--- ==========================================
+-------------------------------------------------------------------------------
+-- 6. MAIN LOOP
+-------------------------------------------------------------------------------
 
 local function loop()
-    local now = r.time_precise()
+    local now = reaper.time_precise()
     local dt = math.min(now - State.last_time, 0.1) 
     State.last_time = now
 
-    local current_play_state = r.GetPlayState()
+    local current_play_state = reaper.GetPlayState()
     local is_playing = (current_play_state == 1 or current_play_state == 5)
     local was_playing = (State.play_state == 1 or State.play_state == 5)
     
@@ -757,15 +760,15 @@ local function loop()
 
     -- Dynamic Font Regeneration Engine
     if cached_tooltip_size ~= VisualSettings.Tooltip_Font_Size then
-        r.ImGui_Detach(ctx, tooltip_font)
-        tooltip_font = r.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Tooltip_Font_Size)
-        r.ImGui_Attach(ctx, tooltip_font)
+        reaper.ImGui_Detach(ctx, tooltip_font)
+        tooltip_font = reaper.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Tooltip_Font_Size)
+        reaper.ImGui_Attach(ctx, tooltip_font)
         cached_tooltip_size = VisualSettings.Tooltip_Font_Size
     end
     if cached_settings_size ~= VisualSettings.Settings_Font_Size then
-        r.ImGui_Detach(ctx, settings_font)
-        settings_font = r.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Settings_Font_Size)
-        r.ImGui_Attach(ctx, settings_font)
+        reaper.ImGui_Detach(ctx, settings_font)
+        settings_font = reaper.ImGui_CreateFont(VisualSettings.Global_Font_Family, VisualSettings.Settings_Font_Size)
+        reaper.ImGui_Attach(ctx, settings_font)
         cached_settings_size = VisualSettings.Settings_Font_Size
     end
 
@@ -773,50 +776,50 @@ local function loop()
     local is_warming_up = (is_playing and (now - State.play_start_time < warmup_duration))
     local do_roll_reset = false
 
-    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_WindowBg(), VisualSettings.Color_Background)
-    r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), 0, 0) 
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(), VisualSettings.Color_Background)
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), 0, 0) 
     
-    local main_flags = r.ImGui_WindowFlags_NoCollapse()
-    local visible, open = r.ImGui_Begin(ctx, 'Track Meters', true, main_flags)
+    local main_flags = reaper.ImGui_WindowFlags_NoCollapse()
+    local visible, open = reaper.ImGui_Begin(ctx, 'Track Meters', true, main_flags)
     
     if visible then
-        local draw_list = r.ImGui_GetWindowDrawList(ctx)
-        local win_pos_x, win_pos_y = r.ImGui_GetCursorScreenPos(ctx)
-        local win_width = r.ImGui_GetWindowWidth(ctx)
-        local win_height = r.ImGui_GetWindowHeight(ctx)
+        local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
+        local win_pos_x, win_pos_y = reaper.ImGui_GetCursorScreenPos(ctx)
+        local win_width = reaper.ImGui_GetWindowWidth(ctx)
+        local win_height = reaper.ImGui_GetWindowHeight(ctx)
         
         -- ⌨️ KEYBOARD SHORTCUTS
-        if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_R()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_R()) then
             State.num_peak_max = -150
             State.num_rms_max  = -150
             do_roll_reset      = true
         end
-        if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_C()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_C()) then
             State.num_peak_max = -150
             State.num_rms_max  = -150
             do_roll_reset      = true
             State.clip_log = {}
             State.last_clip_time = -100
         end
-        if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_B()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_B()) then
             State.show_balance_meter = not State.show_balance_meter
         end
-        if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_M()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_M()) then
             State.meter_scale_mode = State.meter_scale_mode == 1 and 2 or 1
         end
-        if r.ImGui_IsKeyPressed(ctx, r.ImGui_Key_L()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_L()) then
             State.is_locked = not State.is_locked
             if State.is_locked then
-                State.locked_track = r.GetSelectedTrack(0, 0)
+                State.locked_track = reaper.GetSelectedTrack(0, 0)
             else
                 State.locked_track = nil
             end
         end
 
         -- 🎯 Robust Track Locking Logic
-        local track = r.GetSelectedTrack(0, 0)
+        local track = reaper.GetSelectedTrack(0, 0)
         if State.is_locked then
-            if State.locked_track and r.ValidatePtr(State.locked_track, "MediaTrack*") then
+            if State.locked_track and reaper.ValidatePtr(State.locked_track, "MediaTrack*") then
                 track = State.locked_track
             else
                 State.is_locked = false
@@ -847,25 +850,25 @@ local function loop()
         local track_color_imgui = VisualSettings.Color_DefaultTrk
         
         if track then
-            local retval, name = r.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+            local retval, name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
             if name ~= "" then track_name = name
             else
-                local tr_num = r.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") or 0
+                local tr_num = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") or 0
                 if tr_num == -1 then track_name = "Master"
                 elseif tr_num > 0 then track_name = "Track " .. math.floor(tr_num) end
             end
             
-            local native_color = r.GetTrackColor(track) or 0
+            local native_color = reaper.GetTrackColor(track) or 0
             track_color_imgui = NativeToImGuiColor(native_color, VisualSettings.Color_DimFactor)
             
-            local peak_l_amp = r.Track_GetPeakInfo(track, 0) or 0.0
-            local peak_r_amp = r.Track_GetPeakInfo(track, 1) or 0.0
+            local peak_l_amp = reaper.Track_GetPeakInfo(track, 0) or 0.0
+            local peak_r_amp = reaper.Track_GetPeakInfo(track, 1) or 0.0
             
             cur_peak_l = AmpToDb(peak_l_amp)
             cur_peak_r = AmpToDb(peak_r_amp)
             
-            local rms_l_amp = r.Track_GetPeakInfo(track, 1024) or 0.0
-            local rms_r_amp = r.Track_GetPeakInfo(track, 1025) or 0.0
+            local rms_l_amp = reaper.Track_GetPeakInfo(track, 1024) or 0.0
+            local rms_r_amp = reaper.Track_GetPeakInfo(track, 1025) or 0.0
             
             if rms_l_amp > 0 or rms_r_amp > 0 then
                 cur_rms_l = AmpToDb(rms_l_amp)
@@ -886,7 +889,7 @@ local function loop()
 
             -- 📡 Actionable Clip Logging
             if is_playing and max_incoming_peak >= 0.0 and not is_warming_up then
-                local play_pos = r.GetPlayPosition()
+                local play_pos = reaper.GetPlayPosition()
                 if (play_pos - State.last_clip_time) > 0.5 then
                     table.insert(State.clip_log, 1, {time = play_pos, val = max_incoming_peak})
                     if #State.clip_log > 10 then table.remove(State.clip_log) end
@@ -975,7 +978,7 @@ local function loop()
         end
 
         local header_h = VisualSettings.Header_Height
-        r.ImGui_DrawList_AddRectFilled(draw_list, win_pos_x, win_pos_y, win_pos_x + win_width, win_pos_y + header_h, track_color_imgui)
+        reaper.ImGui_DrawList_AddRectFilled(draw_list, win_pos_x, win_pos_y, win_pos_x + win_width, win_pos_y + header_h, track_color_imgui)
         
         -- ⚙️ Settings Hamburger Icon
         local hw = 16 
@@ -984,32 +987,32 @@ local function loop()
         local gear_x = win_pos_x + win_width - btn_w - 5
         local gear_y = win_pos_y + (header_h / 2) - (hh / 2)
         
-        r.ImGui_SetCursorScreenPos(ctx, gear_x, gear_y - 5)
-        if r.ImGui_InvisibleButton(ctx, "settings_btn", btn_w, hh + 10) then State.show_settings = not State.show_settings end
-        local btn_col = r.ImGui_IsItemHovered(ctx) and 0x000000FF or 0x222222FF
-        r.ImGui_DrawList_AddLine(draw_list, gear_x, gear_y, gear_x + hw, gear_y, btn_col, 2.0)
-        r.ImGui_DrawList_AddLine(draw_list, gear_x, gear_y + (hh / 2), gear_x + hw, gear_y + (hh / 2), btn_col, 2.0)
-        r.ImGui_DrawList_AddLine(draw_list, gear_x, gear_y + hh, gear_x + hw, gear_y + hh, btn_col, 2.0)
+        reaper.ImGui_SetCursorScreenPos(ctx, gear_x, gear_y - 5)
+        if reaper.ImGui_InvisibleButton(ctx, "settings_btn", btn_w, hh + 10) then State.show_settings = not State.show_settings end
+        local btn_col = reaper.ImGui_IsItemHovered(ctx) and 0x000000FF or 0x222222FF
+        reaper.ImGui_DrawList_AddLine(draw_list, gear_x, gear_y, gear_x + hw, gear_y, btn_col, 2.0)
+        reaper.ImGui_DrawList_AddLine(draw_list, gear_x, gear_y + (hh / 2), gear_x + hw, gear_y + (hh / 2), btn_col, 2.0)
+        reaper.ImGui_DrawList_AddLine(draw_list, gear_x, gear_y + hh, gear_x + hw, gear_y + hh, btn_col, 2.0)
         DrawTooltip(ctx, "Open Settings")
         
         local header_space_used = gear_x
         
         -- 🚨 Clip Log Header Warning
         if #State.clip_log > 0 then
-            r.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size)
+            reaper.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size)
             local log_txt = tostring(#State.clip_log) .. " CLIPS"
-            local log_tw, log_th = r.ImGui_CalcTextSize(ctx, log_txt)
+            local log_tw, log_th = reaper.ImGui_CalcTextSize(ctx, log_txt)
             local log_w = log_tw + 20
             local log_x = header_space_used - log_w - 15
             local log_y = win_pos_y + (header_h/2) - (20/2)
             
-            r.ImGui_DrawList_AddRectFilled(draw_list, log_x, log_y, log_x + log_w, log_y + 20, VisualSettings.Color_Clip, 10.0)
-            r.ImGui_DrawList_AddTextEx(draw_list, nil, VisualSettings.Settings_Font_Size, log_x + 10, log_y + (20/2) - (log_th/2), 0x000000FF, log_txt)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, log_x, log_y, log_x + log_w, log_y + 20, VisualSettings.Color_Clip, 10.0)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, nil, VisualSettings.Settings_Font_Size, log_x + 10, log_y + (20/2) - (log_th/2), 0x000000FF, log_txt)
             
-            r.ImGui_SetCursorScreenPos(ctx, log_x, log_y)
-            if r.ImGui_InvisibleButton(ctx, "clip_log_btn", log_w, 20) then State.show_clip_log = not State.show_clip_log end
+            reaper.ImGui_SetCursorScreenPos(ctx, log_x, log_y)
+            if reaper.ImGui_InvisibleButton(ctx, "clip_log_btn", log_w, 20) then State.show_clip_log = not State.show_clip_log end
             DrawTooltip(ctx, "Clips Detected. Click to view log.")
-            r.ImGui_PopFont(ctx)
+            reaper.ImGui_PopFont(ctx)
             
             header_space_used = log_x
         else
@@ -1024,7 +1027,7 @@ local function loop()
         if pill_w > 20 then
             local pill_h = header_h - (pill_padding_y * 2)
             local pill_y = win_pos_y + pill_padding_y
-            r.ImGui_DrawList_AddRectFilled(draw_list, pill_x, pill_y, pill_x + pill_w, pill_y + pill_h, VisualSettings.Color_MeterBG, pill_h / 2)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, pill_x, pill_y, pill_x + pill_w, pill_y + pill_h, VisualSettings.Color_MeterBG, pill_h / 2)
             
             local lock_x_offset = 0
             if track then
@@ -1040,7 +1043,7 @@ local function loop()
                 
                 local cx = lock_x + (lock_w / 2)
                 local cy = lock_y + (lock_h / 2)
-                r.ImGui_DrawList_AddCircleFilled(draw_list, cx, cy, lock_w / 2, lock_bg_col)
+                reaper.ImGui_DrawList_AddCircleFilled(draw_list, cx, cy, lock_w / 2, lock_bg_col)
                 
                 local body_w = 12
                 local body_h = 10
@@ -1050,32 +1053,32 @@ local function loop()
                 local rot_closed = math.pi / 1
                 
                 if State.is_locked then
-                    r.ImGui_DrawList_PathClear(draw_list)
-                    r.ImGui_DrawList_PathArcTo(draw_list, cx, cy - body_y_offset - 4, shackle_r, math.pi + rot_closed, 0 , 10)
-                    r.ImGui_DrawList_PathStroke(draw_list, icon_col, 0, 2.0)
+                    reaper.ImGui_DrawList_PathClear(draw_list)
+                    reaper.ImGui_DrawList_PathArcTo(draw_list, cx, cy - body_y_offset - 4, shackle_r, math.pi + rot_closed, 0 , 10)
+                    reaper.ImGui_DrawList_PathStroke(draw_list, icon_col, 0, 2.0)
                 else
-                    r.ImGui_DrawList_PathClear(draw_list)
-                    r.ImGui_DrawList_PathArcTo(draw_list, cx, cy - body_y_offset - 4, shackle_r, math.pi + rot_open, 0 + rot_open, 10)
-                    r.ImGui_DrawList_PathStroke(draw_list, icon_col, 0, 2.0)
+                    reaper.ImGui_DrawList_PathClear(draw_list)
+                    reaper.ImGui_DrawList_PathArcTo(draw_list, cx, cy - body_y_offset - 4, shackle_r, math.pi + rot_open, 0 + rot_open, 10)
+                    reaper.ImGui_DrawList_PathStroke(draw_list, icon_col, 0, 2.0)
                 end
                 
-                r.ImGui_DrawList_AddRectFilled(draw_list, cx - (body_w/2), cy + body_y_offset - 2, cx + (body_w/2), cy + body_h + body_y_offset - 2, icon_col, 2.0)
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, cx - (body_w/2), cy + body_y_offset - 2, cx + (body_w/2), cy + body_h + body_y_offset - 2, icon_col, 2.0)
                 
-                r.ImGui_SetCursorScreenPos(ctx, lock_x, lock_y)
-                if r.ImGui_InvisibleButton(ctx, "lock_btn", lock_w, lock_h) then
+                reaper.ImGui_SetCursorScreenPos(ctx, lock_x, lock_y)
+                if reaper.ImGui_InvisibleButton(ctx, "lock_btn", lock_w, lock_h) then
                     State.is_locked = not State.is_locked
                     if State.is_locked then State.locked_track = track end
                 end
                 DrawTooltip(ctx, State.is_locked and "Unlock to follow selected track\n\nShortcut: L" or "Lock meter to current track\n\nShortcut: L")
             end
             
-            local tw, th = r.ImGui_CalcTextSize(ctx, track_name)
+            local tw, th = reaper.ImGui_CalcTextSize(ctx, track_name)
             local tx = pill_x + 15
             local clip_max_x = track and (pill_x + pill_w - lock_x_offset - 5) or (pill_x + pill_w - 10)
             
-            r.ImGui_PushClipRect(ctx, pill_x, pill_y, clip_max_x, pill_y + pill_h, true)
-            r.ImGui_DrawList_AddTextEx(draw_list, nil, 16, tx, pill_y + (pill_h / 2) - (th / 2) - 2, VisualSettings.Color_TrackName, track_name)
-            r.ImGui_PopClipRect(ctx)
+            reaper.ImGui_PushClipRect(ctx, pill_x, pill_y, clip_max_x, pill_y + pill_h, true)
+            reaper.ImGui_DrawList_AddTextEx(draw_list, nil, 16, tx, pill_y + (pill_h / 2) - (th / 2) - 2, VisualSettings.Color_TrackName, track_name)
+            reaper.ImGui_PopClipRect(ctx)
         end
 
         local content_start_y = win_pos_y + header_h + 15 
@@ -1145,94 +1148,94 @@ local function loop()
         end
         
         -- 🎚️ METER SCALE DROPDOWN
-        r.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size) 
+        reaper.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size) 
         local combo_w = total_block_w
         local combo_x = start_x
         local combo_y = shared_meter_y + dynamic_h + 15
-        r.ImGui_SetCursorScreenPos(ctx, combo_x, combo_y)
-        r.ImGui_SetNextItemWidth(ctx, combo_w)
+        reaper.ImGui_SetCursorScreenPos(ctx, combo_x, combo_y)
+        reaper.ImGui_SetNextItemWidth(ctx, combo_w)
         
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBg(), VisualSettings.Color_SettingsFrame)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgHovered(), VisualSettings.Color_SettingsHover)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_FrameBgActive(), VisualSettings.Color_SettingsAccent)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), VisualSettings.Color_Text)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), VisualSettings.Color_SettingsFrame)
-        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FrameRounding(), 2.0)
-        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_FramePadding(), 8, 6)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(), VisualSettings.Color_SettingsFrame)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), VisualSettings.Color_SettingsHover)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(), VisualSettings.Color_SettingsAccent)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), VisualSettings.Color_Text)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), VisualSettings.Color_SettingsFrame)
+        reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(), 2.0)
+        reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 6)
         
         local scale_opts = "Linear\0Mixer's Curve\0"
-        local changed, new_mode_idx = r.ImGui_Combo(ctx, "##ScaleMode", State.meter_scale_mode - 1, scale_opts)
+        local changed, new_mode_idx = reaper.ImGui_Combo(ctx, "##ScaleMode", State.meter_scale_mode - 1, scale_opts)
         if changed then State.meter_scale_mode = new_mode_idx + 1 end
         
         DrawTooltip(ctx, "Meter Scale Mode\n\nLinear: Evenly spaced decibel increments.\nMixer's Curve: Expands the top 24 dB for high-resolution critical mixing.\n\nShortcut: M")
         
-        r.ImGui_PopStyleVar(ctx, 2)
-        r.ImGui_PopStyleColor(ctx, 5)
-        r.ImGui_PopFont(ctx)
+        reaper.ImGui_PopStyleVar(ctx, 2)
+        reaper.ImGui_PopStyleColor(ctx, 5)
+        reaper.ImGui_PopFont(ctx)
 
         -- 🌑 DIM OVERLAY WHEN NO TRACK
         if not track then
             local dim_alpha = math.floor(VisualSettings.Dim_Opacity_Pct * 255)
             local hex_alpha = dim_alpha 
-            r.ImGui_DrawList_AddRectFilled(draw_list, win_pos_x, win_pos_y + header_h, win_pos_x + win_width, win_pos_y + win_height, hex_alpha)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, win_pos_x, win_pos_y + header_h, win_pos_x + win_width, win_pos_y + win_height, hex_alpha)
         end
 
     end
     
-    r.ImGui_End(ctx) 
-    r.ImGui_PopStyleVar(ctx, 1) 
-    r.ImGui_PopStyleColor(ctx, 1)
+    reaper.ImGui_End(ctx) 
+    reaper.ImGui_PopStyleVar(ctx, 1) 
+    reaper.ImGui_PopStyleColor(ctx, 1)
 
-    -- ==========================================
-    -- 🚨 FLOATING CLIP LOG
-    -- ==========================================
+    -------------------------------------------------------------------------------
+-- 7. FLOATING CLIP LOG
+-------------------------------------------------------------------------------
     if State.show_clip_log then
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_WindowBg(), VisualSettings.Color_Background)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_TitleBg(), VisualSettings.Color_TitleBg)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_TitleBgActive(), VisualSettings.Color_Clip)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), VisualSettings.Color_SettingsFrame)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonHovered(), VisualSettings.Color_SettingsHover)
-        r.ImGui_PushStyleColor(ctx, r.ImGui_Col_ButtonActive(), VisualSettings.Color_SettingsAccent)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(), VisualSettings.Color_Background)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBg(), VisualSettings.Color_TitleBg)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBgActive(), VisualSettings.Color_Clip)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), VisualSettings.Color_SettingsFrame)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), VisualSettings.Color_SettingsHover)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), VisualSettings.Color_SettingsAccent)
         
-        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), 10, 10) 
-        r.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size) 
+        reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), 10, 10) 
+        reaper.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size) 
         
-        local clip_flags = r.ImGui_WindowFlags_AlwaysAutoResize()
-        local c_visible, c_open = r.ImGui_Begin(ctx, 'Recent Clips', true, clip_flags)
+        local clip_flags = reaper.ImGui_WindowFlags_AlwaysAutoResize()
+        local c_visible, c_open = reaper.ImGui_Begin(ctx, 'Recent Clips', true, clip_flags)
         
         if c_visible then
             if #State.clip_log == 0 then
-                r.ImGui_Text(ctx, "No clips detected.")
+                reaper.ImGui_Text(ctx, "No clips detected.")
             else
-                r.ImGui_Text(ctx, "Click timestamp to jump to location:")
-                r.ImGui_Separator(ctx)
+                reaper.ImGui_Text(ctx, "Click timestamp to jump to location:")
+                reaper.ImGui_Separator(ctx)
                 for i, clip in ipairs(State.clip_log) do
-                    local time_str = r.format_timestr_pos(clip.time, "", -1)
+                    local time_str = reaper.format_timestr_pos(clip.time, "", -1)
                     local val_str = string.format("+%.1f dB", clip.val)
-                    if r.ImGui_Button(ctx, time_str .. "  |  " .. val_str .. "##" .. i, -1, 30) then
-                        r.SetEditCurPos(clip.time, true, false)
+                    if reaper.ImGui_Button(ctx, time_str .. "  |  " .. val_str .. "##" .. i, -1, 30) then
+                        reaper.SetEditCurPos(clip.time, true, false)
                     end
                 end
-                r.ImGui_Dummy(ctx, 0, 10)
-                r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Button(), VisualSettings.Color_Clip)
-                r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), 0x000000FF)
-                if r.ImGui_Button(ctx, "Clear Log", -1, 30) then
+                reaper.ImGui_Dummy(ctx, 0, 10)
+                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), VisualSettings.Color_Clip)
+                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x000000FF)
+                if reaper.ImGui_Button(ctx, "Clear Log", -1, 30) then
                     State.clip_log = {}
                     State.last_clip_time = -100
                 end
-                r.ImGui_PopStyleColor(ctx, 2)
+                reaper.ImGui_PopStyleColor(ctx, 2)
             end
         end
-        r.ImGui_End(ctx)
-        r.ImGui_PopFont(ctx)
-        r.ImGui_PopStyleVar(ctx, 1)
-        r.ImGui_PopStyleColor(ctx, 6)
+        reaper.ImGui_End(ctx)
+        reaper.ImGui_PopFont(ctx)
+        reaper.ImGui_PopStyleVar(ctx, 1)
+        reaper.ImGui_PopStyleColor(ctx, 6)
         if not c_open then State.show_clip_log = false end
     end
 
-    -- ==========================================
-    -- ⚙️ FLOATING SETTINGS MODAL
-    -- ==========================================
+    -------------------------------------------------------------------------------
+-- 8. FLOATING SETTINGS MODAL
+-------------------------------------------------------------------------------
     if State.show_settings then
         
         local num_style_colors = 0
@@ -1240,84 +1243,84 @@ local function loop()
             local col_id = fallback_int
             if type(enum_func) == "function" then col_id = enum_func()
             elseif type(enum_func) == "number" then col_id = enum_func end
-            r.ImGui_PushStyleColor(ctx, col_id, hex_color)
+            reaper.ImGui_PushStyleColor(ctx, col_id, hex_color)
             num_style_colors = num_style_colors + 1
         end
 
-        SafePushColor(r.ImGui_Col_TitleBg, 10, VisualSettings.Color_TitleBg)
-        SafePushColor(r.ImGui_Col_TitleBgActive, 11, VisualSettings.Color_TitleActive)
-        SafePushColor(r.ImGui_Col_TitleBgCollapsed, 12, VisualSettings.Color_TitleBg)
+        SafePushColor(reaper.ImGui_Col_TitleBg, 10, VisualSettings.Color_TitleBg)
+        SafePushColor(reaper.ImGui_Col_TitleBgActive, 11, VisualSettings.Color_TitleActive)
+        SafePushColor(reaper.ImGui_Col_TitleBgCollapsed, 12, VisualSettings.Color_TitleBg)
         
-        SafePushColor(r.ImGui_Col_WindowBg, 2, VisualSettings.Color_Background)
-        SafePushColor(r.ImGui_Col_FrameBg, 7, VisualSettings.Color_SettingsFrame)
-        SafePushColor(r.ImGui_Col_FrameBgHovered, 8, VisualSettings.Color_SettingsHover)
-        SafePushColor(r.ImGui_Col_SliderGrab, 19, VisualSettings.Color_SettingsAccent)
-        SafePushColor(r.ImGui_Col_SliderGrabActive, 20, VisualSettings.Color_SettingsAccent)
-        SafePushColor(r.ImGui_Col_CheckMark, 18, VisualSettings.Color_SettingsAccent)
+        SafePushColor(reaper.ImGui_Col_WindowBg, 2, VisualSettings.Color_Background)
+        SafePushColor(reaper.ImGui_Col_FrameBg, 7, VisualSettings.Color_SettingsFrame)
+        SafePushColor(reaper.ImGui_Col_FrameBgHovered, 8, VisualSettings.Color_SettingsHover)
+        SafePushColor(reaper.ImGui_Col_SliderGrab, 19, VisualSettings.Color_SettingsAccent)
+        SafePushColor(reaper.ImGui_Col_SliderGrabActive, 20, VisualSettings.Color_SettingsAccent)
+        SafePushColor(reaper.ImGui_Col_CheckMark, 18, VisualSettings.Color_SettingsAccent)
         
-        SafePushColor(r.ImGui_Col_Tab, 33, VisualSettings.Tab_Inactive)
-        SafePushColor(r.ImGui_Col_TabHovered, 34, VisualSettings.Tab_Hovered)
-        SafePushColor(r.ImGui_Col_TabActive, 35, VisualSettings.Tab_Active)
-        SafePushColor(r.ImGui_Col_TabUnfocused, 36, VisualSettings.Tab_Inactive)
-        SafePushColor(r.ImGui_Col_TabUnfocusedActive, 37, VisualSettings.Tab_Active)
+        SafePushColor(reaper.ImGui_Col_Tab, 33, VisualSettings.Tab_Inactive)
+        SafePushColor(reaper.ImGui_Col_TabHovered, 34, VisualSettings.Tab_Hovered)
+        SafePushColor(reaper.ImGui_Col_TabActive, 35, VisualSettings.Tab_Active)
+        SafePushColor(reaper.ImGui_Col_TabUnfocused, 36, VisualSettings.Tab_Inactive)
+        SafePushColor(reaper.ImGui_Col_TabUnfocusedActive, 37, VisualSettings.Tab_Active)
         
-        SafePushColor(r.ImGui_Col_Header, 24, VisualSettings.Color_SettingsFrame)
-        SafePushColor(r.ImGui_Col_HeaderHovered, 25, VisualSettings.Color_SettingsHover)
-        SafePushColor(r.ImGui_Col_HeaderActive, 26, VisualSettings.Color_SettingsAccent)
+        SafePushColor(reaper.ImGui_Col_Header, 24, VisualSettings.Color_SettingsFrame)
+        SafePushColor(reaper.ImGui_Col_HeaderHovered, 25, VisualSettings.Color_SettingsHover)
+        SafePushColor(reaper.ImGui_Col_HeaderActive, 26, VisualSettings.Color_SettingsAccent)
         
-        r.ImGui_PushStyleVar(ctx, r.ImGui_StyleVar_WindowPadding(), 8, 8) 
-        r.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size) 
+        reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), 8, 8) 
+        reaper.ImGui_PushFont(ctx, settings_font, VisualSettings.Settings_Font_Size) 
         
-        local set_flags = r.ImGui_WindowFlags_AlwaysAutoResize() | r.ImGui_WindowFlags_NoCollapse()
-        local set_visible, set_open = r.ImGui_Begin(ctx, 'Meter Settings', true, set_flags)
+        local set_flags = reaper.ImGui_WindowFlags_AlwaysAutoResize() | reaper.ImGui_WindowFlags_NoCollapse()
+        local set_visible, set_open = reaper.ImGui_Begin(ctx, 'Meter Settings', true, set_flags)
         
         if set_visible then
-            if r.ImGui_BeginTabBar(ctx, "SettingsTabs") then
+            if reaper.ImGui_BeginTabBar(ctx, "SettingsTabs") then
                 
                 -- TAB 1: Appearance
-                if r.ImGui_BeginTabItem(ctx, "Appearance") then
-                    r.ImGui_Text(ctx, "Meter Colors")
-                    r.ImGui_Separator(ctx)
+                if reaper.ImGui_BeginTabItem(ctx, "Appearance") then
+                    reaper.ImGui_Text(ctx, "Meter Colors")
+                    reaper.ImGui_Separator(ctx)
                     local c_changed, c_new
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Safe Zone", VisualSettings.Color_Safe, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Safe Zone", VisualSettings.Color_Safe, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Color_Safe = c_new end
                     DrawTooltip(ctx, "Color for normal operating levels.")
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Warning Zone", VisualSettings.Color_Warn, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Warning Zone", VisualSettings.Color_Warn, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Color_Warn = c_new end
                     DrawTooltip(ctx, "Color when signal exceeds the warning threshold.")
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Clip Zone", VisualSettings.Color_Clip, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Clip Zone", VisualSettings.Color_Clip, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Color_Clip = c_new end
                     DrawTooltip(ctx, "Color when signal hits or exceeds 0 dBFS.")
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Target Line", VisualSettings.Color_TargetLine, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Target Line", VisualSettings.Color_TargetLine, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Color_TargetLine = c_new end
                     DrawTooltip(ctx, "Color of the draggable target markers.")
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Meter Background", VisualSettings.Color_MeterBG, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Meter Background", VisualSettings.Color_MeterBG, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Color_MeterBG = c_new end
                     DrawTooltip(ctx, "Background color of the meter tracks.")
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Window Background", VisualSettings.Color_Background, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Window Background", VisualSettings.Color_Background, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Color_Background = c_new end
                     DrawTooltip(ctx, "Main window background color.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Tab Navigation Colors")
-                    r.ImGui_Separator(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Tab Navigation Colors")
+                    reaper.ImGui_Separator(ctx)
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Active Tab", VisualSettings.Tab_Active, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Active Tab", VisualSettings.Tab_Active, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Tab_Active = c_new end
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Inactive Tab", VisualSettings.Tab_Inactive, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Inactive Tab", VisualSettings.Tab_Inactive, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Tab_Inactive = c_new end
                     
-                    c_changed, c_new = r.ImGui_ColorEdit4(ctx, "Hovered Tab", VisualSettings.Tab_Hovered, r.ImGui_ColorEditFlags_NoInputs())
+                    c_changed, c_new = reaper.ImGui_ColorEdit4(ctx, "Hovered Tab", VisualSettings.Tab_Hovered, reaper.ImGui_ColorEditFlags_NoInputs())
                     if c_changed then VisualSettings.Tab_Hovered = c_new end
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    if r.ImGui_Button(ctx, "Reset All Colors to Default") then
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    if reaper.ImGui_Button(ctx, "Reset All Colors to Default") then
                         VisualSettings.Color_Safe = 0x0088CCFF
                         VisualSettings.Color_Warn = 0xE0B000FF
                         VisualSettings.Color_Clip = 0xDD0000FF
@@ -1330,189 +1333,193 @@ local function loop()
                     end
                     
                     local changed
-                    changed, VisualSettings.Dim_Opacity_Pct = r.ImGui_SliderDouble(ctx, "Unselected Dim Opacity", VisualSettings.Dim_Opacity_Pct, 0.0, 1.0, "%.2f")
+                    changed, VisualSettings.Dim_Opacity_Pct = reaper.ImGui_SliderDouble(ctx, "Unselected Dim Opacity", VisualSettings.Dim_Opacity_Pct, 0.0, 1.0, "%.2f")
                     DrawTooltip(ctx, "Darkness of the overlay when no track is selected.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Typography")
-                    r.ImGui_Separator(ctx)
-                    changed, VisualSettings.Tooltip_Font_Size = r.ImGui_SliderInt(ctx, "Tooltip Font Size", VisualSettings.Tooltip_Font_Size, 10, 36)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Typography")
+                    reaper.ImGui_Separator(ctx)
+                    changed, VisualSettings.Tooltip_Font_Size = reaper.ImGui_SliderInt(ctx, "Tooltip Font Size", VisualSettings.Tooltip_Font_Size, 10, 36)
                     DrawTooltip(ctx, "Size of the hover tooltips.")
                     
-                    changed, VisualSettings.Settings_Font_Size = r.ImGui_SliderInt(ctx, "Settings Font Size", VisualSettings.Settings_Font_Size, 10, 36)
+                    changed, VisualSettings.Settings_Font_Size = reaper.ImGui_SliderInt(ctx, "Settings Font Size", VisualSettings.Settings_Font_Size, 10, 36)
                     DrawTooltip(ctx, "Size of the text in this menu.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Layout")
-                    r.ImGui_Separator(ctx)
-                    changed, State.column_gap = r.ImGui_SliderInt(ctx, "Column Gap (px)", State.column_gap, 0, 100)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Layout")
+                    reaper.ImGui_Separator(ctx)
+                    changed, State.column_gap = reaper.ImGui_SliderInt(ctx, "Column Gap (px)", State.column_gap, 0, 100)
                     DrawTooltip(ctx, "Space between the Left/Right meters and the Crest Factor column.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Separator(ctx)
-                    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), VisualSettings.Color_TextDim)
-                    r.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
-                    r.ImGui_PopStyleColor(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), VisualSettings.Color_TextDim)
+                    reaper.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
+                    reaper.ImGui_PopStyleColor(ctx)
                     
-                    r.ImGui_EndTabItem(ctx)
+                    reaper.ImGui_EndTabItem(ctx)
                 end
                 
                 -- TAB 2: Stereo Balance
-                if r.ImGui_BeginTabItem(ctx, "Stereo Balance") then
-                    r.ImGui_Text(ctx, "Visibility")
-                    r.ImGui_Separator(ctx)
+                if reaper.ImGui_BeginTabItem(ctx, "Stereo Balance") then
+                    reaper.ImGui_Text(ctx, "Visibility")
+                    reaper.ImGui_Separator(ctx)
                     local changed
-                    changed, State.show_balance_meter = r.ImGui_Checkbox(ctx, "Show Stereo Balance Drift", State.show_balance_meter)
+                    changed, State.show_balance_meter = reaper.ImGui_Checkbox(ctx, "Show Stereo Balance Drift", State.show_balance_meter)
                     DrawTooltip(ctx, "Toggle the top horizontal balance meter.\nShortcut: B")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Range")
-                    r.ImGui_Separator(ctx)
-                    changed, State.balance_db_scale = r.ImGui_SliderDouble(ctx, "Max Range (+/- dB)", State.balance_db_scale, 1.0, 24.0, "%.1f")
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Range")
+                    reaper.ImGui_Separator(ctx)
+                    changed, State.balance_db_scale = reaper.ImGui_SliderDouble(ctx, "Max Range (+/- dB)", State.balance_db_scale, 1.0, 24.0, "%.1f")
                     DrawTooltip(ctx, "Decibel range from center to edge.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Drift Speeds")
-                    r.ImGui_Separator(ctx)
-                    changed, State.balance_window_sec = r.ImGui_SliderDouble(ctx, "Slow Drift Speed (sec)", State.balance_window_sec, 0.1, 10.0, "%.1f")
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Drift Speeds")
+                    reaper.ImGui_Separator(ctx)
+                    changed, State.balance_window_sec = reaper.ImGui_SliderDouble(ctx, "Slow Drift Speed (sec)", State.balance_window_sec, 0.1, 10.0, "%.1f")
                     DrawTooltip(ctx, "Integration time for sustained RMS balance.")
                     
-                    changed, State.balance_window_sec_fast = r.ImGui_SliderDouble(ctx, "Fast Drift Speed (sec)", State.balance_window_sec_fast, 0.033, 2.0, "%.3f")
+                    changed, State.balance_window_sec_fast = reaper.ImGui_SliderDouble(ctx, "Fast Drift Speed (sec)", State.balance_window_sec_fast, 0.033, 2.0, "%.3f")
                     DrawTooltip(ctx, "Integration time for instantaneous Peak balance.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Separator(ctx)
-                    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), VisualSettings.Color_TextDim)
-                    r.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
-                    r.ImGui_PopStyleColor(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), VisualSettings.Color_TextDim)
+                    reaper.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
+                    reaper.ImGui_PopStyleColor(ctx)
                     
-                    r.ImGui_EndTabItem(ctx)
+                    reaper.ImGui_EndTabItem(ctx)
                 end
                 
                 -- TAB 3: Level Meters
-                if r.ImGui_BeginTabItem(ctx, "Level Meters") then
-                    r.ImGui_Text(ctx, "Peak Settings")
-                    r.ImGui_Separator(ctx)
+                if reaper.ImGui_BeginTabItem(ctx, "Level Meters") then
+                    reaper.ImGui_Text(ctx, "Peak Settings")
+                    reaper.ImGui_Separator(ctx)
                     local changed
-                    changed, State.peak_db_min = r.ImGui_SliderDouble(ctx, "Min DB##Peak", State.peak_db_min, -100.0, 0.0, "%.1f")
+                    changed, State.peak_db_min = reaper.ImGui_SliderDouble(ctx, "Min DB##Peak", State.peak_db_min, -100.0, 0.0, "%.1f")
                     DrawTooltip(ctx, "Lowest decibel value shown on Peak meters.")
                     
-                    changed, State.peak_db_max = r.ImGui_SliderDouble(ctx, "Max DB##Peak", State.peak_db_max, -100.0, 0.0, "%.1f")
+                    changed, State.peak_db_max = reaper.ImGui_SliderDouble(ctx, "Max DB##Peak", State.peak_db_max, -100.0, 0.0, "%.1f")
                     DrawTooltip(ctx, "Highest decibel value shown on Peak meters.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "RMS Settings")
-                    r.ImGui_Separator(ctx)
-                    changed, State.rms_db_min = r.ImGui_SliderDouble(ctx, "Min DB##RMS", State.rms_db_min, -100.0, 0.0, "%.1f")
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "RMS Settings")
+                    reaper.ImGui_Separator(ctx)
+                    changed, State.rms_db_min = reaper.ImGui_SliderDouble(ctx, "Min DB##RMS", State.rms_db_min, -100.0, 0.0, "%.1f")
                     DrawTooltip(ctx, "Lowest decibel value shown on RMS meters.")
                     
-                    changed, State.rms_db_max = r.ImGui_SliderDouble(ctx, "Max DB##RMS", State.rms_db_max, -100.0, 0.0, "%.1f")
+                    changed, State.rms_db_max = reaper.ImGui_SliderDouble(ctx, "Max DB##RMS", State.rms_db_max, -100.0, 0.0, "%.1f")
                     DrawTooltip(ctx, "Highest decibel value shown on RMS meters.")
                     
-                    changed, State.damping = r.ImGui_SliderDouble(ctx, "Smoothing", State.damping, 0.01, 1.0, "%.2f")
+                    changed, State.damping = reaper.ImGui_SliderDouble(ctx, "Smoothing", State.damping, 0.01, 1.0, "%.2f")
                     DrawTooltip(ctx, "RC filter speed for the RMS calculation. Lower is slower.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Global")
-                    r.ImGui_Separator(ctx)
-                    changed, State.falloff_db_sec = r.ImGui_SliderDouble(ctx, "Meter Falloff (dB/s)", State.falloff_db_sec, 5.0, 100.0, "%.1f")
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Global")
+                    reaper.ImGui_Separator(ctx)
+                    changed, State.falloff_db_sec = reaper.ImGui_SliderDouble(ctx, "Meter Falloff (dB/s)", State.falloff_db_sec, 5.0, 100.0, "%.1f")
                     DrawTooltip(ctx, "Speed at which the meter bars drop (dB per second).")
                     
-                    changed, State.rolling_window_sec = r.ImGui_SliderDouble(ctx, "Rolling Window (sec)", State.rolling_window_sec, 1.0, 10.0, "%.1f")
+                    changed, State.rolling_window_sec = reaper.ImGui_SliderDouble(ctx, "Rolling Window (sec)", State.rolling_window_sec, 1.0, 10.0, "%.1f")
                     DrawTooltip(ctx, "Time in seconds before the rolling maximum resets.")
                     
                     if State.peak_db_min >= State.peak_db_max then State.peak_db_min = State.peak_db_max - 1 end
                     if State.rms_db_min >= State.rms_db_max then State.rms_db_min = State.rms_db_max - 1 end
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Separator(ctx)
-                    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), VisualSettings.Color_TextDim)
-                    r.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
-                    r.ImGui_PopStyleColor(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), VisualSettings.Color_TextDim)
+                    reaper.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
+                    reaper.ImGui_PopStyleColor(ctx)
                     
-                    r.ImGui_EndTabItem(ctx)
+                    reaper.ImGui_EndTabItem(ctx)
                 end
                 
                 -- TAB 4: Target Markers
-                if r.ImGui_BeginTabItem(ctx, "Target Markers") then
-                    r.ImGui_Text(ctx, "Peaks")
-                    r.ImGui_Separator(ctx)
+                if reaper.ImGui_BeginTabItem(ctx, "Target Markers") then
+                    reaper.ImGui_Text(ctx, "Peaks")
+                    reaper.ImGui_Separator(ctx)
                     local changed
-                    changed, State.tgt_peak_active = r.ImGui_Checkbox(ctx, "Enable Peak Target by Default##Peak", State.tgt_peak_active)
+                    changed, State.tgt_peak_active = reaper.ImGui_Checkbox(ctx, "Enable Peak Target by Default##Peak", State.tgt_peak_active)
                     DrawTooltip(ctx, "Turn on the Peak target line automatically.")
                     
-                    changed, State.tgt_peak_db = r.ImGui_SliderDouble(ctx, "Default Peak Target (dB)##Peak", State.tgt_peak_db, -60.0, 0.0, "%.1f")
+                    changed, State.tgt_peak_db = reaper.ImGui_SliderDouble(ctx, "Default Peak Target (dB)##Peak", State.tgt_peak_db, -60.0, 0.0, "%.1f")
                     DrawTooltip(ctx, "Default decibel level for the Peak target.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "RMS")
-                    r.ImGui_Separator(ctx)
-                    changed, State.tgt_rms_active = r.ImGui_Checkbox(ctx, "Enable RMS Target by Default##RMS", State.tgt_rms_active)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "RMS")
+                    reaper.ImGui_Separator(ctx)
+                    changed, State.tgt_rms_active = reaper.ImGui_Checkbox(ctx, "Enable RMS Target by Default##RMS", State.tgt_rms_active)
                     DrawTooltip(ctx, "Turn on the RMS target line automatically.")
                     
-                    changed, State.tgt_rms_db = r.ImGui_SliderDouble(ctx, "Default RMS Target (dB)##RMS", State.tgt_rms_db, -60.0, 0.0, "%.1f")
+                    changed, State.tgt_rms_db = reaper.ImGui_SliderDouble(ctx, "Default RMS Target (dB)##RMS", State.tgt_rms_db, -60.0, 0.0, "%.1f")
                     DrawTooltip(ctx, "Default decibel level for the RMS target.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Appearance")
-                    r.ImGui_Separator(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Appearance")
+                    reaper.ImGui_Separator(ctx)
                     
                     local size_opts = "Small (Inline)\0Large (Stacked)\0"
-                    changed, State.tgt_marker_size = r.ImGui_Combo(ctx, "Marker Size", State.tgt_marker_size, size_opts)
+                    changed, State.tgt_marker_size = reaper.ImGui_Combo(ctx, "Marker Size", State.tgt_marker_size, size_opts)
                     DrawTooltip(ctx, "Choose the size and layout of the target value handle.")
                     
-                    changed, State.tgt_marker_indent = r.ImGui_SliderDouble(ctx, "Box Indent (px)", State.tgt_marker_indent, 0.0, 50.0, "%.1f")
+                    changed, State.tgt_marker_indent = reaper.ImGui_SliderDouble(ctx, "Box Indent (px)", State.tgt_marker_indent, 0.0, 50.0, "%.1f")
                     DrawTooltip(ctx, "Shrinks the target box to expose the target line underneath.")
                     
-                    changed, State.tgt_marker_bg_alpha = r.ImGui_SliderDouble(ctx, "Box Opacity", State.tgt_marker_bg_alpha, 0.0, 1.0, "%.2f")
+                    changed, State.tgt_marker_bg_alpha = reaper.ImGui_SliderDouble(ctx, "Box Opacity", State.tgt_marker_bg_alpha, 0.0, 1.0, "%.2f")
                     DrawTooltip(ctx, "Transparency of the target handle background.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Separator(ctx)
-                    r.ImGui_PushStyleColor(ctx, r.ImGui_Col_Text(), VisualSettings.Color_TextDim)
-                    r.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
-                    r.ImGui_PopStyleColor(ctx)
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), VisualSettings.Color_TextDim)
+                    reaper.ImGui_Text(ctx, "💡 Tip: Ctrl/Cmd + Click any slider to type a value.")
+                    reaper.ImGui_PopStyleColor(ctx)
                     
-                    r.ImGui_EndTabItem(ctx)
+                    reaper.ImGui_EndTabItem(ctx)
                 end
                 
                 -- TAB 5: Shortcuts
-                if r.ImGui_BeginTabItem(ctx, "Shortcuts") then
-                    r.ImGui_Text(ctx, "Keyboard Shortcuts")
-                    r.ImGui_Separator(ctx)
+                if reaper.ImGui_BeginTabItem(ctx, "Shortcuts") then
+                    reaper.ImGui_Text(ctx, "Keyboard Shortcuts")
+                    reaper.ImGui_Separator(ctx)
                     
-                    r.ImGui_Text(ctx, "R : Reset infinite and rolling meters.")
-                    r.ImGui_Text(ctx, "C : Clear clip log and reset meters.")
-                    r.ImGui_Text(ctx, "B : Toggle Stereo Balance visibility.")
-                    r.ImGui_Text(ctx, "M : Switch Meter Scale Mode (Linear/Mixer).")
-                    r.ImGui_Text(ctx, "L : Lock/Unlock current track.")
+                    reaper.ImGui_Text(ctx, "R : Reset infinite and rolling meters.")
+                    reaper.ImGui_Text(ctx, "C : Clear clip log and reset meters.")
+                    reaper.ImGui_Text(ctx, "B : Toggle Stereo Balance visibility.")
+                    reaper.ImGui_Text(ctx, "M : Switch Meter Scale Mode (Linear/Mixer).")
+                    reaper.ImGui_Text(ctx, "L : Lock/Unlock current track.")
                     
-                    r.ImGui_Dummy(ctx, 0, 10)
-                    r.ImGui_Text(ctx, "Mouse Shortcuts")
-                    r.ImGui_Separator(ctx)
-                    r.ImGui_Text(ctx, "Click Meter : Enable and set target marker.")
-                    r.ImGui_Text(ctx, "Click Infinite Box (∞) : Reset infinite peak/rms.")
-                    r.ImGui_Text(ctx, "Click Rolling Box (↻) : Reset rolling peak/rms.")
-                    r.ImGui_Text(ctx, "Ctrl/Cmd + Click Slider : Type exact value manually.")
+                    reaper.ImGui_Dummy(ctx, 0, 10)
+                    reaper.ImGui_Text(ctx, "Mouse Shortcuts")
+                    reaper.ImGui_Separator(ctx)
+                    reaper.ImGui_Text(ctx, "Click Meter : Enable and set target marker.")
+                    reaper.ImGui_Text(ctx, "Click Infinite Box (∞) : Reset infinite peak/rms.")
+                    reaper.ImGui_Text(ctx, "Click Rolling Box (↻) : Reset rolling peak/rms.")
+                    reaper.ImGui_Text(ctx, "Ctrl/Cmd + Click Slider : Type exact value manually.")
                     
-                    r.ImGui_EndTabItem(ctx)
+                    reaper.ImGui_EndTabItem(ctx)
                 end
                 
-                r.ImGui_EndTabBar(ctx)
+                reaper.ImGui_EndTabBar(ctx)
             end
         end
         
-        r.ImGui_End(ctx) 
-        r.ImGui_PopFont(ctx) 
-        r.ImGui_PopStyleVar(ctx, 1) 
-        r.ImGui_PopStyleColor(ctx, num_style_colors)
+        reaper.ImGui_End(ctx) 
+        reaper.ImGui_PopFont(ctx) 
+        reaper.ImGui_PopStyleVar(ctx, 1) 
+        reaper.ImGui_PopStyleColor(ctx, num_style_colors)
         
         if not set_open then State.show_settings = false end
     end
 
     if open then
-        r.defer(loop)
+        reaper.defer(loop)
     end
 end
 
-r.defer(loop)
+function main()
+  reaper.defer(loop)
+end
+
+main()
