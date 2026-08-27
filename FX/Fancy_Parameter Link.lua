@@ -1,8 +1,8 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 4.0.0
+-- @version 4.1.0
 -- @changelog
---   + Added ReaPack distribution support
+--   + Migrated to shared _lib/ modules (theme, json, utils)
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
 --   Features: shared pickers for all workflows, quick single-param add,
@@ -13,6 +13,7 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
+--   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -29,131 +30,13 @@ if not reaper.ImGui_CreateContext then
 end
 
 -------------------------------------------------------------------------------
--- 2. TINY JSON LIBRARY
+-- 2. SHARED LIBRARY BOOTSTRAP
 -------------------------------------------------------------------------------
-local JSON = {}
+local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
+package.path = script_dir .. "../_lib/?.lua;" .. package.path
 
-function JSON.encode(v)
-  local t = type(v)
-  if t == "nil"     then return "null" end
-  if t == "boolean" then return tostring(v) end
-  if t == "number"  then
-    if v ~= v then return "null" end
-    return string.format("%.10g", v)
-  end
-  if t == "string"  then
-    return '"' .. v:gsub('\\', '\\\\'):gsub('"', '\\"')
-                   :gsub('\n', '\\n'):gsub('\r', '\\r') .. '"'
-  end
-  if t == "table" then
-    local n = 0
-    for _ in pairs(v) do n = n + 1 end
-    if n == #v then
-      local p = {}
-      for i, x in ipairs(v) do p[i] = JSON.encode(x) end
-      return "[" .. table.concat(p, ",") .. "]"
-    else
-      local p = {}
-      for k, x in pairs(v) do
-        p[#p + 1] = JSON.encode(tostring(k)) .. ":" .. JSON.encode(x)
-      end
-      table.sort(p)
-      return "{" .. table.concat(p, ",") .. "}"
-    end
-  end
-  return "null"
-end
-
-function JSON.decode(s)
-  local i = 1
-  local function ws()
-    while i <= #s and s:sub(i, i):match('%s') do i = i + 1 end
-  end
-  local parse
-  local function pstr()
-    i = i + 1
-    local b = {}
-    while i <= #s do
-      local c = s:sub(i, i)
-      if c == '"' then
-        i = i + 1
-        break
-      elseif c == '\\' then
-        i = i + 1
-        c = s:sub(i, i)
-        local e = { n = '\n', r = '\r', t = '\t', ['\\'] = '\\', ['"'] = '"', ['/'] = '/' }
-        b[#b + 1] = e[c] or c
-      else
-        b[#b + 1] = c
-      end
-      i = i + 1
-    end
-    return table.concat(b)
-  end
-
-  local function parr()
-    i = i + 1
-    local a = {}
-    ws()
-    if s:sub(i, i) == ']' then i = i + 1; return a end
-    repeat
-      ws()
-      a[#a + 1] = parse()
-      ws()
-      local c = s:sub(i, i)
-      i = i + 1
-    until c ~= ','
-    return a
-  end
-
-  local function pobj()
-    i = i + 1
-    local o = {}
-    ws()
-    if s:sub(i, i) == '}' then i = i + 1; return o end
-    repeat
-      ws()
-      local k = pstr()
-      ws()
-      i = i + 1
-      ws()
-      o[k] = parse()
-      ws()
-      local c = s:sub(i, i)
-      i = i + 1
-    until c ~= ','
-    return o
-  end
-
-  parse = function()
-    ws()
-    local c = s:sub(i, i)
-    if c == '"' then
-      return pstr()
-    elseif c == '[' then
-      return parr()
-    elseif c == '{' then
-      return pobj()
-    elseif c == 't' then
-      i = i + 4
-      return true
-    elseif c == 'f' then
-      i = i + 5
-      return false
-    elseif c == 'n' then
-      i = i + 4
-      return nil
-    else
-      local n = s:match('^-?%d+%.?%d*[eE]?[+-]?%d*', i)
-      if n then
-        i = i + #n
-        return tonumber(n)
-      end
-    end
-  end
-
-  return parse()
-end
+local Theme = require("theme")
+local JSON  = require("json")
 
 -------------------------------------------------------------------------------
 -- 3. STATE & CONFIGURATION
@@ -938,67 +821,8 @@ end
 -------------------------------------------------------------------------------
 -- 7. COLORS & THEME
 -------------------------------------------------------------------------------
-local C = {
-  bg     = 0x12121EFF,
-  panel  = 0x1C1C30FF,
-  card   = 0x22223AFF,
-  acc    = 0x8B70FAFF,
-  acc_h  = 0x8B70FACC,
-  acc_d  = 0x8B70FA55,
-  acc_e  = 0x8B70FA20,
-  grn    = 0x56E39FFF,
-  grn_d  = 0x56E39F77,
-  grn_h  = 0x56E39FBB,
-  red    = 0xF45B69FF,
-  red_d  = 0xF45B6944,
-  red_h  = 0xF45B69AA,
-  yel    = 0xFFCC66FF,
-  dim    = 0x7A7A9FFF,
-  sep    = 0x8B70FA33,
-  dim_bg = 0x0C0E24D8,
-}
+local C = Theme.build_palette()
 
-local function push_theme()
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(),             C.bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBg(),              C.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBgActive(),        C.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),               C.acc_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(),        C.acc_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),         C.acc)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),               C.acc_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(),        C.acc_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),         C.acc)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),              C.card)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(),       C.acc_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),        C.acc_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrab(),           C.acc)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrabActive(),     0xA28CFEFF)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_CheckMark(),            C.acc)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PopupBg(),              C.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ModalWindowDimBg(),     C.dim_bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(),            C.sep)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorHovered(),     C.acc_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorActive(),      C.acc)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableHeaderBg(),        C.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(),     C.sep)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),      C.acc_e)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableRowBg(),           0x16162AFF)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableRowBgAlt(),        0x1C1C32FF)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarBg(),          C.bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrab(),        C.acc_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabHovered(), C.acc_h)
-
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding(), 10)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(),  5)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(),     8, 5)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(),    8, 4)
-  return 28, 4
-end
-
-local function pop_theme(nc, nv)
-  reaper.ImGui_PopStyleColor(ctx, nc)
-  reaper.ImGui_PopStyleVar(ctx, nv)
-end
 
 -------------------------------------------------------------------------------
 -- 8. SHARED UI HELPERS
@@ -1187,13 +1011,13 @@ local function draw_brand_icon(size, target_h)
   local c2_x, c2_y = x + 161.0 * s, dy + 139.0 * s
   local p2_x, p2_y = x + 161.0 * s, dy + 101.0 * s
   local curve_w    = math.max(1.2, 15.0 * s)
-  reaper.ImGui_DrawList_AddBezierCubic(dl, p1_x, p1_y, c1_x, c1_y, c2_x, c2_y, p2_x, p2_y, C.acc, curve_w)
+  reaper.ImGui_DrawList_AddBezierCubic(dl, p1_x, p1_y, c1_x, c1_y, c2_x, c2_y, p2_x, p2_y, C.accent, curve_w)
 
   -- Source node (Green: cx=79, cy=169, r=30)
-  reaper.ImGui_DrawList_AddCircleFilled(dl, x + 79.0 * s, dy + 169.0 * s, 30.0 * s, C.grn)
+  reaper.ImGui_DrawList_AddCircleFilled(dl, x + 79.0 * s, dy + 169.0 * s, 30.0 * s, C.green)
 
   -- Target node (Yellow: cx=161, cy=71, r=30)
-  reaper.ImGui_DrawList_AddCircleFilled(dl, x + 161.0 * s, dy + 71.0 * s, 30.0 * s, C.yel)
+  reaper.ImGui_DrawList_AddCircleFilled(dl, x + 161.0 * s, dy + 71.0 * s, 30.0 * s, C.yellow)
 
   -- Advance cursor past the icon with target_h
   reaper.ImGui_Dummy(ctx, size, target_h)
@@ -1217,7 +1041,7 @@ end
 local function draw_combo(id, items, sel)
   local new = sel
   local preview = (sel > 0 and items[sel]) and items[sel].name or "-- select --"
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (sel > 0) and 0xFFFFFFFF or C.dim)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (sel > 0) and 0xFFFFFFFF or C.text_dim)
   if reaper.ImGui_BeginCombo(ctx, id, preview) then
     reaper.ImGui_PopStyleColor(ctx, 1)
     for j, item in ipairs(items) do
@@ -1235,16 +1059,16 @@ local function draw_combo(id, items, sel)
 end
 
 local function field_label(txt, col)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col or C.dim)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col or C.text_dim)
   reaper.ImGui_Text(ctx, txt)
   reaper.ImGui_PopStyleColor(ctx, 1)
 end
 
 local function mode_btn(id, mode, h)
   local is_fol = (mode == "follow")
-  local bg   = is_fol and C.grn_d or C.acc_d
-  local bg_h = is_fol and C.grn_h or C.acc_h
-  local bg_a = is_fol and C.grn   or C.acc
+  local bg   = is_fol and C.green_d or C.accent_d
+  local bg_h = is_fol and C.green_h or C.accent_h
+  local bg_a = is_fol and C.green   or C.accent
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
@@ -1265,12 +1089,12 @@ end
 -- Styled section divider: colored label + separator line
 local function section_divider(label, col, tooltip)
   reaper.ImGui_Spacing(ctx)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col or C.dim)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col or C.text_dim)
   reaper.ImGui_Text(ctx, label)
   reaper.ImGui_PopStyleColor(ctx, 1)
   if tooltip then
     reaper.ImGui_SameLine(ctx, 0, 6)
-    if icon_btn("info_" .. label, icon_info, 16, 16, 12, C.dim, tooltip) then end
+    if icon_btn("info_" .. label, icon_info, 16, 16, 12, C.text_dim, tooltip) then end
   end
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(), (col and (col & 0xFFFFFF99) or C.sep))
   reaper.ImGui_Separator(ctx)
@@ -1291,11 +1115,11 @@ local function draw_shared_pickers(tlist)
     reaper.ImGui_TableNextRow(ctx)
     reaper.ImGui_TableSetColumnIndex(ctx, 0)
     reaper.ImGui_AlignTextToFramePadding(ctx)
-    field_label("SOURCE TRACK", C.grn)
+    field_label("SOURCE TRACK", C.green)
 
     reaper.ImGui_TableSetColumnIndex(ctx, 1)
     reaper.ImGui_AlignTextToFramePadding(ctx)
-    field_label("TARGET TRACK", C.acc)
+    field_label("TARGET TRACK", C.accent)
 
     -- Row 1: Dropdown combos with exact same vertical position
     reaper.ImGui_TableNextRow(ctx)
@@ -1402,7 +1226,7 @@ local function draw_shared_pickers(tlist)
 
   -- Warning if plugin missing on target track
   if S.src_ti > 0 and S.dst_ti > 0 and S.src_fi > 0 and S.dst_fi == 0 then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
     reaper.ImGui_Text(ctx, "  * Selected plugin not found on Target Track")
     reaper.ImGui_PopStyleColor(ctx, 1)
   end
@@ -1417,7 +1241,7 @@ local function draw_link_builder()
   local plugins_ready = (S.src_fi > 0 and S.dst_fi > 0)
 
   if not plugins_ready then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
     if S.src_ti == 0 or S.dst_ti == 0 then
       reaper.ImGui_TextWrapped(ctx, "Select source and target tracks, then select a plugin above.")
     else
@@ -1438,13 +1262,13 @@ local function draw_link_builder()
 
   -- Expand All (icon)
   reaper.ImGui_SameLine(ctx, 0, 6)
-  if icon_btn_colored("exp_all", icon_tri_down, 24, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.acc_d, "Expand All Groups") then
+  if icon_btn_colored("exp_all", icon_tri_down, 24, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.accent_d, "Expand All Groups") then
     for _, g in ipairs(M.groups) do g.force_open = true end
   end
 
   -- Collapse All (icon)
   reaper.ImGui_SameLine(ctx, 0, 4)
-  if icon_btn_colored("col_all", icon_tri_up, 24, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.acc_d, "Collapse All Groups") then
+  if icon_btn_colored("col_all", icon_tri_up, 24, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.accent_d, "Collapse All Groups") then
     for _, g in ipairs(M.groups) do g.force_open = false end
   end
 
@@ -1459,43 +1283,43 @@ local function draw_link_builder()
       reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + 300)
       if LT.track ~= "" then
         local lt_val = LT.tr and fmt_val(LT.tr, LT.fxi, LT.pi, LT.norm) or "?"
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, "Last Touched:")
         reaper.ImGui_PopStyleColor(ctx, 1)
 
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, LT.track)
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 4)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, "/")
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 4)
 
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, LT.fx)
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 4)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, "/")
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 4)
 
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, LT.param)
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 4)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, "=")
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 4)
 
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, lt_val)
         reaper.ImGui_PopStyleColor(ctx, 1)
 
         reaper.ImGui_Spacing(ctx)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, "Click to select parameter")
         reaper.ImGui_PopStyleColor(ctx, 1)
       else
@@ -1516,7 +1340,7 @@ local function draw_link_builder()
     -- Matched params from auto-scan
     if #M.groups == 0 then
       reaper.ImGui_Spacing(ctx)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
       reaper.ImGui_Text(ctx, "  No matching parameters found.")
       reaper.ImGui_PopStyleColor(ctx, 1)
     else
@@ -1586,7 +1410,7 @@ local function draw_link_builder()
                   -- Col 1: Parameter Name
                   reaper.ImGui_TableSetColumnIndex(ctx, 1)
                   reaper.ImGui_AlignTextToFramePadding(ctx)
-                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), item.checked and 0xFFFFFFFF or C.dim)
+                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), item.checked and 0xFFFFFFFF or C.text_dim)
                   reaper.ImGui_Text(ctx, disp)
                   reaper.ImGui_PopStyleColor(ctx, 1)
                 end
@@ -1643,11 +1467,11 @@ local function draw_preset_modal()
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Preset Library##preset_mgr_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
     reaper.ImGui_Text(ctx, string.format("Saved Presets (%d)", #P.list))
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_SameLine(ctx, 0, 12)
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
     reaper.ImGui_Text(ctx, "Select tracks, then Apply to create links instantly.")
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_Separator(ctx)
@@ -1667,7 +1491,7 @@ local function draw_preset_modal()
       if #P.list == 0 then
         reaper.ImGui_TableNextRow(ctx, 0, 24)
         reaper.ImGui_TableSetColumnIndex(ctx, 0)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, "No presets saved yet. Save from Active Links.")
         reaper.ImGui_PopStyleColor(ctx, 1)
       end
@@ -1679,14 +1503,14 @@ local function draw_preset_modal()
         -- Col 0: Name
         reaper.ImGui_TableSetColumnIndex(ctx, 0)
         reaper.ImGui_AlignTextToFramePadding(ctx)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (P.sel == pi) and C.acc or 0xFFFFFFFF)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (P.sel == pi) and C.accent or 0xFFFFFFFF)
         reaper.ImGui_Text(ctx, preset.name)
         reaper.ImGui_PopStyleColor(ctx, 1)
 
         -- Col 1: Plugin
         reaper.ImGui_TableSetColumnIndex(ctx, 1)
         reaper.ImGui_AlignTextToFramePadding(ctx)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         local pname_display = preset.plugin_name or preset.plugin_hint or "--"
         reaper.ImGui_Text(ctx, (pname_display ~= "") and pname_display or "--")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1745,7 +1569,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "1. Choose Tracks")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1753,7 +1577,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "2. Select Plugin")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1761,7 +1585,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "3. Select Parameters")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1769,7 +1593,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "4. Add Links")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1784,7 +1608,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.grn)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.green)
         reaper.ImGui_Text(ctx, "Follow Mode")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1792,7 +1616,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.acc)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.accent)
         reaper.ImGui_Text(ctx, "Inverse Mode")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1800,7 +1624,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "Strength Control (0% – 100%)")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1808,7 +1632,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "Last Touched Automation")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1816,7 +1640,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
 
         local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, "Creating Presets")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
@@ -1849,7 +1673,7 @@ local function draw_info_modal()
         local w2 = reaper.ImGui_CalcTextSize(ctx, t2)
         local total_tw = w1 + w2
         reaper.ImGui_SetCursorPosX(ctx, (avail_w - total_tw) * 0.5)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
         reaper.ImGui_Text(ctx, t1)
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 0)
@@ -1862,7 +1686,7 @@ local function draw_info_modal()
         local sub = "v1.0 crafted by Fancy Wolf Audio & Antigravity for REAPER"
         local sw = reaper.ImGui_CalcTextSize(ctx, sub)
         reaper.ImGui_SetCursorPosX(ctx, (avail_w - sw) * 0.5)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
         reaper.ImGui_Text(ctx, sub)
         reaper.ImGui_PopStyleColor(ctx, 1)
 
@@ -1884,7 +1708,7 @@ local function draw_info_modal()
         reaper.ImGui_SetCursorPosX(ctx, (avail_w - btn_w) * 0.5)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.card)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.panel)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.acc_d)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.accent_d)
         if reaper.ImGui_Button(ctx, "Buy me a Cup of Coffee as Thanks", btn_w, btn_h) then
           open_url("https://buymeacoffee.com/fancywolf")
         end
@@ -1915,7 +1739,7 @@ local function draw_settings_modal()
     reaper.ImGui_Spacing(ctx)
 
     -- Section 1: Default Behaviors
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
     reaper.ImGui_Text(ctx, "Default Link Rules")
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_Separator(ctx)
@@ -1951,7 +1775,7 @@ local function draw_settings_modal()
     reaper.ImGui_Spacing(ctx)
 
     -- Section 2: Last Touched Automation
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
     reaper.ImGui_Text(ctx, "Last Touched Automation")
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_Separator(ctx)
@@ -1962,7 +1786,7 @@ local function draw_settings_modal()
       SETTINGS.auto_touch_sync = n_at
       save_settings()
     end
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
     reaper.ImGui_TextWrapped(ctx, "When enabled, touching any plugin control in REAPER automatically loads its track and plugin into the Link Builder.")
     reaper.ImGui_PopStyleColor(ctx, 1)
 
@@ -1970,7 +1794,7 @@ local function draw_settings_modal()
     reaper.ImGui_Spacing(ctx)
 
     -- Section 3: UI & Density
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
     reaper.ImGui_Text(ctx, "UI Density & Appearance")
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_Separator(ctx)
@@ -1998,13 +1822,13 @@ local function draw_settings_modal()
     reaper.ImGui_Spacing(ctx)
 
     -- Section 4: File Storage & Backups
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
     reaper.ImGui_Text(ctx, "File Storage & Backups")
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_Separator(ctx)
     reaper.ImGui_Spacing(ctx)
 
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
     reaper.ImGui_Text(ctx, "Project Config: " .. sav_path())
     reaper.ImGui_Text(ctx, "Presets File: " .. PRESET_PATH)
     reaper.ImGui_PopStyleColor(ctx, 1)
@@ -2036,12 +1860,12 @@ end
 -- 12. MAIN WINDOW
 -------------------------------------------------------------------------------
 local function draw_main()
-  local nc, nv = push_theme()
+  local nc, nv = Theme.push(ctx, C)
   reaper.ImGui_SetNextWindowSize(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
 
   local vis, op = reaper.ImGui_Begin(ctx, "Fancy Parameter Link", true, reaper.ImGui_WindowFlags_NoCollapse())
   if not vis then
-    pop_theme(nc, nv)
+    Theme.pop(ctx, nc, nv)
     return op
   end
 
@@ -2059,7 +1883,7 @@ local function draw_main()
 
   -- "FANCY" (Bold Accent)
   local pf_b = push_font(font_brand_bold, 15)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yel)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
   reaper.ImGui_Text(ctx, "FANCY")
   reaper.ImGui_PopStyleColor(ctx, 1)
   pop_font(pf_b)
@@ -2082,7 +1906,7 @@ local function draw_main()
   local sel_count_hdr = 0
   for i = 1, #links do if link_sel[i] then sel_count_hdr = sel_count_hdr + 1 end end
   if sel_count_hdr > 0 then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
     reaper.ImGui_Text(ctx, string.format("%d selected", sel_count_hdr))
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_SameLine(ctx, 0, 12)
@@ -2093,7 +1917,7 @@ local function draw_main()
     local elapsed = reaper.time_precise() - preset_status_time
     if elapsed < 4.0 then
       local alpha = math.max(0, math.min(1, 1.0 - (elapsed - 3.0)))
-      local status_col = (preset_status_msg:find("✓") and C.grn) or C.yel
+      local status_col = (preset_status_msg:find("✓") and C.green) or C.yellow
       if elapsed > 3.0 then
         local r_c = (status_col >> 24) & 0xFF
         local g_c = (status_col >> 16) & 0xFF
@@ -2144,10 +1968,10 @@ local function draw_main()
     if lvis then
       local tlist = get_tlist()
 
-      section_divider("  Source & Target", C.yel, "Pick source and target tracks. All workflows (Builder, Quick Add, Presets) use these shared pickers.")
+      section_divider("  Source & Target", C.yellow, "Pick source and target tracks. All workflows (Builder, Quick Add, Presets) use these shared pickers.")
       draw_shared_pickers(tlist)
 
-      section_divider("  Link Builder", C.yel, "Scan matching plugins to create links in bulk. Check parameters, then click Create Links.")
+      section_divider("  Link Builder", C.yellow, "Scan matching plugins to create links in bulk. Check parameters, then click Create Links.")
       draw_link_builder()
 
       reaper.ImGui_EndChild(ctx)
@@ -2170,9 +1994,9 @@ local function draw_main()
         if reaper.ImGui_Button(ctx, "Resume All") then paused = false end
         reaper.ImGui_PopStyleColor(ctx, 3)
       else
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.grn_d)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.grn_h)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.grn)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.green_d)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.green_h)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.green)
         if reaper.ImGui_Button(ctx, "Pause All") then paused = true end
         reaper.ImGui_PopStyleColor(ctx, 3)
       end
@@ -2236,7 +2060,7 @@ local function draw_main()
       local right_x = cur_x + avail_w - total_group_w
       reaper.ImGui_SetCursorPosX(ctx, math.max(cur_x + 6, right_x))
       reaper.ImGui_AlignTextToFramePadding(ctx)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
       reaper.ImGui_Text(ctx, "Preset:")
       reaper.ImGui_PopStyleColor(ctx, 1)
       reaper.ImGui_SameLine(ctx, 0, 4)
@@ -2271,7 +2095,7 @@ local function draw_main()
 
       -- [+] Preset menu (DrawList icon)
       reaper.ImGui_SameLine(ctx, 0, 2)
-      if icon_btn_colored("al_preset_menu", icon_plus, menu_btn_w, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.acc_d, "Preset Options") then
+      if icon_btn_colored("al_preset_menu", icon_plus, menu_btn_w, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.accent_d, "Preset Options") then
         reaper.ImGui_OpenPopup(ctx, "al_preset_menu_popup")
       end
       if reaper.ImGui_BeginPopup(ctx, "al_preset_menu_popup") then
@@ -2350,7 +2174,7 @@ local function draw_main()
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(),     0x8B70FA50)
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),      0x8B70FA60)
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(), C.sep)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),  C.acc_e)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),  C.accent_e)
       if reaper.ImGui_BeginTable(ctx, "links_tbl", 9, TFLG, 0, tbl_h) then
         reaper.ImGui_TableSetupScrollFreeze(ctx, 0, 1)
         reaper.ImGui_TableSetupColumn(ctx, "Source",      reaper.ImGui_TableColumnFlags_WidthStretch(), 0.13)
@@ -2367,7 +2191,7 @@ local function draw_main()
         if #links == 0 then
           reaper.ImGui_TableNextRow(ctx, 0, 32)
           reaper.ImGui_TableSetColumnIndex(ctx, 0)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
           reaper.ImGui_Text(ctx, "No links yet.")
           reaper.ImGui_PopStyleColor(ctx, 1)
         end
@@ -2405,21 +2229,21 @@ local function draw_main()
           -- 1. Source Track (same cell, after selectable)
           reaper.ImGui_SameLine(ctx, 0, 0)
           reaper.ImGui_AlignTextToFramePadding(ctx)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.grn)
+          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.green)
           reaper.ImGui_Text(ctx, lk.src_name)
           reaper.ImGui_PopStyleColor(ctx, 1)
 
           -- 2. Target Track
           reaper.ImGui_TableSetColumnIndex(ctx, 1)
           reaper.ImGui_AlignTextToFramePadding(ctx)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.acc)
+          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.accent)
           reaper.ImGui_Text(ctx, lk.dst_name)
           reaper.ImGui_PopStyleColor(ctx, 1)
 
           -- 3. Plugin
           reaper.ImGui_TableSetColumnIndex(ctx, 2)
           reaper.ImGui_AlignTextToFramePadding(ctx)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.dim)
+          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
           reaper.ImGui_Text(ctx, lk.src_fxname)
           reaper.ImGui_PopStyleColor(ctx, 1)
 
@@ -2436,9 +2260,9 @@ local function draw_main()
             local bar_w = math.max(10, math.floor((avail_w - 4) * 0.5))
             local sv = reaper.TrackFX_GetParamNormalized(str, lk.src_fxi, lk.src_pi)
             local dv = reaper.TrackFX_GetParamNormalized(dtr, lk.dst_fxi, lk.dst_pi)
-            draw_progress_bar_centered(sv, bar_w, pb_h, C.grn_d, C.card, fmt_val(str, lk.src_fxi, lk.src_pi, sv))
+            draw_progress_bar_centered(sv, bar_w, pb_h, C.green_d, C.card, fmt_val(str, lk.src_fxi, lk.src_pi, sv))
             reaper.ImGui_SameLine(ctx, 0, 4)
-            draw_progress_bar_centered(dv, bar_w, pb_h, C.acc_d, C.card, fmt_val(dtr, lk.dst_fxi, lk.dst_pi, dv))
+            draw_progress_bar_centered(dv, bar_w, pb_h, C.accent_d, C.card, fmt_val(dtr, lk.dst_fxi, lk.dst_pi, dv))
           else
             reaper.ImGui_AlignTextToFramePadding(ctx)
             reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.red)
@@ -2473,7 +2297,7 @@ local function draw_main()
           reaper.ImGui_TableSetColumnIndex(ctx, 7)
           if row_dimmed then reaper.ImGui_PopStyleVar(ctx, 1) end
           local pause_icon = lk.link_paused and icon_play or icon_pause
-          if icon_btn("lp" .. i, pause_icon, -1, row_h, 8, C.dim) then
+          if icon_btn("lp" .. i, pause_icon, -1, row_h, 8, C.text_dim) then
             lk.link_paused = not lk.link_paused
             if lk.link_paused then lsrc[i] = nil end
             save_links()
@@ -2513,7 +2337,7 @@ local function draw_main()
   draw_settings_modal()
 
   reaper.ImGui_End(ctx)
-  pop_theme(nc, nv)
+  Theme.pop(ctx, nc, nv)
   return op
 end
 

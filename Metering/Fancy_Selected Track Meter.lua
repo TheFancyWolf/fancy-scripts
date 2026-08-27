@@ -1,8 +1,9 @@
 -- @description Fancy Selected Track Meter
 -- @author Fancy Scripts
--- @version 9.66.0
+-- @version 9.67.0
 -- @changelog
 --   + Added ReaPack distribution support
+--   + Migrated to shared _lib/ modules, replaced r. alias with reaper.
 -- @about
 --   Real-time visual metering display for selected tracks.
 --   Features customizable colors, peak hold, and docking support.
@@ -11,6 +12,7 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
+--   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -26,7 +28,15 @@ end
 local ctx = reaper.ImGui_CreateContext('Selected Track Meter', reaper.ImGui_ConfigFlags_DockingEnable())
 
 -------------------------------------------------------------------------------
--- 2. VISUAL SETTINGS
+-- 2. SHARED LIBRARY BOOTSTRAP
+-------------------------------------------------------------------------------
+local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
+package.path = script_dir .. "../_lib/?.lua;" .. package.path
+
+local Theme = require("theme")
+
+-------------------------------------------------------------------------------
+-- 3. VISUAL SETTINGS
 -------------------------------------------------------------------------------
 local VisualSettings = {
     Window_Padding   = 15,   
@@ -76,7 +86,7 @@ local VisualSettings = {
 }
 
 -------------------------------------------------------------------------------
--- 3. FUNCTIONAL STATE & DEFAULTS
+-- 4. FUNCTIONAL STATE & DEFAULTS
 -------------------------------------------------------------------------------
 local State = {
     show_settings       = false,
@@ -162,7 +172,7 @@ local PersistVisualKeys = {
 }
 
 -------------------------------------------------------------------------------
--- 4. STATE PERSISTENCE
+-- 5. STATE PERSISTENCE
 -------------------------------------------------------------------------------
 local function LoadSettings()
     -- Load Functional State
@@ -219,7 +229,7 @@ local cached_tooltip_size = VisualSettings.Tooltip_Font_Size
 local cached_settings_size = VisualSettings.Settings_Font_Size
 
 -------------------------------------------------------------------------------
--- 5. MATH & UTILITY FUNCTIONS
+-- 6. MATH & UTILITY FUNCTIONS
 -------------------------------------------------------------------------------
 local function AmpToDb(amp)
     if not amp or amp <= 0.0000001 then return -150.0 end
@@ -732,7 +742,7 @@ local function DrawStereoMeterPair(draw_list, x_pos, start_y, val_l, val_r, labe
 end
 
 -------------------------------------------------------------------------------
--- 6. MAIN LOOP
+-- 7. MAIN LOOP
 -------------------------------------------------------------------------------
 
 local function loop()
@@ -1187,7 +1197,7 @@ local function loop()
     reaper.ImGui_PopStyleColor(ctx, 1)
 
     -------------------------------------------------------------------------------
--- 7. FLOATING CLIP LOG
+-- 8. FLOATING CLIP LOG
 -------------------------------------------------------------------------------
     if State.show_clip_log then
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(), VisualSettings.Color_Background)
@@ -1234,7 +1244,7 @@ local function loop()
     end
 
     -------------------------------------------------------------------------------
--- 8. FLOATING SETTINGS MODAL
+-- 9. FLOATING SETTINGS MODAL
 -------------------------------------------------------------------------------
     if State.show_settings then
         
@@ -1518,7 +1528,7 @@ local function loop()
     end
 end
 
-function main()
+local function main()
   reaper.defer(loop)
 end
 
