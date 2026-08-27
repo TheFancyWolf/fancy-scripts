@@ -41,8 +41,11 @@ jobs:
         with:
           ruby-version: '3.2'
 
-      - name: Install reapack-index
-        run: gem install reapack-index
+      - name: Install pandoc and reapack-index
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          gem install reapack-index
 
       - name: Configure Git identity
         run: |
