@@ -158,6 +158,7 @@ local save_links
 
 -- LT: Last Touched live display
 local LT = { track = "", fx = "", param = "", norm = 0, tr = nil, fxi = 0, pi = 0 }
+local _scroll_to_param_idx = nil  -- param index to scroll into view after Last Touched
 local _prev_lt_key = ""
 local function poll_last_touched()
   local ok, trnum, fxnum, paramnum = reaper.GetLastTouchedFX()
@@ -695,12 +696,15 @@ use_last_touched_builder = function(silent)
     -- Check the touched parameter and force its group open
     local _, pname = reaper.TrackFX_GetParamName(tr, real_fxi, paramnum, "")
     for _, grp in ipairs(M.groups) do
+      local grp_match = false
       for _, item in ipairs(grp.params) do
         if item.param.idx == paramnum or item.param.name == pname then
           item.checked   = true
-          grp.force_open = true
+          grp_match      = true
+          _scroll_to_param_idx = item.param.idx
         end
       end
+      grp.force_open = grp_match
     end
   end
 end
@@ -1416,6 +1420,11 @@ local function draw_link_builder()
                   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), item.checked and 0xFFFFFFFF or C.text_dim)
                   reaper.ImGui_Text(ctx, disp)
                   reaper.ImGui_PopStyleColor(ctx, 1)
+                  -- Scroll to this param if it was the Last Touched target
+                  if _scroll_to_param_idx ~= nil and item.param.idx == _scroll_to_param_idx then
+                    reaper.ImGui_SetScrollHereY(ctx, 0.5)
+                    _scroll_to_param_idx = nil
+                  end
                 end
               end
               reaper.ImGui_EndTable(ctx)
