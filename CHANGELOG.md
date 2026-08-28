@@ -9,6 +9,7 @@ All notable changes to Fancy Scripts will be documented here.
   - `theme.lua` — 3-mode palette builder (Fancy Dark / Match Theme / Full Theme), shared font management, ImGui push/pop, settings combo widget
   - `json.lua` — lightweight JSON encoder/decoder (consolidated from inline copies)
   - `utils.lua` — dependency checks, undo block wrapper, track helpers, math utilities
+- **Fancy Parameter Link v5.1.0** — "All" button in Link Builder to select/deselect all parameters at once
 
 ### Changed
 - **Fancy Parameter Link v5.0.0** — Major redesign

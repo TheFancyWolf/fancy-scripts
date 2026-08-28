@@ -1,11 +1,8 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.0.0
+-- @version 5.1.0
 -- @changelog
---   + Bidirectional links: either side can drive the other
---   + Multi-track selection: link the same plugin across N tracks at once
---   + Full-mesh topology: every pair of tracks is linked
---   + Active links table grouped by parameter
+--   + "All" button in Link Builder to select/deselect all parameters at once
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
 --   Features: multi-track selector, auto group-scan for same plugin, full-mesh linking,
@@ -1302,7 +1299,7 @@ local function draw_link_builder()
   if not M.scanned then do_scan() end
 
   -- Search filter + Expand/Collapse All + Last Touched button
-  reaper.ImGui_SetNextItemWidth(ctx, -170)
+  reaper.ImGui_SetNextItemWidth(ctx, -210)
   local fr, nf = reaper.ImGui_InputTextWithHint(ctx, "##mf", "Search parameters...", M.filter, 256)
   if fr then M.filter = nf end
 
@@ -1343,6 +1340,26 @@ local function draw_link_builder()
       reaper.ImGui_EndTooltip(ctx)
     end
   end
+
+  reaper.ImGui_SameLine(ctx, 0, 4)
+  if #M.groups == 0 then reaper.ImGui_BeginDisabled(ctx) end
+  if reaper.ImGui_Button(ctx, "All##lb_all", 32, 0) then
+    local all_checked = true
+    for _, grp in ipairs(M.groups) do
+      for _, item in ipairs(grp.params) do
+        if not item.checked then all_checked = false; break end
+      end
+      if not all_checked then break end
+    end
+    local new_state = not all_checked
+    for _, grp in ipairs(M.groups) do
+      for _, item in ipairs(grp.params) do item.checked = new_state end
+    end
+  end
+  if reaper.ImGui_IsItemHovered(ctx) then
+    reaper.ImGui_SetTooltip(ctx, "Select / deselect all parameters")
+  end
+  if #M.groups == 0 then reaper.ImGui_EndDisabled(ctx) end
 
   reaper.ImGui_Spacing(ctx)
 
