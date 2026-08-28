@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="393aa1931c140e57c5deb65a945c020b1c918e6a">
+<index version="1" name="Fancy Scripts" commit="0c43e72d29d1e4e485831ad3fa21bfcebad404ee">
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
@@ -33,6 +33,13 @@
         <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/_lib/json.lua</source>
         <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/_lib/theme.lua</source>
         <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/18cf8d322b34467a9d74d856d712e292b27dbeeb/_lib/utils.lua</source>
+      </version>
+      <version name="5.1.0" author="Fancy Scripts" time="2026-08-28T11:30:46Z">
+        <changelog><![CDATA[+ "All" button in Link Builder to select/deselect all parameters at once]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/0c43e72d29d1e4e485831ad3fa21bfcebad404ee/FX/Fancy_Parameter%20Link.lua</source>
+        <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/0c43e72d29d1e4e485831ad3fa21bfcebad404ee/_lib/json.lua</source>
+        <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/0c43e72d29d1e4e485831ad3fa21bfcebad404ee/_lib/theme.lua</source>
+        <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/0c43e72d29d1e4e485831ad3fa21bfcebad404ee/_lib/utils.lua</source>
       </version>
     </reapack>
   </category>
