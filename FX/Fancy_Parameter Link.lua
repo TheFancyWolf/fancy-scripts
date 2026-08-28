@@ -131,6 +131,7 @@ end
 -- S: Multi-track selector state
 local S = {
   tracks = {},     -- list of tlist indices for selected tracks
+  tracks_expanded = false, -- whether track list is expanded
   fi     = 0,      -- selected FX index (into fxs list)
   fxs    = {},     -- FX list (intersection across all selected tracks)
   params = {},     -- param list for the selected plugin
@@ -1106,12 +1107,6 @@ local function draw_combo(id, items, sel)
   return new
 end
 
-local function field_label(txt, col)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col or C.text_dim)
-  reaper.ImGui_Text(ctx, txt)
-  reaper.ImGui_PopStyleColor(ctx, 1)
-end
-
 local function mode_btn(id, mode, h)
   local is_fol = (mode == "follow")
   local bg   = is_fol and C.green_d or C.accent_d
@@ -1154,82 +1149,49 @@ end
 -- 9. TRACK SELECTOR (Multi-track)
 -------------------------------------------------------------------------------
 local function draw_track_selector(tlist)
-  -- Track selection display
-  field_label("LINKED TRACKS", C.yellow)
+  -- Action row: Add Tracks combo + Use Selected on same line
+  local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
+  local use_sel_w = 90
+  local combo_w = avail_w - use_sel_w - 6
 
-  -- Selected tracks as removable tags
-  if #S.tracks == 0 then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
-    reaper.ImGui_Text(ctx, "  No tracks selected")
-    reaper.ImGui_PopStyleColor(ctx, 1)
-  else
-    local to_remove = nil
-    for si, ti in ipairs(S.tracks) do
-      local t = tlist[ti]
-      local tag_label = t and t.name or "?"
-      -- Colored tag with X button
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.accent_d)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.accent_h)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.accent)
-      if reaper.ImGui_Button(ctx, tag_label .. "  \xc3\x97##trk" .. si, 0, 20) then
-        to_remove = si
-      end
-      reaper.ImGui_PopStyleColor(ctx, 3)
-      -- Wrap to next line if needed, otherwise same line
-      if si < #S.tracks then
-        local avail = reaper.ImGui_GetContentRegionAvail(ctx)
-        if avail > 80 then
-          reaper.ImGui_SameLine(ctx, 0, 4)
-        end
-      end
-    end
-    if to_remove then
-      table.remove(S.tracks, to_remove)
-      compute_shared_fxs()
-      -- Re-validate FX selection
-      if S.fi > 0 and S.fi > #S.fxs then S.fi = 0 end
-      M.scanned = false
-      M.groups = {}
-    end
-  end
-
-  reaper.ImGui_Spacing(ctx)
-
-  -- Add Track combo
-  reaper.ImGui_SetNextItemWidth(ctx, -1)
-  if reaper.ImGui_BeginCombo(ctx, "##add_track", "+ Add Track...") then
+  reaper.ImGui_SetNextItemWidth(ctx, combo_w)
+  if reaper.ImGui_BeginCombo(ctx, "##add_track", "+ Add Tracks...") then
     for j, t in ipairs(tlist) do
-      -- Skip already-selected tracks
+      -- Check if already selected
       local already = false
-      for _, ti in ipairs(S.tracks) do
-        if ti == j then already = true; break end
+      local sel_idx = nil
+      for si, ti in ipairs(S.tracks) do
+        if ti == j then already = true; sel_idx = si; break end
       end
-      if not already then
-        if reaper.ImGui_Selectable(ctx, t.name .. "##addtr" .. j, false) then
+      local changed, new_val = reaper.ImGui_Checkbox(ctx, t.name .. "##addtr" .. j, already)
+      if changed then
+        if not new_val and sel_idx then
+          -- Deselect: remove from tracks
+          table.remove(S.tracks, sel_idx)
+        elseif new_val and not already then
+          -- Select: add to tracks
           S.tracks[#S.tracks + 1] = j
-          compute_shared_fxs()
-          -- Try to preserve FX selection
-          local cur_name = (S.fi > 0 and S.fxs[S.fi]) and S.fxs[S.fi].name or nil
-          if cur_name then
-            S.fi = 0
-            for fi, f in ipairs(S.fxs) do
-              if f.name == cur_name then S.fi = fi; break end
-            end
-          else
-            S.fi = 0
-          end
-          M.scanned = false
-          M.groups = {}
         end
+        compute_shared_fxs()
+        -- Try to preserve FX selection
+        local cur_name = (S.fi > 0 and S.fxs[S.fi]) and S.fxs[S.fi].name or nil
+        if cur_name then
+          S.fi = 0
+          for fi, f in ipairs(S.fxs) do
+            if f.name == cur_name then S.fi = fi; break end
+          end
+        else
+          S.fi = 0
+        end
+        M.scanned = false
+        M.groups = {}
       end
     end
     reaper.ImGui_EndCombo(ctx)
   end
 
-  reaper.ImGui_Spacing(ctx)
-
-  -- "Use REAPER Selection" button
-  if reaper.ImGui_Button(ctx, "Use REAPER Selection", -1, 0) then
+  reaper.ImGui_SameLine(ctx, 0, 6)
+  if reaper.ImGui_Button(ctx, "Use Selected", use_sel_w, 0) then
     S.tracks = {}
     local n_sel = reaper.CountSelectedTracks(0)
     for i = 0, n_sel - 1 do
@@ -1252,9 +1214,81 @@ local function draw_track_selector(tlist)
 
   reaper.ImGui_Spacing(ctx)
 
-  -- Plugin dropdown (shared across all tracks)
+  -- Collapsible track list (below action buttons)
+  if #S.tracks == 0 then
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_Text(ctx, "  No tracks selected")
+    reaper.ImGui_PopStyleColor(ctx, 1)
+  else
+    -- Collapsible header row (same pattern as Active Links table)
+    local arrow = S.tracks_expanded and "\xe2\x96\xbe" or "\xe2\x96\xb8"
+    local n = #S.tracks
+    local summary = string.format("%s %d track%s selected", arrow, n, n == 1 and "" or "s")
+
+    if reaper.ImGui_BeginTable(ctx, "trk_hdr", 2, reaper.ImGui_TableFlags_None()) then
+      reaper.ImGui_TableSetupColumn(ctx, "##label", reaper.ImGui_TableColumnFlags_WidthStretch())
+      reaper.ImGui_TableSetupColumn(ctx, "##clear", reaper.ImGui_TableColumnFlags_WidthFixed(), UI.del_col_w)
+      reaper.ImGui_TableNextRow(ctx, 0, 22)
+
+      reaper.ImGui_TableSetColumnIndex(ctx, 0)
+      local sel_flags = reaper.ImGui_SelectableFlags_SpanAllColumns()
+                      | reaper.ImGui_SelectableFlags_AllowOverlap()
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.accent)
+      if reaper.ImGui_Selectable(ctx, summary .. "##trk_toggle", false, sel_flags, 0, 22) then
+        S.tracks_expanded = not S.tracks_expanded
+      end
+      reaper.ImGui_PopStyleColor(ctx, 1)
+
+      reaper.ImGui_TableSetColumnIndex(ctx, 1)
+      if icon_btn("trk_clear", icon_close, -1, 22, 7, C.text_dim, "Clear all tracks") then
+        S.tracks = {}
+        compute_shared_fxs()
+        S.fi = 0
+        M.scanned = false
+        M.groups = {}
+        S.tracks_expanded = false
+      end
+
+      reaper.ImGui_EndTable(ctx)
+    end
+
+    -- Expanded: compact vertical track list
+    if S.tracks_expanded then
+      local to_remove = nil
+      if reaper.ImGui_BeginTable(ctx, "trk_list", 2, reaper.ImGui_TableFlags_None()) then
+        reaper.ImGui_TableSetupColumn(ctx, "##name", reaper.ImGui_TableColumnFlags_WidthStretch())
+        reaper.ImGui_TableSetupColumn(ctx, "##del",  reaper.ImGui_TableColumnFlags_WidthFixed(), UI.chk_col_w)
+
+        for si, ti in ipairs(S.tracks) do
+          local t = tlist[ti]
+          reaper.ImGui_TableNextRow(ctx, 0, 22)
+          reaper.ImGui_TableSetColumnIndex(ctx, 0)
+          reaper.ImGui_AlignTextToFramePadding(ctx)
+          reaper.ImGui_Text(ctx, t and t.name or "?")
+          reaper.ImGui_TableSetColumnIndex(ctx, 1)
+          if icon_btn("trk_rm" .. si, icon_close, UI.chk_col_w, 22, 7, C.text_dim) then
+            to_remove = si
+          end
+        end
+        reaper.ImGui_EndTable(ctx)
+      end
+      if to_remove then
+        table.remove(S.tracks, to_remove)
+        compute_shared_fxs()
+        -- Re-validate FX selection
+        if S.fi > 0 and S.fi > #S.fxs then S.fi = 0 end
+        M.scanned = false
+        M.groups = {}
+      end
+    end
+  end
+end
+
+-------------------------------------------------------------------------------
+-- 9b. PLUGIN SELECTOR
+-------------------------------------------------------------------------------
+local function draw_plugin_selector()
   if #S.tracks >= 2 then
-    field_label("PLUGIN")
     reaper.ImGui_SetNextItemWidth(ctx, -1)
     local new_fi = draw_combo("##shared_fx", S.fxs, S.fi)
     if new_fi ~= S.fi then
@@ -1263,7 +1297,7 @@ local function draw_track_selector(tlist)
       M.groups = {}
     end
 
-    if #S.fxs == 0 and #S.tracks >= 2 then
+    if #S.fxs == 0 then
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
       reaper.ImGui_Text(ctx, "  * No shared plugins across selected tracks")
       reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1271,6 +1305,10 @@ local function draw_track_selector(tlist)
   elseif #S.tracks == 1 then
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
     reaper.ImGui_TextWrapped(ctx, "Select at least 2 tracks to link parameters.")
+    reaper.ImGui_PopStyleColor(ctx, 1)
+  else
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_TextWrapped(ctx, "Select tracks first.")
     reaper.ImGui_PopStyleColor(ctx, 1)
   end
 
@@ -1599,7 +1637,7 @@ local function draw_info_modal()
         reaper.ImGui_Text(ctx, "1. Select Tracks")
         reaper.ImGui_PopStyleColor(ctx, 1)
         pop_font(pf)
-        reaper.ImGui_TextWrapped(ctx, "Add 2 or more tracks using the track selector, or click 'Use REAPER Selection' to import your current track selection.")
+        reaper.ImGui_TextWrapped(ctx, "Add 2 or more tracks using the track selector, or click 'Use Selected' to import your current track selection.")
         reaper.ImGui_Spacing(ctx)
 
         pf = push_font(font_brand_bold, 14)
@@ -1984,6 +2022,9 @@ local function draw_main()
 
       section_divider("  Tracks", C.yellow, "Select 2 or more tracks that share the same plugin. Links are created for every pair.")
       draw_track_selector(tlist)
+
+      section_divider("  Plugin", C.yellow, "Choose the plugin shared across all selected tracks.")
+      draw_plugin_selector()
 
       section_divider("  Link Builder", C.yellow, "Select parameters to link across all selected tracks.")
       draw_link_builder()
