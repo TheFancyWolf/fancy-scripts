@@ -6,9 +6,16 @@ All notable changes to Fancy Scripts will be documented here.
 
 ### Added
 - **Shared Library (`_lib/`)** — shared modules loaded via `require()`
-  - `theme.lua` — 3-mode palette builder (Fancy Dark / Match Theme / Full Theme), shared font management, ImGui push/pop, settings combo widget
+  - `theme.lua` — 2-mode palette builder (Fancy Dark / Match Theme), shared font management, ImGui push/pop, settings combo widget
   - `json.lua` — lightweight JSON encoder/decoder (consolidated from inline copies)
   - `utils.lua` — dependency checks, undo block wrapper, track helpers, math utilities
+- **Design System & Theme Engine**
+  - Unified scale extended to `xxl=24` and `xxxl=32`
+  - Streamlined theme modes to 2: **Fancy Dark** (curated palette) and **Match Theme** (extracts surfaces, text, borders, and edit cursor accent `col_cursor` from REAPER)
+  - All layout tokens (`rounding`, `icon_sm/md/lg`, `row_h`, `chk_col_w`, `indent`, `section_gap`) strictly derive from scale tokens; dropdowns and combo boxes calculate reactive width dynamically via `Theme.calc_combo_width()`
+  - `FANCY_PALETTE` simplified to base colors; derived states (`accent_h/d/e`, `green_h/d`, `red_h/d`) computed dynamically with consistent alpha ratios (80% / 33%)
+  - Safe color math: `icon_btn` hover uses `lighten()` and `section_divider` uses `with_alpha()`
+  - Added minimal template and full API token references in `theme.lua`
 - **Fancy Parameter Link v5.1.0** — "All" button in Link Builder to select/deselect all parameters at once
 
 ### Changed
