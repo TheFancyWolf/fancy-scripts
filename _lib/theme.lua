@@ -66,13 +66,25 @@
 --   icon_btn_colored(ctx, id, icon_fn, [opts]) -> bool  opts: +bg,bg_hover,bg_active,icon_color
 --   tooltip(ctx, text, [max_w])
 --   section_divider(ctx, label, [opts])        opts: tooltip,color
---   collapsing_header(ctx, label, [opts])      -> bool  opts: default_open,flags
+--   collapsing_header(ctx, label, [opts])      Safe collapsing header (opts: default_open, flags)
+--   progress_bar(ctx, fraction, [opts])        Meter/progress bar (opts: preset,fonts,fill_color,bg_color,overlay)
+--   toggle_button(ctx, id, label, is_act, [o]) Button-derived toggle button (opts: preset,fonts,w,h,colors)
+--   badge(ctx, label, [opts])                  Button-derived status badge (opts: preset,fonts,color,bg,w,h)
+--   push_button_preset(ctx, fonts, preset)     -> var_count, pushed_font (e.g. for sliders, combos)
+--   pop_button_preset(ctx, var_count, pfont)   Pops styling pushed by push_button_preset
+--   combo(ctx, id, items, selected_idx, [opts]) Standardized combo box (opts: w, placeholder, get_label)
 --   center_next_window(ctx, w, h)
 --   brand_icon(ctx, [size], [target_h])
 --   invalidate_palette()                       clear internal widget palette cache
 --
 -- ALIGNMENT
---   vcenter(ctx, item_h, row_h)        Cursor Y: center item in row (tables, toolbars)
+--   align(ctx, [row_h], [item_h])     PRIMARY — call before every item on a row
+--                                      No args: text↔widget baseline alignment
+--                                      row_h:   center item in explicit row (tables)
+--                                      item_h:  custom-height item override
+--                                      nil,item_h: center short item in default row
+--                                                  (e.g. btn_sm next to default text)
+--   vcenter(ctx, item_h, row_h)        Low-level: cursor math (use align() instead)
 --   right_align(ctx, item_w, [margin]) Cursor X: right-align next item
 --   hcenter(ctx, item_w)               Cursor X: center next item
 --
@@ -100,7 +112,7 @@
 -- =============================================================================
 -- RULES: NO hardcoded hex colors, pixel values, fonts, or icon functions.
 -- Colors from build_palette(). Dims from layout.*. Fonts from create_fonts().
--- Icons from icons.*. Alignment from vcenter/hcenter/right_align.
+-- Icons from icons.*. Alignment from align() (primary) / right_align / hcenter.
 -- =============================================================================
 
 local Theme = {}
@@ -328,9 +340,10 @@ Theme.layout = {
 
   -- ── Button size presets ─────────────────────────────────────────────────
   -- Height flows from font + padding. Default uses global FramePadding (md, sm).
-  -- Push FramePadding + font for sm/lg; pop after rendering.
-  btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small" },
-  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium" },
+  -- Pass opts.preset (or use push_button_preset) for sm/lg variants.
+  btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small",   h = 16 },
+  btn_default  = { pad_x = S.md, pad_y = S.sm, font = "default", h = 22 },
+  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 26 },
 
   -- ── Icon size presets ───────────────────────────────────────────────────
   -- Button dimension = size + pad * 2. Default icon_btn uses icon_md.
@@ -656,9 +669,10 @@ function Theme.invalidate_palette()
   _cached_mode = nil
 end
 
---- Vertically centers the next item within a row of a given height.
---- Call before rendering the item. Adjusts the cursor Y position so the
---- item appears centered within the row.
+--- Low-level: vertically centers the next item within a row of a given height.
+--- For standard alignment, prefer Theme.align(ctx, row_h, item_h) instead.
+--- This function is retained for truly custom DrawList positioning where
+--- you control the cursor entirely and need explicit ref_y tracking.
 ---
 --- When placing multiple items on the same line (via SameLine), always pass
 --- `ref_y` — the cursor Y saved **before** the first item — to every call.
@@ -700,6 +714,58 @@ function Theme.hcenter(ctx, item_w)
   local avail = reaper.ImGui_GetContentRegionAvail(ctx)
   local cx = reaper.ImGui_GetCursorPosX(ctx)
   reaper.ImGui_SetCursorPosX(ctx, cx + math.floor((avail - item_w) * 0.5))
+end
+
+--- Vertically aligns the next item within the current line.
+---
+--- THE SINGLE ALIGNMENT FUNCTION — call before every item on a row.
+---
+--- Three calling patterns:
+---
+---   Theme.align(ctx)                 Standard row: aligns text baseline to
+---                                     framed widgets via AlignTextToFramePadding.
+---
+---   Theme.align(ctx, row_h)          Table/toolbar: centers a frame-height item
+---                                     within an explicit row height.
+---
+---   Theme.align(ctx, row_h, item_h)  Custom item: centers item_h within row_h.
+---                                     If row_h is nil, uses GetFrameHeight() as
+---                                     the implicit row — this handles btn_sm
+---                                     widgets on a default-height SameLine row.
+---
+--- When row_h is provided (table context), the function automatically adjusts
+--- for CellPadding.y: the content area inside a table cell is
+--- row_h - 2 * CellPadding.y. Without this, items are pushed too far down.
+---
+--- On SameLine rows, ImGui resets cursor Y to the line start, so
+--- GetCursorPosY() always returns the correct base. No ref_y needed.
+---
+--- @param ctx    userdata     ImGui context
+--- @param row_h  number|nil   Row height (nil = GetFrameHeight for centering,
+---                             or baseline alignment when item_h is also nil)
+--- @param item_h number|nil   Height of the next item (nil = frame height)
+function Theme.align(ctx, row_h, item_h)
+  if not row_h and not item_h then
+    -- Standard row: align text baseline to framed widgets
+    reaper.ImGui_AlignTextToFramePadding(ctx)
+    return
+  end
+  -- Resolve row height: explicit or implicit from current frame height
+  local explicit_row = (row_h ~= nil)
+  row_h = row_h or reaper.ImGui_GetFrameHeight(ctx)
+  -- In table cells, CellPadding.y is added above and below the content area.
+  -- The cursor is already positioned after top padding, so the available
+  -- content height is row_h minus 2 * CellPadding.y.
+  -- CellPadding.y is pushed as Theme.layout.xs in Theme.push().
+  if explicit_row then
+    row_h = row_h - Theme.layout.xs * 2
+  end
+  -- Resolve item height: explicit or frame height
+  item_h = item_h or reaper.ImGui_GetFrameHeight(ctx)
+  if item_h < row_h then
+    local cur_y = reaper.ImGui_GetCursorPosY(ctx)
+    reaper.ImGui_SetCursorPosY(ctx, cur_y + math.floor((row_h - item_h) * 0.5))
+  end
 end
 
 --- Renders an invisible button with a DrawList vector icon overlay.
@@ -848,6 +914,380 @@ function Theme.collapsing_header(ctx, label, opts)
     flags = flags | reaper.ImGui_TreeNodeFlags_DefaultOpen()
   end
   return reaper.ImGui_CollapsingHeader(ctx, label, nil, flags)
+end
+
+--- Renders a styled, compact value/progress bar with an optional centered text overlay.
+--- Uses DrawList primitives for crisp rendering, custom fill/bg colors, and rounded corners.
+---
+--- @param ctx userdata  ImGui context
+--- @param fraction number  Normalized progress/value between 0.0 and 1.0
+--- @param opts table|nil  Optional configuration:
+---   opts.w            (number)  Bar width in pixels (default: available region width)
+---   opts.h            (number)  Bar height in pixels (default: Theme.layout.row_h - 4)
+---   opts.fill_color   (number)  Fill color (default: palette.accent)
+---   opts.bg_color     (number)  Background color (default: palette.card)
+---   opts.border_color (number)  Border color (optional)
+---   opts.rounding     (number)  Corner rounding (default: Theme.layout.rounding)
+--- Pushes button preset styling (FramePadding and font) onto the stack.
+--- Use for standard ImGui controls (sliders, inputs, combo boxes) that should
+--- match a button preset tier (e.g. Theme.layout.btn_sm, Theme.layout.btn_lg).
+---
+--- @param ctx userdata        ImGui context
+--- @param fonts table|nil      Font table from Theme.create_fonts()
+--- @param preset table|nil     Preset table (default: Theme.layout.btn_sm)
+--- @return integer var_count, userdata|nil pushed_font
+function Theme.push_button_preset(ctx, fonts, preset)
+  preset = preset or Theme.layout.btn_sm
+  local var_count = 0
+  if preset.pad_x or preset.pad_y then
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(),
+      preset.pad_x or Theme.layout.md,
+      preset.pad_y or Theme.layout.sm)
+    var_count = var_count + 1
+  end
+  local pushed_font = nil
+  if fonts and preset.font and fonts[preset.font] then
+    pushed_font = Theme.push_font(ctx, fonts[preset.font])
+  end
+  return var_count, pushed_font
+end
+
+--- Pops button preset styling from the stack.
+---
+--- @param ctx userdata         ImGui context
+--- @param var_count integer    Number of style vars pushed
+--- @param pushed_font userdata|nil Font returned by Theme.push_button_preset
+function Theme.pop_button_preset(ctx, var_count, pushed_font)
+  if pushed_font then
+    Theme.pop_font(ctx, pushed_font)
+  end
+  if var_count and var_count > 0 then
+    reaper.ImGui_PopStyleVar(ctx, var_count)
+  end
+end
+
+--- Renders a compact or standard meter/progress bar with DrawList background,
+--- fill color, rounding, and optional centered text overlay.
+---
+--- @param ctx userdata  ImGui context
+--- @param fraction number  Normalized progress/value between 0.0 and 1.0
+--- @param opts table|nil  Optional configuration:
+---   opts.w            (number)  Bar width in pixels (default: available region width)
+---   opts.h            (number)  Bar height in pixels (default: preset.h or Theme.layout.row_h - 4)
+---   opts.preset       (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
+---   opts.fonts        (table)   Font table from Theme.create_fonts() (for overlay text)
+---   opts.fill_color   (number)  Fill color (default: palette.accent)
+---   opts.bg_color     (number)  Background color (default: palette.card)
+---   opts.border_color (number)  Border color (optional)
+---   opts.rounding     (number)  Corner rounding (default: Theme.layout.rounding)
+---   opts.overlay      (string)  Centered text overlay (e.g. "+3.5 dB" or "75%")
+---   opts.text_color   (number)  Overlay text color (default: palette.text)
+---   opts.tooltip      (string)  Tooltip text on hover
+function Theme.progress_bar(ctx, fraction, opts)
+  opts = opts or {}
+  local P = _get_palette()
+  local L = Theme.layout
+
+  local preset = opts.preset
+  if preset == "small" or preset == "sm" then preset = L.btn_sm end
+  if preset == "large" or preset == "lg" then preset = L.btn_lg end
+
+  local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
+  local w = opts.w or math.max(L.xxxl, avail_w)
+  local default_h = (preset and preset.h) or (L.row_h - L.sm)
+  local h = opts.h or default_h
+  local rounding = opts.rounding or L.rounding
+  local fill_col = opts.fill_color or P.accent
+  local bg_col = opts.bg_color or P.card
+  local text_col = opts.text_color or P.text
+
+  local dl = reaper.ImGui_GetWindowDrawList(ctx)
+  local x, y = reaper.ImGui_GetCursorScreenPos(ctx)
+
+  -- Background
+  reaper.ImGui_DrawList_AddRectFilled(dl, x, y, x + w, y + h, bg_col, rounding)
+
+  -- Filled bar
+  local clamped = math.max(0.0, math.min(1.0, fraction or 0.0))
+  if clamped > 0.001 then
+    local fw = math.max(rounding * 2, math.floor(w * clamped))
+    if fw > w then fw = w end
+    reaper.ImGui_DrawList_AddRectFilled(dl, x, y, x + fw, y + h, fill_col, rounding)
+  end
+
+  -- Border
+  if opts.border_color then
+    reaper.ImGui_DrawList_AddRect(dl, x, y, x + w, y + h, opts.border_color, rounding)
+  end
+
+  -- Centered text overlay
+  if opts.overlay and opts.overlay ~= "" then
+    local pushed_font = nil
+    if opts.fonts and preset and preset.font and opts.fonts[preset.font] then
+      pushed_font = Theme.push_font(ctx, opts.fonts[preset.font])
+    end
+    local tw, th = reaper.ImGui_CalcTextSize(ctx, opts.overlay)
+    local tx = x + math.floor((w - tw) * 0.5)
+    local ty = y + math.floor((h - th) * 0.5)
+    reaper.ImGui_DrawList_AddText(dl, tx, ty, text_col, opts.overlay)
+    if pushed_font then
+      Theme.pop_font(ctx, pushed_font)
+    end
+  end
+
+  -- Advance layout cursor
+  reaper.ImGui_Dummy(ctx, w, h)
+
+  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+    Theme.tooltip(ctx, opts.tooltip)
+  end
+end
+
+--- Renders a toggle button derived from standard ImGui button styling.
+--- Inherits parent theme padding, font, text centering, and rounding by default,
+--- or follows a button preset (e.g. Theme.layout.btn_sm).
+---
+--- @param ctx userdata  ImGui context
+--- @param id string  Unique button ID (appended to label with ##)
+--- @param label string  Button text label
+--- @param is_active boolean  Whether button is in active/secondary state
+--- @param opts table|nil  Optional configuration:
+---   opts.preset         (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
+---   opts.fonts          (table)   Font table from Theme.create_fonts() (for preset font)
+---   opts.w              (number)  Button width (default: 0 = auto from text + frame padding)
+---   opts.h              (number)  Button height (default: 0 = auto from font + frame padding)
+---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
+---   opts.pad_x          (number)  Horizontal padding override (default: preset or FramePadding)
+---   opts.pad_y          (number)  Vertical padding override (default: preset or FramePadding)
+---   opts.active_bg      (number)  Active background (default: palette.accent_d)
+---   opts.active_hover   (number)  Active hovered background (default: palette.accent_h)
+---   opts.active_active  (number)  Active pressed background (default: palette.accent)
+---   opts.active_text    (number)  Active text color (default: palette.accent)
+---   opts.inactive_bg    (number)  Inactive background (default: palette.card)
+---   opts.inactive_hover (number)  Inactive hovered background (default: palette.panel)
+---   opts.inactive_active(number)  Inactive pressed background (default: palette.accent_d)
+---   opts.inactive_text  (number)  Inactive text color (default: palette.text_dim)
+---   opts.tooltip        (string)  Hover tooltip text
+--- @return boolean  true if the button was clicked
+function Theme.toggle_button(ctx, id, label, is_active, opts)
+  opts = opts or {}
+  local P = _get_palette()
+  local L = Theme.layout
+
+  local preset = opts.preset
+  if preset == "small" or preset == "sm" then preset = L.btn_sm end
+  if preset == "large" or preset == "lg" then preset = L.btn_lg end
+
+  local btn_w = opts.w or 0
+  local btn_h = opts.h or 0
+
+  local bg, bg_h, bg_a, text_col
+  if is_active then
+    bg       = opts.active_bg     or P.accent_d
+    bg_h     = opts.active_hover  or P.accent_h
+    bg_a     = opts.active_active or P.accent
+    text_col = opts.active_text   or P.accent
+  else
+    bg       = opts.inactive_bg     or P.card
+    bg_h     = opts.inactive_hover  or P.panel
+    bg_a     = opts.inactive_active or P.accent_d
+    text_col = opts.inactive_text   or P.text_dim
+  end
+
+  local pushed_vars = 0
+  if opts.rounding then
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(), opts.rounding)
+    pushed_vars = pushed_vars + 1
+  end
+
+  local px = opts.pad_x or (preset and preset.pad_x)
+  local py = opts.pad_y or (preset and preset.pad_y)
+  if px or py then
+    px = px or Theme.layout.md
+    py = py or Theme.layout.sm
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), px, py)
+    pushed_vars = pushed_vars + 1
+  end
+
+  local pushed_font = nil
+  if opts.fonts and preset and preset.font and opts.fonts[preset.font] then
+    pushed_font = Theme.push_font(ctx, opts.fonts[preset.font])
+  end
+
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
+
+  local btn_label = string.format("%s##%s", label, id)
+  local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
+
+  reaper.ImGui_PopStyleColor(ctx, 4)
+  if pushed_font then
+    Theme.pop_font(ctx, pushed_font)
+  end
+  if pushed_vars > 0 then
+    reaper.ImGui_PopStyleVar(ctx, pushed_vars)
+  end
+
+  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+    Theme.tooltip(ctx, opts.tooltip)
+  end
+
+  return pressed
+end
+
+--- Alias for toggle_button.
+Theme.badge_button = Theme.toggle_button
+
+--- Renders a status badge derived from button styling with centered text and frame padding.
+---
+--- @param ctx userdata  ImGui context
+--- @param label string  Badge text label
+--- @param opts table|nil  Optional configuration:
+---   opts.preset         (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
+---   opts.fonts          (table)   Font table from Theme.create_fonts() (for preset font)
+---   opts.color          (number)  Text and accent color (default: palette.accent)
+---   opts.bg             (number)  Background color (default: 20% alpha of color or palette.card)
+---   opts.w              (number)  Badge width (default: 0 = auto from text + frame padding)
+---   opts.h              (number)  Badge height (default: 0 = auto from font + frame padding)
+---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
+---   opts.pad_x          (number)  Horizontal padding override (default: preset or FramePadding)
+---   opts.pad_y          (number)  Vertical padding override (default: preset or FramePadding)
+---   opts.interactive    (boolean) Whether badge is clickable (default: false)
+---   opts.id             (string)  Unique ID if interactive
+---   opts.tooltip        (string)  Hover tooltip text
+--- @return boolean  true if the badge was clicked (when interactive = true)
+function Theme.badge(ctx, label, opts)
+  opts = opts or {}
+  local P = _get_palette()
+  local L = Theme.layout
+
+  local preset = opts.preset
+  if preset == "small" or preset == "sm" then preset = L.btn_sm end
+  if preset == "large" or preset == "lg" then preset = L.btn_lg end
+
+  local text_col = opts.color or P.accent
+  local bg = opts.bg or with_alpha(text_col, 0.20)
+  local bg_h = opts.bg_hover or with_alpha(text_col, 0.35)
+  local bg_a = opts.bg_active or with_alpha(text_col, 0.50)
+
+  local btn_w = opts.w or 0
+  local btn_h = opts.h or 0
+
+  local pushed_vars = 0
+  if opts.rounding then
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(), opts.rounding)
+    pushed_vars = pushed_vars + 1
+  end
+  local px = opts.pad_x or (preset and preset.pad_x)
+  local py = opts.pad_y or (preset and preset.pad_y)
+  if px or py then
+    px = px or Theme.layout.md
+    py = py or Theme.layout.xs
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), px, py)
+    pushed_vars = pushed_vars + 1
+  end
+
+  local pushed_font = nil
+  if opts.fonts and preset and preset.font and opts.fonts[preset.font] then
+    pushed_font = Theme.push_font(ctx, opts.fonts[preset.font])
+  end
+
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.interactive and bg_h or bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.interactive and bg_a or bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
+
+  local badge_id = opts.id and ("##badge_" .. opts.id) or ("##badge_" .. label)
+  local btn_label = label .. badge_id
+
+  local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
+
+  reaper.ImGui_PopStyleColor(ctx, 4)
+  if pushed_font then
+    Theme.pop_font(ctx, pushed_font)
+  end
+  if pushed_vars > 0 then
+    reaper.ImGui_PopStyleVar(ctx, pushed_vars)
+  end
+
+  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+    Theme.tooltip(ctx, opts.tooltip)
+  end
+
+  return opts.interactive and pressed or false
+end
+
+--- Renders a standardized combo box wrapping ImGui_BeginCombo.
+--- Handles label resolution, item iteration, and selection state.
+---
+--- @param ctx userdata  ImGui context
+--- @param id string  Unique combo ID (e.g. "##shared_fx")
+--- @param items table  Array of items (strings or tables)
+--- @param selected_idx number  1-based index of the currently selected item (0 if none)
+--- @param opts table|nil  Optional configuration:
+---   opts.w           (number)   Combo width override (default: full available width)
+---   opts.placeholder (string)   Placeholder text when selected_idx <= 0 (default: "-- Select --")
+---   opts.get_label   (function) Custom function(item, idx) -> string
+---   opts.disabled    (boolean)  Whether the combo is disabled
+---   opts.tooltip     (string)   Hover tooltip text
+--- @return number new_idx, boolean changed  The selected 1-based index and whether it changed
+function Theme.combo(ctx, id, items, selected_idx, opts)
+  opts = opts or {}
+  items = items or {}
+  selected_idx = selected_idx or 0
+
+  if opts.disabled then
+    reaper.ImGui_BeginDisabled(ctx)
+  end
+
+  if opts.w then
+    reaper.ImGui_SetNextItemWidth(ctx, opts.w)
+  end
+
+  local function get_item_label(item, idx)
+    if opts.get_label then
+      return opts.get_label(item, idx)
+    end
+    if type(item) == "table" then
+      return item.name or item.label or item.title or tostring(item)
+    end
+    return tostring(item)
+  end
+
+  local preview = opts.placeholder or "-- Select --"
+  if selected_idx > 0 and selected_idx <= #items then
+    preview = get_item_label(items[selected_idx], selected_idx)
+  end
+
+  local new_idx = selected_idx
+  local changed = false
+
+  if reaper.ImGui_BeginCombo(ctx, id, preview) then
+    for i, item in ipairs(items) do
+      local lbl = get_item_label(item, i) .. "##item_" .. i
+      local is_sel = (selected_idx == i)
+      if reaper.ImGui_Selectable(ctx, lbl, is_sel) then
+        new_idx = i
+        changed = true
+      end
+      if is_sel then
+        reaper.ImGui_SetItemDefaultFocus(ctx)
+      end
+    end
+    reaper.ImGui_EndCombo(ctx)
+  end
+
+  if opts.disabled then
+    reaper.ImGui_EndDisabled(ctx)
+  end
+
+  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+    Theme.tooltip(ctx, opts.tooltip)
+  end
+
+  return new_idx, changed
 end
 
 --- Centers the next ImGui window on the viewport.

@@ -1,7 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.1.0
+-- @version 1.2.0
 -- @changelog
+--   + Add live interactive demonstrations for Theme.progress_bar(), Theme.badge_button(), and Theme.combo()
 --   + Rebuild header using shared Theme.header() composite widget
 --   + Fix vertical alignment across header icon, title, subtitle, and controls
 --   + Add Theme.header() component preview in Widget Components section
@@ -47,6 +48,13 @@ Theme.attach_fonts(ctx, fonts)
 
 local P = Theme.build_palette()
 local L = Theme.layout
+
+-- Interactive widget demo state
+local demo_prog_val     = 0.65
+local demo_badge_active = true
+local demo_mode_active  = false
+local demo_combo_items  = { "Pro-Q 4 (FabFilter)", "Ozone 11 (iZotope)", "Decapitator (Soundtoys)", "ValhallaVintageVerb" }
+local demo_combo_sel    = 1
 
 -- Script-specific layout — uses Theme.layout values as building blocks
 local UI = {
@@ -577,6 +585,178 @@ local function draw_widgets_section()
   end
   vspace(L.xxxl)
 
+  -- progress_bar
+  Theme.section_divider(ctx, "Theme.progress_bar(ctx, fraction, [opts])", {
+    tooltip = "Styled progress/meter bar with DrawList rendering and centered text overlay.",
+  })
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Adjust Value:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  reaper.ImGui_SetNextItemWidth(ctx, 180)
+  local chg_pv, new_pv = reaper.ImGui_SliderDouble(ctx, "##demo_prog_slider", demo_prog_val, 0.0, 1.0, "%.2f")
+  if chg_pv then demo_prog_val = new_pv end
+
+  vspace(L.sm)
+  reaper.ImGui_Text(ctx, "Accent Fill:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.progress_bar(ctx, demo_prog_val, {
+    w = 200,
+    overlay = string.format("%.0f%%", demo_prog_val * 100),
+    tooltip = "Default Accent Bar",
+  })
+  reaper.ImGui_SameLine(ctx, 0, L.lg)
+  reaper.ImGui_Text(ctx, "Green dB Meter:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  local db_val = (demo_prog_val * 24.0) - 18.0
+  Theme.progress_bar(ctx, demo_prog_val, {
+    w = 200,
+    fill_color = P.green_d,
+    overlay = string.format("%+.1f dB", db_val),
+    tooltip = "Green Meter Bar",
+  })
+  reaper.ImGui_SameLine(ctx, 0, L.lg)
+  reaper.ImGui_Text(ctx, "Red Limit:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.progress_bar(ctx, demo_prog_val, {
+    w = 120,
+    fill_color = P.red_d,
+    overlay = demo_prog_val > 0.85 and "OVER" or "OK",
+    tooltip = "Red Threshold Bar",
+  })
+  vspace(L.xxxl)
+
+  -- toggle_button
+  Theme.section_divider(ctx, "Theme.toggle_button(ctx, id, label, is_active, [opts])", {
+    tooltip = "Button-derived toggle button inheriting parent frame padding, text centering, and rounding.",
+  })
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Mode Toggle:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  local mode_label = demo_mode_active and "INVERSE" or "FOLLOW"
+  if Theme.toggle_button(ctx, "demo_mode_btn", mode_label, demo_mode_active, {
+    active_bg      = P.accent_d,
+    active_hover   = P.accent_h,
+    active_active  = P.accent,
+    active_text    = Theme.lighten(P.accent, 0.45),
+    inactive_bg    = P.green_d,
+    inactive_hover = P.green_h,
+    inactive_active= P.green,
+    inactive_text  = Theme.lighten(P.green, 0.45),
+    tooltip = "Click to toggle mode",
+  }) then
+    demo_mode_active = not demo_mode_active
+  end
+
+  reaper.ImGui_SameLine(ctx, 0, L.xl)
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Toggle Switch:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  local toggle_lbl = demo_badge_active and "ACTIVE" or "MUTED"
+  if Theme.toggle_button(ctx, "demo_toggle_switch", toggle_lbl, demo_badge_active, {
+    active_bg      = P.accent_d,
+    active_hover   = P.accent_h,
+    active_active  = P.accent,
+    active_text    = P.accent,
+    inactive_bg    = P.card,
+    inactive_hover = P.panel,
+    inactive_active= P.accent_d,
+    inactive_text  = P.text_dim,
+    tooltip = "Click to toggle state",
+  }) then
+    demo_badge_active = not demo_badge_active
+  end
+  vspace(L.xxxl)
+
+  -- badge
+  Theme.section_divider(ctx, "Theme.badge(ctx, label, [opts])", {
+    tooltip = "Button-derived status badge with centered text, frame padding, and semantic theme colors.",
+  })
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Status Badges:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.badge(ctx, "ACTIVE", { color = P.green, tooltip = "Online and running" })
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.badge(ctx, "INVERSE", { color = P.accent, tooltip = "Inverse tracking mode" })
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.badge(ctx, "WARNING", { color = P.yellow, tooltip = "High CPU or pending link" })
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.badge(ctx, "OFFLINE", { color = P.red, tooltip = "Track or plugin missing" })
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.badge(ctx, "BYPASS", { color = P.text_dim, tooltip = "Processing bypassed" })
+  vspace(L.xxxl)
+
+  -- Small Button Preset (btn_sm for tables)
+  Theme.section_divider(ctx, "TABLE CONTROLS PRESET: Theme.layout.btn_sm", {
+    tooltip = "Unified 16px compact sizing (pad_x=4, pad_y=2, font=small) for table rows and dense data grids.",
+  })
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Live Values:")
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.align(ctx, nil, L.btn_sm.h)
+  Theme.progress_bar(ctx, demo_prog_val, {
+    w = 120,
+    preset = L.btn_sm,
+    fonts = fonts,
+    fill_color = P.green_d,
+    overlay = string.format("%.0f%%", demo_prog_val * 100),
+  })
+  reaper.ImGui_SameLine(ctx, 0, L.lg)
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Mode:")
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.align(ctx, nil, L.btn_sm.h)
+  local sm_mode_lbl = demo_mode_active and "INV" or "FLW"
+  if Theme.toggle_button(ctx, "demo_sm_mode", sm_mode_lbl, demo_mode_active, {
+    w = 54,
+    preset = L.btn_sm,
+    fonts = fonts,
+    active_bg      = P.accent_d,
+    active_hover   = P.accent_h,
+    active_active  = P.accent,
+    active_text    = Theme.lighten(P.accent, 0.45),
+    inactive_bg    = P.green_d,
+    inactive_hover = P.green_h,
+    inactive_active= P.green,
+    inactive_text  = Theme.lighten(P.green, 0.45),
+  }) then
+    demo_mode_active = not demo_mode_active
+  end
+  reaper.ImGui_SameLine(ctx, 0, L.lg)
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Strength:")
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.align(ctx, nil, L.btn_sm.h)
+  reaper.ImGui_SetNextItemWidth(ctx, 90)
+  local sp_vars, sp_font = Theme.push_button_preset(ctx, fonts, L.btn_sm)
+  local _, new_pct = reaper.ImGui_SliderDouble(ctx, "##demo_sm_slider", demo_prog_val * 100, 0, 100, "%.0f%%")
+  Theme.pop_button_preset(ctx, sp_vars, sp_font)
+  demo_prog_val = new_pct / 100
+  reaper.ImGui_SameLine(ctx, 0, L.lg)
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Badge:")
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.align(ctx, nil, L.btn_sm.h)
+  Theme.badge(ctx, "OFFLINE", { color = P.red, preset = L.btn_sm, fonts = fonts })
+  vspace(L.xxxl)
+
+  -- combo
+  Theme.section_divider(ctx, "Theme.combo(ctx, id, items, selected_idx, [opts])", {
+    tooltip = "Standardized combo box wrapping ImGui_BeginCombo with automatic item extraction.",
+  })
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Plugin Selector:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  local new_sel, chg_sel = Theme.combo(ctx, "##demo_combo_box", demo_combo_items, demo_combo_sel, {
+    w = 260,
+    tooltip = "Select a plugin from list",
+  })
+  if chg_sel then demo_combo_sel = new_sel end
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+  reaper.ImGui_Text(ctx, string.format("(Selected index: %d)", demo_combo_sel))
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.xxxl)
+
   -- center_next_window
   Theme.section_divider(ctx, "Theme.center_next_window(ctx, w, h)")
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
@@ -640,15 +820,36 @@ local function draw_widgets_section()
 
   -- Alignment helpers
   Theme.section_divider(ctx, "ALIGNMENT HELPERS", {
-    tooltip = "Theme.vcenter, Theme.right_align, Theme.hcenter — position items consistently.",
+    tooltip = "Theme.align, Theme.vcenter, Theme.right_align, Theme.hcenter — position items consistently.",
   })
+
+  -- Theme.align (primary)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
+  reaper.ImGui_Text(ctx, "Theme.align(ctx, [row_h], [item_h])")
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+  reaper.ImGui_Text(ctx, "THE primary alignment function. Call before every item on a SameLine row.")
+  reaper.ImGui_Text(ctx, "No args: aligns text baseline to framed widgets. row_h: centers in explicit row.")
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.sm)
+
+  -- Live demo: text + button + badge on one row
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Label:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.align(ctx)
+  reaper.ImGui_Button(ctx, "Aligned Button##demo_align")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.align(ctx)
+  Theme.badge(ctx, "BADGE", { color = P.green })
+  vspace(L.xl)
 
   -- vcenter demo (including ref_y pattern)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
-  reaper.ImGui_Text(ctx, "Theme.vcenter(ctx, item_h, row_h, [ref_y])")
+  reaper.ImGui_Text(ctx, "Theme.vcenter(ctx, item_h, row_h, [ref_y]) (low-level)")
   reaper.ImGui_PopStyleColor(ctx, 1)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "Vertically centers the next item within a row. On SameLine rows, always pass start_y as ref_y.")
+  reaper.ImGui_Text(ctx, "Low-level cursor math. Prefer Theme.align(ctx, row_h) for standard use cases.")
   reaper.ImGui_Text(ctx, "Example: local start_y = reaper.ImGui_GetCursorPosY(ctx)")
   reaper.ImGui_Text(ctx, "         Theme.vcenter(ctx, item_h, row_h, start_y)")
   reaper.ImGui_PopStyleColor(ctx, 1)

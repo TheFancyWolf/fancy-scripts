@@ -1,8 +1,10 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.2.0
 -- @changelog
---   + "All" button in Link Builder to select/deselect all parameters at once
+--   + Full migration to shared Theme engine and design tokens (_lib/theme.lua)
+--   + Reactive theme mode switching (Fancy Dark / Match REAPER Theme) in Settings
+--   + Standardized Theme.header, icons, widgets, and layout scale
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
 --   Features: multi-track selector, auto group-scan for same plugin, full-mesh linking,
@@ -32,18 +34,18 @@ end
 -------------------------------------------------------------------------------
 -- 2. SHARED LIBRARY BOOTSTRAP
 -------------------------------------------------------------------------------
-local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\\/])[^\\/]-$]])
+local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
 
 local Theme = require("theme")
 local JSON  = require("json")
+local Utils = require("utils")
 
 -------------------------------------------------------------------------------
 -- 3. STATE & CONFIGURATION
 -------------------------------------------------------------------------------
 local ctx
-local font_brand_bold
-local font_brand_reg
+local fonts
 local links   = {}   -- active links (bidirectional a <-> b)
 local paused  = false
 local lval_a  = {}   -- last known normalized values for side A
@@ -65,19 +67,20 @@ local SETTINGS = {
   row_height       = 24,      -- row height in active links table
 }
 
--- UI Layout Constants
+-- UI Layout Constants built from Theme.layout tokens
+local L = Theme.layout
 local UI = {
   win_w       = 1200,
   win_h       = 820,
-  btn_h       = 26,
-  btn_info_w  = 48,
-  btn_sett_w  = 72,
-  indent_w    = 28,
-  chk_col_w   = 22,
+  btn_h       = L.xxl + L.xs,              -- 26
+  btn_info_w  = L.xxxl + L.xl,             -- 48
+  btn_sett_w  = L.xxxl * 2 + L.md,         -- 72
+  indent_w    = L.indent,                  -- 32 (from Theme.layout)
+  chk_col_w   = L.chk_col_w,               -- 24 (from Theme.layout)
   val_col_w   = 150,
   mode_col_w  = 74,
   str_col_w   = 85,
-  del_col_w   = 28,
+  del_col_w   = L.icon_md.size + L.icon_md.pad * 2 + L.md, -- 28
 }
 
 -- Modal Dialog State
@@ -144,8 +147,8 @@ local M = {
   filter  = "",
 }
 
--- P: Presets state
-local P = {
+-- Presets state
+local Presets = {
   list = {},
   sel  = 0,
 }
@@ -525,7 +528,7 @@ local function save_preset_from_links(name)
     end
   end
   if #params == 0 then return false end
-  P.list[#P.list + 1] = {
+  Presets.list[#Presets.list + 1] = {
     name        = name,
     plugin_name = plugin_name_val,
     params      = params,
@@ -802,7 +805,7 @@ local function load_settings()
 end
 
 local function save_presets()
-  write_file(PRESET_PATH, JSON.encode(P.list))
+  write_file(PRESET_PATH, JSON.encode(Presets.list))
 end
 
 local function load_presets()
@@ -810,7 +813,7 @@ local function load_presets()
   if not raw then return end
   local ok, data = pcall(JSON.decode, raw)
   if ok and type(data) == "table" then
-    P.list = data
+    Presets.list = data
   end
 end
 
@@ -903,256 +906,14 @@ local function apply_links()
 end
 
 -------------------------------------------------------------------------------
--- 7. COLORS & THEME
--------------------------------------------------------------------------------
-local C = Theme.build_palette()
-
--------------------------------------------------------------------------------
--- 8. SHARED UI HELPERS
--------------------------------------------------------------------------------
-
--- === Table cell vertical centering helper ===
-local function table_vcenter(item_h, row_h)
-  if row_h and item_h < row_h then
-    local cy = reaper.ImGui_GetCursorPosY(ctx)
-    reaper.ImGui_SetCursorPosY(ctx, cy + math.floor((row_h - item_h) * 0.5))
-  end
-end
-
--- Progress bar with text centered via DrawList
-local function draw_progress_bar_centered(fraction, w, h, col_bar, col_bg, text)
-  local dl = reaper.ImGui_GetWindowDrawList(ctx)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PlotHistogram(), col_bar)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),       col_bg)
-  reaper.ImGui_ProgressBar(ctx, fraction, w, h, "")
-  reaper.ImGui_PopStyleColor(ctx, 2)
-  if text and text ~= "" then
-    local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
-    local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
-    local tw, th = reaper.ImGui_CalcTextSize(ctx, text)
-    local tx = rx + math.floor((rx2 - rx - tw) * 0.5)
-    local ty = ry + math.floor((ry2 - ry - th) * 0.5)
-    reaper.ImGui_DrawList_AddText(dl, tx, ty, 0xFFFFFFFF, text)
-  end
-end
-
--- === DrawList Vector Icons ===
-local function icon_play(dl, cx, cy, hs, col)
-  local ox = math.floor(cx)
-  local oy = math.floor(cy)
-  reaper.ImGui_DrawList_AddTriangleFilled(dl,
-    ox - math.floor(hs * 0.5), oy - math.floor(hs),
-    ox + math.floor(hs),       oy,
-    ox - math.floor(hs * 0.5), oy + math.floor(hs), col)
-end
-
-local function icon_pause(dl, cx, cy, hs, col)
-  local bw = math.max(1, math.floor(hs * 0.35))
-  local gap = math.floor(hs * 0.25)
-  local ox, oy = math.floor(cx), math.floor(cy)
-  local h = math.floor(hs)
-  reaper.ImGui_DrawList_AddRectFilled(dl, ox - gap - bw, oy - h, ox - gap, oy + h, col)
-  reaper.ImGui_DrawList_AddRectFilled(dl, ox + gap, oy - h, ox + gap + bw, oy + h, col)
-end
-
-local function icon_close(dl, cx, cy, hs, col)
-  local th = math.max(1.5, hs * 0.3)
-  local s = math.floor(hs * 0.8)
-  local ox, oy = math.floor(cx), math.floor(cy)
-  reaper.ImGui_DrawList_AddLine(dl, ox - s, oy - s, ox + s, oy + s, col, th)
-  reaper.ImGui_DrawList_AddLine(dl, ox + s, oy - s, ox - s, oy + s, col, th)
-end
-
-local function icon_plus(dl, cx, cy, hs, col)
-  local th = math.max(1.5, hs * 0.35)
-  local ox, oy = math.floor(cx), math.floor(cy)
-  reaper.ImGui_DrawList_AddLine(dl, ox - hs, oy, ox + hs, oy, col, th)
-  reaper.ImGui_DrawList_AddLine(dl, ox, oy - hs, ox, oy + hs, col, th)
-end
-
-local function icon_info(dl, cx, cy, hs, col)
-  local s = hs / 10.0
-  local stroke_w = math.max(1.0, 1.6 * s)
-  reaper.ImGui_DrawList_AddCircle(dl, cx, cy, hs, col, 0, stroke_w)
-  local dot_r = math.max(0.8, 1.2 * s)
-  reaper.ImGui_DrawList_AddCircleFilled(dl, cx, cy - 4.2 * s, dot_r, col)
-  local stem_hw = math.max(0.6, 1.0 * s)
-  local stem_top = cy - 0.5 * s
-  local stem_bot = cy + 4.5 * s
-  reaper.ImGui_DrawList_AddRectFilled(dl, cx - stem_hw, stem_top, cx + stem_hw, stem_bot, col, stem_hw)
-end
-
-local function icon_tri_down(dl, cx, cy, hs, col)
-  local ox, oy = math.floor(cx), math.floor(cy)
-  reaper.ImGui_DrawList_AddTriangleFilled(dl,
-    ox - math.floor(hs * 0.7), oy - math.floor(hs * 0.4),
-    ox + math.floor(hs * 0.7), oy - math.floor(hs * 0.4),
-    ox, oy + math.floor(hs * 0.6), col)
-end
-
-local function icon_tri_up(dl, cx, cy, hs, col)
-  local ox, oy = math.floor(cx), math.floor(cy)
-  reaper.ImGui_DrawList_AddTriangleFilled(dl,
-    ox - math.floor(hs * 0.7), oy + math.floor(hs * 0.4),
-    ox + math.floor(hs * 0.7), oy + math.floor(hs * 0.4),
-    ox, oy - math.floor(hs * 0.6), col)
-end
-
--- Tooltip with automatic text wrapping
-local function show_wrapped_tooltip(text, max_w)
-  max_w = max_w or 300
-  if reaper.ImGui_BeginTooltip(ctx) then
-    reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + max_w)
-    reaper.ImGui_Text(ctx, text)
-    reaper.ImGui_PopTextWrapPos(ctx)
-    reaper.ImGui_EndTooltip(ctx)
-  end
-end
-
--- Icon button: invisible button + DrawList icon
-local function icon_btn(id, icon_fn, btn_w, btn_h, icon_size, col, tooltip)
-  local pressed = reaper.ImGui_InvisibleButton(ctx, id, btn_w, btn_h)
-  local dl = reaper.ImGui_GetWindowDrawList(ctx)
-  local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
-  local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
-  local cx = (rx + rx2) * 0.5
-  local cy = (ry + ry2) * 0.5
-  local hs = (icon_size or math.min(btn_w, btn_h) * 0.35) * 0.5
-  local hover = reaper.ImGui_IsItemHovered(ctx)
-  local draw_col = hover and (col + 0x40404000) or col
-  icon_fn(dl, cx, cy, hs, draw_col)
-  if tooltip and hover then
-    show_wrapped_tooltip(tooltip, 300)
-  end
-  return pressed
-end
-
--- Icon button with background color
-local function icon_btn_colored(id, icon_fn, btn_w, btn_h, icon_size, icon_col, bg, bg_h, bg_a, tooltip)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
-  local pressed = reaper.ImGui_Button(ctx, "##" .. id, btn_w, btn_h)
-  reaper.ImGui_PopStyleColor(ctx, 3)
-  local dl = reaper.ImGui_GetWindowDrawList(ctx)
-  local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
-  local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
-  local cx = (rx + rx2) * 0.5
-  local cy = (ry + ry2) * 0.5
-  local hs = (icon_size or math.min(btn_w, btn_h) * 0.3) * 0.5
-  icon_fn(dl, cx, cy, hs, icon_col)
-  if tooltip and reaper.ImGui_IsItemHovered(ctx) then
-    show_wrapped_tooltip(tooltip, 300)
-  end
-  return pressed
-end
-
-local function draw_brand_icon(size, target_h)
-  size = size or 24
-  target_h = target_h or size
-  local dl = reaper.ImGui_GetWindowDrawList(ctx)
-  local x, y = reaper.ImGui_GetCursorScreenPos(ctx)
-  local y_off = math.max(0, (target_h - size) * 0.5)
-  local s = size / 240.0
-  local dy = y + y_off
-  local bx1, by1 = x + 5.0 * s, dy + 5.0 * s
-  local bx2, by2 = x + 235.0 * s, dy + 235.0 * s
-  local r_bg     = 50.0 * s
-  local stroke_w = math.max(1.0, 10.0 * s)
-  reaper.ImGui_DrawList_AddRectFilled(dl, bx1, by1, bx2, by2, C.card, r_bg)
-  reaper.ImGui_DrawList_AddRect(dl, bx1, by1, bx2, by2, C.sep, r_bg, 0, stroke_w)
-  local p1_x, p1_y = x + 79.0 * s, dy + 139.0 * s
-  local c1_x, c1_y = x + 79.0 * s, dy + 101.0 * s
-  local c2_x, c2_y = x + 161.0 * s, dy + 139.0 * s
-  local p2_x, p2_y = x + 161.0 * s, dy + 101.0 * s
-  local curve_w    = math.max(1.2, 15.0 * s)
-  reaper.ImGui_DrawList_AddBezierCubic(dl, p1_x, p1_y, c1_x, c1_y, c2_x, c2_y, p2_x, p2_y, C.accent, curve_w)
-  reaper.ImGui_DrawList_AddCircleFilled(dl, x + 79.0 * s, dy + 169.0 * s, 30.0 * s, C.green)
-  reaper.ImGui_DrawList_AddCircleFilled(dl, x + 161.0 * s, dy + 71.0 * s, 30.0 * s, C.yellow)
-  reaper.ImGui_Dummy(ctx, size, target_h)
-end
-
-local function push_font(font, sz)
-  if not font or not reaper.ImGui_PushFont then return false end
-  local ok = pcall(reaper.ImGui_PushFont, ctx, font, sz or 14.0)
-  if not ok then
-    ok = pcall(reaper.ImGui_PushFont, ctx, font)
-  end
-  return ok
-end
-
-local function pop_font(pushed)
-  if pushed and reaper.ImGui_PopFont then
-    pcall(reaper.ImGui_PopFont, ctx)
-  end
-end
-
-local function draw_combo(id, items, sel)
-  local new = sel
-  local preview = (sel > 0 and items[sel]) and items[sel].name or "-- select --"
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (sel > 0) and 0xFFFFFFFF or C.text_dim)
-  if reaper.ImGui_BeginCombo(ctx, id, preview) then
-    reaper.ImGui_PopStyleColor(ctx, 1)
-    for j, item in ipairs(items) do
-      local is_sel = (j == sel)
-      if reaper.ImGui_Selectable(ctx, item.name .. "##" .. id .. j, is_sel) then
-        new = j
-      end
-      if is_sel then reaper.ImGui_SetItemDefaultFocus(ctx) end
-    end
-    reaper.ImGui_EndCombo(ctx)
-  else
-    reaper.ImGui_PopStyleColor(ctx, 1)
-  end
-  return new
-end
-
-local function mode_btn(id, mode, h)
-  local is_fol = (mode == "follow")
-  local bg   = is_fol and C.green_d or C.accent_d
-  local bg_h = is_fol and C.green_h or C.accent_h
-  local bg_a = is_fol and C.green   or C.accent
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
-  local clicked = reaper.ImGui_Button(ctx, "##" .. id, -1, h or 0)
-  reaper.ImGui_PopStyleColor(ctx, 3)
-  local dl = reaper.ImGui_GetWindowDrawList(ctx)
-  local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
-  local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
-  local text = is_fol and "Follow" or "Inverse"
-  local tw, th = reaper.ImGui_CalcTextSize(ctx, text)
-  local tx = rx + math.floor((rx2 - rx - tw) * 0.5)
-  local ty = ry + math.floor((ry2 - ry - th) * 0.5)
-  local text_col = is_fol and 0xD0FFD0FF or 0xD0C8FFFF
-  reaper.ImGui_DrawList_AddText(dl, tx, ty, text_col, text)
-  return clicked
-end
-
--- Styled section divider
-local function section_divider(label, col, tooltip)
-  reaper.ImGui_Spacing(ctx)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col or C.text_dim)
-  reaper.ImGui_Text(ctx, label)
-  reaper.ImGui_PopStyleColor(ctx, 1)
-  if tooltip then
-    reaper.ImGui_SameLine(ctx, 0, 6)
-    icon_btn("info_" .. label, icon_info, 16, 16, 12, C.text_dim, tooltip)
-  end
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(), (col and (col & 0xFFFFFF99) or C.sep))
-  reaper.ImGui_Separator(ctx)
-  reaper.ImGui_PopStyleColor(ctx, 1)
-  reaper.ImGui_Spacing(ctx)
-end
-
--------------------------------------------------------------------------------
--- 9. TRACK SELECTOR (Multi-track)
+-- 7. TRACK SELECTOR (Multi-track)
 -------------------------------------------------------------------------------
 local function draw_track_selector(tlist)
+  local P = Theme.build_palette()
   -- Action row: Add Tracks combo + Use Selected on same line
   local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
   local use_sel_w = 90
-  local combo_w = avail_w - use_sel_w - 6
+  local combo_w = avail_w - use_sel_w - L.md
 
   reaper.ImGui_SetNextItemWidth(ctx, combo_w)
   if reaper.ImGui_BeginCombo(ctx, "##add_track", "+ Add Tracks...") then
@@ -1190,7 +951,7 @@ local function draw_track_selector(tlist)
     reaper.ImGui_EndCombo(ctx)
   end
 
-  reaper.ImGui_SameLine(ctx, 0, 6)
+  reaper.ImGui_SameLine(ctx, 0, L.md)
   if reaper.ImGui_Button(ctx, "Use Selected", use_sel_w, 0) then
     S.tracks = {}
     local n_sel = reaper.CountSelectedTracks(0)
@@ -1216,7 +977,7 @@ local function draw_track_selector(tlist)
 
   -- Collapsible track list (below action buttons)
   if #S.tracks == 0 then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     reaper.ImGui_Text(ctx, "  No tracks selected")
     reaper.ImGui_PopStyleColor(ctx, 1)
   else
@@ -1228,19 +989,23 @@ local function draw_track_selector(tlist)
     if reaper.ImGui_BeginTable(ctx, "trk_hdr", 2, reaper.ImGui_TableFlags_None()) then
       reaper.ImGui_TableSetupColumn(ctx, "##label", reaper.ImGui_TableColumnFlags_WidthStretch())
       reaper.ImGui_TableSetupColumn(ctx, "##clear", reaper.ImGui_TableColumnFlags_WidthFixed(), UI.del_col_w)
-      reaper.ImGui_TableNextRow(ctx, 0, 22)
+      reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
 
       reaper.ImGui_TableSetColumnIndex(ctx, 0)
       local sel_flags = reaper.ImGui_SelectableFlags_SpanAllColumns()
                       | reaper.ImGui_SelectableFlags_AllowOverlap()
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.accent)
-      if reaper.ImGui_Selectable(ctx, summary .. "##trk_toggle", false, sel_flags, 0, 22) then
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
+      if reaper.ImGui_Selectable(ctx, summary .. "##trk_toggle", false, sel_flags, 0, L.row_h) then
         S.tracks_expanded = not S.tracks_expanded
       end
       reaper.ImGui_PopStyleColor(ctx, 1)
 
       reaper.ImGui_TableSetColumnIndex(ctx, 1)
-      if icon_btn("trk_clear", icon_close, -1, 22, 7, C.text_dim, "Clear all tracks") then
+      if Theme.icon_btn(ctx, "trk_clear", Theme.icons.close, {
+        preset = L.icon_sm,
+        color = P.text_dim,
+        tooltip = "Clear all tracks",
+      }) then
         S.tracks = {}
         compute_shared_fxs()
         S.fi = 0
@@ -1261,12 +1026,15 @@ local function draw_track_selector(tlist)
 
         for si, ti in ipairs(S.tracks) do
           local t = tlist[ti]
-          reaper.ImGui_TableNextRow(ctx, 0, 22)
+          reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
           reaper.ImGui_TableSetColumnIndex(ctx, 0)
-          reaper.ImGui_AlignTextToFramePadding(ctx)
+          Theme.align(ctx)
           reaper.ImGui_Text(ctx, t and t.name or "?")
           reaper.ImGui_TableSetColumnIndex(ctx, 1)
-          if icon_btn("trk_rm" .. si, icon_close, UI.chk_col_w, 22, 7, C.text_dim) then
+          if Theme.icon_btn(ctx, "trk_rm" .. si, Theme.icons.close, {
+            preset = L.icon_sm,
+            color = P.text_dim,
+          }) then
             to_remove = si
           end
         end
@@ -1285,29 +1053,30 @@ local function draw_track_selector(tlist)
 end
 
 -------------------------------------------------------------------------------
--- 9b. PLUGIN SELECTOR
+-- 8. PLUGIN SELECTOR
 -------------------------------------------------------------------------------
 local function draw_plugin_selector()
+  local P = Theme.build_palette()
   if #S.tracks >= 2 then
     reaper.ImGui_SetNextItemWidth(ctx, -1)
-    local new_fi = draw_combo("##shared_fx", S.fxs, S.fi)
-    if new_fi ~= S.fi then
+    local new_fi, chg = Theme.combo(ctx, "##shared_fx", S.fxs, S.fi)
+    if chg then
       S.fi = new_fi
       M.scanned = false
       M.groups = {}
     end
 
     if #S.fxs == 0 then
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
       reaper.ImGui_Text(ctx, "  * No shared plugins across selected tracks")
       reaper.ImGui_PopStyleColor(ctx, 1)
     end
   elseif #S.tracks == 1 then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     reaper.ImGui_TextWrapped(ctx, "Select at least 2 tracks to link parameters.")
     reaper.ImGui_PopStyleColor(ctx, 1)
   else
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     reaper.ImGui_TextWrapped(ctx, "Select tracks first.")
     reaper.ImGui_PopStyleColor(ctx, 1)
   end
@@ -1316,13 +1085,14 @@ local function draw_plugin_selector()
 end
 
 -------------------------------------------------------------------------------
--- 10. LINK BUILDER
+-- 9. LINK BUILDER
 -------------------------------------------------------------------------------
 local function draw_link_builder()
+  local P = Theme.build_palette()
   local plugins_ready = (S.fi > 0 and #S.tracks >= 2)
 
   if not plugins_ready then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     if #S.tracks < 2 then
       reaper.ImGui_TextWrapped(ctx, "Select at least 2 tracks above, then select a shared plugin.")
     else
@@ -1341,34 +1111,52 @@ local function draw_link_builder()
   local fr, nf = reaper.ImGui_InputTextWithHint(ctx, "##mf", "Search parameters...", M.filter, 256)
   if fr then M.filter = nf end
 
-  reaper.ImGui_SameLine(ctx, 0, 6)
-  if icon_btn_colored("exp_all", icon_tri_down, 24, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.accent_d, "Expand All Groups") then
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  if Theme.icon_btn_colored(ctx, "exp_all", Theme.icons.tri_down, {
+    w = L.xxl,
+    h = 0,
+    icon_size = 10,
+    icon_color = P.text,
+    bg = P.card,
+    bg_hover = P.panel,
+    bg_active = P.accent_d,
+    tooltip = "Expand All Groups",
+  }) then
     for _, g in ipairs(M.groups) do g.force_open = true end
   end
 
-  reaper.ImGui_SameLine(ctx, 0, 4)
-  if icon_btn_colored("col_all", icon_tri_up, 24, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.accent_d, "Collapse All Groups") then
+  reaper.ImGui_SameLine(ctx, 0, L.xs)
+  if Theme.icon_btn_colored(ctx, "col_all", Theme.icons.tri_up, {
+    w = L.xxl,
+    h = 0,
+    icon_size = 10,
+    icon_color = P.text,
+    bg = P.card,
+    bg_hover = P.panel,
+    bg_active = P.accent_d,
+    tooltip = "Collapse All Groups",
+  }) then
     for _, g in ipairs(M.groups) do g.force_open = false end
   end
 
-  reaper.ImGui_SameLine(ctx, 0, 6)
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
   if reaper.ImGui_Button(ctx, "Last Touched##lb_lt", 100, 0) then
     use_last_touched_builder()
   end
   if reaper.ImGui_IsItemHovered(ctx) then
     poll_last_touched()
     if reaper.ImGui_BeginTooltip(ctx) then
-      reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + 300)
+      reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.tooltip_wrap)
       if LT.track ~= "" then
         local lt_val = LT.tr and fmt_val(LT.tr, LT.fxi, LT.pi, LT.norm) or "?"
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
         reaper.ImGui_Text(ctx, "Last Touched:")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, LT.track .. " / " .. LT.fx .. " / " .. LT.param .. " = " .. lt_val)
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_Spacing(ctx)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
         reaper.ImGui_Text(ctx, "Click to add track and select parameter")
         reaper.ImGui_PopStyleColor(ctx, 1)
       else
@@ -1379,9 +1167,9 @@ local function draw_link_builder()
     end
   end
 
-  reaper.ImGui_SameLine(ctx, 0, 4)
+  reaper.ImGui_SameLine(ctx, 0, L.xs)
   if #M.groups == 0 then reaper.ImGui_BeginDisabled(ctx) end
-  if reaper.ImGui_Button(ctx, "All##lb_all", 32, 0) then
+  if reaper.ImGui_Button(ctx, "All##lb_all", L.xxxl, 0) then
     local all_checked = true
     for _, grp in ipairs(M.groups) do
       for _, item in ipairs(grp.params) do
@@ -1395,7 +1183,7 @@ local function draw_link_builder()
     end
   end
   if reaper.ImGui_IsItemHovered(ctx) then
-    reaper.ImGui_SetTooltip(ctx, "Select / deselect all parameters")
+    Theme.tooltip(ctx, "Select / deselect all parameters")
   end
   if #M.groups == 0 then reaper.ImGui_EndDisabled(ctx) end
 
@@ -1408,7 +1196,7 @@ local function draw_link_builder()
   if reaper.ImGui_BeginChild(ctx, "lb_list", 0, list_h) then
     if #M.groups == 0 then
       reaper.ImGui_Spacing(ctx)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
       reaper.ImGui_Text(ctx, "  No parameters found.")
       reaper.ImGui_PopStyleColor(ctx, 1)
     else
@@ -1437,7 +1225,7 @@ local function draw_link_builder()
           if crv then
             for _, item in ipairs(grp.params) do item.checked = nc end
           end
-          reaper.ImGui_SameLine(ctx, 0, 6)
+          reaper.ImGui_SameLine(ctx, 0, L.sm)
 
           if flo ~= "" then
             reaper.ImGui_SetNextItemOpen(ctx, true, reaper.ImGui_Cond_Always())
@@ -1446,11 +1234,8 @@ local function draw_link_builder()
             grp.force_open = nil
           end
 
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),        0x8B70FA22)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(), 0x8B70FA55)
           local hdr_label = string.format("%s  (%d)##gh%d", grp.name, #grp.params, gi)
-          local is_open = reaper.ImGui_CollapsingHeader(ctx, hdr_label)
-          reaper.ImGui_PopStyleColor(ctx, 2)
+          local is_open = Theme.collapsing_header(ctx, hdr_label)
 
           if is_open then
             reaper.ImGui_Indent(ctx, UI.indent_w)
@@ -1466,13 +1251,13 @@ local function draw_link_builder()
                 end
                 local matches_search = (flo == "") or grp.name:lower():find(flo, 1, true) or disp:lower():find(flo, 1, true)
                 if matches_search then
-                  reaper.ImGui_TableNextRow(ctx, 0, 22)
+                  reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
                   reaper.ImGui_TableSetColumnIndex(ctx, 0)
                   local ck, nc2 = reaper.ImGui_Checkbox(ctx, "##ck" .. gi .. "_" .. pi, item.checked)
                   if ck then item.checked = nc2 end
                   reaper.ImGui_TableSetColumnIndex(ctx, 1)
-                  reaper.ImGui_AlignTextToFramePadding(ctx)
-                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), item.checked and 0xFFFFFFFF or C.text_dim)
+                  Theme.align(ctx)
+                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), item.checked and P.text or P.text_dim)
                   reaper.ImGui_Text(ctx, disp)
                   reaper.ImGui_PopStyleColor(ctx, 1)
                   -- Scroll to this param if it was the Last Touched target
@@ -1504,13 +1289,13 @@ local function draw_link_builder()
   if total_links == 0 then reaper.ImGui_BeginDisabled(ctx) end
   local lbl = string.format("Add %d Link%s across %d Tracks", total_links, total_links == 1 and "" or "s", n_tracks)
   if reaper.ImGui_Button(ctx, lbl, -1, 0) and total_links > 0 then
-    reaper.Undo_BeginBlock()
-    create_links_from_match()
-    save_links()
-    for _, grp in ipairs(M.groups) do
-      for _, item in ipairs(grp.params) do item.checked = false end
-    end
-    reaper.Undo_EndBlock("Create parameter links", -1)
+    Utils.undo_block("Create parameter links", function()
+      create_links_from_match()
+      save_links()
+      for _, grp in ipairs(M.groups) do
+        for _, item in ipairs(grp.params) do item.checked = false end
+      end
+    end)
   end
   if total_links == 0 then reaper.ImGui_EndDisabled(ctx) end
 
@@ -1520,28 +1305,22 @@ end
 -------------------------------------------------------------------------------
 -- 11. MODAL DIALOGS (Preset Manager, Info & Guide, Settings)
 -------------------------------------------------------------------------------
-local function center_next_modal(modal_w, modal_h)
-  local wx, wy = reaper.ImGui_GetWindowPos(ctx)
-  local ww, wh = reaper.ImGui_GetWindowSize(ctx)
-  reaper.ImGui_SetNextWindowPos(ctx, wx + ww * 0.5, wy + wh * 0.5, reaper.ImGui_Cond_Appearing(), 0.5, 0.5)
-  reaper.ImGui_SetNextWindowSize(ctx, modal_w, modal_h, reaper.ImGui_Cond_Appearing())
-end
-
 local function draw_preset_modal()
+  local P = Theme.build_palette()
   if show_preset_modal then
     reaper.ImGui_OpenPopup(ctx, "Preset Library##preset_mgr_modal")
     show_preset_modal = false
   end
 
-  center_next_modal(640, 420)
+  Theme.center_next_window(ctx, L.modal_lg.w, 420)
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Preset Library##preset_mgr_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
-    reaper.ImGui_Text(ctx, string.format("Saved Presets (%d)", #P.list))
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
+    reaper.ImGui_Text(ctx, string.format("Saved Presets (%d)", #Presets.list))
     reaper.ImGui_PopStyleColor(ctx, 1)
-    reaper.ImGui_SameLine(ctx, 0, 12)
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     reaper.ImGui_Text(ctx, "Select tracks, then Apply to create links instantly.")
     reaper.ImGui_PopStyleColor(ctx, 1)
     reaper.ImGui_Separator(ctx)
@@ -1558,43 +1337,43 @@ local function draw_preset_modal()
       reaper.ImGui_TableSetupColumn(ctx, "Actions",       reaper.ImGui_TableColumnFlags_WidthFixed(), 130)
       reaper.ImGui_TableHeadersRow(ctx)
 
-      if #P.list == 0 then
-        reaper.ImGui_TableNextRow(ctx, 0, 24)
+      if #Presets.list == 0 then
+        reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
         reaper.ImGui_TableSetColumnIndex(ctx, 0)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
         reaper.ImGui_Text(ctx, "No presets saved yet. Save from Active Links.")
         reaper.ImGui_PopStyleColor(ctx, 1)
       end
 
       local to_del_p = nil
-      for pi, preset in ipairs(P.list) do
-        reaper.ImGui_TableNextRow(ctx, 0, 24)
+      for pi, preset in ipairs(Presets.list) do
+        reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
         reaper.ImGui_TableSetColumnIndex(ctx, 0)
-        reaper.ImGui_AlignTextToFramePadding(ctx)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (P.sel == pi) and C.accent or 0xFFFFFFFF)
+        Theme.align(ctx)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), (Presets.sel == pi) and P.accent or P.text)
         reaper.ImGui_Text(ctx, preset.name)
         reaper.ImGui_PopStyleColor(ctx, 1)
 
         reaper.ImGui_TableSetColumnIndex(ctx, 1)
-        reaper.ImGui_AlignTextToFramePadding(ctx)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+        Theme.align(ctx)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
         local pname_display = preset.plugin_name or "--"
         reaper.ImGui_Text(ctx, (pname_display ~= "") and pname_display or "--")
         reaper.ImGui_PopStyleColor(ctx, 1)
 
         reaper.ImGui_TableSetColumnIndex(ctx, 2)
-        reaper.ImGui_AlignTextToFramePadding(ctx)
+        Theme.align(ctx)
         reaper.ImGui_Text(ctx, tostring(#(preset.params or {})))
 
         reaper.ImGui_TableSetColumnIndex(ctx, 3)
         if reaper.ImGui_SmallButton(ctx, "Apply##papply" .. pi) then
-          P.sel = pi
+          Presets.sel = pi
           apply_preset_direct(preset)
         end
-        reaper.ImGui_SameLine(ctx, 0, 6)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.red_d)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.red_h)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.red)
+        reaper.ImGui_SameLine(ctx, 0, L.sm)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        P.red_d)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), P.red_h)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  P.red)
         if reaper.ImGui_SmallButton(ctx, "Del##pdel" .. pi) then
           to_del_p = pi
         end
@@ -1602,8 +1381,8 @@ local function draw_preset_modal()
       end
 
       if to_del_p then
-        table.remove(P.list, to_del_p)
-        if P.sel > #P.list then P.sel = #P.list end
+        table.remove(Presets.list, to_del_p)
+        if Presets.sel > #Presets.list then Presets.sel = #Presets.list end
         save_presets()
       end
       reaper.ImGui_EndTable(ctx)
@@ -1620,47 +1399,48 @@ local function draw_preset_modal()
 end
 
 local function draw_info_modal()
+  local P = Theme.build_palette()
   if show_info_modal then
     reaper.ImGui_OpenPopup(ctx, "Fancy Parameter Link -- Info & Guide##info_modal")
     show_info_modal = false
   end
 
-  center_next_modal(600, 374)
+  Theme.center_next_window(ctx, 600, 380)
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Fancy Parameter Link -- Info & Guide##info_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     if reaper.ImGui_BeginTabBar(ctx, "info_tab_bar") then
       if reaper.ImGui_BeginTabItem(ctx, "Quick Start Guide") then
         reaper.ImGui_Spacing(ctx)
 
-        local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        local pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "1. Select Tracks")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Add 2 or more tracks using the track selector, or click 'Use Selected' to import your current track selection.")
         reaper.ImGui_Spacing(ctx)
 
-        pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "2. Select Plugin")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Choose the plugin that's on all selected tracks. The script shows only plugins common to every track.")
         reaper.ImGui_Spacing(ctx)
 
-        pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "3. Select Parameters")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Check individual parameters or entire groups. Use the search bar to filter by name.")
         reaper.ImGui_Spacing(ctx)
 
-        pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "4. Add Links")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Click 'Add Links' to create bidirectional links across all track pairs. Move any linked knob and all others follow (or inverse).")
         reaper.ImGui_Spacing(ctx)
 
@@ -1670,35 +1450,35 @@ local function draw_info_modal()
       if reaper.ImGui_BeginTabItem(ctx, "Modes & Tips") then
         reaper.ImGui_Spacing(ctx)
 
-        local pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.green)
+        local pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.green)
         reaper.ImGui_Text(ctx, "Follow Mode")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Linked parameters move in the same direction (1:1 tracking). Move any linked knob and all others follow.")
         reaper.ImGui_Spacing(ctx)
 
-        pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.accent)
+        pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
         reaper.ImGui_Text(ctx, "Inverse Mode")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Parameters move inversely around center (0.5). Ideal for complementary EQ, wet/dry crossfades, and dynamic frequency balancing.")
         reaper.ImGui_Spacing(ctx)
 
-        pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "Bidirectional Links")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "All links are bidirectional. Move the parameter on any linked track and the others update automatically. No need to designate a 'source' or 'target'.")
         reaper.ImGui_Spacing(ctx)
 
-        pf = push_font(font_brand_bold, 14)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        pf = Theme.push_font(ctx, fonts.default_bold)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "Multi-Track Linking")
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf)
+        Theme.pop_font(ctx, pf)
         reaper.ImGui_TextWrapped(ctx, "Select any number of tracks. Links are created for every pair (full mesh). 3 tracks = 3 links, 4 tracks = 6 links per parameter.")
         reaper.ImGui_Spacing(ctx)
 
@@ -1706,35 +1486,35 @@ local function draw_info_modal()
       end
 
       if reaper.ImGui_BeginTabItem(ctx, "About") then
-        local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
+        local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
         local content_h = 160
-        local top_pad = math.max(6, math.floor((avail_h - content_h) * 0.5))
+        local top_pad = math.max(L.md, math.floor((avail_h - content_h) * 0.5))
         reaper.ImGui_SetCursorPosY(ctx, reaper.ImGui_GetCursorPosY(ctx) + top_pad)
-        local icon_sz = 36
-        reaper.ImGui_SetCursorPosX(ctx, (avail_w - icon_sz) * 0.5)
-        draw_brand_icon(icon_sz)
+        local icon_sz = L.xxxl + L.sm -- 36
+        Theme.hcenter(ctx, icon_sz)
+        Theme.brand_icon(ctx, icon_sz)
         reaper.ImGui_Spacing(ctx)
 
-        local pf1 = push_font(font_brand_bold, 16)
+        local pf1 = Theme.push_font(ctx, fonts.large_bold)
         local t1 = "FANCY "
         local t2 = "PARAMETER LINK"
         local w1 = reaper.ImGui_CalcTextSize(ctx, t1)
         local w2 = reaper.ImGui_CalcTextSize(ctx, t2)
         local total_tw = w1 + w2
-        reaper.ImGui_SetCursorPosX(ctx, (avail_w - total_tw) * 0.5)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
+        Theme.hcenter(ctx, total_tw)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, t1)
         reaper.ImGui_PopStyleColor(ctx, 1)
         reaper.ImGui_SameLine(ctx, 0, 0)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text)
         reaper.ImGui_Text(ctx, t2)
         reaper.ImGui_PopStyleColor(ctx, 1)
-        pop_font(pf1)
+        Theme.pop_font(ctx, pf1)
 
-        local sub = "v5.0 crafted by Fancy Wolf Audio & Antigravity for REAPER"
+        local sub = "v5.2.0 crafted by Fancy Wolf Audio & Antigravity for REAPER"
         local sw = reaper.ImGui_CalcTextSize(ctx, sub)
-        reaper.ImGui_SetCursorPosX(ctx, (avail_w - sw) * 0.5)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+        Theme.hcenter(ctx, sw)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
         reaper.ImGui_Text(ctx, sub)
         reaper.ImGui_PopStyleColor(ctx, 1)
 
@@ -1743,17 +1523,17 @@ local function draw_info_modal()
 
         local prompt = "Find this useful?"
         local pw = reaper.ImGui_CalcTextSize(ctx, prompt)
-        reaper.ImGui_SetCursorPosX(ctx, (avail_w - pw) * 0.5)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xD0D0D0FF)
+        Theme.hcenter(ctx, pw)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), Theme.with_alpha(P.text, 0.8))
         reaper.ImGui_Text(ctx, prompt)
         reaper.ImGui_PopStyleColor(ctx, 1)
 
         reaper.ImGui_Spacing(ctx)
         local btn_w, btn_h = 240, 28
-        reaper.ImGui_SetCursorPosX(ctx, (avail_w - btn_w) * 0.5)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.card)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.panel)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.accent_d)
+        Theme.hcenter(ctx, btn_w)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        P.card)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), P.panel)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  P.accent_d)
         if reaper.ImGui_Button(ctx, "Buy me a Cup of Coffee as Thanks", btn_w, btn_h) then
           open_url("https://buymeacoffee.com/fancywolf")
         end
@@ -1773,40 +1553,37 @@ local function draw_info_modal()
 end
 
 local function draw_settings_modal()
+  local P = Theme.build_palette()
   if show_settings_modal then
     reaper.ImGui_OpenPopup(ctx, "Settings & Preferences##settings_modal")
     show_settings_modal = false
   end
 
-  center_next_modal(620, 520)
+  Theme.center_next_window(ctx, 620, 560)
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Settings & Preferences##settings_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     reaper.ImGui_Spacing(ctx)
 
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
-    reaper.ImGui_Text(ctx, "Default Link Rules")
-    reaper.ImGui_PopStyleColor(ctx, 1)
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Default Link Rules", { color = P.yellow })
 
-    reaper.ImGui_AlignTextToFramePadding(ctx)
+    Theme.align(ctx)
     reaper.ImGui_Text(ctx, "Inverse Gain by Default:")
-    reaper.ImGui_SameLine(ctx, 0, 14)
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
     local is_yes = (SETTINGS.default_mode ~= "follow")
     if reaper.ImGui_RadioButton(ctx, "Yes##inv_gain_yes", is_yes) then
       SETTINGS.default_mode = "smart"
       save_settings()
     end
-    reaper.ImGui_SameLine(ctx, 0, 14)
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
     if reaper.ImGui_RadioButton(ctx, "No##inv_gain_no", not is_yes) then
       SETTINGS.default_mode = "follow"
       save_settings()
     end
 
     reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_AlignTextToFramePadding(ctx)
+    Theme.align(ctx)
     reaper.ImGui_Text(ctx, "Default Strength:")
-    reaper.ImGui_SameLine(ctx, 0, 14)
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
     reaper.ImGui_SetNextItemWidth(ctx, 200)
     local s_pct = (SETTINGS.default_strength or 1.0) * 100
     local sc, np = reaper.ImGui_SliderDouble(ctx, "##def_st", s_pct, 0, 100, "%.0f%%")
@@ -1816,60 +1593,51 @@ local function draw_settings_modal()
     end
 
     reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_Spacing(ctx)
 
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
-    reaper.ImGui_Text(ctx, "Last Touched Automation")
-    reaper.ImGui_PopStyleColor(ctx, 1)
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Last Touched Automation", { color = P.yellow })
 
     local ck_at, n_at = reaper.ImGui_Checkbox(ctx, "Auto-add track and select parameter when touching FX", SETTINGS.auto_touch_sync)
     if ck_at then
       SETTINGS.auto_touch_sync = n_at
       save_settings()
     end
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     reaper.ImGui_TextWrapped(ctx, "When enabled, touching any plugin control in REAPER automatically adds its track and selects the parameter in the Link Builder.")
     reaper.ImGui_PopStyleColor(ctx, 1)
 
     reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_Spacing(ctx)
 
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
-    reaper.ImGui_Text(ctx, "UI Density & Appearance")
-    reaper.ImGui_PopStyleColor(ctx, 1)
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "UI Density & Appearance", { color = P.yellow })
 
-    reaper.ImGui_AlignTextToFramePadding(ctx)
+    Theme.align(ctx)
+    reaper.ImGui_Text(ctx, "Theme Mode:")
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
+    Theme.settings_widget(ctx, { label = "##theme_mode_settings" })
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.align(ctx)
     reaper.ImGui_Text(ctx, "Table Row Height:")
-    reaper.ImGui_SameLine(ctx, 0, 14)
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
     if reaper.ImGui_RadioButton(ctx, "Compact (20px)##rh20", SETTINGS.row_height == 20) then
       SETTINGS.row_height = 20
       save_settings()
     end
-    reaper.ImGui_SameLine(ctx, 0, 10)
+    reaper.ImGui_SameLine(ctx, 0, L.md)
     if reaper.ImGui_RadioButton(ctx, "Standard (24px)##rh24", SETTINGS.row_height == 24) then
       SETTINGS.row_height = 24
       save_settings()
     end
-    reaper.ImGui_SameLine(ctx, 0, 10)
+    reaper.ImGui_SameLine(ctx, 0, L.md)
     if reaper.ImGui_RadioButton(ctx, "Comfortable (28px)##rh28", SETTINGS.row_height == 28) then
       SETTINGS.row_height = 28
       save_settings()
     end
 
     reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_Spacing(ctx)
 
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
-    reaper.ImGui_Text(ctx, "File Storage & Backups")
-    reaper.ImGui_PopStyleColor(ctx, 1)
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "File Storage & Backups", { color = P.yellow })
 
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
     reaper.ImGui_Text(ctx, "Project Config: " .. sav_path())
     reaper.ImGui_Text(ctx, "Presets File: " .. PRESET_PATH)
     reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1878,11 +1646,11 @@ local function draw_settings_modal()
     if reaper.ImGui_Button(ctx, "Open Config Folder", 180, 0) then
       open_config_folder()
     end
-    reaper.ImGui_SameLine(ctx, 0, 10)
+    reaper.ImGui_SameLine(ctx, 0, L.md)
     if reaper.ImGui_Button(ctx, "Export Links JSON...", 150, 0) then
       export_links_dialog()
     end
-    reaper.ImGui_SameLine(ctx, 0, 10)
+    reaper.ImGui_SameLine(ctx, 0, L.md)
     if reaper.ImGui_Button(ctx, "Import Links JSON...", 150, 0) then
       import_links_dialog()
     end
@@ -1917,96 +1685,67 @@ local function build_link_groups()
 end
 
 local function draw_main()
-  local nc, nv = Theme.push(ctx, C)
+  local P = Theme.build_palette()
+  local nc, nv = Theme.push(ctx, P)
+  local pushed_default = Theme.push_font(ctx, fonts.default)
+
   reaper.ImGui_SetNextWindowSize(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
 
   local vis, op = reaper.ImGui_Begin(ctx, "Fancy Parameter Link", true, reaper.ImGui_WindowFlags_NoCollapse())
   if not vis then
+    Theme.pop_font(ctx, pushed_default)
     Theme.pop(ctx, nc, nv)
     return op
   end
 
-  -- Header: Title | Status | Info | Settings
-  reaper.ImGui_Spacing(ctx)
   poll_last_touched()
 
-  local hdr_h = UI.btn_h
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 4)
-
-  draw_brand_icon(24, hdr_h)
-  reaper.ImGui_SameLine(ctx, 0, 8)
-  reaper.ImGui_AlignTextToFramePadding(ctx)
-
-  local pf_b = push_font(font_brand_bold, 15)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.yellow)
-  reaper.ImGui_Text(ctx, "FANCY")
-  reaper.ImGui_PopStyleColor(ctx, 1)
-  pop_font(pf_b)
-
-  reaper.ImGui_SameLine(ctx, 0, 5)
-  reaper.ImGui_AlignTextToFramePadding(ctx)
-  local pf_r = push_font(font_brand_reg, 15)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
-  reaper.ImGui_Text(ctx, "PARAMETER LINK")
-  reaper.ImGui_PopStyleColor(ctx, 1)
-  pop_font(pf_r)
-
-  -- Center: Status messages
-  local win_w = reaper.ImGui_GetWindowWidth(ctx)
-  reaper.ImGui_SameLine(ctx, math.max(240, (win_w * 0.5) - 100))
-  reaper.ImGui_AlignTextToFramePadding(ctx)
-
+  -- Subtitle text logic (selection count or status toast)
+  local subtitle_text = nil
+  local subtitle_col = nil
   local sel_count_hdr = 0
   for i = 1, #links do if link_sel[i] then sel_count_hdr = sel_count_hdr + 1 end end
-  if sel_count_hdr > 0 then
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
-    reaper.ImGui_Text(ctx, string.format("%d selected", sel_count_hdr))
-    reaper.ImGui_PopStyleColor(ctx, 1)
-    reaper.ImGui_SameLine(ctx, 0, 12)
-  end
 
   if preset_status_msg ~= "" then
     local elapsed = reaper.time_precise() - preset_status_time
     if elapsed < 4.0 then
       local alpha = math.max(0, math.min(1, 1.0 - (elapsed - 3.0)))
-      local status_col = (preset_status_msg:find("\xe2\x9c\x93") and C.green) or C.yellow
-      if elapsed > 3.0 then
-        local r_c = (status_col >> 24) & 0xFF
-        local g_c = (status_col >> 16) & 0xFF
-        local b_c = (status_col >> 8) & 0xFF
-        status_col = (r_c << 24) | (g_c << 16) | (b_c << 8) | math.floor(alpha * 255)
-      end
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), status_col)
-      reaper.ImGui_Text(ctx, preset_status_msg)
-      reaper.ImGui_PopStyleColor(ctx, 1)
+      local base_col = (preset_status_msg:find("\xe2\x9c\x93") and P.green) or P.yellow
+      subtitle_col = (elapsed > 3.0) and Theme.with_alpha(base_col, alpha) or base_col
+      subtitle_text = preset_status_msg
     else
       preset_status_msg = ""
     end
   end
 
-  -- Right: Info + Settings buttons
-  local spacing = 6
-  reaper.ImGui_SameLine(ctx, math.max(280, win_w - (UI.btn_info_w + UI.btn_sett_w + spacing + 16)))
-
-  if reaper.ImGui_Button(ctx, "Info##hdr_info", UI.btn_info_w, hdr_h) then
-    show_info_modal = true
+  if not subtitle_text and sel_count_hdr > 0 then
+    subtitle_text = string.format("%d selected", sel_count_hdr)
+    subtitle_col = P.text_dim
   end
 
-  reaper.ImGui_SameLine(ctx, 0, spacing)
-  if reaper.ImGui_Button(ctx, "Settings##hdr_settings", UI.btn_sett_w, hdr_h) then
-    show_settings_modal = true
-  end
-
-  reaper.ImGui_PopStyleVar(ctx, 1)
-
-  reaper.ImGui_Spacing(ctx)
-  reaper.ImGui_Separator(ctx)
-  reaper.ImGui_Spacing(ctx)
+  local right_w = UI.btn_info_w + UI.btn_sett_w + L.sm
+  Theme.header(ctx, {
+    title          = "PARAMETER LINK",
+    fonts          = fonts,
+    subtitle       = subtitle_text,
+    subtitle_color = subtitle_col,
+    right_width    = right_w,
+    right_widgets  = function(hdr_ctx, hdr_h)
+      if reaper.ImGui_Button(hdr_ctx, "Info##hdr_info", UI.btn_info_w, hdr_h) then
+        show_info_modal = true
+      end
+      reaper.ImGui_SameLine(hdr_ctx, 0, L.sm)
+      if reaper.ImGui_Button(hdr_ctx, "Settings##hdr_settings", UI.btn_sett_w, hdr_h) then
+        show_settings_modal = true
+      end
+    end,
+    show_separator = true,
+  })
 
   -- Two-column resizable body
   local split_flags = reaper.ImGui_TableFlags_Resizable()
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(), 0x00000000)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),  0x00000000)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(), Theme.with_alpha(P.card, 0))
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),  Theme.with_alpha(P.card, 0))
   if reaper.ImGui_BeginTable(ctx, "main_split_tbl", 2, split_flags) then
     reaper.ImGui_TableSetupColumn(ctx, "LeftPane",  reaper.ImGui_TableColumnFlags_WidthStretch(), 0.25)
     reaper.ImGui_TableSetupColumn(ctx, "RightPane", reaper.ImGui_TableColumnFlags_WidthStretch(), 0.75)
@@ -2014,19 +1753,28 @@ local function draw_main()
 
     -- LEFT: track selector + link builder
     reaper.ImGui_TableSetColumnIndex(ctx, 0)
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), C.bg)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.bg)
     local lvis = reaper.ImGui_BeginChild(ctx, "left_col", 0, 0)
     reaper.ImGui_PopStyleColor(ctx, 1)
     if lvis then
       local tlist = get_tlist()
 
-      section_divider("  Tracks", C.yellow, "Select 2 or more tracks that share the same plugin. Links are created for every pair.")
+      Theme.section_divider(ctx, "Tracks", {
+        color = P.yellow,
+        tooltip = "Select 2 or more tracks that share the same plugin. Links are created for every pair.",
+      })
       draw_track_selector(tlist)
 
-      section_divider("  Plugin", C.yellow, "Choose the plugin shared across all selected tracks.")
+      Theme.section_divider(ctx, "Plugin", {
+        color = P.yellow,
+        tooltip = "Choose the plugin shared across all selected tracks.",
+      })
       draw_plugin_selector()
 
-      section_divider("  Link Builder", C.yellow, "Select parameters to link across all selected tracks.")
+      Theme.section_divider(ctx, "Link Builder", {
+        color = P.yellow,
+        tooltip = "Select parameters to link across all selected tracks.",
+      })
       draw_link_builder()
 
       reaper.ImGui_EndChild(ctx)
@@ -2034,48 +1782,47 @@ local function draw_main()
 
     -- RIGHT: active links (grouped by parameter)
     reaper.ImGui_TableSetColumnIndex(ctx, 1)
-    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), C.bg)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.bg)
     local rvis = reaper.ImGui_BeginChild(ctx, "right_col", 0, 0)
     reaper.ImGui_PopStyleColor(ctx, 1)
     if rvis then
       reaper.ImGui_Spacing(ctx)
 
       -- Toolbar
-      reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), 8, 4)
-      if paused then
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.red_d)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.red_h)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.red)
-        if reaper.ImGui_Button(ctx, "Resume All") then paused = false end
-        reaper.ImGui_PopStyleColor(ctx, 3)
-      else
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.green_d)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.green_h)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.green)
-        if reaper.ImGui_Button(ctx, "Pause All") then paused = true end
-        reaper.ImGui_PopStyleColor(ctx, 3)
+      if Theme.toggle_button(ctx, "tb_pause_all", paused and "Resume All" or "Pause All", paused, {
+        active_bg      = P.red_d,
+        active_hover   = P.red_h,
+        active_active  = P.red,
+        active_text    = Theme.lighten(P.red, 0.45),
+        inactive_bg    = P.green_d,
+        inactive_hover = P.green_h,
+        inactive_active= P.green,
+        inactive_text  = Theme.lighten(P.green, 0.45),
+      }) then
+        paused = not paused
       end
 
-      reaper.ImGui_SameLine(ctx, 0, 6)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
       local no_links = (#links == 0)
       if no_links then reaper.ImGui_BeginDisabled(ctx) end
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        C.red_d)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), C.red_h)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  C.red)
-      if reaper.ImGui_Button(ctx, "Clear All") and not no_links then
-        reaper.Undo_BeginBlock()
-        links = {}
-        lval_a = {}
-        lval_b = {}
-        link_sel = {}
-        save_links()
-        reaper.Undo_EndBlock("Clear all parameter links", -1)
+      if Theme.toggle_button(ctx, "tb_clear_all", "Clear All", true, {
+        active_bg      = P.red_d,
+        active_hover   = P.red_h,
+        active_active  = P.red,
+        active_text    = Theme.lighten(P.red, 0.45),
+      }) and not no_links then
+        Utils.undo_block("Clear all parameter links", function()
+          links = {}
+          lval_a = {}
+          lval_b = {}
+          link_sel = {}
+          save_links()
+        end)
       end
-      reaper.ImGui_PopStyleColor(ctx, 3)
       if no_links then reaper.ImGui_EndDisabled(ctx) end
 
       -- Select All / None toggle
-      reaper.ImGui_SameLine(ctx, 0, 6)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
       local sel_count = 0
       for i = 1, #links do if link_sel[i] then sel_count = sel_count + 1 end end
       local all_selected = (#links > 0 and sel_count == #links)
@@ -2088,7 +1835,7 @@ local function draw_main()
       end
 
       -- Save as Preset button
-      reaper.ImGui_SameLine(ctx, 0, 6)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
       if no_links or sel_count == 0 then
         if not no_links then reaper.ImGui_BeginDisabled(ctx) end
       end
@@ -2107,49 +1854,55 @@ local function draw_main()
 
       -- Preset combo (right-aligned)
       local combo_w = 154
-      local menu_btn_w = 24
+      local menu_btn_w = L.icon_md.size + L.icon_md.pad * 2 + L.sm
       local label_w = reaper.ImGui_CalcTextSize(ctx, "Preset:")
-      local total_group_w = label_w + 4 + combo_w + 2 + menu_btn_w
+      local total_group_w = label_w + L.sm + combo_w + L.xs + menu_btn_w
       reaper.ImGui_SameLine(ctx, 0, 0)
-      local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
-      local cur_x   = reaper.ImGui_GetCursorPosX(ctx)
-      local right_x = cur_x + avail_w - total_group_w
-      reaper.ImGui_SetCursorPosX(ctx, math.max(cur_x + 6, right_x))
-      reaper.ImGui_AlignTextToFramePadding(ctx)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+      Theme.right_align(ctx, total_group_w)
+      Theme.align(ctx)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
       reaper.ImGui_Text(ctx, "Preset:")
       reaper.ImGui_PopStyleColor(ctx, 1)
-      reaper.ImGui_SameLine(ctx, 0, 4)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
       reaper.ImGui_SetNextItemWidth(ctx, combo_w)
       local has_tracks = (#S.tracks >= 2) or (reaper.CountSelectedTracks(0) >= 2)
       local preview
       if not has_tracks then
         preview = "Select tracks..."
-      elseif P.sel > 0 and P.sel <= #P.list then
-        preview = P.list[P.sel].name
+      elseif Presets.sel > 0 and Presets.sel <= #Presets.list then
+        preview = Presets.list[Presets.sel].name
       else
         preview = "-- preset --"
       end
       if not has_tracks then reaper.ImGui_BeginDisabled(ctx) end
       local combo_open = reaper.ImGui_BeginCombo(ctx, "##al_preset_combo", preview)
       if combo_open then
-        for i, preset in ipairs(P.list) do
+        for i, preset in ipairs(Presets.list) do
           local pn = preset.plugin_name or ""
           local hint = (pn ~= "") and ("  [" .. pn .. "]") or ""
           local lbl  = preset.name .. hint .. "##alp" .. i
-          if reaper.ImGui_Selectable(ctx, lbl, P.sel == i) then
-            P.sel = i
+          if reaper.ImGui_Selectable(ctx, lbl, Presets.sel == i) then
+            Presets.sel = i
             apply_preset_direct(preset)
           end
-          if P.sel == i then reaper.ImGui_SetItemDefaultFocus(ctx) end
+          if Presets.sel == i then reaper.ImGui_SetItemDefaultFocus(ctx) end
         end
         reaper.ImGui_EndCombo(ctx)
       end
       if not has_tracks then reaper.ImGui_EndDisabled(ctx) end
 
       -- [+] Preset menu
-      reaper.ImGui_SameLine(ctx, 0, 2)
-      if icon_btn_colored("al_preset_menu", icon_plus, menu_btn_w, 0, 10, 0xFFFFFFFF, C.card, C.panel, C.accent_d, "Preset Options") then
+      reaper.ImGui_SameLine(ctx, 0, L.xs)
+      if Theme.icon_btn_colored(ctx, "al_preset_menu", Theme.icons.plus, {
+        w = menu_btn_w,
+        h = 0,
+        icon_size = 10,
+        icon_color = P.text,
+        bg = P.card,
+        bg_hover = P.panel,
+        bg_active = P.accent_d,
+        tooltip = "Preset Options",
+      }) then
         reaper.ImGui_OpenPopup(ctx, "al_preset_menu_popup")
       end
       if reaper.ImGui_BeginPopup(ctx, "al_preset_menu_popup") then
@@ -2157,11 +1910,11 @@ local function draw_main()
           show_preset_modal = true
         end
         reaper.ImGui_Separator(ctx)
-        local can_del = (P.sel > 0 and P.sel <= #P.list)
+        local can_del = (Presets.sel > 0 and Presets.sel <= #Presets.list)
         if not can_del then reaper.ImGui_BeginDisabled(ctx) end
         if reaper.ImGui_Selectable(ctx, "Delete preset##alpm_del") and can_del then
-          table.remove(P.list, P.sel)
-          if P.sel > #P.list then P.sel = #P.list end
+          table.remove(Presets.list, Presets.sel)
+          if Presets.sel > #Presets.list then Presets.sel = #Presets.list end
           save_presets()
         end
         if not can_del then reaper.ImGui_EndDisabled(ctx) end
@@ -2174,7 +1927,6 @@ local function draw_main()
         end
         reaper.ImGui_EndPopup(ctx)
       end
-      reaper.ImGui_PopStyleVar(ctx, 1) -- FramePadding
 
       -- Save Preset popup
       if save_preset_popup then
@@ -2192,7 +1944,7 @@ local function draw_main()
         if reaper.ImGui_Button(ctx, "Save##do_save_preset", 80, 0) and can_save then
           if save_preset_from_links(save_preset_name) then
             save_presets()
-            P.sel = #P.list
+            Presets.sel = #Presets.list
             preset_status_msg = string.format("Preset '%s' saved \xe2\x9c\x93", save_preset_name)
             preset_status_time = reaper.time_precise()
             save_preset_name = ""
@@ -2201,7 +1953,7 @@ local function draw_main()
           reaper.ImGui_CloseCurrentPopup(ctx)
         end
         if not can_save then reaper.ImGui_EndDisabled(ctx) end
-        reaper.ImGui_SameLine(ctx, 0, 8)
+        reaper.ImGui_SameLine(ctx, 0, L.md)
         if reaper.ImGui_Button(ctx, "Cancel##cancel_save_preset", 80, 0) then
           reaper.ImGui_CloseCurrentPopup(ctx)
         end
@@ -2213,34 +1965,24 @@ local function draw_main()
       -- Active Links Table (grouped by parameter)
       local _, ah = reaper.ImGui_GetContentRegionAvail(ctx)
       local tbl_h = math.max(80, ah)
-      local row_h = SETTINGS.row_height or 24
-      local pb_h  = math.max(14, row_h - 6)
+      local row_h = SETTINGS.row_height or L.row_h
 
       local link_groups = build_link_groups()
-
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),            0x8B70FA30)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(),     0x8B70FA50)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),      0x8B70FA60)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(), C.sep)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),  C.accent_e)
 
       if reaper.ImGui_BeginChild(ctx, "links_scroll", 0, tbl_h) then
         if #links == 0 then
           reaper.ImGui_Spacing(ctx)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.text_dim)
+          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
           reaper.ImGui_Text(ctx, "  No links yet.")
           reaper.ImGui_PopStyleColor(ctx, 1)
         end
 
         local to_del = nil
         for gi, grp in ipairs(link_groups) do
-          -- Group header: Plugin / Parameter (N links)
+          -- Group header: Plugin / Parameter (N links) — closed by default
           local grp_label = string.format("%s  /  %s  (%d)", grp.plugin, grp.param, #grp.links)
 
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),        0x8B70FA22)
-          reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(), 0x8B70FA44)
-          local grp_open = reaper.ImGui_CollapsingHeader(ctx, grp_label .. "##grp" .. gi, reaper.ImGui_TreeNodeFlags_DefaultOpen())
-          reaper.ImGui_PopStyleColor(ctx, 2)
+          local grp_open = Theme.collapsing_header(ctx, grp_label .. "##grp" .. gi)
 
           if grp_open then
             local TFLG = reaper.ImGui_TableFlags_RowBg()
@@ -2286,52 +2028,85 @@ local function draw_main()
 
                 -- Track A
                 reaper.ImGui_SameLine(ctx, 0, 0)
-                reaper.ImGui_AlignTextToFramePadding(ctx)
-                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.green)
+                Theme.align(ctx)
+                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.green)
                 reaper.ImGui_Text(ctx, lk.a_name)
                 reaper.ImGui_PopStyleColor(ctx, 1)
 
                 -- Track B
                 reaper.ImGui_TableSetColumnIndex(ctx, 1)
-                reaper.ImGui_AlignTextToFramePadding(ctx)
-                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.accent)
+                Theme.align(ctx)
+                reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
                 reaper.ImGui_Text(ctx, lk.b_name)
                 reaper.ImGui_PopStyleColor(ctx, 1)
 
                 -- Live Values
                 reaper.ImGui_TableSetColumnIndex(ctx, 2)
                 if ok then
-                  table_vcenter(pb_h, row_h)
+                  Theme.align(ctx, row_h, L.btn_sm.h)
                   local val_avail = reaper.ImGui_GetContentRegionAvail(ctx)
-                  local bar_w = math.max(10, math.floor((val_avail - 4) * 0.5))
+                  local bar_w = math.max(10, math.floor((val_avail - L.sm) * 0.5))
                   local av = reaper.TrackFX_GetParamNormalized(tra, lk.a_fxi, lk.a_pi)
                   local bv = reaper.TrackFX_GetParamNormalized(trb, lk.b_fxi, lk.b_pi)
-                  draw_progress_bar_centered(av, bar_w, pb_h, C.green_d, C.card, fmt_val(tra, lk.a_fxi, lk.a_pi, av))
-                  reaper.ImGui_SameLine(ctx, 0, 4)
-                  draw_progress_bar_centered(bv, bar_w, pb_h, C.accent_d, C.card, fmt_val(trb, lk.b_fxi, lk.b_pi, bv))
+                  Theme.badge(ctx, fmt_val(tra, lk.a_fxi, lk.a_pi, av), {
+                    w = bar_w,
+                    preset = L.btn_sm,
+                    fonts = fonts,
+                    color = Theme.lighten(P.green, 0.45),
+                    bg = P.green_d,
+                    id = "va_" .. i,
+                  })
+                  reaper.ImGui_SameLine(ctx, 0, L.sm)
+                  Theme.badge(ctx, fmt_val(trb, lk.b_fxi, lk.b_pi, bv), {
+                    w = bar_w,
+                    preset = L.btn_sm,
+                    fonts = fonts,
+                    color = Theme.lighten(P.accent, 0.45),
+                    bg = P.accent_d,
+                    id = "vb_" .. i,
+                  })
                 else
-                  reaper.ImGui_AlignTextToFramePadding(ctx)
-                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), C.red)
-                  reaper.ImGui_Text(ctx, "Offline")
-                  reaper.ImGui_PopStyleColor(ctx, 1)
+                  Theme.align(ctx, row_h, L.btn_sm.h)
+                  Theme.badge(ctx, "OFFLINE", {
+                    color = P.red,
+                    bg = P.red_d,
+                    w = -1,
+                    preset = L.btn_sm,
+                    fonts = fonts,
+                    id = "off_" .. i,
+                  })
                 end
 
                 -- Mode
                 reaper.ImGui_TableSetColumnIndex(ctx, 3)
-                table_vcenter(pb_h, row_h)
-                if mode_btn("tbl_m_" .. i, lk.mode, pb_h) then
-                  lk.mode = (lk.mode == "follow") and "inverse" or "follow"
+                Theme.align(ctx, row_h, L.btn_sm.h)
+                local is_inv = (lk.mode ~= "follow")
+                local mode_lbl = is_inv and "Inverse" or "Follow"
+                if Theme.toggle_button(ctx, "tbl_m_" .. i, mode_lbl, is_inv, {
+                  w = -1,
+                  preset = L.btn_sm,
+                  fonts = fonts,
+                  active_bg      = P.accent_d,
+                  active_hover   = P.accent_h,
+                  active_active  = P.accent,
+                  active_text    = Theme.lighten(P.accent, 0.45),
+                  inactive_bg    = P.green_d,
+                  inactive_hover = P.green_h,
+                  inactive_active= P.green,
+                  inactive_text  = Theme.lighten(P.green, 0.45),
+                }) then
+                  lk.mode = is_inv and "follow" or "inverse"
                   save_links()
                 end
 
                 -- Strength
                 reaper.ImGui_TableSetColumnIndex(ctx, 4)
-                table_vcenter(pb_h, row_h)
+                Theme.align(ctx, row_h, L.btn_sm.h)
                 reaper.ImGui_SetNextItemWidth(ctx, -1)
-                reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_GrabRounding(), 5)
+                local sp_vars, sp_font = Theme.push_button_preset(ctx, fonts, L.btn_sm)
                 local s_pct = (lk.strength or 1.0) * 100
                 local ch_s, np_s = reaper.ImGui_SliderDouble(ctx, "##tbl_s_" .. i, s_pct, 0, 100, "%.0f%%")
-                reaper.ImGui_PopStyleVar(ctx, 1)
+                Theme.pop_button_preset(ctx, sp_vars, sp_font)
                 if ch_s then
                   lk.strength = np_s / 100
                 end
@@ -2342,8 +2117,12 @@ local function draw_main()
                 -- Pause
                 reaper.ImGui_TableSetColumnIndex(ctx, 5)
                 if row_dimmed then reaper.ImGui_PopStyleVar(ctx, 1) end
-                local pause_icon = lk.link_paused and icon_play or icon_pause
-                if icon_btn("lp" .. i, pause_icon, -1, row_h, 8, C.text_dim) then
+                local pause_icon = lk.link_paused and Theme.icons.play or Theme.icons.pause
+                if Theme.icon_btn(ctx, "lp" .. i, pause_icon, {
+                  h = row_h,
+                  icon_size = 8,
+                  color = P.text_dim,
+                }) then
                   lk.link_paused = not lk.link_paused
                   if lk.link_paused then
                     lval_a[i] = nil
@@ -2355,7 +2134,11 @@ local function draw_main()
 
                 -- Remove
                 reaper.ImGui_TableSetColumnIndex(ctx, 6)
-                if icon_btn("ld" .. i, icon_close, -1, row_h, 8, C.red) then
+                if Theme.icon_btn(ctx, "ld" .. i, Theme.icons.close, {
+                  h = row_h,
+                  icon_size = 8,
+                  color = P.red,
+                }) then
                   to_del = i
                 end
                 if row_dimmed then reaper.ImGui_PopStyleVar(ctx, 1) end
@@ -2368,18 +2151,17 @@ local function draw_main()
         end
 
         if to_del then
-          reaper.Undo_BeginBlock()
-          table.remove(links, to_del)
-          lval_a = {}
-          lval_b = {}
-          link_sel = {}
-          save_links()
-          reaper.Undo_EndBlock("Remove parameter link", -1)
+          Utils.undo_block("Remove parameter link", function()
+            table.remove(links, to_del)
+            lval_a = {}
+            lval_b = {}
+            link_sel = {}
+            save_links()
+          end)
         end
 
         reaper.ImGui_EndChild(ctx)
       end
-      reaper.ImGui_PopStyleColor(ctx, 5)
 
       reaper.ImGui_EndChild(ctx)
     end
@@ -2394,6 +2176,7 @@ local function draw_main()
   draw_settings_modal()
 
   reaper.ImGui_End(ctx)
+  Theme.pop_font(ctx, pushed_default)
   Theme.pop(ctx, nc, nv)
   return op
 end
@@ -2417,21 +2200,8 @@ local function main()
 
   local dock_flag = (reaper.ImGui_ConfigFlags_DockingEnable and reaper.ImGui_ConfigFlags_DockingEnable()) or 0
   ctx = reaper.ImGui_CreateContext("Fancy Parameter Link", dock_flag)
-
-  local function safe_create_font(family, size)
-    if not reaper.ImGui_CreateFont then return nil end
-    local ok, font = pcall(reaper.ImGui_CreateFont, family, size)
-    if ok and font then return font end
-    local ok2, font2 = pcall(reaper.ImGui_CreateFont, 'sans-serif', size)
-    if ok2 and font2 then return font2 end
-    return nil
-  end
-
-  font_brand_bold = safe_create_font('sans-serif Bold', 15)
-  font_brand_reg  = safe_create_font('sans-serif', 15)
-
-  if font_brand_bold and reaper.ImGui_Attach then reaper.ImGui_Attach(ctx, font_brand_bold) end
-  if font_brand_reg  and reaper.ImGui_Attach then reaper.ImGui_Attach(ctx, font_brand_reg) end
+  fonts = Theme.create_fonts(ctx)
+  Theme.attach_fonts(ctx, fonts)
 
   reaper.atexit(function()
     save_links()
