@@ -66,7 +66,7 @@
 --   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip
 --   icon_btn_colored(ctx, id, icon_fn, [opts]) -> bool  opts: +bg,bg_hover,bg_active,icon_color
 --   tooltip(ctx, text, [max_w])
---   section_divider(ctx, label, [opts])        opts: tooltip,color
+--   section_divider(ctx, label, [opts])        opts: tooltip,color,preset,icon_size,w,h,icon_color
 --   collapsing_header(ctx, label, [opts])      Safe collapsing header (opts: default_open, flags)
 --   progress_bar(ctx, fraction, [opts])        Meter/progress bar (opts: preset,fonts,fill_color,bg_color,overlay)
 --   toggle_button(ctx, id, label, is_act, [o]) Button-derived toggle button (opts: preset,fonts,w,h,colors)
@@ -895,22 +895,38 @@ end
 --- @param ctx userdata  ImGui context
 --- @param label string  Section title text
 --- @param opts table|nil  Optional overrides:
----   opts.color   (number)  Label text color (default: palette.text_dim)
----   opts.tooltip (string)  Info icon + tooltip text shown next to label
+---   opts.color       (number)  Label text color (default: palette.text_dim)
+---   opts.tooltip     (string)  Info icon + tooltip text shown next to label
+---   opts.id          (string)  Unique ID for the info button (default: "##info_" .. label)
+---   opts.preset      (table)   Icon preset (default: Theme.layout.icon_md)
+---   opts.icon_size   (number)  Icon size override
+---   opts.icon_color  (number)  Icon color override (default: palette.text_dim)
+---   opts.w           (number)  Button width override
+---   opts.h           (number)  Button height override
 function Theme.section_divider(ctx, label, opts)
   opts = opts or {}
   local P = _get_palette()
   local col = opts.color or P.text_dim
+  local preset = opts.preset or Theme.layout.icon_md
+  local icon_sz = opts.icon_size or preset.size
+  local btn_w = opts.w or (icon_sz + preset.pad * 2)
+  local btn_h = opts.h or btn_w
+
   reaper.ImGui_Spacing(ctx)
+  Theme.align(ctx)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col)
   reaper.ImGui_Text(ctx, label)
   reaper.ImGui_PopStyleColor(ctx, 1)
   if opts.tooltip then
     reaper.ImGui_SameLine(ctx, 0, Theme.layout.section_gap)
+    Theme.align(ctx, nil, btn_h)
     local btn_id = opts.id and ("info_" .. opts.id) or ("##info_" .. label)
     Theme.icon_btn(ctx, btn_id, Theme.icons.info, {
-      preset = Theme.layout.icon_sm,
-      color = P.text_dim,
+      preset = preset,
+      icon_size = opts.icon_size,
+      w = opts.w,
+      h = opts.h,
+      color = opts.icon_color or P.text_dim,
       tooltip = opts.tooltip,
     })
   end
@@ -1011,9 +1027,10 @@ function Theme.progress_bar(ctx, fraction, opts)
   local default_h = (preset and preset.h) or (L.row_h - L.sm)
   local h = opts.h or default_h
   local rounding = opts.rounding or L.rounding
-  local fill_col = opts.fill_color or P.accent
-  local bg_col = opts.bg_color or P.card
+  local fill_col = opts.fill_color or opts.fg or P.accent
+  local bg_col = opts.bg_color or opts.bg or P.card
   local text_col = opts.text_color or P.text
+  local overlay = opts.overlay or opts.text
 
   local dl = reaper.ImGui_GetWindowDrawList(ctx)
   local x, y = reaper.ImGui_GetCursorScreenPos(ctx)
@@ -1037,15 +1054,15 @@ function Theme.progress_bar(ctx, fraction, opts)
   end
 
   -- Centered text overlay
-  if opts.overlay and opts.overlay ~= "" then
+  if overlay and overlay ~= "" then
     local pushed_font = nil
     if opts.fonts and preset and preset.font and opts.fonts[preset.font] then
       pushed_font = Theme.push_font(ctx, opts.fonts[preset.font])
     end
-    local tw, th = reaper.ImGui_CalcTextSize(ctx, opts.overlay)
+    local tw, th = reaper.ImGui_CalcTextSize(ctx, overlay)
     local tx = x + math.floor((w - tw) * 0.5)
     local ty = y + math.floor((h - th) * 0.5)
-    reaper.ImGui_DrawList_AddText(dl, tx, ty, text_col, opts.overlay)
+    reaper.ImGui_DrawList_AddText(dl, tx, ty, text_col, overlay)
     if pushed_font then
       Theme.pop_font(ctx, pushed_font)
     end
@@ -1308,18 +1325,31 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
   return new_idx, changed
 end
 
---- Centers the next ImGui window on the viewport.
+--- Centers the next ImGui window on the active window (or viewport if none is active).
 --- Call immediately before ImGui_Begin or ImGui_BeginPopupModal.
 ---
 --- @param ctx userdata  ImGui context
---- @param w number  Window width in pixels
---- @param h number  Window height in pixels
+--- @param w number|nil  Window width in pixels (optional)
+--- @param h number|nil  Window height in pixels (optional)
 function Theme.center_next_window(ctx, w, h)
-  local vp = reaper.ImGui_GetMainViewport(ctx)
-  local vp_x, vp_y = reaper.ImGui_Viewport_GetPos(vp)
-  local vp_w, vp_h = reaper.ImGui_Viewport_GetSize(vp)
-  reaper.ImGui_SetNextWindowPos(ctx, vp_x + (vp_w - w) * 0.5, vp_y + (vp_h - h) * 0.5, reaper.ImGui_Cond_Appearing())
-  reaper.ImGui_SetNextWindowSize(ctx, w, h, reaper.ImGui_Cond_Appearing())
+  local cx, cy
+  local ok_p, wx, wy = pcall(reaper.ImGui_GetWindowPos, ctx)
+  local ok_s, ww, wh = pcall(reaper.ImGui_GetWindowSize, ctx)
+  if ok_p and ok_s and ww and wh and ww > 0 and wh > 0 then
+    cx = wx + ww * 0.5
+    cy = wy + wh * 0.5
+  else
+    local vp = reaper.ImGui_GetMainViewport(ctx)
+    local vp_x, vp_y = reaper.ImGui_Viewport_GetPos(vp)
+    local vp_w, vp_h = reaper.ImGui_Viewport_GetSize(vp)
+    cx = vp_x + vp_w * 0.5
+    cy = vp_y + vp_h * 0.5
+  end
+
+  reaper.ImGui_SetNextWindowPos(ctx, cx, cy, reaper.ImGui_Cond_Appearing(), 0.5, 0.5)
+  if w and h and w > 0 and h > 0 then
+    reaper.ImGui_SetNextWindowSize(ctx, w, h, reaper.ImGui_Cond_Appearing())
+  end
 end
 
 --- Renders the Fancy Scripts brand icon (logo) using DrawList vectors.

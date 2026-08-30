@@ -29,7 +29,11 @@ All notable changes to Fancy Scripts will be documented here.
 - **Fancy Parameter Link v5.1.0** — "All" button in Link Builder to select/deselect all parameters at once
 
 ### Fixed
+- **Section Dividers & Info Tooltips (`_lib/theme.lua`)**:
+  - Increased default info icon size in `Theme.section_divider()` from `icon_sm` (8px) to `icon_md` (12px) for improved visibility and legibility next to section titles (e.g. Tracks, Plugin, Link Builder)
+  - Added vertical alignment using `Theme.align()` to align the section title baseline and center the info button within the frame height
 - **Theme Engine Hardening & Bug Fixes (`_lib/theme.lua`)**:
+  - Fixed `Theme.center_next_window()` to dynamically center relative to the active parent window (with viewport fallback) using `(0.5, 0.5)` pivot alignment, fixing off-center horizontal positioning when opening modals (e.g. Settings, Info & Guide, Preset Manager)
   - Added missing `ImGui_Col_Text`, `ImGui_Col_TextDisabled`, `ImGui_Col_Border`, and `ImGui_Col_ScrollbarGrabActive` to `Theme.push()` (updating push/pop stack parity to 32 colors)
   - Fixed 64-bit Lua 5.4 integer underflow/overflow and sign extension in `darken()`, `lighten()`, and `with_alpha()` via strict boundary clamping
   - Fixed custom REAPER color flag (bit 24) decoding in `bgr_to_rgba()` by unconditionally masking `0x00FFFFFF`
@@ -42,6 +46,20 @@ All notable changes to Fancy Scripts will be documented here.
   - Fixed `Theme.toggle_button()` crash when `id` argument is `nil`
   - Fixed `Theme.header()` right-aligned width allocation and spacing with custom widgets, and added vertical alignment for close button
   - Removed orphaned docblock above `Theme.push_button_preset()`
+- **Parameter Link Engine Hardening & Optimization (`FX/Fancy_Parameter Link.lua`)**:
+  - Preserved and hardened direct bidirectional parameter modulation and full-mesh topology across all linked tracks
+  - Added FX GUID resolution and validation (`resolve_fx`) to guard against FX reordering, movement, or deletion
+  - Added Master Track support to track caching and selector lists
+  - Added project tab change detection to automatically persist and switch project configuration files
+  - Fixed ReaImGui window lifecycle to guarantee `reaper.ImGui_End(ctx)` is called when `reaper.ImGui_Begin()` returns false
+  - Eliminated per-frame link group table allocations with dirty-flag invalidation caching (`get_link_groups`)
+  - Eliminated per-frame row string concatenations by scoping table rows with `reaper.ImGui_PushID(ctx, i)`
+  - Gated `poll_last_touched()` behind integer target change checks to eliminate redundant string and regex operations
+  - Added "Delete Selected" batch action button to Active Links toolbar
+  - Added Enter key confirmation to Save Preset popup and Escape key dismissal across all modal dialogs
+  - Standardized Live Values display with dual `Theme.badge()` indicators with natural button height flow (`preset = L.btn_sm`)
+  - Fixed table cell vertical alignments using `Theme.align(ctx, row_h)` and `Theme.align(ctx, row_h, item_h)`
+  - Fixed Section 10 numbering and removed phantom undo points from internal state mutations
 
 ### Changed
 - **Fancy Parameter Link v5.2.0** — Complete Design System & Theme Engine migration
