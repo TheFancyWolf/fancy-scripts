@@ -432,8 +432,8 @@ end
 --- Font families and size scale. Scripts must use Theme.font_sizes.* tokens
 --- and Theme.create_fonts() instead of calling ImGui_CreateFont directly.
 
-Theme.font_family      = "Verdana"
-Theme.font_bold_family = "Verdana Bold"
+Theme.font_family      = "sans-serif"
+Theme.font_bold_family = "sans-serif Bold"
 
 Theme.font_sizes = {
   small   = 12,    -- labels, secondary text, table metadata
@@ -477,6 +477,7 @@ function Theme.create_fonts(_ctx, overrides)
   fonts.header  = reaper.ImGui_CreateFont(family, sizes.header)
   -- Bold weights
   fonts.default_bold = reaper.ImGui_CreateFont(bold_family, sizes.default)
+  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, sizes.medium)
   fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, sizes.large)
   -- Backward compat alias
   fonts.tooltip = fonts.default
@@ -489,6 +490,7 @@ function Theme.create_fonts(_ctx, overrides)
   Theme._font_sizes[fonts.large]        = sizes.large
   Theme._font_sizes[fonts.header]       = sizes.header
   Theme._font_sizes[fonts.default_bold] = sizes.default
+  Theme._font_sizes[fonts.medium_bold]  = sizes.medium
   Theme._font_sizes[fonts.large_bold]   = sizes.large
 
   return fonts
@@ -658,13 +660,19 @@ end
 --- Call before rendering the item. Adjusts the cursor Y position so the
 --- item appears centered within the row.
 ---
---- @param ctx userdata  ImGui context
---- @param item_h number  Height of the item to center (e.g. font size, icon size)
---- @param row_h number   Height of the containing row (e.g. Theme.layout.row_h)
-function Theme.vcenter(ctx, item_h, row_h)
+--- When placing multiple items on the same line (via SameLine), always pass
+--- `ref_y` — the cursor Y saved **before** the first item — to every call.
+--- Without `ref_y`, each call reads the current cursor Y, which already
+--- includes the previous call's offset, causing elements to drift downward.
+---
+--- @param ctx    userdata     ImGui context
+--- @param item_h number       Height of the item to center (e.g. font size, icon size)
+--- @param row_h  number       Height of the containing row (e.g. Theme.layout.row_h)
+--- @param ref_y  number|nil   Absolute row-start Y — pass this on SameLine rows
+function Theme.vcenter(ctx, item_h, row_h, ref_y)
   if row_h and item_h < row_h then
-    local cy = reaper.ImGui_GetCursorPosY(ctx)
-    reaper.ImGui_SetCursorPosY(ctx, cy + math.floor((row_h - item_h) * 0.5))
+    local base_y = ref_y or reaper.ImGui_GetCursorPosY(ctx)
+    reaper.ImGui_SetCursorPosY(ctx, base_y + math.floor((row_h - item_h) * 0.5))
   end
 end
 
@@ -957,5 +965,158 @@ function Theme.settings_widget(ctx, opts)
   return changed, w
 end
 
+-------------------------------------------------------------------------------
+-- 13. WINDOW HEADER WIDGET
+-------------------------------------------------------------------------------
+
+--- Renders a standardized window header bar matching the Parameter Link layout pattern.
+--- Uses ReaImGui's native AlignTextToFramePadding() for pixel-perfect vertical alignment
+--- across brand icon, signature "FANCY" prefix, title, subtitle, and right controls.
+---
+--- @param ctx userdata  ImGui context
+--- @param opts table|nil  Header configuration:
+---   opts.title          (string)      Window title text (required)
+---   opts.prefix         (string|nil)  Brand prefix text (default: "FANCY")
+---   opts.fancy_prefix   (boolean|nil) Whether to show "FANCY" prefix (default: true)
+---   opts.prefix_color   (number|nil)  Prefix text color (default: palette.yellow)
+---   opts.subtitle       (string|nil)  Secondary subtitle text (optional)
+---   opts.fonts          (table|nil)   Font table from Theme.create_fonts() (optional)
+---   opts.font_header    (userdata|nil) Title font override (default: opts.fonts.large_bold or fonts.header)
+---   opts.font_subtitle  (userdata|nil) Subtitle font override (default: opts.fonts.default)
+---   opts.title_color    (number|nil)  Title text color (default: palette.text)
+---   opts.subtitle_color (number|nil)  Subtitle text color (default: palette.text_dim)
+---   opts.icon_fn        (function|false|nil) Custom icon function (ctx, sz, target_h).
+---                                     Set false to omit icon; defaults to Theme.brand_icon.
+---   opts.brand_size     (number|nil)  Brand icon size in pixels (default: 24)
+---   opts.show_settings  (boolean|nil) Whether to show the theme mode dropdown (default: false)
+---   opts.show_close     (boolean|nil) Whether to show the close button (default: false)
+---   opts.close_id       (string|nil)  Close button ID (default: "win_hdr_close")
+---   opts.close_tooltip  (string|nil)  Close button tooltip (default: "Close (Esc)")
+---   opts.right_widgets  (function|nil) Callback `function(ctx, hdr_h)` for custom controls
+---   opts.right_width    (number|nil)  Extra width allocated for right-aligned items
+---   opts.show_separator (boolean|nil) Whether to render separator line below header (default: true)
+---   opts.height         (number|nil)  Row height override (default: Theme.layout.row_h)
+--- @return boolean open  Returns true if the window should stay open (false if close was clicked)
+function Theme.header(ctx, opts)
+  opts = opts or {}
+  local P = _get_palette()
+  local L = Theme.layout
+
+  local brand_sz = opts.brand_size or 24
+  local close_btn_sz = L.icon_md.size + L.icon_md.pad * 2
+  local frame_h = reaper.ImGui_GetFrameHeight(ctx)
+  local hdr_h = opts.height or math.max(L.row_h, brand_sz, close_btn_sz, frame_h)
+
+  -- 1. Brand icon (centers itself in target_h and establishes the line height)
+  local has_icon = (opts.icon_fn ~= false)
+  if has_icon then
+    if type(opts.icon_fn) == "function" then
+      opts.icon_fn(ctx, brand_sz, hdr_h)
+    else
+      Theme.brand_icon(ctx, brand_sz, hdr_h)
+    end
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+  end
+
+  -- 2. Signature "FANCY" brand prefix (yellow bold text)
+  if opts.fancy_prefix ~= false then
+    local font_bold = opts.font_brand or (opts.fonts and (opts.fonts.medium_bold or opts.fonts.large_bold or opts.fonts.default_bold))
+    local pushed_b = Theme.push_font(ctx, font_bold)
+    reaper.ImGui_AlignTextToFramePadding(ctx)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), opts.prefix_color or P.yellow)
+    reaper.ImGui_Text(ctx, opts.prefix or "FANCY")
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    Theme.pop_font(ctx, pushed_b)
+    reaper.ImGui_SameLine(ctx, 0, opts.prefix_gap or L.sm)
+  end
+
+  -- 3. Title (white text aligned to frame padding)
+  if opts.title then
+    local font_title = opts.font_header or (opts.fonts and (opts.fonts.medium or opts.fonts.default_bold or opts.fonts.large))
+    local pushed_title = Theme.push_font(ctx, font_title)
+    reaper.ImGui_AlignTextToFramePadding(ctx)
+    if opts.title_color then
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), opts.title_color)
+    end
+    reaper.ImGui_Text(ctx, opts.title)
+    if opts.title_color then
+      reaper.ImGui_PopStyleColor(ctx, 1)
+    end
+    Theme.pop_font(ctx, pushed_title)
+  end
+
+  -- 4. Subtitle (dim text aligned to frame padding)
+  if opts.subtitle then
+    reaper.ImGui_SameLine(ctx, 0, L.lg)
+    reaper.ImGui_AlignTextToFramePadding(ctx)
+    local font_sub = opts.font_subtitle or (opts.fonts and (opts.fonts.default or opts.fonts.small))
+    local pushed_sub = Theme.push_font(ctx, font_sub)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), opts.subtitle_color or P.text_dim)
+    reaper.ImGui_Text(ctx, opts.subtitle)
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    Theme.pop_font(ctx, pushed_sub)
+  end
+
+  -- 5. Right-aligned controls
+  local show_settings = opts.show_settings
+  local show_close = opts.show_close
+  local right_w = opts.right_width or 0
+  local combo_w = 0
+  if show_settings then
+    local labels = { "Fancy Dark", "Match Theme" }
+    combo_w = Theme.calc_combo_width(ctx, labels)
+    right_w = right_w + combo_w
+    if show_close then
+      right_w = right_w + L.md
+    end
+  end
+  if show_close then
+    right_w = right_w + close_btn_sz
+  end
+
+  local close_clicked = false
+
+  if right_w > 0 or opts.right_widgets then
+    reaper.ImGui_SameLine(ctx)
+    if right_w > 0 then
+      Theme.right_align(ctx, right_w)
+    end
+
+    if opts.right_widgets then
+      opts.right_widgets(ctx, hdr_h)
+      if show_settings or show_close then
+        reaper.ImGui_SameLine(ctx, 0, L.md)
+      end
+    end
+
+    if show_settings then
+      local changed = Theme.settings_widget(ctx, { w = combo_w })
+      if changed then
+        Theme.invalidate_palette()
+      end
+      if show_close then
+        reaper.ImGui_SameLine(ctx, 0, L.md)
+      end
+    end
+
+    if show_close then
+      local close_id = opts.close_id or "win_hdr_close"
+      local close_tt = opts.close_tooltip or "Close (Esc)"
+      if Theme.icon_btn(ctx, close_id, Theme.icons.close, { preset = L.icon_md, tooltip = close_tt }) then
+        close_clicked = true
+      end
+    end
+  end
+
+  if opts.show_separator ~= false then
+    reaper.ImGui_Spacing(ctx)
+    reaper.ImGui_Separator(ctx)
+    reaper.ImGui_Spacing(ctx)
+  end
+
+  return not close_clicked
+end
+
 return Theme
+
 

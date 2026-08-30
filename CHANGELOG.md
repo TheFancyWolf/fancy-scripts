@@ -10,12 +10,15 @@ All notable changes to Fancy Scripts will be documented here.
   - `json.lua` — lightweight JSON encoder/decoder (consolidated from inline copies)
   - `utils.lua` — dependency checks, undo block wrapper, track helpers, math utilities
 - **Design System & Theme Engine**
+  - Added `Theme.header(ctx, opts)` composite widget to standardize window headers with brand icon, title, subtitle, theme dropdown, and close button with pixel-perfect alignment
+  - Fixed `Theme.vcenter()` compounding vertical offset bug by adding optional `ref_y` parameter for `SameLine()` rows
   - Unified scale extended to `xxl=24` and `xxxl=32`
   - Streamlined theme modes to 2: **Fancy Dark** (curated palette) and **Match Theme** (extracts surfaces, text, borders, and edit cursor accent `col_cursor` from REAPER)
   - All layout tokens (`rounding`, `icon_sm/md/lg`, `row_h`, `chk_col_w`, `indent`, `section_gap`) strictly derive from scale tokens; dropdowns and combo boxes calculate reactive width dynamically via `Theme.calc_combo_width()`
   - `FANCY_PALETTE` simplified to base colors; derived states (`accent_h/d/e`, `green_h/d`, `red_h/d`) computed dynamically with consistent alpha ratios (80% / 33%)
   - Safe color math: `icon_btn` hover uses `lighten()` and `section_divider` uses `with_alpha()`
   - Added minimal template and full API token references in `theme.lua`
+- **Fancy Design System v1.1.0** — Rebuilt from scratch using `Theme.header()`, added `Theme.header()` live component preview and `vcenter` `ref_y` demonstration, eliminated raw hex color literals
 - **Fancy Parameter Link v5.1.0** — "All" button in Link Builder to select/deselect all parameters at once
 
 ### Changed

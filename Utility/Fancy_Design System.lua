@@ -1,8 +1,12 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.0.0
+-- @version 1.1.0
 -- @changelog
---   + Initial release
+--   + Rebuild header using shared Theme.header() composite widget
+--   + Fix vertical alignment across header icon, title, subtitle, and controls
+--   + Add Theme.header() component preview in Widget Components section
+--   + Add SameLine vcenter ref_y pattern demonstration
+--   + Eliminate raw hex color literals in color swatch alpha checkerboard
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -81,14 +85,14 @@ local function color_swatch(label, color)
   local cell_w = math.max(w, label_w, hex_w)
   local cell_h = h + L.xs + font_h + L.xs + font_h
 
-  -- Checkerboard behind transparent colors
+  -- Checkerboard behind transparent colors using theme palette
   local alpha = color & 0xFF
   if alpha < 0xFF then
     local ck = math.floor(w / 2)
     for row = 0, 1 do
       for col = 0, math.ceil(w / ck) - 1 do
         local dark = ((row + col) % 2 == 0)
-        local ck_col = dark and 0x333333FF or 0x555555FF
+        local ck_col = dark and P.bg or P.card
         local cx1 = x + col * ck
         local cy1 = y + row * math.floor(h / 2)
         local cx2 = math.min(cx1 + ck, x + w)
@@ -194,59 +198,13 @@ end
 -- 5. SECTION: HEADER
 -------------------------------------------------------------------------------
 local function draw_header()
-  local brand_sz = L.icon_md.size + L.icon_md.pad * 2
-  local close_btn_sz = L.icon_md.size + L.icon_md.pad * 2
-  local labels = { "Fancy Dark", "Match Theme" }
-  local combo_w = Theme.calc_combo_width(ctx, labels)
-  local total_right_w = combo_w + L.md + close_btn_sz
-  local hdr_h = math.max(L.row_h, brand_sz, close_btn_sz, reaper.ImGui_GetFrameHeight(ctx), Theme.font_sizes.header)
-  local start_y = reaper.ImGui_GetCursorPosY(ctx)
-
-  -- 1. Brand icon (vertically centered)
-  Theme.vcenter(ctx, brand_sz, hdr_h)
-  Theme.brand_icon(ctx, brand_sz, brand_sz)
-  reaper.ImGui_SameLine(ctx, 0, L.md)
-
-  -- 2. Window Title (vertically centered via Theme.vcenter)
-  Theme.vcenter(ctx, Theme.font_sizes.header, hdr_h)
-  local pushed = Theme.push_font(ctx, fonts.header)
-  reaper.ImGui_Text(ctx, "Design System")
-  Theme.pop_font(ctx, pushed)
-
-  -- 3. Subtitle (vertically centered via Theme.vcenter)
-  reaper.ImGui_SameLine(ctx, 0, L.lg)
-  Theme.vcenter(ctx, Theme.font_sizes.default, hdr_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, Theme.font_family .. " \xc2\xb7 " .. Theme.get_mode() .. " mode")
-  reaper.ImGui_PopStyleColor(ctx, 1)
-
-  -- 4. Right-aligned controls: stay on SAME line via SameLine() before right_align()
-  reaper.ImGui_SameLine(ctx)
-  Theme.right_align(ctx, total_right_w)
-
-  -- 5. Theme mode dropdown (vertically centered via Theme.vcenter)
-  Theme.vcenter(ctx, reaper.ImGui_GetFrameHeight(ctx), hdr_h)
-  if Theme.settings_widget(ctx, { w = combo_w }) then
-    P = Theme.build_palette()
-    Theme.invalidate_palette()
-  end
-
-  -- 6. Theme-aware vector close button (vertically centered via Theme.vcenter)
-  reaper.ImGui_SameLine(ctx, 0, L.md)
-  Theme.vcenter(ctx, close_btn_sz, hdr_h)
-  local close_clicked = Theme.icon_btn(ctx, "ds_win_close", Theme.icons.close, {
-    preset = L.icon_md,
-    tooltip = "Close (Esc)",
+  return Theme.header(ctx, {
+    title         = "DESIGN SYSTEM",
+    fonts         = fonts,
+    show_settings = true,
+    show_close    = true,
+    close_id      = "ds_win_close",
   })
-
-  -- Advance cursor cleanly past the entire header row
-  reaper.ImGui_SetCursorPosY(ctx, start_y + hdr_h)
-
-  vspace(L.md)
-  reaper.ImGui_Separator(ctx)
-  vspace(L.lg)
-
-  return not close_clicked
 end
 
 -------------------------------------------------------------------------------
@@ -322,10 +280,11 @@ local function draw_typography_section()
   local font_list = {
     { "small",        fonts.small,        Theme.font_sizes.small,   "Labels, secondary text, metadata" },
     { "default",      fonts.default,      Theme.font_sizes.default, "Body text, standard UI elements" },
-    { "medium",       fonts.medium,       Theme.font_sizes.medium,  "Emphasized text, settings labels" },
+    { "medium",       fonts.medium,       Theme.font_sizes.medium,  "Emphasized text, settings labels, script titles" },
     { "large",        fonts.large,        Theme.font_sizes.large,   "Section headers, dialog titles" },
     { "header",       fonts.header,       Theme.font_sizes.header,  "Primary headers, window titles" },
     { "default_bold", fonts.default_bold, Theme.font_sizes.default, "Bold body text, labels" },
+    { "medium_bold",  fonts.medium_bold,  Theme.font_sizes.medium,  "Bold brand headers, emphasized titles" },
     { "large_bold",   fonts.large_bold,   Theme.font_sizes.large,   "Bold section headers" },
   }
 
@@ -643,6 +602,26 @@ local function draw_widgets_section()
   Theme.brand_icon(ctx, brand_lg, brand_lg)
   vspace(L.xxxl)
 
+  -- Theme.header (Window header widget)
+  Theme.section_divider(ctx, "Theme.header(ctx, opts)", {
+    tooltip = "Composite window header widget with brand icon, title, subtitle, settings, and close button.",
+  })
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+  reaper.ImGui_Text(ctx, "Renders a toolbar header with pixel-perfect vertical alignment and right-align.")
+  reaper.ImGui_Text(ctx, "Example: Theme.header(ctx, { title = 'My Script', subtitle = 'v1.0.0', fonts = fonts, show_settings = true })")
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.sm)
+  -- Embedded mini-header preview
+  Theme.header(ctx, {
+    title          = "Preview Header",
+    subtitle       = "Embedded demonstration",
+    fonts          = fonts,
+    show_settings  = false,
+    show_close     = false,
+    show_separator = false,
+  })
+  vspace(L.xxxl)
+
   -- push_font / pop_font
   Theme.section_divider(ctx, "Theme.push_font / pop_font")
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
@@ -664,13 +643,14 @@ local function draw_widgets_section()
     tooltip = "Theme.vcenter, Theme.right_align, Theme.hcenter — position items consistently.",
   })
 
-  -- vcenter demo
+  -- vcenter demo (including ref_y pattern)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
-  reaper.ImGui_Text(ctx, "Theme.vcenter(ctx, item_h, row_h)")
+  reaper.ImGui_Text(ctx, "Theme.vcenter(ctx, item_h, row_h, [ref_y])")
   reaper.ImGui_PopStyleColor(ctx, 1)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "Vertically centers the next item within a row. Use in table rows, toolbars.")
-  reaper.ImGui_Text(ctx, "Example: Theme.vcenter(ctx, Theme.font_sizes.small, Theme.layout.row_h)")
+  reaper.ImGui_Text(ctx, "Vertically centers the next item within a row. On SameLine rows, always pass start_y as ref_y.")
+  reaper.ImGui_Text(ctx, "Example: local start_y = reaper.ImGui_GetCursorPosY(ctx)")
+  reaper.ImGui_Text(ctx, "         Theme.vcenter(ctx, item_h, row_h, start_y)")
   reaper.ImGui_PopStyleColor(ctx, 1)
   vspace(L.xl)
 
