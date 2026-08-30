@@ -28,6 +28,21 @@ All notable changes to Fancy Scripts will be documented here.
 - **Fancy Design System v1.2.0** — Added live interactive demonstrations for `Theme.progress_bar()`, `Theme.toggle_button()`, `Theme.badge()`, `Theme.combo()`, and `L.btn_sm` table controls, eliminated raw hex color literals
 - **Fancy Parameter Link v5.1.0** — "All" button in Link Builder to select/deselect all parameters at once
 
+### Fixed
+- **Theme Engine Hardening & Bug Fixes (`_lib/theme.lua`)**:
+  - Added missing `ImGui_Col_Text`, `ImGui_Col_TextDisabled`, `ImGui_Col_Border`, and `ImGui_Col_ScrollbarGrabActive` to `Theme.push()` (updating push/pop stack parity to 32 colors)
+  - Fixed 64-bit Lua 5.4 integer underflow/overflow and sign extension in `darken()`, `lighten()`, and `with_alpha()` via strict boundary clamping
+  - Fixed custom REAPER color flag (bit 24) decoding in `bgr_to_rgba()` by unconditionally masking `0x00FFFFFF`
+  - Eliminated per-frame closure allocations in `Theme.combo()` by factoring item label resolution to file scope
+  - Eliminated per-widget C-API `reaper.GetExtState` queries by caching `_cached_mode` in memory
+  - Eliminated per-frame table churn in `Theme.settings_widget()` and `Theme.header()` by using static option tables
+  - Added public `Theme.get_palette()` accessor and optimized `Theme.push()` to consume cached palette
+  - Fixed `Theme.layout.btn_lg.h` token from 26 to 24px to match natural button height flow (`16 + 4*2`)
+  - Fixed string preset normalization in `Theme.push_button_preset()` (`"sm"`, `"small"`, `"lg"`, `"large"`)
+  - Fixed `Theme.toggle_button()` crash when `id` argument is `nil`
+  - Fixed `Theme.header()` right-aligned width allocation and spacing with custom widgets, and added vertical alignment for close button
+  - Removed orphaned docblock above `Theme.push_button_preset()`
+
 ### Changed
 - **Fancy Parameter Link v5.2.0** — Complete Design System & Theme Engine migration
   - Replaced all hardcoded colors, spacing, and font definitions with `_lib/theme.lua` tokens and dynamic palette

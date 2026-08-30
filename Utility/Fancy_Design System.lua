@@ -878,7 +878,7 @@ local function draw_widgets_section()
   -- Pushed style vars summary
   Theme.section_divider(ctx, "PUSHED STYLE VARS (via Theme.push)")
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "28 colors + 9 style vars are pushed automatically:")
+  reaper.ImGui_Text(ctx, "32 colors + 9 style vars are pushed automatically:")
   reaper.ImGui_Text(ctx, "  WindowRounding, FrameRounding, GrabRounding,")
   reaper.ImGui_Text(ctx, "  ItemSpacing, FramePadding, WindowPadding,")
   reaper.ImGui_Text(ctx, "  CellPadding, ItemInnerSpacing, IndentSpacing")

@@ -5,7 +5,7 @@
 -- API QUICK REFERENCE
 -- =============================================================================
 --
--- PALETTE -- Theme.build_palette([overrides]) returns table with:
+-- PALETTE -- Theme.build_palette([overrides]) / Theme.get_palette() returns table with:
 --   Surfaces:   bg, panel, card               (window bg, popups, frame bg)
 --   Text:       text, text_dim                (primary, secondary)
 --   Accent:     accent      = active state    (ButtonActive, CheckMark, SliderGrab)
@@ -20,7 +20,7 @@
 --   Controls:   slider_grab_active            (slider grab while dragging)
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
 --
--- THEME MODES -- Theme.get_mode() / .set_mode(mode)
+-- THEME MODES -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
 --   MODE_FANCY="fancy"  Curated dark, purple accent
 --   MODE_MATCH="match"  Everything from REAPER theme (including edit cursor accent)
 --
@@ -32,9 +32,9 @@
 --   Misc:       tooltip_wrap=300  section_gap=sm (4)
 --
 -- BUTTON PRESETS -- height flows from font + padding (no hardcoded heights)
---   btn_sm = {pad_x=sm, pad_y=xs, font="small"}   Push FramePadding + font
---   default = global FramePadding (md,sm)          No override needed
---   btn_lg = {pad_x=lg, pad_y=sm, font="medium"}  Push FramePadding + font
+--   btn_sm = {pad_x=sm, pad_y=xs, font="small", h=16}   Push FramePadding + font
+--   btn_default = global FramePadding (md,sm) (h=22)    No override needed
+--   btn_lg = {pad_x=lg, pad_y=sm, font="medium", h=24}  Push FramePadding + font
 --   Usage:
 --     PushStyleVar(ctx, FramePadding, L.btn_lg.pad_x, L.btn_lg.pad_y)
 --     push_font(ctx, fonts[L.btn_lg.font])
@@ -46,15 +46,16 @@
 --   Pass via opts.preset: Theme.icon_btn(ctx, id, fn, {preset = L.icon_sm})
 --
 -- FONTS -- Theme.font_sizes: small=12 default=14 medium=16 large=18 header=20
---   create_fonts(ctx)          -> {default,small,medium,large,header,default_bold,large_bold}
+--   create_fonts(ctx)          -> {default,small,medium,large,header,default_bold,medium_bold,large_bold}
 --   attach_fonts(ctx, fonts)   -> call once before first frame
 --   push_font(ctx, font, [sz]) -> bool (safe pcall, auto-resolves size from registry)
 --   pop_font(ctx, pushed)      -> conditional pop
 --   fonts.tooltip = fonts.default (backward-compat alias)
 --
--- STYLE -- Theme.push(ctx, [palette]) -> nc=28, nv=9 / Theme.pop(ctx, nc, nv)
---   Colors: WindowBg, Button*3, Header*3, FrameBg*3, Slider*2, CheckMark,
---           Popup, ModalDim, Separator*3, Table*5, Scrollbar*3
+-- STYLE -- Theme.push(ctx, [palette]) -> nc=32, nv=9 / Theme.pop(ctx, nc, nv)
+--   Colors: WindowBg, TitleBg*2, Header*3, Button*3, FrameBg*3, Slider*2, CheckMark,
+--           Popup, ModalDim, Separator*3, Table*5, Scrollbar*3, ScrollbarGrabActive,
+--           Text, TextDisabled, Border
 --   Vars:   WindowRounding, FrameRounding, GrabRounding, ItemSpacing, FramePadding,
 --           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing
 --
@@ -73,9 +74,11 @@
 --   push_button_preset(ctx, fonts, preset)     -> var_count, pushed_font (e.g. for sliders, combos)
 --   pop_button_preset(ctx, var_count, pfont)   Pops styling pushed by push_button_preset
 --   combo(ctx, id, items, selected_idx, [opts]) Standardized combo box (opts: w, placeholder, get_label)
+--   header(ctx, opts)                          Standardized window header bar (title, FANCY prefix, settings, close)
 --   center_next_window(ctx, w, h)
 --   brand_icon(ctx, [size], [target_h])
---   invalidate_palette()                       clear internal widget palette cache
+--   get_palette()                              Get active cached palette
+--   invalidate_palette()                       Clear internal widget palette cache
 --
 -- ALIGNMENT
 --   align(ctx, [row_h], [item_h])     PRIMARY — call before every item on a row
@@ -98,7 +101,7 @@
 --   local fonts = Theme.create_fonts(ctx)
 --   Theme.attach_fonts(ctx, fonts)
 --   local function loop()
---     local P = Theme.build_palette()
+--     local P = Theme.get_palette()
 --     local nc, nv = Theme.push(ctx, P)
 --     local pushed = Theme.push_font(ctx, fonts.default)
 --     local visible, open = reaper.ImGui_Begin(ctx, "Script Name", true)
@@ -121,41 +124,44 @@ local Theme = {}
 -- 1. COLOR HELPERS
 -------------------------------------------------------------------------------
 
---- Adjusts the alpha channel of an RGBA color.
+--- Adjusts the alpha channel of an RGBA color with strict [0, 255] clamping.
 --- @param rgba integer  Color in 0xRRGGBBAA format
 --- @param alpha number  Alpha value (0.0–1.0)
 --- @return integer  Color with new alpha
 local function with_alpha(rgba, alpha)
-  return (rgba & 0xFFFFFF00) | math.floor(alpha * 255 + 0.5)
+  local a = math.max(0, math.min(255, math.floor((alpha or 1.0) * 255 + 0.5)))
+  return (rgba & 0xFFFFFF00) | a
 end
 
---- Lightens an RGBA color by blending toward white.
+--- Lightens an RGBA color by blending toward white with strict bounds.
 --- @param rgba integer  Color in 0xRRGGBBAA format
 --- @param factor number  Lightening factor (0.0 = no change, 1.0 = white)
 --- @return integer
 local function lighten(rgba, factor)
+  local f = math.max(0.0, math.min(1.0, factor or 0.0))
   local r = (rgba >> 24) & 0xFF
   local g = (rgba >> 16) & 0xFF
   local b = (rgba >> 8) & 0xFF
   local a = rgba & 0xFF
-  r = math.min(255, math.floor(r + (255 - r) * factor + 0.5))
-  g = math.min(255, math.floor(g + (255 - g) * factor + 0.5))
-  b = math.min(255, math.floor(b + (255 - b) * factor + 0.5))
+  r = math.max(0, math.min(255, math.floor(r + (255 - r) * f + 0.5)))
+  g = math.max(0, math.min(255, math.floor(g + (255 - g) * f + 0.5)))
+  b = math.max(0, math.min(255, math.floor(b + (255 - b) * f + 0.5)))
   return (r << 24) | (g << 16) | (b << 8) | a
 end
 
---- Darkens an RGBA color by blending toward black.
+--- Darkens an RGBA color by blending toward black with strict bounds.
 --- @param rgba integer  Color in 0xRRGGBBAA format
 --- @param factor number  Darkening factor (0.0 = no change, 1.0 = black)
 --- @return integer
 local function darken(rgba, factor)
+  local f = math.max(0.0, math.min(1.0, factor or 0.0))
   local r = (rgba >> 24) & 0xFF
   local g = (rgba >> 16) & 0xFF
   local b = (rgba >> 8) & 0xFF
   local a = rgba & 0xFF
-  r = math.floor(r * (1 - factor) + 0.5)
-  g = math.floor(g * (1 - factor) + 0.5)
-  b = math.floor(b * (1 - factor) + 0.5)
+  r = math.max(0, math.min(255, math.floor(r * (1.0 - f) + 0.5)))
+  g = math.max(0, math.min(255, math.floor(g * (1.0 - f) + 0.5)))
+  b = math.max(0, math.min(255, math.floor(b * (1.0 - f) + 0.5)))
   return (r << 24) | (g << 16) | (b << 8) | a
 end
 
@@ -163,12 +169,12 @@ end
 --- REAPER's GetThemeColor returns OS-native colors (BGR on Windows, RGB on
 --- macOS). We use reaper.ColorFromNative() to extract R, G, B correctly on
 --- any platform, then pack into 0xRRGGBBAA for ReaImGui.
---- Negative values indicate alpha-blended or special colors; we mask them.
+--- Unconditionally masks bit 24 (REAPER's custom color flag) before conversion.
 --- @param native integer  Native REAPER color value
 --- @return integer  Color in 0xRRGGBBAA format (fully opaque)
 local function bgr_to_rgba(native)
-  if native < 0 then native = native & 0x00FFFFFF end
-  local r, g, b = reaper.ColorFromNative(native)
+  local clean = (native or 0) & 0x00FFFFFF
+  local r, g, b = reaper.ColorFromNative(clean)
   return (r << 24) | (g << 16) | (b << 8) | 0xFF
 end
 
@@ -179,7 +185,7 @@ Theme.darken = darken
 Theme.bgr_to_rgba = bgr_to_rgba
 
 -------------------------------------------------------------------------------
--- 2. THEME MODE CONSTANTS
+-- 2. THEME MODE CONSTANTS & PALETTE CACHE
 -------------------------------------------------------------------------------
 Theme.MODE_FANCY = "fancy"  -- Curated Fancy Scripts palette (default)
 Theme.MODE_MATCH = "match"  -- Everything from REAPER theme (including edit cursor accent)
@@ -187,20 +193,35 @@ Theme.MODE_MATCH = "match"  -- Everything from REAPER theme (including edit curs
 local EXTSTATE_SECTION = "FancyScripts"
 local EXTSTATE_KEY     = "theme_mode"
 
---- Returns the current theme mode from global ExtState.
+local _cached_palette = nil
+local _cached_mode = nil
+
+--- Returns the current theme mode from global ExtState (cached in memory).
 --- @return string  One of "fancy" or "match"
 function Theme.get_mode()
+  if _cached_mode then return _cached_mode end
   local mode = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_KEY)
   if mode == Theme.MODE_MATCH or mode == "full" then
-    return Theme.MODE_MATCH
+    _cached_mode = Theme.MODE_MATCH
+  else
+    _cached_mode = Theme.MODE_FANCY
   end
-  return Theme.MODE_FANCY
+  return _cached_mode
 end
 
---- Sets the global theme mode (persists across sessions).
+--- Sets the global theme mode (persists across sessions and updates cache).
 --- @param mode string  One of Theme.MODE_FANCY, Theme.MODE_MATCH
 function Theme.set_mode(mode)
   reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEY, mode, true)
+  _cached_mode = mode
+  _cached_palette = Theme.build_palette()
+end
+
+--- Forces the internal widget palette cache to rebuild.
+--- Call after Theme.set_mode() or when live REAPER theme colors change.
+function Theme.invalidate_palette()
+  _cached_palette = nil
+  _cached_mode = nil
 end
 
 -------------------------------------------------------------------------------
@@ -314,6 +335,21 @@ function Theme.build_palette(overrides)
   return P
 end
 
+--- Returns the active cached palette, rebuilding only when mode changes.
+--- @param overrides table|nil  Optional table of color overrides (bypasses cache when provided)
+--- @return table  Palette table with all color fields
+function Theme.get_palette(overrides)
+  if overrides then
+    return Theme.build_palette(overrides)
+  end
+  if not _cached_palette then
+    local mode = Theme.get_mode()
+    _cached_palette = Theme.build_palette()
+    _cached_mode = mode
+  end
+  return _cached_palette
+end
+
 -------------------------------------------------------------------------------
 -- 6. DESIGN TOKENS — LAYOUT
 -------------------------------------------------------------------------------
@@ -343,7 +379,7 @@ Theme.layout = {
   -- Pass opts.preset (or use push_button_preset) for sm/lg variants.
   btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small",   h = 16 },
   btn_default  = { pad_x = S.md, pad_y = S.sm, font = "default", h = 22 },
-  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 26 },
+  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 24 },
 
   -- ── Icon size presets ───────────────────────────────────────────────────
   -- Button dimension = size + pad * 2. Default icon_btn uses icon_md.
@@ -378,14 +414,14 @@ Theme.layout = {
 --- Uses palette colors and layout tokens — no hardcoded values.
 --- Call at the start of each frame, before ImGui_Begin.
 --- @param ctx userdata  ImGui context
---- @param palette table|nil  Palette from build_palette() (builds default if nil)
---- @return integer color_count  Number of style colors pushed
---- @return integer var_count  Number of style vars pushed
+--- @param palette table|nil  Palette from build_palette() / get_palette() (builds default if nil)
+--- @return integer color_count  Number of style colors pushed (32)
+--- @return integer var_count  Number of style vars pushed (9)
 function Theme.push(ctx, palette)
-  local P = palette or Theme.build_palette()
+  local P = palette or Theme.get_palette()
   local L = Theme.layout
 
-  -- Style colors (28 total)
+  -- Style colors (32 total)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(),             P.bg)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBg(),              P.panel)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBgActive(),        P.panel)
@@ -414,6 +450,10 @@ function Theme.push(ctx, palette)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarBg(),          P.bg)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrab(),        P.accent_d)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabHovered(), P.accent_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabActive(),  P.accent)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),                 P.text)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TextDisabled(),         P.text_dim)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(),               P.border)
 
   -- Style vars (9 total — all values from layout tokens)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding(),  L.rounding)
@@ -426,16 +466,16 @@ function Theme.push(ctx, palette)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemInnerSpacing(),L.sm, L.sm)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_IndentSpacing(),   L.indent)
 
-  return 28, 9
+  return 32, 9
 end
 
 --- Pops all Fancy Scripts ImGui styles from the stack.
 --- Call after ImGui_End, using the counts returned by Theme.push().
 --- @param ctx userdata  ImGui context
---- @param nc integer|nil  Number of colors to pop (default 28)
+--- @param nc integer|nil  Number of colors to pop (default 32)
 --- @param nv integer|nil  Number of vars to pop (default 9)
 function Theme.pop(ctx, nc, nv)
-  reaper.ImGui_PopStyleColor(ctx, nc or 28)
+  reaper.ImGui_PopStyleColor(ctx, nc or 32)
   reaper.ImGui_PopStyleVar(ctx, nv or 9)
 end
 
@@ -463,12 +503,12 @@ Theme.font_sizes = {
 
 --- Creates a complete set of shared fonts for a ReaImGui context.
 --- Call once at script startup, before the defer loop.
---- Produces 7 fonts: default, small, medium, large, header (regular)
----                    default_bold, large_bold (bold)
+--- Produces 8 fonts: default, small, medium, large, header (regular)
+---                    default_bold, medium_bold, large_bold (bold)
 --- @param _ctx userdata  ImGui context (unused but kept for API consistency)
 --- @param overrides table|nil  Optional: { family="Arial", bold_family="Arial Bold", large=24, ... }
 --- @return table  Font table with keys: default, small, medium, large, header,
----                default_bold, large_bold
+---                default_bold, medium_bold, large_bold
 function Theme.create_fonts(_ctx, overrides)
   overrides = overrides or {}
   local family      = overrides.family      or Theme.font_family
@@ -496,7 +536,7 @@ function Theme.create_fonts(_ctx, overrides)
   fonts.tooltip = fonts.default
 
   -- Store font→size mapping for push_font (ImGui_PushFont requires size arg)
-  Theme._font_sizes = {}
+  Theme._font_sizes = Theme._font_sizes or {}
   Theme._font_sizes[fonts.default]      = sizes.default
   Theme._font_sizes[fonts.small]        = sizes.small
   Theme._font_sizes[fonts.medium]       = sizes.medium
@@ -647,26 +687,9 @@ end
 --- pull colors from the palette, and dimensions from Theme.layout.
 --- Optional overrides are passed via an opts table as the last argument.
 
--- Lazy-init palette cache: built once per script session, rebuilt when
--- Theme mode changes. Widgets call _get_palette() internally.
-local _cached_palette = nil
-local _cached_mode = nil
-
+-- Palette accessor for widgets: delegates to Theme.get_palette().
 local function _get_palette()
-  local mode = Theme.get_mode()
-  if not _cached_palette or mode ~= _cached_mode then
-    _cached_palette = Theme.build_palette()
-    _cached_mode = mode
-  end
-  return _cached_palette
-end
-
---- Forces the internal widget palette cache to rebuild.
---- Call after Theme.set_mode() if you need widgets to reflect the change
---- within the same frame.
-function Theme.invalidate_palette()
-  _cached_palette = nil
-  _cached_mode = nil
+  return Theme.get_palette()
 end
 
 --- Low-level: vertically centers the next item within a row of a given height.
@@ -916,27 +939,18 @@ function Theme.collapsing_header(ctx, label, opts)
   return reaper.ImGui_CollapsingHeader(ctx, label, nil, flags)
 end
 
---- Renders a styled, compact value/progress bar with an optional centered text overlay.
---- Uses DrawList primitives for crisp rendering, custom fill/bg colors, and rounded corners.
----
---- @param ctx userdata  ImGui context
---- @param fraction number  Normalized progress/value between 0.0 and 1.0
---- @param opts table|nil  Optional configuration:
----   opts.w            (number)  Bar width in pixels (default: available region width)
----   opts.h            (number)  Bar height in pixels (default: Theme.layout.row_h - 4)
----   opts.fill_color   (number)  Fill color (default: palette.accent)
----   opts.bg_color     (number)  Background color (default: palette.card)
----   opts.border_color (number)  Border color (optional)
----   opts.rounding     (number)  Corner rounding (default: Theme.layout.rounding)
 --- Pushes button preset styling (FramePadding and font) onto the stack.
 --- Use for standard ImGui controls (sliders, inputs, combo boxes) that should
 --- match a button preset tier (e.g. Theme.layout.btn_sm, Theme.layout.btn_lg).
 ---
 --- @param ctx userdata        ImGui context
 --- @param fonts table|nil      Font table from Theme.create_fonts()
---- @param preset table|nil     Preset table (default: Theme.layout.btn_sm)
+--- @param preset table|string|nil Preset table or name (default: Theme.layout.btn_sm)
 --- @return integer var_count, userdata|nil pushed_font
 function Theme.push_button_preset(ctx, fonts, preset)
+  if preset == "small" or preset == "sm" then preset = Theme.layout.btn_sm end
+  if preset == "large" or preset == "lg" then preset = Theme.layout.btn_lg end
+  if preset == "default" then preset = Theme.layout.btn_default end
   preset = preset or Theme.layout.btn_sm
   local var_count = 0
   if preset.pad_x or preset.pad_y then
@@ -1008,7 +1022,9 @@ function Theme.progress_bar(ctx, fraction, opts)
   reaper.ImGui_DrawList_AddRectFilled(dl, x, y, x + w, y + h, bg_col, rounding)
 
   -- Filled bar
-  local clamped = math.max(0.0, math.min(1.0, fraction or 0.0))
+  local frac = fraction or 0.0
+  if frac ~= frac then frac = 0.0 end
+  local clamped = math.max(0.0, math.min(1.0, frac))
   if clamped > 0.001 then
     local fw = math.max(rounding * 2, math.floor(w * clamped))
     if fw > w then fw = w end
@@ -1119,7 +1135,8 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
 
-  local btn_label = string.format("%s##%s", label, id)
+  local btn_id = id or label or "toggle_btn"
+  local btn_label = string.format("%s##%s", label or "", btn_id)
   local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
 
   reaper.ImGui_PopStyleColor(ctx, 4)
@@ -1219,6 +1236,17 @@ function Theme.badge(ctx, label, opts)
   return opts.interactive and pressed or false
 end
 
+-- File-level helper for Theme.combo to eliminate per-frame closure allocations
+local function _get_combo_item_label(item, idx, custom_fn)
+  if custom_fn then
+    return custom_fn(item, idx)
+  end
+  if type(item) == "table" then
+    return item.name or item.label or item.title or tostring(item)
+  end
+  return tostring(item)
+end
+
 --- Renders a standardized combo box wrapping ImGui_BeginCombo.
 --- Handles label resolution, item iteration, and selection state.
 ---
@@ -1246,19 +1274,9 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
     reaper.ImGui_SetNextItemWidth(ctx, opts.w)
   end
 
-  local function get_item_label(item, idx)
-    if opts.get_label then
-      return opts.get_label(item, idx)
-    end
-    if type(item) == "table" then
-      return item.name or item.label or item.title or tostring(item)
-    end
-    return tostring(item)
-  end
-
   local preview = opts.placeholder or "-- Select --"
   if selected_idx > 0 and selected_idx <= #items then
-    preview = get_item_label(items[selected_idx], selected_idx)
+    preview = _get_combo_item_label(items[selected_idx], selected_idx, opts.get_label)
   end
 
   local new_idx = selected_idx
@@ -1266,7 +1284,7 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
 
   if reaper.ImGui_BeginCombo(ctx, id, preview) then
     for i, item in ipairs(items) do
-      local lbl = get_item_label(item, i) .. "##item_" .. i
+      local lbl = _get_combo_item_label(item, i, opts.get_label) .. "##item_" .. i
       local is_sel = (selected_idx == i)
       if reaper.ImGui_Selectable(ctx, lbl, is_sel) then
         new_idx = i
@@ -1340,6 +1358,9 @@ end
 -- 12. SETTINGS UI WIDGET
 -------------------------------------------------------------------------------
 
+local SETTINGS_LABELS = { "Fancy Dark", "Match Theme" }
+local SETTINGS_VALUES = { Theme.MODE_FANCY, Theme.MODE_MATCH }
+
 --- Calculates the reactive width required for a combo box to display its options
 --- without truncation, based on the current font metrics and ImGui frame padding.
 --- @param ctx userdata      ImGui context
@@ -1372,14 +1393,12 @@ end
 function Theme.settings_widget(ctx, opts)
   opts = opts or {}
   local mode = Theme.get_mode()
-  local labels = { "Fancy Dark", "Match Theme" }
-  local values = { Theme.MODE_FANCY, Theme.MODE_MATCH }
   local current = 1
-  for i, v in ipairs(values) do
+  for i, v in ipairs(SETTINGS_VALUES) do
     if v == mode then current = i; break end
   end
 
-  local auto_w = Theme.calc_combo_width(ctx, labels)
+  local auto_w = Theme.calc_combo_width(ctx, SETTINGS_LABELS)
   local w = opts.w or auto_w
 
   if opts.align == "right" then
@@ -1389,12 +1408,12 @@ function Theme.settings_widget(ctx, opts)
   local changed = false
   local combo_label = opts.label or "##theme_mode"
   reaper.ImGui_SetNextItemWidth(ctx, w)
-  if reaper.ImGui_BeginCombo(ctx, combo_label, labels[current]) then
-    for i, label in ipairs(labels) do
+  if reaper.ImGui_BeginCombo(ctx, combo_label, SETTINGS_LABELS[current]) then
+    for i, label in ipairs(SETTINGS_LABELS) do
       local selected = (i == current)
       if reaper.ImGui_Selectable(ctx, label, selected) then
         if not selected then
-          Theme.set_mode(values[i])
+          Theme.set_mode(SETTINGS_VALUES[i])
           Theme.invalidate_palette()
           changed = true
         end
@@ -1462,7 +1481,7 @@ function Theme.header(ctx, opts)
   if opts.fancy_prefix ~= false then
     local font_bold = opts.font_brand or (opts.fonts and (opts.fonts.medium_bold or opts.fonts.large_bold or opts.fonts.default_bold))
     local pushed_b = Theme.push_font(ctx, font_bold)
-    reaper.ImGui_AlignTextToFramePadding(ctx)
+    Theme.align(ctx)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), opts.prefix_color or P.yellow)
     reaper.ImGui_Text(ctx, opts.prefix or "FANCY")
     reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1474,7 +1493,7 @@ function Theme.header(ctx, opts)
   if opts.title then
     local font_title = opts.font_header or (opts.fonts and (opts.fonts.medium or opts.fonts.default_bold or opts.fonts.large))
     local pushed_title = Theme.push_font(ctx, font_title)
-    reaper.ImGui_AlignTextToFramePadding(ctx)
+    Theme.align(ctx)
     if opts.title_color then
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), opts.title_color)
     end
@@ -1488,7 +1507,7 @@ function Theme.header(ctx, opts)
   -- 4. Subtitle (dim text aligned to frame padding)
   if opts.subtitle then
     reaper.ImGui_SameLine(ctx, 0, L.lg)
-    reaper.ImGui_AlignTextToFramePadding(ctx)
+    Theme.align(ctx)
     local font_sub = opts.font_subtitle or (opts.fonts and (opts.fonts.default or opts.fonts.small))
     local pushed_sub = Theme.push_font(ctx, font_sub)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), opts.subtitle_color or P.text_dim)
@@ -1503,14 +1522,16 @@ function Theme.header(ctx, opts)
   local right_w = opts.right_width or 0
   local combo_w = 0
   if show_settings then
-    local labels = { "Fancy Dark", "Match Theme" }
-    combo_w = Theme.calc_combo_width(ctx, labels)
-    right_w = right_w + combo_w
-    if show_close then
+    combo_w = Theme.calc_combo_width(ctx, SETTINGS_LABELS)
+    if right_w > 0 then
       right_w = right_w + L.md
     end
+    right_w = right_w + combo_w
   end
   if show_close then
+    if right_w > 0 then
+      right_w = right_w + L.md
+    end
     right_w = right_w + close_btn_sz
   end
 
@@ -1540,6 +1561,7 @@ function Theme.header(ctx, opts)
     end
 
     if show_close then
+      Theme.align(ctx, hdr_h, close_btn_sz)
       local close_id = opts.close_id or "win_hdr_close"
       local close_tt = opts.close_tooltip or "Close (Esc)"
       if Theme.icon_btn(ctx, close_id, Theme.icons.close, { preset = L.icon_md, tooltip = close_tt }) then

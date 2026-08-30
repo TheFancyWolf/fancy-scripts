@@ -17,5 +17,6 @@ _fancy_*.json
 *.bak
 
 # Antigravity / Agent files (managed externally)
+.agents/
 agents.md
 AGENTS.md
