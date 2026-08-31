@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="032b0138404b4b5dff9f43a55c2e737fec9ddb76">
+<index version="1" name="Fancy Scripts" commit="d21288056e9060d397fe8da94d5be9380a3e5a60">
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
@@ -49,6 +49,17 @@
         <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/478f96109b46d9b0a0ef84af72a4f2453393d0ce/_lib/json.lua</source>
         <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/478f96109b46d9b0a0ef84af72a4f2453393d0ce/_lib/theme.lua</source>
         <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/478f96109b46d9b0a0ef84af72a4f2453393d0ce/_lib/utils.lua</source>
+      </version>
+      <version name="5.3.0" author="Fancy Scripts" time="2026-08-31T18:11:37Z">
+        <changelog><![CDATA[+ Bundled 1x and 2x Retina toolbar icons (toolbar_fancy_parameter_link.png)
++ Active toolbar button state while script is running]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/FX/Fancy_Parameter%20Link.lua</source>
+        <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/_lib/json.lua</source>
+        <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/_lib/theme.lua</source>
+        <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/_lib/utils.lua</source>
+        <source type="data" file="toolbar_icons/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/toolbar_icons/toolbar_fancy_parameter_link.png</source>
+        <source type="data" file="toolbar_icons/150/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/toolbar_icons/150/toolbar_fancy_parameter_link.png</source>
+        <source type="data" file="toolbar_icons/200/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/toolbar_icons/200/toolbar_fancy_parameter_link.png</source>
       </version>
     </reapack>
   </category>
