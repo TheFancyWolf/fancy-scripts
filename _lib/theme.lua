@@ -9,13 +9,13 @@
 --   Surfaces:   bg, panel, card               (window bg, popups, frame bg)
 --   Text:       text, text_dim                (primary, secondary)
 --   Accent:     accent      = active state    (ButtonActive, CheckMark, SliderGrab)
---               accent_h    = hover  (80%)    (ButtonHovered, HeaderHovered, FrameBgActive)
---               accent_d    = dim    (33%)    (Button, Header, FrameBgHovered, ScrollbarGrab)
+--               accent_h    = hover  (40%)    (ButtonHovered, HeaderHovered, FrameBgActive)
+--               accent_d    = dim    (20%)    (Button, Header, FrameBgHovered, ScrollbarGrab)
 --               accent_e    = subtle (12.5%)  (TableBorderLight)
 --               accent_l    = light  (70%)    (High-contrast text on badges/active toggles)
 --   Secondary:  accent2 / blue = active state (secondary accent, info, badge highlights)
---               accent2_h / blue_h = hover (80%)
---               accent2_d / blue_d = dim   (33%)
+--               accent2_h / blue_h = hover (40%)
+--               accent2_d / blue_d = dim   (20%)
 --               accent2_e / blue_e = subtle (12.5%)
 --               accent2_l / blue_l = light (70%) (High-contrast text on badges/info)
 --   Semantic:   green/green_h/green_d/green_l (success, enabled, positive)
@@ -318,25 +318,25 @@ function Theme.build_palette(overrides)
   P.blue    = blue_base
   P.accent2 = blue_base
 
-  -- Derive semantic states from base colors (consistent 80% / 33% ratios)
-  P.green_h = overrides.green_h or with_alpha(P.green, 0.80)
-  P.green_d = overrides.green_d or with_alpha(P.green, 0.33)
-  P.red_h   = overrides.red_h   or with_alpha(P.red, 0.80)
-  P.red_d   = overrides.red_d   or with_alpha(P.red, 0.33)
+  -- Derive semantic states from base colors (consistent 40% / 20% ratios)
+  P.green_h = overrides.green_h or with_alpha(P.green, 0.40)
+  P.green_d = overrides.green_d or with_alpha(P.green, 0.20)
+  P.red_h   = overrides.red_h   or with_alpha(P.red, 0.40)
+  P.red_d   = overrides.red_d   or with_alpha(P.red, 0.20)
 
-  -- Derive secondary accent / blue states (consistent 80% / 33% / 12.5% ratios)
-  P.blue_h    = overrides.blue_h    or overrides.accent2_h or with_alpha(P.blue, 0.80)
-  P.blue_d    = overrides.blue_d    or overrides.accent2_d or with_alpha(P.blue, 0.33)
+  -- Derive secondary accent / blue states (consistent 40% / 20% / 12.5% ratios)
+  P.blue_h    = overrides.blue_h    or overrides.accent2_h or with_alpha(P.blue, 0.40)
+  P.blue_d    = overrides.blue_d    or overrides.accent2_d or with_alpha(P.blue, 0.20)
   P.blue_e    = overrides.blue_e    or overrides.accent2_e or with_alpha(P.blue, 0.125)
   P.accent2_h = P.blue_h
   P.accent2_d = P.blue_d
   P.accent2_e = P.blue_e
 
   -- Derive accent states from the resolved primary accent color
-  -- accent_h = Hover state (80% alpha): ButtonHovered, HeaderHovered, FrameBgActive, SeparatorHovered, ScrollbarGrabHovered
-  P.accent_h = overrides.accent_h or with_alpha(P.accent, 0.80)
-  -- accent_d = Dim/default state (33% alpha): Button, Header, FrameBgHovered, ScrollbarGrab
-  P.accent_d = overrides.accent_d or with_alpha(P.accent, 0.33)
+  -- accent_h = Hover state (40% alpha): ButtonHovered, HeaderHovered, FrameBgActive, SeparatorHovered, ScrollbarGrabHovered
+  P.accent_h = overrides.accent_h or with_alpha(P.accent, 0.40)
+  -- accent_d = Dim/default state (20% alpha): Button, Header, FrameBgHovered, ScrollbarGrab
+  P.accent_d = overrides.accent_d or with_alpha(P.accent, 0.20)
   -- accent_e = Extra-dim (12.5% alpha): TableBorderLight — subtle structural lines
   P.accent_e = overrides.accent_e or with_alpha(P.accent, 0.125)
 
@@ -1235,8 +1235,8 @@ function Theme.badge(ctx, label, opts)
 
   local base_color = opts.color or P.accent
   local text_col   = opts.text_color or (opts.color and lighten(opts.color, 0.70) or P.accent_l)
-  local bg         = opts.bg or with_alpha(base_color, 0.33)
-  local bg_h       = opts.bg_hover or with_alpha(base_color, 0.50)
+  local bg         = opts.bg or with_alpha(base_color, 0.20)
+  local bg_h       = opts.bg_hover or with_alpha(base_color, 0.40)
   local bg_a       = opts.bg_active or base_color
 
   local btn_w = opts.w or 0

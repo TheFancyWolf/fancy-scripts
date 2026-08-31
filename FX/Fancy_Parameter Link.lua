@@ -1163,8 +1163,8 @@ local function draw_plugin_selector()
     end
 
     if #S.fxs == 0 then
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
-      reaper.ImGui_Text(ctx, "  * No shared plugins across selected tracks")
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.red)
+      reaper.ImGui_TextWrapped(ctx, "  * No shared plugins across selected tracks")
       reaper.ImGui_PopStyleColor(ctx, 1)
     end
   elseif #S.tracks == 1 then

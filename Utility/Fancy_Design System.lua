@@ -241,7 +241,7 @@ local function draw_colors_section()
     { "accent_d", P.accent_d },
     { "accent_e", P.accent_e },
     { "accent_l", P.accent_l },
-  }, "active → hover (80%) → default (33%) → subtle (12%) → light text (70%)")
+  }, "active → hover (40%) → default (20%) → subtle (12.5%) → light text (70%)")
 
   swatch_row("Accent — Secondary (Blue)", {
     { "accent2",   P.accent2 },
