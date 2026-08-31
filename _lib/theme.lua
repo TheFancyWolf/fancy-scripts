@@ -12,9 +12,16 @@
 --               accent_h    = hover  (80%)    (ButtonHovered, HeaderHovered, FrameBgActive)
 --               accent_d    = dim    (33%)    (Button, Header, FrameBgHovered, ScrollbarGrab)
 --               accent_e    = subtle (12.5%)  (TableBorderLight)
---   Semantic:   green/green_h/green_d         (success, enabled, positive)
---               red/red_h/red_d               (error, delete, destructive)
---               yellow                        (warning, caution)
+--               accent_l    = light  (70%)    (High-contrast text on badges/active toggles)
+--   Secondary:  accent2 / blue = active state (secondary accent, info, badge highlights)
+--               accent2_h / blue_h = hover (80%)
+--               accent2_d / blue_d = dim   (33%)
+--               accent2_e / blue_e = subtle (12.5%)
+--               accent2_l / blue_l = light (70%) (High-contrast text on badges/info)
+--   Semantic:   green/green_h/green_d/green_l (success, enabled, positive)
+--               red/red_h/red_d/red_l         (error, delete, destructive)
+--               yellow/yellow_l               (warning, caution)
+--               blue/blue_h/blue_d/blue_e/blue_l (info, secondary accent)
 --   Structure:  border, sep, dim_bg           (borders, separators, modal overlay)
 --   Table:      table_row, table_row_alt      (alternating row backgrounds)
 --   Controls:   slider_grab_active            (slider grab while dragging)
@@ -237,13 +244,17 @@ local FANCY_PALETTE = {
   text     = 0xFFFFFFFF,
   text_dim = 0x7A7A9FFF,
 
-  -- Accent
+  -- Accent (primary purple)
   accent   = 0x8B70FAFF,
+
+  -- Accent (secondary blue)
+  accent2  = 0x4DA6FFFF,
 
   -- Semantic base colors
   green    = 0x56E39FFF,
   red      = 0xF45B69FF,
   yellow   = 0xFFCC66FF,
+  blue     = 0x4DA6FFFF,
 
   -- Structural base
   border   = 0x444444FF,
@@ -298,10 +309,13 @@ function Theme.build_palette(overrides)
     P.border   = overrides.border   or read_theme_color("col_main_3dhl", FANCY_PALETTE.border)
   end
 
-  -- Semantic base colors
-  P.green  = overrides.green  or FANCY_PALETTE.green
-  P.red    = overrides.red    or FANCY_PALETTE.red
-  P.yellow = overrides.yellow or FANCY_PALETTE.yellow
+  -- Semantic base colors & secondary accent
+  P.green   = overrides.green   or FANCY_PALETTE.green
+  P.red     = overrides.red     or FANCY_PALETTE.red
+  P.yellow  = overrides.yellow  or FANCY_PALETTE.yellow
+  local blue_base = overrides.accent2 or overrides.blue or FANCY_PALETTE.blue
+  P.blue    = blue_base
+  P.accent2 = blue_base
 
   -- Derive semantic states from base colors (consistent 80% / 33% ratios)
   P.green_h = overrides.green_h or with_alpha(P.green, 0.80)
@@ -309,13 +323,29 @@ function Theme.build_palette(overrides)
   P.red_h   = overrides.red_h   or with_alpha(P.red, 0.80)
   P.red_d   = overrides.red_d   or with_alpha(P.red, 0.33)
 
-  -- Derive accent states from the resolved accent color
+  -- Derive secondary accent / blue states (consistent 80% / 33% / 12.5% ratios)
+  P.blue_h    = overrides.blue_h    or overrides.accent2_h or with_alpha(P.blue, 0.80)
+  P.blue_d    = overrides.blue_d    or overrides.accent2_d or with_alpha(P.blue, 0.33)
+  P.blue_e    = overrides.blue_e    or overrides.accent2_e or with_alpha(P.blue, 0.125)
+  P.accent2_h = P.blue_h
+  P.accent2_d = P.blue_d
+  P.accent2_e = P.blue_e
+
+  -- Derive accent states from the resolved primary accent color
   -- accent_h = Hover state (80% alpha): ButtonHovered, HeaderHovered, FrameBgActive, SeparatorHovered, ScrollbarGrabHovered
   P.accent_h = overrides.accent_h or with_alpha(P.accent, 0.80)
   -- accent_d = Dim/default state (33% alpha): Button, Header, FrameBgHovered, ScrollbarGrab
   P.accent_d = overrides.accent_d or with_alpha(P.accent, 0.33)
   -- accent_e = Extra-dim (12.5% alpha): TableBorderLight — subtle structural lines
   P.accent_e = overrides.accent_e or with_alpha(P.accent, 0.125)
+
+  -- High-contrast text states (lightened 70% toward white for badges, active states, and dense grids)
+  P.accent_l  = overrides.accent_l  or lighten(P.accent, 0.70)
+  P.accent2_l = overrides.accent2_l or overrides.blue_l or lighten(P.accent2, 0.70)
+  P.blue_l    = P.accent2_l
+  P.green_l   = overrides.green_l   or lighten(P.green, 0.70)
+  P.red_l     = overrides.red_l     or lighten(P.red, 0.70)
+  P.yellow_l  = overrides.yellow_l  or lighten(P.yellow, 0.70)
 
   -- Derive structural colors
   -- sep = Separator lines (20% accent): Separator
@@ -1119,7 +1149,7 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
     bg       = opts.active_bg     or P.accent_d
     bg_h     = opts.active_hover  or P.accent_h
     bg_a     = opts.active_active or P.accent
-    text_col = opts.active_text   or P.accent
+    text_col = opts.active_text   or P.accent_l
   else
     bg       = opts.inactive_bg     or P.card
     bg_h     = opts.inactive_hover  or P.panel
@@ -1181,8 +1211,9 @@ Theme.badge_button = Theme.toggle_button
 --- @param opts table|nil  Optional configuration:
 ---   opts.preset         (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
 ---   opts.fonts          (table)   Font table from Theme.create_fonts() (for preset font)
----   opts.color          (number)  Text and accent color (default: palette.accent)
----   opts.bg             (number)  Background color (default: 20% alpha of color or palette.card)
+---   opts.color          (number)  Semantic base color (auto-derives 70% lightened text & 33% bg)
+---   opts.text_color     (number)  Explicit text color override (default: 70% lightened color or palette.accent_l)
+---   opts.bg             (number)  Explicit background color override (default: 33% alpha of color)
 ---   opts.w              (number)  Badge width (default: 0 = auto from text + frame padding)
 ---   opts.h              (number)  Badge height (default: 0 = auto from font + frame padding)
 ---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
@@ -1201,10 +1232,11 @@ function Theme.badge(ctx, label, opts)
   if preset == "small" or preset == "sm" then preset = L.btn_sm end
   if preset == "large" or preset == "lg" then preset = L.btn_lg end
 
-  local text_col = opts.color or P.accent
-  local bg = opts.bg or with_alpha(text_col, 0.20)
-  local bg_h = opts.bg_hover or with_alpha(text_col, 0.35)
-  local bg_a = opts.bg_active or with_alpha(text_col, 0.50)
+  local base_color = opts.color or P.accent
+  local text_col   = opts.text_color or (opts.color and lighten(opts.color, 0.70) or P.accent_l)
+  local bg         = opts.bg or with_alpha(base_color, 0.33)
+  local bg_h       = opts.bg_hover or with_alpha(base_color, 0.50)
+  local bg_a       = opts.bg_active or base_color
 
   local btn_w = opts.w or 0
   local btn_h = opts.h or 0

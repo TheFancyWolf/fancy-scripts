@@ -1791,10 +1791,6 @@ local _current_proj = ""
 
 local function draw_main()
   local P = Theme.get_palette()
-  local green_light  = Theme.lighten(P.green, 0.45)
-  local accent_light = Theme.lighten(P.accent, 0.45)
-  local red_light    = Theme.lighten(P.red, 0.45)
-
   local nc, nv = Theme.push(ctx, P)
   local pushed_default = Theme.push_font(ctx, fonts.default)
 
@@ -1913,11 +1909,11 @@ local function draw_main()
           active_bg      = P.red_d,
           active_hover   = P.red_h,
           active_active  = P.red,
-          active_text    = red_light,
+          active_text    = P.red_l,
           inactive_bg    = P.green_d,
           inactive_hover = P.green_h,
           inactive_active= P.green,
-          inactive_text  = green_light,
+          inactive_text  = P.green_l,
         }) then
           paused = not paused
         end
@@ -1929,7 +1925,7 @@ local function draw_main()
           active_bg      = P.red_d,
           active_hover   = P.red_h,
           active_active  = P.red,
-          active_text    = red_light,
+          active_text    = P.red_l,
         }) and not no_links then
           links = {}
           link_sel = {}
@@ -1958,7 +1954,7 @@ local function draw_main()
             active_bg      = P.red_d,
             active_hover   = P.red_h,
             active_active  = P.red,
-            active_text    = red_light,
+            active_text    = P.red_l,
           }) then
             local new_links = {}
             for i = 1, #links do
@@ -2179,7 +2175,7 @@ local function draw_main()
                   -- Track B
                   reaper.ImGui_TableSetColumnIndex(ctx, 1)
                   Theme.align(ctx, row_h)
-                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
+                  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent2)
                   reaper.ImGui_Text(ctx, lk.b_name)
                   reaper.ImGui_PopStyleColor(ctx, 1)
 
@@ -2195,7 +2191,7 @@ local function draw_main()
                       w = bar_w,
                       preset = L.btn_sm,
                       fonts = fonts,
-                      color = green_light,
+                      color = P.green_l,
                       bg = P.green_d,
                       id = "va",
                     })
@@ -2204,14 +2200,14 @@ local function draw_main()
                       w = bar_w,
                       preset = L.btn_sm,
                       fonts = fonts,
-                      color = accent_light,
-                      bg = P.accent_d,
+                      color = P.accent2_l,
+                      bg = P.accent2_d,
                       id = "vb",
                     })
                   else
                     Theme.align(ctx, row_h, L.btn_sm.h)
                     Theme.badge(ctx, "OFFLINE", {
-                      color = P.red,
+                      color = P.red_l,
                       bg = P.red_d,
                       w = -1,
                       preset = L.btn_sm,
@@ -2232,11 +2228,11 @@ local function draw_main()
                     active_bg      = P.accent_d,
                     active_hover   = P.accent_h,
                     active_active  = P.accent,
-                    active_text    = accent_light,
+                    active_text    = P.accent_l,
                     inactive_bg    = P.green_d,
                     inactive_hover = P.green_h,
                     inactive_active= P.green,
-                    inactive_text  = green_light,
+                    inactive_text  = P.green_l,
                   }) then
                     lk.mode = is_inv and "follow" or "inverse"
                     lk.last_a = nil

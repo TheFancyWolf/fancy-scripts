@@ -234,28 +234,48 @@ local function draw_colors_section()
     { "text_dim", P.text_dim },
   }, "Primary and secondary text")
 
-  swatch_row("Accent", {
+  swatch_row("Accent — Primary", {
     { "accent",   P.accent },
     { "accent_h", P.accent_h },
     { "accent_d", P.accent_d },
     { "accent_e", P.accent_e },
-  }, "active → hover (80%) → default (33%) → subtle (12%)")
+    { "accent_l", P.accent_l },
+  }, "active → hover (80%) → default (33%) → subtle (12%) → light text (70%)")
+
+  swatch_row("Accent — Secondary (Blue)", {
+    { "accent2",   P.accent2 },
+    { "accent2_h", P.accent2_h },
+    { "accent2_d", P.accent2_d },
+    { "accent2_e", P.accent2_e },
+    { "accent2_l", P.accent2_l },
+  }, "Secondary accent, info, badge highlights (aliased to blue)")
 
   swatch_row("Semantic — Green", {
     { "green",   P.green },
     { "green_h", P.green_h },
     { "green_d", P.green_d },
-  }, "Success, enabled, positive actions")
+    { "green_l", P.green_l },
+  }, "Success, enabled, positive actions (green_l = 70% lightened text)")
 
   swatch_row("Semantic — Red", {
     { "red",   P.red },
     { "red_h", P.red_h },
     { "red_d", P.red_d },
-  }, "Error, delete, destructive actions")
+    { "red_l", P.red_l },
+  }, "Error, delete, destructive actions (red_l = 70% lightened text)")
 
   swatch_row("Semantic — Yellow", {
-    { "yellow", P.yellow },
-  }, "Warning, caution, pending states")
+    { "yellow",   P.yellow },
+    { "yellow_l", P.yellow_l },
+  }, "Warning, caution, pending states (yellow_l = 70% lightened text)")
+
+  swatch_row("Semantic — Blue", {
+    { "blue",   P.blue },
+    { "blue_h", P.blue_h },
+    { "blue_d", P.blue_d },
+    { "blue_e", P.blue_e },
+    { "blue_l", P.blue_l },
+  }, "Info, links, secondary accent (aliased to accent2)")
 
   swatch_row("Structural", {
     { "border", P.border },
@@ -637,11 +657,11 @@ local function draw_widgets_section()
     active_bg      = P.accent_d,
     active_hover   = P.accent_h,
     active_active  = P.accent,
-    active_text    = Theme.lighten(P.accent, 0.45),
+    active_text    = P.accent_l,
     inactive_bg    = P.green_d,
     inactive_hover = P.green_h,
     inactive_active= P.green,
-    inactive_text  = Theme.lighten(P.green, 0.45),
+    inactive_text  = P.green_l,
     tooltip = "Click to toggle mode",
   }) then
     demo_mode_active = not demo_mode_active
@@ -656,7 +676,7 @@ local function draw_widgets_section()
     active_bg      = P.accent_d,
     active_hover   = P.accent_h,
     active_active  = P.accent,
-    active_text    = P.accent,
+    active_text    = P.accent_l,
     inactive_bg    = P.card,
     inactive_hover = P.panel,
     inactive_active= P.accent_d,
@@ -675,6 +695,8 @@ local function draw_widgets_section()
   reaper.ImGui_Text(ctx, "Status Badges:")
   reaper.ImGui_SameLine(ctx, 0, L.md)
   Theme.badge(ctx, "ACTIVE", { color = P.green, tooltip = "Online and running" })
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.badge(ctx, "INFO", { color = P.blue, tooltip = "Informational status (secondary accent)" })
   reaper.ImGui_SameLine(ctx, 0, L.sm)
   Theme.badge(ctx, "INVERSE", { color = P.accent, tooltip = "Inverse tracking mode" })
   reaper.ImGui_SameLine(ctx, 0, L.sm)
@@ -713,11 +735,11 @@ local function draw_widgets_section()
     active_bg      = P.accent_d,
     active_hover   = P.accent_h,
     active_active  = P.accent,
-    active_text    = Theme.lighten(P.accent, 0.45),
+    active_text    = P.accent_l,
     inactive_bg    = P.green_d,
     inactive_hover = P.green_h,
     inactive_active= P.green,
-    inactive_text  = Theme.lighten(P.green, 0.45),
+    inactive_text  = P.green_l,
   }) then
     demo_mode_active = not demo_mode_active
   end

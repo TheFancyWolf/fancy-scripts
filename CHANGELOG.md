@@ -22,13 +22,18 @@ All notable changes to Fancy Scripts will be documented here.
   - Unified scale extended to `xxl=24` and `xxxl=32`
   - Streamlined theme modes to 2: **Fancy Dark** (curated palette) and **Match Theme** (extracts surfaces, text, borders, and edit cursor accent `col_cursor` from REAPER)
   - All layout tokens (`rounding`, `icon_sm/md/lg`, `row_h`, `chk_col_w`, `indent`, `section_gap`) strictly derive from scale tokens; dropdowns and combo boxes calculate reactive width dynamically via `Theme.calc_combo_width()`
-  - `FANCY_PALETTE` simplified to base colors; derived states (`accent_h/d/e`, `green_h/d`, `red_h/d`) computed dynamically with consistent alpha ratios (80% / 33%)
+  - Added blue secondary accent color `accent2` / `blue` (`0x4DA6FFFF`) to `FANCY_PALETTE` with derived states `accent2_h`/`blue_h` (80%), `accent2_d`/`blue_d` (33%), and `accent2_e`/`blue_e` (12.5%) for info indicators, links, and secondary badge highlights
+  - `FANCY_PALETTE` simplified to base colors; derived states (`accent_h/d/e`, `accent2_h/d/e`, `green_h/d`, `red_h/d`, `blue_h/d/e`) computed dynamically with consistent alpha ratios (80% / 33% / 12.5%)
   - Safe color math: `icon_btn` hover uses `lighten()` and `section_divider` uses `with_alpha()`
-  - Added minimal template and full API token references in `theme.lua`
-- **Fancy Design System v1.2.0** — Added live interactive demonstrations for `Theme.progress_bar()`, `Theme.toggle_button()`, `Theme.badge()`, `Theme.combo()`, and `L.btn_sm` table controls, eliminated raw hex color literals
-- **Fancy Parameter Link v5.1.0** — "All" button in Link Builder to select/deselect all parameters at once
+    - Added high-contrast text tokens (`accent_l`, `accent2_l`/`blue_l`, `green_l`, `red_l`, `yellow_l`) derived via 70% lightening for WCAG AAA badge text and active controls
+    - Hardened `Theme.badge()` and `Theme.toggle_button()` defaults to automatically derive high-contrast text and 33% alpha background from base semantic colors
+- **Fancy Design System v1.2.0** — Added live interactive demonstrations for `Theme.progress_bar()`, `Theme.toggle_button()`, `Theme.badge()`, `Theme.combo()`, `_l` high-contrast text tokens, and `L.btn_sm` table controls, secondary accent / blue swatches and info badges, eliminated raw hex color literals
+- **Fancy Parameter Link v5.2.0** — Updated Track B name labels and Track B Live Values indicators to use the secondary accent color (`P.accent2` / `P.blue`), and transitioned all badges and toolbar buttons to first-class `P.*_l` high-contrast palette tokens
 
 ### Fixed
+- **UI Legibility & WCAG Contrast Hardening**:
+  - Added first-class `_l` palette tokens (70% lightened text) and updated `Theme.badge()` / `Theme.toggle_button()` defaults to eliminate low-contrast badge text (boosting contrast ratios from ~3.3:1 – 5.5:1 up to 6.5:1 – 8.1:1, passing WCAG AAA on toolbar action buttons and badges)
+  - Fixed `OFFLINE` status badge in `Fancy_Parameter Link.lua` to automatically use `P.red_l` / high-contrast red instead of unlightened `P.red` (raising contrast from 3.3:1 to 7.5:1)
 - **Section Dividers & Info Tooltips (`_lib/theme.lua`)**:
   - Increased default info icon size in `Theme.section_divider()` from `icon_sm` (8px) to `icon_md` (12px) for improved visibility and legibility next to section titles (e.g. Tracks, Plugin, Link Builder)
   - Added vertical alignment using `Theme.align()` to align the section title baseline and center the info button within the frame height
