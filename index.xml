@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="5c181bfea4e4dbde02022c0bfa788619461e4698">
+<index version="1" name="Fancy Scripts" commit="032b0138404b4b5dff9f43a55c2e737fec9ddb76">
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
