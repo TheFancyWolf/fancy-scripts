@@ -129,4 +129,33 @@ function Utils.format_db(val)
   return string.format("%.1f dB", db)
 end
 
+-------------------------------------------------------------------------------
+-- 6. TOOLBAR & ACTION HELPERS
+-------------------------------------------------------------------------------
+
+--- Initializes and manages REAPER toolbar toggle state for the running script.
+--- Sets state to 1 (active) on startup, and automatically hooks atexit to reset state to 0 (inactive).
+--- @return function  A cleanup function that manually turns off the toggle state
+function Utils.init_toolbar_toggle()
+  local _, _, sec_id, cmd_id = reaper.get_action_context()
+  if not sec_id or not cmd_id or cmd_id <= 0 then
+    return function() end
+  end
+
+  reaper.SetToggleCommandState(sec_id, cmd_id, 1)
+  reaper.RefreshToolbar2(sec_id, cmd_id)
+
+  local cleaned = false
+  local function cleanup()
+    if cleaned then return end
+    cleaned = true
+    reaper.SetToggleCommandState(sec_id, cmd_id, 0)
+    reaper.RefreshToolbar2(sec_id, cmd_id)
+  end
+
+  reaper.atexit(cleanup)
+  return cleanup
+end
+
 return Utils
+

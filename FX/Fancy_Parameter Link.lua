@@ -1,10 +1,9 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.2.0
+-- @version 5.3.0
 -- @changelog
---   + Full migration to shared Theme engine and design tokens (_lib/theme.lua)
---   + Reactive theme mode switching (Fancy Dark / Match REAPER Theme) in Settings
---   + Standardized Theme.header, icons, widgets, and layout scale
+--   + Bundled 1x and 2x Retina toolbar icons (toolbar_fancy_parameter_link.png)
+--   + Active toolbar button state while script is running
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
 --   Features: multi-track selector, auto group-scan for same plugin, full-mesh linking,
@@ -16,6 +15,9 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [data] ../toolbar_icons/toolbar_fancy_parameter_link.png > toolbar_icons/toolbar_fancy_parameter_link.png
+--   [data] ../toolbar_icons/150/toolbar_fancy_parameter_link.png > toolbar_icons/150/toolbar_fancy_parameter_link.png
+--   [data] ../toolbar_icons/200/toolbar_fancy_parameter_link.png > toolbar_icons/200/toolbar_fancy_parameter_link.png
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -39,6 +41,7 @@ package.path = script_dir .. "../_lib/?.lua;" .. package.path
 
 local Theme = require("theme")
 local JSON  = require("json")
+local Utils = require("utils")
 
 -------------------------------------------------------------------------------
 -- 3. STATE & CONFIGURATION
@@ -2335,6 +2338,7 @@ end
 -- 13. ENTRY POINT
 -------------------------------------------------------------------------------
 local function main()
+  Utils.init_toolbar_toggle()
   load_links()
   load_presets()
   load_settings()

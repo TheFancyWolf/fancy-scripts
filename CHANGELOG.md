@@ -8,7 +8,8 @@ All notable changes to Fancy Scripts will be documented here.
 - **Shared Library (`_lib/`)** — shared modules loaded via `require()`
   - `theme.lua` — 2-mode palette builder (Fancy Dark / Match Theme), shared font management, ImGui push/pop, settings combo widget
   - `json.lua` — lightweight JSON encoder/decoder (consolidated from inline copies)
-  - `utils.lua` — dependency checks, undo block wrapper, track helpers, math utilities
+  - `utils.lua` — dependency checks, undo block wrapper, track helpers, math utilities, REAPER toolbar toggle state lifecycle helper (`Utils.init_toolbar_toggle()`)
+- **Fancy Parameter Link v5.3.0** — Bundled custom 3-state horizontal strip toolbar icons across 100% (`90x30`), 150% (`135x45` in `150/`), and 200% Retina (`180x60` in `200/`), enabled automatic ReaPack `[data]` extraction to REAPER's `Data/toolbar_icons/`, and hooked action toggle command state to light up the toolbar icon while the script is active and running.
 - **Design System & Theme Engine**
   - Added `Theme.header(ctx, opts)` composite widget to standardize window headers with brand icon, title, subtitle, theme dropdown, and close button with pixel-perfect alignment
   - Added `Theme.progress_bar(ctx, fraction, [opts])` for crisp value meters and progress indicators with preset support (`opts.preset = L.btn_sm`)
