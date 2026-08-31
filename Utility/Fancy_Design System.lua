@@ -50,11 +50,12 @@ local P = Theme.build_palette()
 local L = Theme.layout
 
 -- Interactive widget demo state
-local demo_prog_val     = 0.65
-local demo_badge_active = true
-local demo_mode_active  = false
-local demo_combo_items  = { "Pro-Q 4 (FabFilter)", "Ozone 11 (iZotope)", "Decapitator (Soundtoys)", "ValhallaVintageVerb" }
-local demo_combo_sel    = 1
+local demo_prog_val        = 0.65
+local demo_badge_active    = true
+local demo_mode_active     = false
+local demo_combo_items     = { "Pro-Q 4 (FabFilter)", "Ozone 11 (iZotope)", "Decapitator (Soundtoys)", "ValhallaVintageVerb" }
+local demo_combo_sel       = 1
+local demo_multi_combo_sel = { [1] = true, [3] = true }
 
 -- Script-specific layout — uses Theme.layout values as building blocks
 local UI = {
@@ -777,6 +778,24 @@ local function draw_widgets_section()
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
   reaper.ImGui_Text(ctx, string.format("(Selected index: %d)", demo_combo_sel))
   reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.xxxl)
+
+  -- multi_combo
+  Theme.section_divider(ctx, "Theme.multi_combo(ctx, id, items, selected, [opts])", {
+    tooltip = "Standardized multi-select combo with full-row clicking, hover highlights, and compact density.",
+  })
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Multi-Selector:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  local t_idx, is_sel, chg_multi = Theme.multi_combo(ctx, "##demo_multi_combo_box", demo_combo_items, demo_multi_combo_sel, {
+    w = 260,
+    show_count = true,
+    placeholder = "+ Select items...",
+    tooltip = "Click any row to toggle selection",
+  })
+  if chg_multi and t_idx then
+    demo_multi_combo_sel[t_idx] = is_sel or nil
+  end
   vspace(L.xxxl)
 
   -- center_next_window

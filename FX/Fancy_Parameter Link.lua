@@ -999,49 +999,51 @@ end
 -------------------------------------------------------------------------------
 local function draw_track_selector(tlist)
   local P = Theme.get_palette()
-  -- Action row: Add Tracks combo + Use Selected on same line
+  -- Action row: Add Tracks multi-combo + Use Selected on same line
   local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
-  local use_sel_w = 90
+  local use_sel_text = "Use Selected"
+  local text_w = reaper.ImGui_CalcTextSize(ctx, use_sel_text)
+  local use_sel_w = math.ceil(text_w + L.md * 2)
   local combo_w = avail_w - use_sel_w - L.md
 
-  reaper.ImGui_SetNextItemWidth(ctx, combo_w)
-  if reaper.ImGui_BeginCombo(ctx, "##add_track", "+ Add Tracks...") then
-    for j, t in ipairs(tlist) do
-      -- Check if already selected
+  local toggled_idx, is_now_selected = Theme.multi_combo(ctx, "##add_track", tlist, S.tracks, {
+    w = combo_w,
+    placeholder = "+ Add Tracks...",
+    preview = "+ Add Tracks...",
+  })
+
+  if toggled_idx then
+    if is_now_selected then
       local already = false
-      local sel_idx = nil
-      for si, ti in ipairs(S.tracks) do
-        if ti == j then already = true; sel_idx = si; break end
+      for _, ti in ipairs(S.tracks) do
+        if ti == toggled_idx then already = true; break end
       end
-      local changed, new_val = reaper.ImGui_Checkbox(ctx, t.name .. "##addtr" .. j, already)
-      if changed then
-        if not new_val and sel_idx then
-          -- Deselect: remove from tracks
-          table.remove(S.tracks, sel_idx)
-        elseif new_val and not already then
-          -- Select: add to tracks
-          S.tracks[#S.tracks + 1] = j
+      if not already then S.tracks[#S.tracks + 1] = toggled_idx end
+    else
+      for si, ti in ipairs(S.tracks) do
+        if ti == toggled_idx then
+          table.remove(S.tracks, si)
+          break
         end
-        compute_shared_fxs()
-        -- Try to preserve FX selection
-        local cur_name = (S.fi > 0 and S.fxs[S.fi]) and S.fxs[S.fi].name or nil
-        if cur_name then
-          S.fi = 0
-          for fi, f in ipairs(S.fxs) do
-            if f.name == cur_name then S.fi = fi; break end
-          end
-        else
-          S.fi = 0
-        end
-        M.scanned = false
-        M.groups = {}
       end
     end
-    reaper.ImGui_EndCombo(ctx)
+    compute_shared_fxs()
+    -- Try to preserve FX selection
+    local cur_name = (S.fi > 0 and S.fxs[S.fi]) and S.fxs[S.fi].name or nil
+    if cur_name then
+      S.fi = 0
+      for fi, f in ipairs(S.fxs) do
+        if f.name == cur_name then S.fi = fi; break end
+      end
+    else
+      S.fi = 0
+    end
+    M.scanned = false
+    M.groups = {}
   end
 
   reaper.ImGui_SameLine(ctx, 0, L.md)
-  if reaper.ImGui_Button(ctx, "Use Selected", use_sel_w, 0) then
+  if reaper.ImGui_Button(ctx, use_sel_text, use_sel_w, 0) then
     S.tracks = {}
     local n_sel = reaper.CountSelectedTracks(0)
     for i = 0, n_sel - 1 do
@@ -1062,7 +1064,7 @@ local function draw_track_selector(tlist)
     M.groups = {}
   end
 
-  reaper.ImGui_Spacing(ctx)
+  reaper.ImGui_Dummy(ctx, 0, L.sm)
 
   -- Collapsible track list (below action buttons)
   if #S.tracks == 0 then

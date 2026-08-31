@@ -81,6 +81,7 @@
 --   push_button_preset(ctx, fonts, preset)     -> var_count, pushed_font (e.g. for sliders, combos)
 --   pop_button_preset(ctx, var_count, pfont)   Pops styling pushed by push_button_preset
 --   combo(ctx, id, items, selected_idx, [opts]) Standardized combo box (opts: w, placeholder, get_label)
+--   multi_combo(ctx, id, items, sel, [opts])   Standardized multi-select combo (compact, full-row hover/click)
 --   header(ctx, opts)                          Standardized window header bar (title, FANCY prefix, settings, close)
 --   center_next_window(ctx, w, h)
 --   brand_icon(ctx, [size], [target_h])
@@ -1355,6 +1356,146 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
   end
 
   return new_idx, changed
+end
+
+-- Helpers for Theme.multi_combo
+local function _is_item_selected(selected, item, idx, get_id_fn)
+  if not selected then return false end
+  local t = type(selected)
+  if t == "function" then
+    return selected(item, idx) == true
+  end
+  if t == "table" then
+    if selected[idx] == true then return true end
+    if get_id_fn then
+      local id_val = get_id_fn(item, idx)
+      if id_val ~= nil and selected[id_val] == true then return true end
+    end
+    if type(item) == "table" then
+      if item.guid and selected[item.guid] == true then return true end
+      if item.id and selected[item.id] == true then return true end
+      if item.checked == true then return true end
+    end
+    for _, v in ipairs(selected) do
+      if v == idx then return true end
+      if type(item) == "table" and (v == item.guid or v == item.id or v == item) then
+        return true
+      end
+    end
+  end
+  return false
+end
+
+local function _count_selected(items, selected, get_id_fn)
+  local count = 0
+  for i, item in ipairs(items) do
+    if _is_item_selected(selected, item, i, get_id_fn) then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+--- Renders a standardized, compact multi-select combo box.
+--- Supports full-row clicking, hover highlights, and compact density.
+--- Does not close the popup on item selection unless opts.close_on_select is true.
+---
+--- @param ctx userdata  ImGui context
+--- @param id string  Unique combo ID (e.g. "##add_tracks")
+--- @param items table  Array of items (strings or tables)
+--- @param selected table|function|nil  Selection state (index map, array of indices/GUIDs, or predicate)
+--- @param opts table|nil  Optional configuration:
+---   opts.w               (number)   Combo width override (default: full available width)
+---   opts.placeholder     (string)   Placeholder text when no items selected (default: "-- Select --")
+---   opts.preview         (string|function) Preview text override or custom function(selected_count, total_count) -> string
+---   opts.show_count      (boolean)  If true, formats preview as "N Selected" / "All Selected"
+---   opts.get_label       (function) Custom function(item, idx) -> string
+---   opts.get_id          (function) Custom function(item, idx) -> id
+---   opts.disabled        (boolean)  Whether the combo is disabled
+---   opts.tooltip         (string)   Hover tooltip text
+---   opts.compact         (boolean)  Use tight vertical padding inside popup (default: true)
+---   opts.close_on_select (boolean)  Close popup after selecting an item (default: false)
+---   opts.check_mark      (string)   Prefix for selected items (default: "\xe2\x9c\x93 ")
+--- @return number|nil toggled_idx  1-based index of the toggled item, or nil if no interaction
+--- @return boolean|nil is_now_selected  New boolean selection state of the toggled item
+--- @return boolean changed  Whether a selection was modified this frame
+function Theme.multi_combo(ctx, id, items, selected, opts)
+  opts = opts or {}
+  items = items or {}
+
+  if opts.disabled then
+    reaper.ImGui_BeginDisabled(ctx)
+  end
+
+  if opts.w then
+    reaper.ImGui_SetNextItemWidth(ctx, opts.w)
+  end
+
+  local L = Theme.layout
+  local total_count = #items
+  local sel_count = _count_selected(items, selected, opts.get_id)
+
+  local preview = opts.placeholder or "-- Select --"
+  if opts.preview then
+    if type(opts.preview) == "function" then
+      preview = opts.preview(sel_count, total_count)
+    else
+      preview = tostring(opts.preview)
+    end
+  elseif opts.show_count and sel_count > 0 then
+    if sel_count == total_count and total_count > 1 then
+      preview = "All (" .. total_count .. ") Selected"
+    else
+      preview = sel_count .. " Selected"
+    end
+  end
+
+  local toggled_idx = nil
+  local is_now_selected = nil
+  local changed = false
+
+  if reaper.ImGui_BeginCombo(ctx, id, preview) then
+    local pushed_vars = 0
+    if opts.compact ~= false then
+      reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(), L.md, L.xs)
+      reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(), L.sm, L.xs)
+      pushed_vars = 2
+    end
+
+    local sel_flags = opts.close_on_select and reaper.ImGui_SelectableFlags_None()
+                      or (reaper.ImGui_SelectableFlags_NoAutoClosePopups and reaper.ImGui_SelectableFlags_NoAutoClosePopups() or reaper.ImGui_SelectableFlags_None())
+    local check_prefix = opts.check_mark or "\xe2\x9c\x93 "
+    local blank_prefix = "   "
+
+    for i, item in ipairs(items) do
+      local is_sel = _is_item_selected(selected, item, i, opts.get_id)
+      local prefix = is_sel and check_prefix or blank_prefix
+      local label_text = _get_combo_item_label(item, i, opts.get_label)
+      local row_label = prefix .. label_text .. "##mitem_" .. i
+
+      if reaper.ImGui_Selectable(ctx, row_label, is_sel, sel_flags) then
+        toggled_idx = i
+        is_now_selected = not is_sel
+        changed = true
+      end
+    end
+
+    if pushed_vars > 0 then
+      reaper.ImGui_PopStyleVar(ctx, pushed_vars)
+    end
+
+    reaper.ImGui_EndCombo(ctx)
+  end
+
+  if opts.disabled then
+    reaper.ImGui_EndDisabled(ctx)
+  end
+
+  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+    Theme.tooltip(ctx, opts.tooltip)
+  end
+
+  return toggled_idx, is_now_selected, changed
 end
 
 --- Centers the next ImGui window on the active window (or viewport if none is active).
