@@ -970,20 +970,82 @@ end
 --- Renders a standardized collapsing header widget.
 --- Encapsulates ReaImGui's argument order and default flags to prevent
 --- argument-misalignment bugs (such as accidental close buttons).
+--- Supports optional right-aligned close/action button.
 ---
 --- @param ctx userdata  ImGui context
 --- @param label string  Section header label text
 --- @param opts table|nil  Optional configuration:
----   opts.default_open (boolean) Whether the header starts expanded (default: false)
----   opts.flags        (integer) Additional ImGui TreeNodeFlags
---- @return boolean  true if the section is expanded and its content should be rendered
+---   opts.default_open (boolean)  Whether the header starts expanded (default: false)
+---   opts.flags        (integer)  Additional ImGui TreeNodeFlags
+---   opts.close_id     (string)   Optional ID to render an inline close/clear button on the right
+---   opts.close_tooltip(string)   Tooltip for the close button (e.g. "Clear all")
+---   opts.close_color  (integer)  Close icon color override (default: palette.text_dim)
+---   opts.close_w      (number)   Close button width override
+---   opts.close_h      (number)   Close button height override
+---   opts.on_close     (function) Callback when close button is clicked
+---   opts.action_fn    (function) Custom right-aligned action renderer function(ctx)
+---   opts.margin       (number)   Right margin for close/action button (default: Theme.layout.sm)
+--- @return boolean is_open, boolean close_clicked
 function Theme.collapsing_header(ctx, label, opts)
   opts = opts or {}
   local flags = opts.flags or reaper.ImGui_TreeNodeFlags_None()
   if opts.default_open then
     flags = flags | reaper.ImGui_TreeNodeFlags_DefaultOpen()
   end
-  return reaper.ImGui_CollapsingHeader(ctx, label, nil, flags)
+  local has_action = (opts.close_id ~= nil) or (opts.on_close ~= nil) or (opts.action_fn ~= nil)
+  if has_action or opts.allow_overlap then
+    local overlap_flag = (reaper.ImGui_TreeNodeFlags_AllowOverlap and reaper.ImGui_TreeNodeFlags_AllowOverlap())
+                      or (reaper.ImGui_TreeNodeFlags_AllowItemOverlap and reaper.ImGui_TreeNodeFlags_AllowItemOverlap())
+                      or 0
+    flags = flags | overlap_flag
+  end
+
+  local cur_y = reaper.ImGui_GetCursorPosY(ctx)
+  local screen_x, screen_y = reaper.ImGui_GetCursorScreenPos(ctx)
+  local frame_h = reaper.ImGui_GetFrameHeight(ctx)
+  local P = _get_palette()
+  local L = Theme.layout
+
+  local visible_label = label:match("^(.-)##") or label
+  local id = label:match("##(.+)$") or label
+
+  local is_open = reaper.ImGui_CollapsingHeader(ctx, "##ch_" .. id, nil, flags)
+  local next_y = reaper.ImGui_GetCursorPosY(ctx)
+
+  -- Precise 8px visual gap after arrow (arrow right edge is at ~18px -> text at 26px)
+  local text_offset_x = opts.text_offset or (L.md + 10 + L.md)
+  local _, text_h = reaper.ImGui_CalcTextSize(ctx, visible_label)
+  local text_y = screen_y + math.floor((frame_h - text_h) * 0.5)
+  local dl = reaper.ImGui_GetWindowDrawList(ctx)
+  reaper.ImGui_DrawList_AddText(dl, screen_x + text_offset_x, text_y, P.text, visible_label)
+
+  local close_clicked = false
+  if has_action then
+    local preset = opts.preset or L.icon_sm
+    local btn_w = opts.close_w or (preset.size + preset.pad * 2)
+    local btn_h = opts.close_h or btn_w
+
+    reaper.ImGui_SameLine(ctx, 0, 0)
+    Theme.right_align(ctx, btn_w, opts.margin or L.sm)
+    reaper.ImGui_SetCursorPosY(ctx, cur_y + math.floor((frame_h - btn_h) * 0.5))
+
+    if opts.action_fn then
+      opts.action_fn(ctx)
+    else
+      local btn_id = opts.close_id or ("##ch_close_" .. id)
+      if Theme.icon_btn(ctx, btn_id, Theme.icons.close, {
+        preset = preset,
+        color = opts.close_color or P.text_dim,
+        tooltip = opts.close_tooltip,
+      }) then
+        close_clicked = true
+        if opts.on_close then opts.on_close() end
+      end
+    end
+    reaper.ImGui_SetCursorPosY(ctx, next_y)
+  end
+
+  return is_open, close_clicked
 end
 
 --- Pushes button preset styling (FramePadding and font) onto the stack.
@@ -1297,6 +1359,66 @@ local function _get_combo_item_label(item, idx, custom_fn)
   return tostring(item)
 end
 
+--- Renders a selectable item with rounded highlight corners matching the design system.
+--- Replaces native square-cornered Selectables.
+---
+--- @param ctx userdata  ImGui context
+--- @param label string  Selectable label (can include ##ID)
+--- @param is_selected boolean|nil  Whether item is selected (default: false)
+--- @param flags integer|nil  ImGui SelectableFlags (default: None)
+--- @param w number|nil  Width (default: 0 = full available width)
+--- @param h number|nil  Height (default: 0 = frame/row height)
+--- @param opts table|nil  Optional overrides:
+---   opts.rounding (number) Corner rounding radius (default: Theme.layout.rounding)
+---   opts.bg_hover (number) Hover color (default: palette.accent_d)
+---   opts.bg_sel   (number) Selected color (default: palette.accent_h)
+---   opts.text_col (number) Text color override
+---   opts.pad_x    (number) Left padding for text (default: Theme.layout.sm)
+--- @return boolean clicked
+function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
+  opts = opts or {}
+  local P = _get_palette()
+  local L = Theme.layout
+  local rounding = opts.rounding or L.rounding
+  local bg_hover = opts.bg_hover or P.accent_h
+  local bg_sel   = opts.bg_sel   or P.accent_d
+  local sel_state = is_selected == true
+
+  local visible_label = label:match("^(.-)##") or label
+  local id = label:match("##(.+)$") or label
+
+  -- Push transparent header colors to suppress native square highlights
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),        0)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(), 0)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),  0)
+
+  local clicked = reaper.ImGui_Selectable(ctx, "##sel_" .. id, sel_state, flags or reaper.ImGui_SelectableFlags_None(), w or 0, h or 0)
+  local is_hovered = reaper.ImGui_IsItemHovered(ctx)
+
+  reaper.ImGui_PopStyleColor(ctx, 3)
+
+  local rx1, ry1 = reaper.ImGui_GetItemRectMin(ctx)
+  local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
+  local dl = reaper.ImGui_GetWindowDrawList(ctx)
+
+  -- 1. Draw rounded background highlight (using Theme.layout.rounding)
+  if is_hovered or sel_state then
+    local bg = sel_state and (is_hovered and P.accent or bg_sel) or bg_hover
+    reaper.ImGui_DrawList_AddRectFilled(dl, rx1, ry1, rx2, ry2, bg, rounding)
+  end
+
+  -- 2. Draw text on top if visible label is non-empty
+  if visible_label ~= "" then
+    local text_col = opts.text_col or (sel_state and P.accent_l or P.text)
+    local pad_x = opts.pad_x or L.sm
+    local _, th = reaper.ImGui_CalcTextSize(ctx, visible_label)
+    local ty = ry1 + math.floor(((ry2 - ry1) - th) * 0.5)
+    reaper.ImGui_DrawList_AddText(dl, rx1 + pad_x, ty, text_col, visible_label)
+  end
+
+  return clicked
+end
+
 --- Renders a standardized combo box wrapping ImGui_BeginCombo.
 --- Handles label resolution, item iteration, and selection state.
 ---
@@ -1336,7 +1458,7 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
     for i, item in ipairs(items) do
       local lbl = _get_combo_item_label(item, i, opts.get_label) .. "##item_" .. i
       local is_sel = (selected_idx == i)
-      if reaper.ImGui_Selectable(ctx, lbl, is_sel) then
+      if Theme.selectable(ctx, lbl, is_sel) then
         new_idx = i
         changed = true
       end
@@ -1473,7 +1595,7 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
       local label_text = _get_combo_item_label(item, i, opts.get_label)
       local row_label = prefix .. label_text .. "##mitem_" .. i
 
-      if reaper.ImGui_Selectable(ctx, row_label, is_sel, sel_flags) then
+      if Theme.selectable(ctx, row_label, is_sel, sel_flags) then
         toggled_idx = i
         is_now_selected = not is_sel
         changed = true
@@ -1614,7 +1736,7 @@ function Theme.settings_widget(ctx, opts)
   if reaper.ImGui_BeginCombo(ctx, combo_label, SETTINGS_LABELS[current]) then
     for i, label in ipairs(SETTINGS_LABELS) do
       local selected = (i == current)
-      if reaper.ImGui_Selectable(ctx, label, selected) then
+      if Theme.selectable(ctx, label, selected) then
         if not selected then
           Theme.set_mode(SETTINGS_VALUES[i])
           Theme.invalidate_palette()

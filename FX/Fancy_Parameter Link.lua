@@ -1072,77 +1072,81 @@ local function draw_track_selector(tlist)
   -- Collapsible track list (below action buttons)
   if #S.tracks == 0 then
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-    reaper.ImGui_Text(ctx, "  No tracks selected")
+    reaper.ImGui_TextWrapped(ctx, "No tracks selected.")
     reaper.ImGui_PopStyleColor(ctx, 1)
   else
-    -- Collapsible header row (same pattern as Active Links table)
-    local arrow = S.tracks_expanded and "\xe2\x96\xbe" or "\xe2\x96\xb8"
     local n = #S.tracks
-    local summary = string.format("%s %d track%s selected", arrow, n, n == 1 and "" or "s")
+    local hdr_label = string.format("Tracks Selected  (%d)##trk_hdr", n)
+    local is_open, clear_clicked = Theme.collapsing_header(ctx, hdr_label, {
+      default_open = S.tracks_expanded,
+      close_id = "trk_clear",
+      close_tooltip = "Clear all tracks",
+    })
+    S.tracks_expanded = is_open
 
-    if reaper.ImGui_BeginTable(ctx, "trk_hdr", 2, reaper.ImGui_TableFlags_None()) then
-      reaper.ImGui_TableSetupColumn(ctx, "##label", reaper.ImGui_TableColumnFlags_WidthStretch())
-      reaper.ImGui_TableSetupColumn(ctx, "##clear", reaper.ImGui_TableColumnFlags_WidthFixed(), UI.del_col_w)
-      reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
-
-      reaper.ImGui_TableSetColumnIndex(ctx, 0)
-      local sel_flags = reaper.ImGui_SelectableFlags_SpanAllColumns()
-                      | reaper.ImGui_SelectableFlags_AllowOverlap()
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
-      if reaper.ImGui_Selectable(ctx, summary .. "##trk_toggle", false, sel_flags, 0, L.row_h) then
-        S.tracks_expanded = not S.tracks_expanded
-      end
-      reaper.ImGui_PopStyleColor(ctx, 1)
-
-      reaper.ImGui_TableSetColumnIndex(ctx, 1)
-      Theme.align(ctx, L.row_h, L.icon_sm.size + L.icon_sm.pad * 2)
-      if Theme.icon_btn(ctx, "trk_clear", Theme.icons.close, {
-        preset = L.icon_sm,
-        color = P.text_dim,
-        tooltip = "Clear all tracks",
-      }) then
-        S.tracks = {}
-        compute_shared_fxs()
-        S.fi = 0
-        M.scanned = false
-        M.groups = {}
-        S.tracks_expanded = false
-      end
-
-      reaper.ImGui_EndTable(ctx)
+    if clear_clicked then
+      S.tracks = {}
+      compute_shared_fxs()
+      S.fi = 0
+      M.scanned = false
+      M.groups = {}
+      S.tracks_expanded = false
     end
 
-    -- Expanded: compact vertical track list
-    if S.tracks_expanded then
+    -- Expanded: track list matching Link Builder table style with right-aligned close buttons
+    if S.tracks_expanded and #S.tracks > 0 then
       local to_remove = nil
-      if reaper.ImGui_BeginTable(ctx, "trk_list", 2, reaper.ImGui_TableFlags_None()) then
-        reaper.ImGui_TableSetupColumn(ctx, "##name", reaper.ImGui_TableColumnFlags_WidthStretch())
-        reaper.ImGui_TableSetupColumn(ctx, "##del",  reaper.ImGui_TableColumnFlags_WidthFixed(), UI.chk_col_w)
+      local btn_preset = L.icon_sm
+      local btn_w = btn_preset.size + btn_preset.pad * 2
+      local btn_col_w = btn_w + L.sm * 2
+      local tree_indent = L.md + 10 + L.md
+
+      if reaper.ImGui_BeginTable(ctx, "trk_list_tbl", 2, reaper.ImGui_TableFlags_None()) then
+        reaper.ImGui_TableSetupColumn(ctx, "##tname", reaper.ImGui_TableColumnFlags_WidthStretch())
+        reaper.ImGui_TableSetupColumn(ctx, "##tdel",  reaper.ImGui_TableColumnFlags_WidthFixed(), btn_col_w)
 
         for si, ti in ipairs(S.tracks) do
           local t = tlist[ti]
+          local trk_name = t and t.name or ("Track " .. ti)
           reaper.ImGui_TableNextRow(ctx, 0, L.row_h)
+
+          -- Column 0: Track Name (aligned with "Tracks" in header)
           reaper.ImGui_TableSetColumnIndex(ctx, 0)
-          Theme.align(ctx, L.row_h)
-          reaper.ImGui_Text(ctx, t and t.name or "?")
+          local col_start_x = reaper.ImGui_GetCursorPosX(ctx)
+          local sel_flags = reaper.ImGui_SelectableFlags_SpanAllColumns()
+                          | reaper.ImGui_SelectableFlags_AllowOverlap()
+          Theme.selectable(ctx, "##tsel" .. si, false, sel_flags, 0, L.row_h)
+
+          reaper.ImGui_SameLine(ctx, 0, 0)
+          reaper.ImGui_SetCursorPosX(ctx, col_start_x + tree_indent)
+          Theme.align(ctx)
+          reaper.ImGui_Text(ctx, trk_name)
+
+          -- Column 1: Close button (aligned with header close button)
           reaper.ImGui_TableSetColumnIndex(ctx, 1)
-          Theme.align(ctx, L.row_h, L.icon_sm.size + L.icon_sm.pad * 2)
+          Theme.align(ctx, L.row_h, btn_w)
+          reaper.ImGui_SetCursorPosY(ctx, reaper.ImGui_GetCursorPosY(ctx) + 1)
+          Theme.right_align(ctx, btn_w, L.sm)
           if Theme.icon_btn(ctx, "trk_rm" .. si, Theme.icons.close, {
-            preset = L.icon_sm,
+            preset = btn_preset,
             color = P.text_dim,
+            tooltip = "Remove track",
           }) then
             to_remove = si
           end
         end
         reaper.ImGui_EndTable(ctx)
       end
+
       if to_remove then
         table.remove(S.tracks, to_remove)
         compute_shared_fxs()
-        -- Re-validate FX selection
         if S.fi > 0 and S.fi > #S.fxs then S.fi = 0 end
         M.scanned = false
         M.groups = {}
+        if #S.tracks == 0 then
+          S.tracks_expanded = false
+        end
       end
     end
   end
@@ -1351,7 +1355,7 @@ local function draw_link_builder()
                   if ck then item.checked = nc2 end
                   reaper.ImGui_TableSetColumnIndex(ctx, 1)
                   Theme.align(ctx, L.row_h)
-                  if reaper.ImGui_Selectable(ctx, disp .. "##psel" .. gi .. "_" .. pi, item.checked, reaper.ImGui_SelectableFlags_None()) then
+                  if Theme.selectable(ctx, disp .. "##psel" .. gi .. "_" .. pi, item.checked, reaper.ImGui_SelectableFlags_None()) then
                     item.checked = not item.checked
                   end
                   -- Scroll to this param if it was the Last Touched target
@@ -2021,7 +2025,7 @@ local function draw_main()
             local pn = preset.plugin_name or ""
             local hint = (pn ~= "") and ("  [" .. pn .. "]") or ""
             local lbl  = preset.name .. hint .. "##alp" .. i
-            if reaper.ImGui_Selectable(ctx, lbl, Presets.sel == i) then
+            if Theme.selectable(ctx, lbl, Presets.sel == i) then
               Presets.sel = i
               apply_preset_direct(preset)
             end
@@ -2046,23 +2050,23 @@ local function draw_main()
           reaper.ImGui_OpenPopup(ctx, "al_preset_menu_popup")
         end
         if reaper.ImGui_BeginPopup(ctx, "al_preset_menu_popup") then
-          if reaper.ImGui_Selectable(ctx, "Preset library...##alpm_lib") then
+          if Theme.selectable(ctx, "Preset library...##alpm_lib") then
             show_preset_modal = true
           end
           reaper.ImGui_Separator(ctx)
           local can_del = (Presets.sel > 0 and Presets.sel <= #Presets.list)
           if not can_del then reaper.ImGui_BeginDisabled(ctx) end
-          if reaper.ImGui_Selectable(ctx, "Delete preset##alpm_del") and can_del then
+          if Theme.selectable(ctx, "Delete preset##alpm_del") and can_del then
             table.remove(Presets.list, Presets.sel)
             if Presets.sel > #Presets.list then Presets.sel = #Presets.list end
             save_presets()
           end
           if not can_del then reaper.ImGui_EndDisabled(ctx) end
           reaper.ImGui_Separator(ctx)
-          if reaper.ImGui_Selectable(ctx, "Export links...##alpm_exp") then
+          if Theme.selectable(ctx, "Export links...##alpm_exp") then
             export_links_dialog()
           end
-          if reaper.ImGui_Selectable(ctx, "Import links...##alpm_imp") then
+          if Theme.selectable(ctx, "Import links...##alpm_imp") then
             import_links_dialog()
           end
           reaper.ImGui_EndPopup(ctx)
@@ -2155,7 +2159,7 @@ local function draw_main()
                   reaper.ImGui_TableSetColumnIndex(ctx, 0)
                   local sel_flags = reaper.ImGui_SelectableFlags_SpanAllColumns()
                                  | reaper.ImGui_SelectableFlags_AllowOverlap()
-                  if reaper.ImGui_Selectable(ctx, "##sel_row", link_sel[i] == true, sel_flags, 0, row_h) then
+                  if Theme.selectable(ctx, "##sel_row", link_sel[i] == true, sel_flags, 0, row_h) then
                     local shift = reaper.ImGui_IsKeyDown(ctx, reaper.ImGui_Key_LeftShift()) or reaper.ImGui_IsKeyDown(ctx, reaper.ImGui_Key_RightShift())
                     if shift and last_clicked_link > 0 and last_clicked_link ~= i then
                       local lo = math.min(last_clicked_link, i)
