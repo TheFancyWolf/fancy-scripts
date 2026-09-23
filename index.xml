@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="27186c56073f692282947893904a3c9a9d6141ce">
+<index version="1" name="Fancy Scripts" commit="57b4aef26d9f5e9d693f6e54acd861f5f90f3156">
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
@@ -60,6 +60,19 @@
         <source type="data" file="toolbar_icons/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/toolbar_icons/toolbar_fancy_parameter_link.png</source>
         <source type="data" file="toolbar_icons/150/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/toolbar_icons/150/toolbar_fancy_parameter_link.png</source>
         <source type="data" file="toolbar_icons/200/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/d21288056e9060d397fe8da94d5be9380a3e5a60/toolbar_icons/200/toolbar_fancy_parameter_link.png</source>
+      </version>
+      <version name="5.4.0" author="Fancy Scripts" time="2026-09-23T02:00:27Z">
+        <changelog><![CDATA[+ Added global Show Tooltips option in Settings
++ Respect global tooltip visibility setting for Last Touched preview
++ Bundled 1x and 2x Retina toolbar icons (toolbar_fancy_parameter_link.png)
++ Active toolbar button state while script is running]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/FX/Fancy_Parameter%20Link.lua</source>
+        <source file="../_lib/json.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/_lib/json.lua</source>
+        <source file="../_lib/theme.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/_lib/theme.lua</source>
+        <source file="../_lib/utils.lua">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/_lib/utils.lua</source>
+        <source type="data" file="toolbar_icons/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/toolbar_icons/toolbar_fancy_parameter_link.png</source>
+        <source type="data" file="toolbar_icons/150/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/toolbar_icons/150/toolbar_fancy_parameter_link.png</source>
+        <source type="data" file="toolbar_icons/200/toolbar_fancy_parameter_link.png">https://github.com/TheFancyWolf/fancy-scripts/raw/57b4aef26d9f5e9d693f6e54acd861f5f90f3156/toolbar_icons/200/toolbar_fancy_parameter_link.png</source>
       </version>
     </reapack>
   </category>
