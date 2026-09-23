@@ -75,7 +75,22 @@ local state = {
   end_time = 0,
   current_time = 0,
   item_len = 0,
-  buffer = nil
+  buffer = nil,
+
+  -- Interaction state
+  hovered_note = nil,   -- index of note block under cursor
+  hovered_zone = nil,   -- "drift" / "pitch" / "vibrato"
+  selected_note = nil,  -- index of currently selected note
+  drag = nil,           -- { note_idx, zone, start_mouse_y, original_value, dirty }
+
+  -- Visualization toggles
+  show_note_blocks = true,
+  show_raw_pitch = true,
+  show_trend = false,
+  show_smart_spots = true,
+  show_split_points = false,
+  show_preview = true,
+  show_vibrato_regions = false
 }
 
 -------------------------------------------------------------------------------
@@ -194,6 +209,38 @@ end
 -- 3. ANALYSIS ROUTINE (DEFERRED)
 -------------------------------------------------------------------------------
 
+local function reset_analysis()
+  state.results = {}
+  state.notes = nil
+  state.split_points = nil
+  state.progress = 0
+  state.is_analyzing = false
+  state.hovered_note = nil
+  state.hovered_zone = nil
+  state.selected_note = nil
+  state.drag = nil
+  
+  if state.accessor then
+    reaper.DestroyAudioAccessor(state.accessor)
+    state.accessor = nil
+  end
+
+  local item = reaper.GetSelectedMediaItem(0, 0)
+  if item then
+    local take = reaper.GetActiveTake(item)
+    if take then
+      local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+      if env then
+        reaper.Undo_BeginBlock()
+        reaper.DeleteEnvelopePointRange(env, 0, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+        reaper.Envelope_SortPointsEx(env, -1)
+        reaper.UpdateArrange()
+        reaper.Undo_EndBlock("Clear Pitch Envelope", -1)
+      end
+    end
+  end
+end
+
 local function start_analysis()
   local item = reaper.GetSelectedMediaItem(0, 0)
   if not item then
@@ -221,6 +268,246 @@ local function start_analysis()
   state.results = {}
   state.is_analyzing = true
   state.progress = 0
+end
+
+local function extract_note_features(note)
+  if note.count == 0 then return end
+  
+  -- 1. Extract raw pitch array
+  local raw_pitch = {}
+  for i, frame in ipairs(note.frames) do
+    raw_pitch[i] = frame.note
+  end
+  
+  -- Simple moving average helper
+  local function get_sma(arr, win_size)
+    local res = {}
+    local half = math.floor(win_size / 2)
+    for i = 1, #arr do
+      local sum = 0
+      local count = 0
+      for j = math.max(1, i - half), math.min(#arr, i + half) do
+        sum = sum + arr[j]
+        count = count + 1
+      end
+      res[i] = sum / count
+    end
+    return res
+  end
+  
+  -- 2. Calculate Trend (Heavy smoothing to find the true center, ~240ms window)
+  local trend = get_sma(raw_pitch, 21)
+  
+  -- 3. Calculate smooth pitch (Light smoothing to remove YIN micro-jitters, ~58ms window)
+  local smooth_pitch = get_sma(raw_pitch, 5)
+  
+  -- 4. Calculate Modulation
+  local mod = {}
+  for i = 1, #raw_pitch do
+    mod[i] = smooth_pitch[i] - trend[i]
+  end
+  
+  -- 5. Find Smart Spots via Zero-Crossing (1 peak per vibrato wave)
+  local smart_spots = {}
+  table.insert(smart_spots, { index = 1, time = note.frames[1].time, type = "anchor_start" })
+  
+  local current_sign = nil
+  local extrema_idx = nil
+  local extrema_val = 0
+  
+  for i = 1, #mod do
+    local val = mod[i]
+    local sign = val >= 0 and 1 or -1
+    
+    if current_sign == nil then
+      current_sign = sign
+      extrema_idx = i
+      extrema_val = val
+    elseif sign == current_sign then
+      if sign == 1 and val > extrema_val then
+        extrema_idx = i
+        extrema_val = val
+      elseif sign == -1 and val < extrema_val then
+        extrema_idx = i
+        extrema_val = val
+      end
+    else
+      -- Zero crossing! Save the previous extrema if it's prominent enough (ignore micro-wobbles under 5 cents)
+      if math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
+         local s_type = current_sign == 1 and "peak" or "valley"
+         table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
+      end
+      current_sign = sign
+      extrema_idx = i
+      extrema_val = val
+    end
+  end
+  
+  -- Push the last one if prominent
+  if extrema_idx and math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
+     local s_type = current_sign == 1 and "peak" or "valley"
+     table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
+  end
+  
+  table.insert(smart_spots, { index = #raw_pitch, time = note.frames[#raw_pitch].time, type = "anchor_end" })
+  
+  note.trend = trend
+  note.modulation = mod
+  note.smart_spots = smart_spots
+
+  -- 6. Vibrato detection — three-gate approach
+  --    Gate 1: Onset/offset exclusion (pitch settling is not vibrato)
+  --    Gate 2: Periodicity validation (must be 4-8 Hz, not a one-shot scoop)
+  --    Gate 3: Energy threshold (modulation must be large enough)
+  local VIB_FLOOR = 0.04    -- below = no vibrato (semitones RMS)
+  local VIB_CEILING = 0.12  -- above = full vibrato
+  local ONSET_SEC = 0.12    -- exclude first 120ms (attack phase)
+  local OFFSET_SEC = 0.08   -- exclude last 80ms (release tail)
+  local VIB_FREQ_MIN = 3.5  -- Hz (generous low bound for vibrato)
+  local VIB_FREQ_MAX = 9.0  -- Hz (generous high bound)
+
+  local vib_win = math.max(3, math.min(#mod, 26)) -- ~300ms window
+  local half_vw = math.floor(vib_win / 2)
+  local vibrato_weight = {}
+
+  -- Estimate frame duration from actual timing
+  local frame_dur = #note.frames > 1
+    and (note.frames[#note.frames].time - note.frames[1].time) / (#note.frames - 1)
+    or 0.012
+
+  for i = 1, #mod do
+    local t = note.frames[i].time
+
+    -- Gate 1: Onset/offset exclusion
+    if (t - note.start_time) < ONSET_SEC or (note.end_time - t) < OFFSET_SEC then
+      vibrato_weight[i] = 0.0
+    else
+      -- Gate 2: Periodicity — zero-crossing rate must be in vibrato band
+      local zc_count = 0
+      local win_start = math.max(2, i - half_vw)
+      local win_end = math.min(#mod, i + half_vw)
+      for j = win_start, win_end do
+        if (mod[j] >= 0) ~= (mod[j - 1] >= 0) then
+          zc_count = zc_count + 1
+        end
+      end
+      local win_dur = (win_end - win_start + 1) * frame_dur
+      local zc_freq = win_dur > 0 and (zc_count / (2 * win_dur)) or 0
+      local is_periodic = zc_freq >= VIB_FREQ_MIN and zc_freq <= VIB_FREQ_MAX
+
+      -- Gate 3: Energy threshold (RMS of modulation in window)
+      local sum_sq = 0
+      local cnt = 0
+      for j = math.max(1, i - half_vw), math.min(#mod, i + half_vw) do
+        sum_sq = sum_sq + mod[j] * mod[j]
+        cnt = cnt + 1
+      end
+      local rms = math.sqrt(sum_sq / cnt)
+
+      -- All three gates must pass
+      if not is_periodic or rms < VIB_FLOOR then
+        vibrato_weight[i] = 0.0
+      elseif rms > VIB_CEILING then
+        vibrato_weight[i] = 1.0
+      else
+        vibrato_weight[i] = (rms - VIB_FLOOR) / (VIB_CEILING - VIB_FLOOR)
+      end
+    end
+  end
+
+  note.vibrato_weight = vibrato_weight
+
+  -- Default controls: NO correction (green preview = raw pitch)
+  note.controls = {
+    center_pitch = note.avg_note,
+    drift_scale = 1.0,
+    vibrato_scale = 1.0,
+    transition_ms = 15
+  }
+end
+
+local function apply_envelope_to_take()
+  local item = reaper.GetSelectedMediaItem(0, 0)
+  if not item then return end
+  local take = reaper.GetActiveTake(item)
+  if not take then return end
+  
+  reaper.Undo_BeginBlock()
+  
+  -- Force Elastique 3.3.3 Pro (Formant Preserving) -- Usually pitch mode 7 (or similar depending on reaper version). Mode 512 is default, but let's just let the user's project default handle it or set it manually later.
+  -- Actually let's just make sure Pitch envelope exists:
+  local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+  if not env then
+    reaper.Main_OnCommand(41142, 0) -- Toggle take pitch envelope
+    env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+  end
+  
+  if not env then
+    reaper.ShowMessageBox("Failed to activate Take Pitch Envelope.", "Error", 0)
+    reaper.Undo_EndBlock("Apply Pitch Correction", -1)
+    return
+  end
+  
+  -- Clear existing points
+  reaper.DeleteEnvelopePointRange(env, 0, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+  
+  for n_idx, note in ipairs(state.notes) do
+    local ctrl = note.controls
+    local prev_note = state.notes[n_idx - 1]
+    local next_note = state.notes[n_idx + 1]
+    
+    -- Check relationships for transitions (if gap is < 50ms, it's a legato pitch jump)
+    local is_legato_prev = prev_note and (note.start_time - prev_note.end_time) < 0.05
+    local is_legato_next = next_note and (next_note.start_time - note.end_time) < 0.05
+    
+    local half_dur = (note.end_time - note.start_time) * 0.5
+    local trans_sec = math.min(ctrl.transition_ms / 1000, half_dur * 0.8)
+    local onset_sec = math.min(0.04, half_dur * 0.8)
+    
+    for spot_idx, spot in ipairs(note.smart_spots) do
+      local i = spot.index
+      local t = spot.time
+      local raw = note.frames[i].note
+      local trend_val = note.trend[i]
+      local mod_val = note.modulation[i]
+
+      -- Vibrato-weight: only scale modulation where vibrato was detected
+      local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
+      local effective_vib = 1.0 + (ctrl.vibrato_scale - 1.0) * vw
+
+      local target_pitch = ctrl.center_pitch
+                         + (trend_val - note.avg_note) * ctrl.drift_scale
+                         + (mod_val * effective_vib)
+                         
+      local env_val = target_pitch - raw
+      
+      -- Context-Aware Smoothing (Shape 2 = Slow Start/End for S-Curve interpolation)
+      if spot.type == "anchor_start" then
+        if not is_legato_prev then
+          reaper.InsertEnvelopePointEx(env, -1, t, 0, 2, 0, 0, false)
+          t = t + onset_sec
+        else
+          t = t + trans_sec
+        end
+      elseif spot.type == "anchor_end" then
+        if not is_legato_next then
+          reaper.InsertEnvelopePointEx(env, -1, t, env_val, 2, 0, 0, false)
+          reaper.InsertEnvelopePointEx(env, -1, t + onset_sec, 0, 2, 0, 0, false)
+          t = nil
+        else
+          t = t - trans_sec
+        end
+      end
+      
+      if t then
+        reaper.InsertEnvelopePointEx(env, -1, t, env_val, 2, 0, 0, false)
+      end
+    end
+  end
+  
+  reaper.Envelope_SortPointsEx(env, -1)
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock("Apply Pitch Correction", -1)
 end
 
 local function run_hybrid_segmentation()
@@ -254,7 +541,7 @@ local function run_hybrid_segmentation()
   local current_note = nil
   local last_split_time = -1
   
-  for i, frame in ipairs(state.results) do
+  for _, frame in ipairs(state.results) do
     local is_voiced = (frame.note ~= nil and frame.rms > rms_noise_floor)
     
     local should_split = false
@@ -326,6 +613,7 @@ local function run_hybrid_segmentation()
     if n.count > 0 then
       n.avg_note = n.sum_note / n.count
       n.display_note = math.floor(n.avg_note + 0.5)
+      extract_note_features(n)
     end
   end
 end
@@ -387,15 +675,28 @@ end
 local function draw_graph(draw_ctx, w, h)
   local draw_list = reaper.ImGui_GetWindowDrawList(draw_ctx)
   local px, py = reaper.ImGui_GetCursorScreenPos(draw_ctx)
+  local P = Theme.get_palette()
+
+  -- Claim canvas space and enable mouse interaction
+  reaper.ImGui_InvisibleButton(draw_ctx, "##pitch_canvas", w, h)
+  local is_canvas_hovered = reaper.ImGui_IsItemHovered(draw_ctx)
 
   -- Draw background
   reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + h, 0x1A1A1AFF)
   reaper.ImGui_DrawList_AddRect(draw_list, px, py, px + w, py + h, 0x444444FF)
 
+  local piano_w = 40
+  local full_px = px
+  local full_w = w
+  px = px + piano_w
+  w = w - piano_w
+
+  reaper.ImGui_DrawList_PushClipRect(draw_list, full_px, py, full_px + full_w, py + h, true)
+
   if #state.results == 0 then
-    reaper.ImGui_SetCursorScreenPos(draw_ctx, px + 10, py + 10)
-    reaper.ImGui_Text(draw_ctx, "No data. Select an item and click Analyze.")
-    reaper.ImGui_Dummy(draw_ctx, w, h)
+    reaper.ImGui_DrawList_AddText(draw_list, px + 10, py + 10, P.text,
+      "No data. Select an item and click Analyze.")
+    reaper.ImGui_DrawList_PopClipRect(draw_list)
     return
   end
 
@@ -410,13 +711,23 @@ local function draw_graph(draw_ctx, w, h)
       if pt.note > max_note then max_note = pt.note end
     end
   end
-  
+  -- Include moved blocks in range calculation
+  if state.notes then
+    for _, note in ipairs(state.notes) do
+      if note.controls then
+        local cp = note.controls.center_pitch
+        if cp + 0.5 > max_note then max_note = cp + 0.5 end
+        if cp - 0.5 < min_note then min_note = cp - 0.5 end
+      end
+    end
+  end
+
   if not has_notes then
-    reaper.ImGui_Dummy(ctx, w, h)
+    reaper.ImGui_DrawList_PopClipRect(draw_list)
     return
   end
 
-  -- Add some padding
+  -- Add padding
   min_note = math.floor(min_note - 2)
   max_note = math.ceil(max_note + 2)
   local note_range = max_note - min_note
@@ -424,37 +735,211 @@ local function draw_graph(draw_ctx, w, h)
 
   local duration = state.end_time - state.start_time
   if duration <= 0 then duration = 1 end
+  local px_per_st = h / note_range -- pixels per semitone
 
-  -- Draw note grid
-  for n = math.floor(min_note), math.ceil(max_note) do
-    local y = py + h - ((n - min_note) / note_range) * h
-    local is_black_key = (n % 12 == 1 or n % 12 == 3 or n % 12 == 6 or n % 12 == 8 or n % 12 == 10)
-    local color = is_black_key and 0x222222FF or 0x333333FF
-    reaper.ImGui_DrawList_AddLine(draw_list, px, y, px + w, y, color)
+  ---------------------------------------------------------------------------
+  -- MOUSE INTERACTION
+  ---------------------------------------------------------------------------
+  local mx, my = reaper.ImGui_GetMousePos(draw_ctx)
+
+  -- Hit-test: find hovered note and zone
+  if is_canvas_hovered and not state.drag and state.notes then
+    state.hovered_note = nil
+    state.hovered_zone = nil
+    for n_idx, note in ipairs(state.notes) do
+      if note.controls then
+        local cp = note.controls.center_pitch
+        local sx = px + ((note.start_time - state.start_time) / duration) * w
+        local ex = px + ((note.end_time - state.start_time) / duration) * w
+        local top_y = py + h - ((cp + 0.5 - min_note) / note_range) * h
+        local bot_y = py + h - ((cp - 0.5 - min_note) / note_range) * h
+
+        if mx >= sx and mx <= ex and my >= top_y and my <= bot_y then
+          state.hovered_note = n_idx
+          local block_w = ex - sx
+          local zone_w = math.max(12, block_w * 0.25)
+          if mx < sx + zone_w then
+            state.hovered_zone = "drift"
+          elseif mx > ex - zone_w then
+            state.hovered_zone = "vibrato"
+          else
+            state.hovered_zone = "pitch"
+          end
+          break
+        end
+      end
+    end
+  elseif not is_canvas_hovered and not state.drag then
+    state.hovered_note = nil
+    state.hovered_zone = nil
   end
 
-  -- Draw pitch curve
-  -- Draw Segmented Notes
-  if state.notes then
-    for _, note in ipairs(state.notes) do
-      local start_x = px + ((note.start_time - state.start_time) / duration) * w
-      local end_x = px + ((note.end_time - state.start_time) / duration) * w
-      
-      local block_top_y = py + h - ((note.display_note + 0.5 - min_note) / note_range) * h
-      local block_bottom_y = py + h - ((note.display_note - 0.5 - min_note) / note_range) * h
-      
-      reaper.ImGui_DrawList_AddRectFilled(draw_list, start_x, block_top_y, end_x, block_bottom_y, 0x44AA4466)
-      reaper.ImGui_DrawList_AddRect(draw_list, start_x, block_top_y, end_x, block_bottom_y, 0x44AA44FF)
-      
-      -- Draw note name
-      local note_text = midi_to_name(note.display_note)
-      local text_y = py + h - ((note.display_note - min_note) / note_range) * h - 7 -- roughly center text vertically
-      reaper.ImGui_DrawList_AddText(draw_list, start_x + 4, text_y, 0xFFFFFFFF, note_text)
+  -- Click: select note and begin drag, or deselect
+  if is_canvas_hovered and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+    if state.hovered_note then
+      state.selected_note = state.hovered_note
+      local note = state.notes[state.hovered_note]
+      local original_val
+      if state.hovered_zone == "pitch" then
+        original_val = note.controls.center_pitch
+      elseif state.hovered_zone == "drift" then
+        original_val = note.controls.drift_scale
+      else
+        original_val = note.controls.vibrato_scale
+      end
+      state.drag = {
+        note_idx = state.hovered_note,
+        zone = state.hovered_zone,
+        start_mouse_y = my,
+        original_value = original_val,
+        dirty = false
+      }
+    else
+      state.selected_note = nil
     end
   end
 
-  -- Draw Split Points
-  if state.split_points then
+  -- Process active drag
+  if state.drag then
+    local d_note = state.notes[state.drag.note_idx]
+    if d_note and d_note.controls then
+      local delta_y = state.drag.start_mouse_y - my -- up = positive
+
+      if math.abs(delta_y) > 2 then -- dead zone: click vs. drag
+        state.drag.dirty = true
+
+        if state.drag.zone == "pitch" then
+          local delta_st = delta_y / px_per_st
+          local new_pitch = state.drag.original_value + delta_st
+          -- Shift modifier = snap to semitones
+          local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
+          if shift_mod > 0 then
+            local ok, mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+            if ok and mods and (mods & shift_mod) ~= 0 then
+              new_pitch = math.floor(new_pitch + 0.5)
+            end
+          end
+          d_note.controls.center_pitch = new_pitch
+        elseif state.drag.zone == "drift" then
+          -- 2 semitones of vertical drag = full range (up = more stable = less drift)
+          local delta = delta_y / (px_per_st * 2)
+          d_note.controls.drift_scale = math.max(0, math.min(1,
+            state.drag.original_value - delta))
+        elseif state.drag.zone == "vibrato" then
+          -- 2 semitones of vertical drag = full 0→2 range
+          local delta = delta_y / px_per_st
+          d_note.controls.vibrato_scale = math.max(0, math.min(2,
+            state.drag.original_value + delta))
+        end
+      end
+    end
+
+    -- End drag → apply envelope to take
+    if reaper.ImGui_IsMouseReleased(draw_ctx, 0) then
+      if state.drag.dirty then
+        apply_envelope_to_take()
+      end
+      state.drag = nil
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- DRAW NOTE GRID & PIANO ROLL
+  ---------------------------------------------------------------------------
+  for n = math.floor(min_note), math.ceil(max_note) do
+    local y = py + h - ((n - min_note) / note_range) * h
+    local key_top = py + h - ((n + 0.5 - min_note) / note_range) * h
+    local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
+    local is_black_key = (n % 12 == 1 or n % 12 == 3 or n % 12 == 6
+                          or n % 12 == 8 or n % 12 == 10)
+                          
+    local grid_color = is_black_key and 0x222222FF or 0x333333FF
+    reaper.ImGui_DrawList_AddLine(draw_list, px, y, px + w, y, grid_color)
+    
+    local key_color = is_black_key and 0x1A1A1AFF or 0xDDDDDDFF
+    local text_col = is_black_key and 0x888888FF or 0x333333FF
+    
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, key_top, full_px + piano_w, key_bot, key_color)
+    reaper.ImGui_DrawList_AddRect(draw_list, full_px, key_top, full_px + piano_w, key_bot, 0x000000FF)
+    
+    if n % 12 == 0 then
+      local label = "C" .. tostring(math.floor(n / 12) - 1)
+      reaper.ImGui_DrawList_AddText(draw_list, full_px + 2, key_top + (key_bot - key_top) * 0.5 - 7, text_col, label)
+    else
+      local label = midi_to_name(n)
+      reaper.ImGui_DrawList_AddText(draw_list, full_px + 2, key_top + (key_bot - key_top) * 0.5 - 7, text_col, label)
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- DRAW NOTE BLOCKS (interactive, positioned by center_pitch)
+  ---------------------------------------------------------------------------
+  if state.show_note_blocks and state.notes then
+    for n_idx, note in ipairs(state.notes) do
+      if note.controls then
+        local cp = note.controls.center_pitch
+        local sx = px + ((note.start_time - state.start_time) / duration) * w
+        local ex = px + ((note.end_time - state.start_time) / duration) * w
+        local top_y = py + h - ((cp + 0.5 - min_note) / note_range) * h
+        local bot_y = py + h - ((cp - 0.5 - min_note) / note_range) * h
+        local block_w = ex - sx
+        local zone_w = math.max(12, block_w * 0.25)
+
+        local is_selected = (state.selected_note == n_idx)
+        local is_hov = (state.hovered_note == n_idx)
+
+        local fill = is_selected and 0x44AA4488 or 0x44AA4466
+        local border = is_selected and P.accent or 0x44AA44FF
+
+        -- Zone-colored hover highlights
+        if is_hov and not state.drag then
+          if state.hovered_zone == "drift" then
+            reaper.ImGui_DrawList_AddRectFilled(draw_list,
+              sx, top_y, sx + zone_w, bot_y, 0x4DA6FF44)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list,
+              sx + zone_w, top_y, ex, bot_y, fill)
+          elseif state.hovered_zone == "vibrato" then
+            reaper.ImGui_DrawList_AddRectFilled(draw_list,
+              sx, top_y, ex - zone_w, bot_y, fill)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list,
+              ex - zone_w, top_y, ex, bot_y, 0xFFAA4444)
+          else -- pitch zone
+            reaper.ImGui_DrawList_AddRectFilled(draw_list,
+              sx, top_y, ex, bot_y, 0x44AA4488)
+          end
+        else
+          reaper.ImGui_DrawList_AddRectFilled(draw_list,
+            sx, top_y, ex, bot_y, fill)
+        end
+
+        -- Border
+        reaper.ImGui_DrawList_AddRect(draw_list,
+          sx, top_y, ex, bot_y, border)
+
+        -- Zone divider lines on hover/select
+        if is_hov or is_selected then
+          reaper.ImGui_DrawList_AddLine(draw_list,
+            sx + zone_w, top_y, sx + zone_w, bot_y, 0xFFFFFF33)
+          reaper.ImGui_DrawList_AddLine(draw_list,
+            ex - zone_w, top_y, ex - zone_w, bot_y, 0xFFFFFF33)
+        end
+
+        -- Note label: name + cents deviation (always visible)
+        local nearest = math.floor(cp + 0.5)
+        local cents = math.floor((cp - nearest) * 100 + 0.5)
+        local sign = cents >= 0 and "+" or ""
+        local label = string.format("%s %s%d\xC2\xA2", midi_to_name(nearest), sign, cents)
+        local text_y = (top_y + bot_y) * 0.5 - 7
+        reaper.ImGui_DrawList_AddText(draw_list,
+          sx + 4, text_y, 0xFFFFFFFF, label)
+      end
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- DRAW SPLIT POINTS
+  ---------------------------------------------------------------------------
+  if state.show_split_points and state.split_points then
     for _, sp in ipairs(state.split_points) do
       local x = px + ((sp.time - state.start_time) / duration) * w
       reaper.ImGui_DrawList_AddLine(draw_list, x, py, x, py + h, 0xFF5555AA, 1.0)
@@ -462,27 +947,155 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  local valid_pts = 0
-  for _, pt in ipairs(state.results) do
-    if pt.note then valid_pts = valid_pts + 1 end
+  ---------------------------------------------------------------------------
+  -- DRAW RAW PITCH CURVE (purple)
+  ---------------------------------------------------------------------------
+  if state.show_raw_pitch then
+    local valid_pts = 0
+    for _, pt in ipairs(state.results) do
+      if pt.note then valid_pts = valid_pts + 1 end
+    end
+
+    if valid_pts > 0 then
+      local polyline = reaper.new_array(valid_pts * 2)
+      local p_idx = 1
+      for _, pt in ipairs(state.results) do
+        if pt.note then
+          local x = px + ((pt.time - state.start_time) / duration) * w
+          local y = py + h - ((pt.note - min_note) / note_range) * h
+          polyline[p_idx] = x
+          polyline[p_idx + 1] = y
+          p_idx = p_idx + 2
+        end
+      end
+      reaper.ImGui_DrawList_AddPolyline(draw_list, polyline, 0x8B70FAFF, 0, 2.0)
+    end
   end
 
-  if valid_pts > 0 then
-    local polyline = reaper.new_array(valid_pts * 2)
-    local p_idx = 1
-    for _, pt in ipairs(state.results) do
-      if pt.note then
-        local x = px + ((pt.time - state.start_time) / duration) * w
-        local y = py + h - ((pt.note - min_note) / note_range) * h
-        polyline[p_idx] = x
-        polyline[p_idx+1] = y
-        p_idx = p_idx + 2
+  ---------------------------------------------------------------------------
+  -- DRAW TREND, SMART SPOTS, VIBRATO REGIONS & CORRECTED PITCH PREVIEW
+  ---------------------------------------------------------------------------
+  if state.notes then
+    for _, note in ipairs(state.notes) do
+      -- Vibrato regions (amber bands where vibrato was detected)
+      if state.show_vibrato_regions and note.vibrato_weight and note.frames then
+        local in_region = false
+        local region_start_x = 0
+        for i, frame in ipairs(note.frames) do
+          local is_vib = note.vibrato_weight[i] > 0.3
+          local x = px + ((frame.time - state.start_time) / duration) * w
+          if is_vib and not in_region then
+            region_start_x = x
+            in_region = true
+          elseif not is_vib and in_region then
+            reaper.ImGui_DrawList_AddRectFilled(draw_list,
+              region_start_x, py, x, py + h, 0xFFAA4418)
+            in_region = false
+          end
+        end
+        -- Close trailing region
+        if in_region then
+          local last_x = px + ((note.frames[#note.frames].time - state.start_time) / duration) * w
+          reaper.ImGui_DrawList_AddRectFilled(draw_list,
+            region_start_x, py, last_x, py + h, 0xFFAA4418)
+        end
+      end
+
+      -- Trend line (cyan)
+      if state.show_trend and note.trend then
+        local t_poly = reaper.new_array(#note.frames * 2)
+        local tp_idx = 1
+        for i, frame in ipairs(note.frames) do
+          local x = px + ((frame.time - state.start_time) / duration) * w
+          local y = py + h - ((note.trend[i] - min_note) / note_range) * h
+          t_poly[tp_idx] = x
+          t_poly[tp_idx + 1] = y
+          tp_idx = tp_idx + 2
+        end
+        reaper.ImGui_DrawList_AddPolyline(draw_list, t_poly, 0x00FFFFFF, 0, 1.0)
+      end
+
+      -- Smart spots (yellow/white circles)
+      if state.show_smart_spots and note.smart_spots then
+        for _, spot in ipairs(note.smart_spots) do
+          local x = px + ((spot.time - state.start_time) / duration) * w
+          local raw_pitch = note.frames[spot.index].note
+          local y = py + h - ((raw_pitch - min_note) / note_range) * h
+
+          local spot_color = 0xFFFF00FF
+          if spot.type == "anchor_start" or spot.type == "anchor_end" then
+            spot_color = 0x00FFFFFF
+          end
+
+          reaper.ImGui_DrawList_AddCircleFilled(draw_list, x, y, 3, spot_color)
+        end
+      end
+
+      -- Corrected pitch preview line (green) — vibrato-weight-aware
+      if state.show_preview and note.controls and note.trend and note.modulation then
+        local ctrl = note.controls
+        local cp_poly = reaper.new_array(#note.frames * 2)
+        local cp_idx = 1
+        for i, frame in ipairs(note.frames) do
+          local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
+          local effective_vib = 1.0 + (ctrl.vibrato_scale - 1.0) * vw
+          local target = ctrl.center_pitch
+                       + (note.trend[i] - note.avg_note) * ctrl.drift_scale
+                       + (note.modulation[i] * effective_vib)
+          local x = px + ((frame.time - state.start_time) / duration) * w
+          local y = py + h - ((target - min_note) / note_range) * h
+          cp_poly[cp_idx] = x
+          cp_poly[cp_idx + 1] = y
+          cp_idx = cp_idx + 2
+        end
+        reaper.ImGui_DrawList_AddPolyline(draw_list, cp_poly, 0x56E39FCC, 0, 2.0)
       end
     end
-    reaper.ImGui_DrawList_AddPolyline(draw_list, polyline, 0x8B70FAFF, 0, 2.0)
   end
 
-  reaper.ImGui_Dummy(ctx, w, h)
+  ---------------------------------------------------------------------------
+  -- TOOLTIPS (drag value / hover hint)
+  ---------------------------------------------------------------------------
+  if state.drag and state.drag.dirty then
+    local d_note = state.notes[state.drag.note_idx]
+    if d_note and d_note.controls then
+      local tip
+      if state.drag.zone == "pitch" then
+        local cp = d_note.controls.center_pitch
+        local nearest = math.floor(cp + 0.5)
+        local cents = math.floor((cp - nearest) * 100 + 0.5)
+        local sign = cents >= 0 and "+" or ""
+        tip = string.format("%s %s%d\xC2\xA2",
+          midi_to_name(nearest), sign, cents)
+      elseif state.drag.zone == "drift" then
+        tip = string.format("Stability: %.0f%%",
+          (1 - d_note.controls.drift_scale) * 100)
+      else
+        tip = string.format("Vibrato: %.0f%%",
+          d_note.controls.vibrato_scale * 100)
+      end
+      reaper.ImGui_DrawList_AddText(draw_list, mx + 15, my - 10,
+        0xFFFFFFFF, tip)
+    end
+  elseif state.hovered_note and not state.drag then
+    local h_note = state.notes[state.hovered_note]
+    if h_note and h_note.controls then
+      local tip
+      if state.hovered_zone == "drift" then
+        tip = string.format("Stability: %.0f%%",
+          (1 - h_note.controls.drift_scale) * 100)
+      elseif state.hovered_zone == "vibrato" then
+        tip = string.format("Vibrato: %.0f%%",
+          h_note.controls.vibrato_scale * 100)
+      else
+        tip = "Drag to retune (Shift=snap)"
+      end
+      reaper.ImGui_DrawList_AddText(draw_list, mx + 15, my - 10,
+        0xFFFFFFBB, tip)
+    end
+  end
+
+  reaper.ImGui_DrawList_PopClipRect(draw_list)
 end
 
 local function loop()
@@ -497,58 +1110,68 @@ local function loop()
     reaper.ImGui_Separator(ctx)
 
 
-    if reaper.ImGui_CollapsingHeader(ctx, "Presets (User Friendly)", reaper.ImGui_TreeNodeFlags_DefaultOpen()) then
-      if reaper.ImGui_BeginCombo(ctx, "Vocal Range", VOCAL_RANGES[state.preset_range_idx].name) then
-        for i, range in ipairs(VOCAL_RANGES) do
-          local is_selected = (state.preset_range_idx == i)
-          if reaper.ImGui_Selectable(ctx, range.name, is_selected) then
-            state.preset_range_idx = i
-            state.min_freq = range.min
-            state.max_freq = range.max
-          end
-          if is_selected then reaper.ImGui_SetItemDefaultFocus(ctx) end
+    -- Compact preset combos (no labels) + action buttons
+    reaper.ImGui_PushItemWidth(ctx, 100)
+    if reaper.ImGui_BeginCombo(ctx, "##range", VOCAL_RANGES[state.preset_range_idx].name) then
+      for i, range in ipairs(VOCAL_RANGES) do
+        if reaper.ImGui_Selectable(ctx, range.name, state.preset_range_idx == i) then
+          state.preset_range_idx = i
+          state.min_freq = range.min
+          state.max_freq = range.max
         end
-        reaper.ImGui_EndCombo(ctx)
       end
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Limits the frequency search range to avoid octave errors. Match this to your vocalist.")
+      reaper.ImGui_EndCombo(ctx)
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Vocal Range — limits frequency search to avoid octave errors")
+    end
+    reaper.ImGui_SameLine(ctx)
+    if reaper.ImGui_BeginCombo(ctx, "##mode", DETECTION_MODES[state.preset_mode_idx].name) then
+      for i, mode in ipairs(DETECTION_MODES) do
+        if reaper.ImGui_Selectable(ctx, mode.name, state.preset_mode_idx == i) then
+          state.preset_mode_idx = i
+          state.threshold = mode.threshold
+        end
       end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Detection Mode — strictness for pitched note detection")
+    end
+    reaper.ImGui_SameLine(ctx)
+    if reaper.ImGui_BeginCombo(ctx, "##quality", QUALITY_MODES[state.preset_quality_idx].name) then
+      for i, mode in ipairs(QUALITY_MODES) do
+        if reaper.ImGui_Selectable(ctx, mode.name, state.preset_quality_idx == i) then
+          state.preset_quality_idx = i
+          state.block_size = mode.block
+          state.hop_size = mode.hop
+        end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Quality / CPU — time vs frequency resolution trade-off")
+    end
+    reaper.ImGui_PopItemWidth(ctx)
 
-      if reaper.ImGui_BeginCombo(ctx, "Detection Mode", DETECTION_MODES[state.preset_mode_idx].name) then
-        for i, mode in ipairs(DETECTION_MODES) do
-          local is_selected = (state.preset_mode_idx == i)
-          if reaper.ImGui_Selectable(ctx, mode.name, is_selected) then
-            state.preset_mode_idx = i
-            state.threshold = mode.threshold
-          end
-          if is_selected then reaper.ImGui_SetItemDefaultFocus(ctx) end
-        end
-        reaper.ImGui_EndCombo(ctx)
-      end
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Adjusts how strict the algorithm is about what it considers a pitched note. Use lenient for breathy vocals.")
-      end
-
-      if reaper.ImGui_BeginCombo(ctx, "Quality / CPU", QUALITY_MODES[state.preset_quality_idx].name) then
-        for i, mode in ipairs(QUALITY_MODES) do
-          local is_selected = (state.preset_quality_idx == i)
-          if reaper.ImGui_Selectable(ctx, mode.name, is_selected) then
-            state.preset_quality_idx = i
-            state.block_size = mode.block
-            state.hop_size = mode.hop
-          end
-          if is_selected then reaper.ImGui_SetItemDefaultFocus(ctx) end
-        end
-        reaper.ImGui_EndCombo(ctx)
-      end
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Balances time/frequency resolution against CPU usage.")
-      end
+    reaper.ImGui_SameLine(ctx)
+    if reaper.ImGui_Button(ctx, "Analyze") then
+      start_analysis()
+    end
+    reaper.ImGui_SameLine(ctx)
+    if reaper.ImGui_Button(ctx, "Reset") then
+      reset_analysis()
     end
 
-    reaper.ImGui_Spacing(ctx)
+    if state.is_analyzing then
+      reaper.ImGui_SameLine(ctx)
+      reaper.ImGui_Text(ctx, string.format("Analyzing... %d%%", math.floor(state.progress * 100)))
+      reaper.ImGui_ProgressBar(ctx, state.progress, -1, 14)
+    end
+
+    -- Advanced DSP Parameters (toggle)
     _, state.advanced_mode = reaper.ImGui_Checkbox(ctx, "Show Advanced DSP Parameters", state.advanced_mode)
-    
+
     if state.advanced_mode then
       reaper.ImGui_Indent(ctx, 10)
       _, state.block_size = reaper.ImGui_InputInt(ctx, "Block Size", state.block_size)
@@ -578,18 +1201,97 @@ local function loop()
       reaper.ImGui_Unindent(ctx, 10)
     end
 
-    if reaper.ImGui_Button(ctx, "Analyze Selected Item") then
-      start_analysis()
-    end
-
-    if state.is_analyzing then
-      reaper.ImGui_SameLine(ctx)
-      reaper.ImGui_Text(ctx, string.format("Analyzing... %d%%", math.floor(state.progress * 100)))
-      reaper.ImGui_ProgressBar(ctx, state.progress, -1, 14)
-    end
-
     reaper.ImGui_Separator(ctx)
     reaper.ImGui_Text(ctx, string.format("Points detected: %d", #state.results))
+
+    -- Visualization toggles
+    if #state.results > 0 then
+      _, state.show_note_blocks = reaper.ImGui_Checkbox(ctx, "Blocks", state.show_note_blocks)
+      reaper.ImGui_SameLine(ctx)
+      _, state.show_raw_pitch = reaper.ImGui_Checkbox(ctx, "Pitch", state.show_raw_pitch)
+      reaper.ImGui_SameLine(ctx)
+      _, state.show_trend = reaper.ImGui_Checkbox(ctx, "Trend", state.show_trend)
+      reaper.ImGui_SameLine(ctx)
+      _, state.show_smart_spots = reaper.ImGui_Checkbox(ctx, "Spots", state.show_smart_spots)
+      reaper.ImGui_SameLine(ctx)
+      _, state.show_split_points = reaper.ImGui_Checkbox(ctx, "Splits", state.show_split_points)
+      reaper.ImGui_SameLine(ctx)
+      _, state.show_preview = reaper.ImGui_Checkbox(ctx, "Preview", state.show_preview)
+      reaper.ImGui_SameLine(ctx)
+      _, state.show_vibrato_regions = reaper.ImGui_Checkbox(ctx, "Vibrato", state.show_vibrato_regions)
+    end
+
+    if #state.results > 0 and state.notes and #state.notes > 0 then
+      reaper.ImGui_Separator(ctx)
+
+      if state.selected_note and state.notes[state.selected_note] then
+        local sel = state.notes[state.selected_note]
+        local ctrl = sel.controls
+        local nearest = math.floor(ctrl.center_pitch + 0.5)
+        local cents = math.floor((ctrl.center_pitch - nearest) * 100 + 0.5)
+        local sign = cents >= 0 and "+" or ""
+        reaper.ImGui_Text(ctx, string.format(
+          "Selected: %s %s%d\xC2\xA2  |  Stability: %.0f%%  |  Vibrato: %.0f%%",
+          midi_to_name(nearest), sign, cents, (1 - ctrl.drift_scale) * 100,
+          ctrl.vibrato_scale * 100))
+      else
+        reaper.ImGui_TextDisabled(ctx,
+          "Click a note block to select. Drag: center=pitch, left=stability, right=vibrato")
+      end
+
+      if reaper.ImGui_Button(ctx, "Apply to Take Pitch Envelope") then
+        apply_envelope_to_take()
+      end
+      reaper.ImGui_SameLine(ctx)
+      if reaper.ImGui_Button(ctx, "Reset Selected") then
+        if state.selected_note and state.notes[state.selected_note] then
+          local sel = state.notes[state.selected_note]
+          sel.controls.center_pitch = sel.avg_note
+          sel.controls.drift_scale = 1.0
+          sel.controls.vibrato_scale = 1.0
+          apply_envelope_to_take()
+        end
+      end
+      reaper.ImGui_SameLine(ctx)
+      -- Check actual bypass state from envelope
+      local is_bypassed = false
+      local bp_item = reaper.GetSelectedMediaItem(0, 0)
+      if bp_item then
+        local bp_take = reaper.GetActiveTake(bp_item)
+        if bp_take then
+          local bp_env = reaper.GetTakeEnvelopeByName(bp_take, "Pitch")
+          if bp_env then
+            local retval, chunk = reaper.GetEnvelopeStateChunk(bp_env, "", false)
+            if retval then
+              is_bypassed = chunk:match("ACT 0") ~= nil
+            end
+          end
+        end
+      end
+      if is_bypassed then
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0xCC4444FF)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), 0xDD5555FF)
+        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), 0xBB3333FF)
+      end
+      if reaper.ImGui_Button(ctx, is_bypassed and "Bypassed" or "Bypass") then
+        if bp_item then
+          local bp_take = reaper.GetActiveTake(bp_item)
+          if bp_take then
+            local bp_env = reaper.GetTakeEnvelopeByName(bp_take, "Pitch")
+            if bp_env then
+              reaper.SetCursorContext(2, bp_env)
+              reaper.Main_OnCommand(40883, 0) -- Envelope: Toggle bypass
+              reaper.UpdateItemInProject(bp_item)
+              reaper.UpdateArrange()
+            end
+          end
+        end
+      end
+      if is_bypassed then
+        reaper.ImGui_PopStyleColor(ctx, 3)
+      end
+      reaper.ImGui_Separator(ctx)
+    end
 
     -- Draw graph area
     local w, h = reaper.ImGui_GetContentRegionAvail(ctx)
