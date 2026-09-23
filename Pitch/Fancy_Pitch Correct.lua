@@ -47,6 +47,57 @@ local QUALITY_MODES = {
   { name = "Low Latency",            block = 512,  hop = 256 }
 }
 
+-- Discover available pitch shift modes at startup
+local PITCH_SHIFT_MODES = {}
+local DEFAULT_PITCH_MODE_IDX = 1
+do
+  local mode_idx = 0
+  while true do
+    local retval, name = reaper.EnumPitchShiftModes(mode_idx)
+    if not retval or not name or name == "" then break end
+    local submodes = {}
+    local sub_idx = 0
+    while true do
+      local sub_name = reaper.EnumPitchShiftSubModes(mode_idx, sub_idx)
+      if not sub_name or sub_name == "" then break end
+      local packed = (mode_idx << 16) | sub_idx
+      table.insert(submodes, { name = sub_name, value = packed })
+      -- Detect Soloist Monophonic as default
+      if name:lower():find("soloist") and sub_name:lower():find("mono") then
+        DEFAULT_PITCH_MODE_IDX = #PITCH_SHIFT_MODES + 1
+      end
+      sub_idx = sub_idx + 1
+    end
+    if #submodes > 0 then
+      table.insert(PITCH_SHIFT_MODES, { name = name, submodes = submodes })
+    else
+      local packed = (mode_idx << 16)
+      table.insert(PITCH_SHIFT_MODES, { name = name, submodes = { { name = "Default", value = packed } } })
+    end
+    mode_idx = mode_idx + 1
+  end
+end
+
+local PITCHMODE_FLAT = { { name = "Project Default", value = -1 } }
+for _, mode in ipairs(PITCH_SHIFT_MODES) do
+  for _, sub in ipairs(mode.submodes) do
+    table.insert(PITCHMODE_FLAT, { name = mode.name .. " - " .. sub.name, value = sub.value })
+  end
+end
+
+-- Find the Soloist Monophonic entry in the flat list
+for i, entry in ipairs(PITCHMODE_FLAT) do
+  if entry.name:lower():find("soloist") and entry.name:lower():find("mono") then
+    DEFAULT_PITCH_MODE_IDX = i
+    break
+  end
+end
+
+-- Will be applied to state after state table is defined
+local INITIAL_PITCHMODE_IDX = DEFAULT_PITCH_MODE_IDX
+local INITIAL_PITCHMODE_VALUE = PITCHMODE_FLAT[DEFAULT_PITCH_MODE_IDX] and PITCHMODE_FLAT[DEFAULT_PITCH_MODE_IDX].value or -1
+local INITIAL_PITCHMODE_NAME = PITCHMODE_FLAT[DEFAULT_PITCH_MODE_IDX] and PITCHMODE_FLAT[DEFAULT_PITCH_MODE_IDX].name or "Project Default"
+
 -------------------------------------------------------------------------------
 -- 1. STATE & SETTINGS
 -------------------------------------------------------------------------------
@@ -58,6 +109,9 @@ local state = {
   preset_range_idx = 1,
   preset_mode_idx = 1,
   preset_quality_idx = 2,
+  preset_pitchmode_idx = INITIAL_PITCHMODE_IDX,
+  pitchmode_value = INITIAL_PITCHMODE_VALUE,
+  pitchmode_name = INITIAL_PITCHMODE_NAME,
   advanced_mode = false,
 
   -- YIN Parameters
@@ -114,7 +168,7 @@ end
 -- Process a single block of audio using the YIN algorithm
 local function yin_process_block(samples, sample_rate, params)
   local b_size = params.calc_block_size or params.block_size
-  
+
   -- Cache to native Lua table. reaper.array metamethods are extremely slow inside nested loops!
   local s = {}
   for i = 1, b_size do
@@ -219,7 +273,7 @@ local function reset_analysis()
   state.hovered_zone = nil
   state.selected_note = nil
   state.drag = nil
-  
+
   if state.accessor then
     reaper.DestroyAudioAccessor(state.accessor)
     state.accessor = nil
@@ -272,13 +326,29 @@ end
 
 local function extract_note_features(note)
   if note.count == 0 then return end
-  
+
   -- 1. Extract raw pitch array
   local raw_pitch = {}
   for i, frame in ipairs(note.frames) do
     raw_pitch[i] = frame.note
   end
-  
+
+  -- Median filter (3-point) to remove YIN tracking outliers
+  local function median3(a, b, c)
+    if a > b then a, b = b, a end
+    if b > c then b = c end
+    if a > b then b = a end
+    return b
+  end
+
+  local filtered = {}
+  filtered[1] = raw_pitch[1]
+  for i = 2, #raw_pitch - 1 do
+    filtered[i] = median3(raw_pitch[i-1], raw_pitch[i], raw_pitch[i+1])
+  end
+  filtered[#raw_pitch] = raw_pitch[#raw_pitch]
+  raw_pitch = filtered
+
   -- Simple moving average helper
   local function get_sma(arr, win_size)
     local res = {}
@@ -294,31 +364,31 @@ local function extract_note_features(note)
     end
     return res
   end
-  
+
   -- 2. Calculate Trend (Heavy smoothing to find the true center, ~240ms window)
   local trend = get_sma(raw_pitch, 21)
-  
+
   -- 3. Calculate smooth pitch (Light smoothing to remove YIN micro-jitters, ~58ms window)
   local smooth_pitch = get_sma(raw_pitch, 5)
-  
+
   -- 4. Calculate Modulation
   local mod = {}
   for i = 1, #raw_pitch do
     mod[i] = smooth_pitch[i] - trend[i]
   end
-  
+
   -- 5. Find Smart Spots via Zero-Crossing (1 peak per vibrato wave)
   local smart_spots = {}
   table.insert(smart_spots, { index = 1, time = note.frames[1].time, type = "anchor_start" })
-  
+
   local current_sign = nil
   local extrema_idx = nil
   local extrema_val = 0
-  
+
   for i = 1, #mod do
     local val = mod[i]
     local sign = val >= 0 and 1 or -1
-    
+
     if current_sign == nil then
       current_sign = sign
       extrema_idx = i
@@ -342,15 +412,15 @@ local function extract_note_features(note)
       extrema_val = val
     end
   end
-  
+
   -- Push the last one if prominent
   if extrema_idx and math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
      local s_type = current_sign == 1 and "peak" or "valley"
      table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
   end
-  
+
   table.insert(smart_spots, { index = #raw_pitch, time = note.frames[#raw_pitch].time, type = "anchor_end" })
-  
+
   note.trend = trend
   note.modulation = mod
   note.smart_spots = smart_spots
@@ -424,6 +494,33 @@ local function extract_note_features(note)
     vibrato_scale = 1.0,
     transition_ms = 15
   }
+
+  -- 7. ONSET ANALYSIS — scoop magnitude and voiced start detection
+  local scoop_frames = math.min(10, math.floor(#raw_pitch * 0.3))
+  local scoop_sum = 0
+  for i = 1, scoop_frames do
+    scoop_sum = scoop_sum + math.abs(raw_pitch[i] - note.avg_note)
+  end
+  note.scoop_magnitude = scoop_frames > 0 and (scoop_sum / scoop_frames) or 0
+
+  -- Find first frame with stable voicing (3+ consecutive voiced frames)
+  note.voiced_start_idx = 1
+  for i = 1, math.min(#note.frames, 15) do
+    if i + 2 <= #note.frames
+      and note.frames[i].note and note.frames[i+1].note and note.frames[i+2].note then
+      note.voiced_start_idx = i
+      break
+    end
+  end
+  note.voiced_start_time = note.frames[note.voiced_start_idx].time
+end
+
+local function is_note_modified(note)
+  if not note or not note.controls then return false end
+  local ctrl = note.controls
+  local pitch_changed = math.abs(ctrl.center_pitch - note.avg_note) > 0.001
+  local fine_changed = (ctrl.drift_scale ~= 1.0) or (ctrl.vibrato_scale ~= 1.0)
+  return pitch_changed or fine_changed
 end
 
 local function apply_envelope_to_take()
@@ -431,80 +528,170 @@ local function apply_envelope_to_take()
   if not item then return end
   local take = reaper.GetActiveTake(item)
   if not take then return end
-  
+
   reaper.Undo_BeginBlock()
-  
-  -- Force Elastique 3.3.3 Pro (Formant Preserving) -- Usually pitch mode 7 (or similar depending on reaper version). Mode 512 is default, but let's just let the user's project default handle it or set it manually later.
-  -- Actually let's just make sure Pitch envelope exists:
+
+  -- Set pitch shift mode (Elastique Soloist Monophonic by default)
+  if state.pitchmode_value ~= -1 then
+    reaper.SetMediaItemTakeInfo_Value(take, "I_PITCHMODE", state.pitchmode_value)
+  end
+
+  -- Ensure pitch envelope exists
   local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
   if not env then
     reaper.Main_OnCommand(41142, 0) -- Toggle take pitch envelope
     env = reaper.GetTakeEnvelopeByName(take, "Pitch")
   end
-  
+
   if not env then
     reaper.ShowMessageBox("Failed to activate Take Pitch Envelope.", "Error", 0)
     reaper.Undo_EndBlock("Apply Pitch Correction", -1)
     return
   end
-  
+
   -- Clear existing points
   reaper.DeleteEnvelopePointRange(env, 0, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
-  
+
+  local SHAPE = 5   -- Bezier
+  local TENSION = 0 -- Neutral tension
+
   for n_idx, note in ipairs(state.notes) do
+    -- SCALPEL RULE: Untouched notes receive zero envelope points
+    if not is_note_modified(note) then
+      goto continue_note
+    end
+
     local ctrl = note.controls
     local prev_note = state.notes[n_idx - 1]
     local next_note = state.notes[n_idx + 1]
-    
-    -- Check relationships for transitions (if gap is < 50ms, it's a legato pitch jump)
-    local is_legato_prev = prev_note and (note.start_time - prev_note.end_time) < 0.05
-    local is_legato_next = next_note and (next_note.start_time - note.end_time) < 0.05
-    
-    local half_dur = (note.end_time - note.start_time) * 0.5
-    local trans_sec = math.min(ctrl.transition_ms / 1000, half_dur * 0.8)
-    local onset_sec = math.min(0.04, half_dur * 0.8)
-    
-    for spot_idx, spot in ipairs(note.smart_spots) do
-      local i = spot.index
-      local t = spot.time
-      local raw = note.frames[i].note
-      local trend_val = note.trend[i]
-      local mod_val = note.modulation[i]
 
-      -- Vibrato-weight: only scale modulation where vibrato was detected
-      local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
-      local effective_vib = 1.0 + (ctrl.vibrato_scale - 1.0) * vw
+    -- STRICT BOUNDARY CONTRACT:
+    -- Legato connection ONLY exists if the neighbor is ALSO MODIFIED and within 50ms!
+    local prev_is_mod = is_note_modified(prev_note)
+    local next_is_mod = is_note_modified(next_note)
 
-      local target_pitch = ctrl.center_pitch
-                         + (trend_val - note.avg_note) * ctrl.drift_scale
-                         + (mod_val * effective_vib)
-                         
-      local env_val = target_pitch - raw
-      
-      -- Context-Aware Smoothing (Shape 2 = Slow Start/End for S-Curve interpolation)
-      if spot.type == "anchor_start" then
-        if not is_legato_prev then
-          reaper.InsertEnvelopePointEx(env, -1, t, 0, 2, 0, 0, false)
-          t = t + onset_sec
-        else
-          t = t + trans_sec
-        end
-      elseif spot.type == "anchor_end" then
-        if not is_legato_next then
-          reaper.InsertEnvelopePointEx(env, -1, t, env_val, 2, 0, 0, false)
-          reaper.InsertEnvelopePointEx(env, -1, t + onset_sec, 0, 2, 0, 0, false)
-          t = nil
-        else
-          t = t - trans_sec
-        end
+    local is_legato_prev = prev_is_mod and ((note.start_time - prev_note.end_time) < 0.05)
+    local is_legato_next = next_is_mod and ((next_note.start_time - note.end_time) < 0.05)
+
+    local note_dur = note.end_time - note.start_time
+    local half_dur = note_dur * 0.5
+
+    -- Onset ramp duration for fine adjustments (scales with scoop)
+    local scoop = note.scoop_magnitude or 0
+    local base_onset = 0.08 -- 80ms
+    local scoop_extra = math.min(0.07, scoop * 0.05)
+    local onset_ramp_sec = math.min(base_onset + scoop_extra, half_dur * 0.6)
+
+    -- Crossfade duration between two modified notes
+    local xfade_sec = math.min(0.04, half_dur * 0.4)
+
+    -- Coarse pitch shift (rigid DC offset)
+    local coarse_shift = ctrl.center_pitch - note.avg_note
+    local fine_changed = (ctrl.drift_scale ~= 1.0) or (ctrl.vibrato_scale ~= 1.0)
+
+    -- Store debug info
+    note.onset_debug = {
+      onset_ramp_ms = onset_ramp_sec * 1000,
+      scoop_st = scoop,
+      voicing_delay_ms = 0,
+      is_legato_prev = is_legato_prev,
+      is_legato_next = is_legato_next
+    }
+
+    if not fine_changed then
+      -- =====================================================================
+      -- 1. COARSE-ONLY MODE (Uniform pitch shift across the note)
+      -- =====================================================================
+      -- START BOUNDARY
+      if not is_legato_prev then
+        -- Strict 0.0 isolation: pin envelope to 0 before note start
+        reaper.InsertEnvelopePointEx(env, -1, note.start_time - 0.001, 0, 0, 0, 0, false)
+        reaper.InsertEnvelopePointEx(env, -1, note.start_time, coarse_shift, SHAPE, TENSION, 0, false)
+      else
+        -- Both notes modified: blend at boundary
+        local prev_shift = prev_note.controls.center_pitch - prev_note.avg_note
+        local blend_val = (prev_shift + coarse_shift) * 0.5
+        reaper.InsertEnvelopePointEx(env, -1, note.start_time, blend_val, SHAPE, TENSION, 0, false)
+        reaper.InsertEnvelopePointEx(env, -1, note.start_time + xfade_sec, coarse_shift, SHAPE, TENSION, 0, false)
       end
-      
-      if t then
-        reaper.InsertEnvelopePointEx(env, -1, t, env_val, 2, 0, 0, false)
+
+      -- END BOUNDARY
+      if not is_legato_next then
+        -- Strict 0.0 isolation: hold coarse shift to note end, pin to 0 immediately after
+        reaper.InsertEnvelopePointEx(env, -1, note.end_time, coarse_shift, SHAPE, TENSION, 0, false)
+        reaper.InsertEnvelopePointEx(env, -1, note.end_time + 0.001, 0, 0, 0, 0, false)
+      else
+        -- Both notes modified: hold coarse shift up to crossfade start
+        reaper.InsertEnvelopePointEx(env, -1, note.end_time - xfade_sec, coarse_shift, SHAPE, TENSION, 0, false)
+      end
+
+    else
+      -- =====================================================================
+      -- 2. FINE CONTOUR MODE (Drift reduction / vibrato scaling)
+      -- =====================================================================
+      -- Decoupled formula: env_val = coarse_shift + drift_corr + vib_corr
+      -- Avoids injecting YIN (smooth - raw) noise into the take envelope.
+      local num_spots = #note.smart_spots
+      for s_idx, spot in ipairs(note.smart_spots) do
+        local i = spot.index
+        local t = spot.time
+        local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
+        local drift_corr = (note.trend[i] - note.avg_note) * (ctrl.drift_scale - 1.0)
+        local vib_corr = note.modulation[i] * (ctrl.vibrato_scale - 1.0) * vw
+        local env_val = coarse_shift + drift_corr + vib_corr
+
+        if s_idx == 1 or spot.type == "anchor_start" then
+          -- START BOUNDARY
+          if not is_legato_prev then
+            -- Strict 0.0 isolation: pin envelope to 0 before note start
+            reaper.InsertEnvelopePointEx(env, -1, note.start_time - 0.001, 0, 0, 0, 0, false)
+            -- Coarse shift engages immediately
+            reaper.InsertEnvelopePointEx(env, -1, note.start_time, coarse_shift, SHAPE, TENSION, 0, false)
+            -- Ease into fine contour
+            local fine_at_ramp = env_val - coarse_shift
+            if math.abs(fine_at_ramp) > 0.01 and onset_ramp_sec > 0.02 then
+              reaper.InsertEnvelopePointEx(env, -1, note.start_time + onset_ramp_sec * 0.5, coarse_shift + fine_at_ramp * 0.5, SHAPE, TENSION, 0, false)
+              t = note.start_time + onset_ramp_sec
+            else
+              t = nil
+            end
+          else
+            -- Both notes modified: blend at boundary
+            local prev_ctrl = prev_note.controls
+            local prev_shift = prev_ctrl.center_pitch - prev_note.avg_note
+            local prev_drift_corr = (prev_note.trend[#prev_note.trend] - prev_note.avg_note) * (prev_ctrl.drift_scale - 1.0)
+            local prev_vw = prev_note.vibrato_weight and prev_note.vibrato_weight[#prev_note.vibrato_weight] or 1.0
+            local prev_vib_corr = prev_note.modulation[#prev_note.modulation] * (prev_ctrl.vibrato_scale - 1.0) * prev_vw
+            local prev_env_val = prev_shift + prev_drift_corr + prev_vib_corr
+
+            local blend_val = (prev_env_val + env_val) * 0.5
+            reaper.InsertEnvelopePointEx(env, -1, note.start_time, blend_val, SHAPE, TENSION, 0, false)
+            t = note.start_time + xfade_sec
+          end
+
+        elseif s_idx == num_spots or spot.type == "anchor_end" then
+          -- END BOUNDARY
+          if not is_legato_next then
+            -- Strict 0.0 isolation: note finishes at env_val, then pin to 0.0 immediately
+            reaper.InsertEnvelopePointEx(env, -1, note.end_time, env_val, SHAPE, TENSION, 0, false)
+            reaper.InsertEnvelopePointEx(env, -1, note.end_time + 0.001, 0, 0, 0, 0, false)
+            t = nil
+          else
+            -- Both notes modified: end slightly before boundary so next note can blend
+            reaper.InsertEnvelopePointEx(env, -1, note.end_time - xfade_sec, env_val, SHAPE, TENSION, 0, false)
+            t = nil
+          end
+        end
+
+        if t then
+          reaper.InsertEnvelopePointEx(env, -1, t, env_val, SHAPE, TENSION, 0, false)
+        end
       end
     end
+
+    ::continue_note::
   end
-  
+
   reaper.Envelope_SortPointsEx(env, -1)
   reaper.UpdateArrange()
   reaper.Undo_EndBlock("Apply Pitch Correction", -1)
@@ -513,15 +700,15 @@ end
 local function run_hybrid_segmentation()
   state.notes = {}
   state.split_points = {} -- For debugging display
-  
+
   if #state.results == 0 then return end
-  
+
   -- Configuration
   local min_note_dur = 0.08 -- 80ms
   local debounce_dur = 0.08 -- 80ms
   local pitch_jump_threshold = 0.75 -- Semitones
   local rms_noise_floor = 0.005 -- Absolute RMS threshold for silence
-  
+
   -- Calculate derivatives (applying a simple median filter logic by looking at 3 frames would be better, but we keep it simple for now)
   for i, frame in ipairs(state.results) do
     if i > 1 then
@@ -537,16 +724,16 @@ local function run_hybrid_segmentation()
       frame.delta_rms = 0
     end
   end
-  
+
   local current_note = nil
   local last_split_time = -1
-  
+
   for _, frame in ipairs(state.results) do
     local is_voiced = (frame.note ~= nil and frame.rms > rms_noise_floor)
-    
+
     local should_split = false
     local split_reason = ""
-    
+
     if is_voiced then
       if not current_note then
         should_split = true
@@ -557,7 +744,7 @@ local function run_hybrid_segmentation()
           should_split = true
           split_reason = "Pitch Jump"
         end
-        
+
         -- Check for amplitude spike (articulation)
         if frame.delta_rms > frame.rms * 0.5 and frame.delta_rms > 0.02 then
           should_split = true
@@ -574,7 +761,7 @@ local function run_hybrid_segmentation()
         current_note = nil
       end
     end
-    
+
     if should_split and (frame.time - last_split_time) >= debounce_dur then
       if current_note then
         current_note.end_time = frame.time
@@ -582,7 +769,7 @@ local function run_hybrid_segmentation()
           table.insert(state.notes, current_note)
         end
       end
-      
+
       current_note = {
         start_time = frame.time,
         end_time = frame.time,
@@ -590,11 +777,11 @@ local function run_hybrid_segmentation()
         count = 0,
         frames = {}
       }
-      
+
       table.insert(state.split_points, { time = frame.time, reason = split_reason })
       last_split_time = frame.time
     end
-    
+
     if current_note and is_voiced then
       current_note.sum_note = current_note.sum_note + frame.note
       current_note.count = current_note.count + 1
@@ -602,12 +789,12 @@ local function run_hybrid_segmentation()
       table.insert(current_note.frames, frame)
     end
   end
-  
+
   -- Push last note
   if current_note and (current_note.end_time - current_note.start_time) >= min_note_dur then
     table.insert(state.notes, current_note)
   end
-  
+
   -- Calculate anchor pitch
   for _, n in ipairs(state.notes) do
     if n.count > 0 then
@@ -852,16 +1039,16 @@ local function draw_graph(draw_ctx, w, h)
     local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
     local is_black_key = (n % 12 == 1 or n % 12 == 3 or n % 12 == 6
                           or n % 12 == 8 or n % 12 == 10)
-                          
+
     local grid_color = is_black_key and 0x222222FF or 0x333333FF
     reaper.ImGui_DrawList_AddLine(draw_list, px, y, px + w, y, grid_color)
-    
+
     local key_color = is_black_key and 0x1A1A1AFF or 0xDDDDDDFF
     local text_col = is_black_key and 0x888888FF or 0x333333FF
-    
+
     reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, key_top, full_px + piano_w, key_bot, key_color)
     reaper.ImGui_DrawList_AddRect(draw_list, full_px, key_top, full_px + piano_w, key_bot, 0x000000FF)
-    
+
     if n % 12 == 0 then
       local label = "C" .. tostring(math.floor(n / 12) - 1)
       reaper.ImGui_DrawList_AddText(draw_list, full_px + 2, key_top + (key_bot - key_top) * 0.5 - 7, text_col, label)
@@ -887,9 +1074,20 @@ local function draw_graph(draw_ctx, w, h)
 
         local is_selected = (state.selected_note == n_idx)
         local is_hov = (state.hovered_note == n_idx)
+        local is_mod = is_note_modified(note)
 
-        local fill = is_selected and 0x44AA4488 or 0x44AA4466
-        local border = is_selected and P.accent or 0x44AA44FF
+        local fill
+        local border
+        if is_selected then
+          fill = is_mod and 0x3FA34D99 or 0x4477AA88
+          border = P.accent
+        elseif is_mod then
+          fill = 0x3FA34D77  -- Vivid green for edited notes
+          border = 0x56E39FFF
+        else
+          fill = 0x2A364466  -- Muted slate for untouched notes
+          border = 0x4A586888
+        end
 
         -- Zone-colored hover highlights
         if is_hov and not state.drag then
@@ -905,7 +1103,7 @@ local function draw_graph(draw_ctx, w, h)
               ex - zone_w, top_y, ex, bot_y, 0xFFAA4444)
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, ex, bot_y, 0x44AA4488)
+              sx, top_y, ex, bot_y, fill)
           end
         else
           reaper.ImGui_DrawList_AddRectFilled(draw_list,
@@ -930,8 +1128,9 @@ local function draw_graph(draw_ctx, w, h)
         local sign = cents >= 0 and "+" or ""
         local label = string.format("%s %s%d\xC2\xA2", midi_to_name(nearest), sign, cents)
         local text_y = (top_y + bot_y) * 0.5 - 7
+        local text_color = is_mod and 0xFFFFFFFF or 0xCCCCCCAA
         reaper.ImGui_DrawList_AddText(draw_list,
-          sx + 4, text_y, 0xFFFFFFFF, label)
+          sx + 4, text_y, text_color, label)
       end
     end
   end
@@ -1031,17 +1230,17 @@ local function draw_graph(draw_ctx, w, h)
         end
       end
 
-      -- Corrected pitch preview line (green) — vibrato-weight-aware
-      if state.show_preview and note.controls and note.trend and note.modulation then
+      -- Corrected pitch preview line (green) — rendered for modified notes
+      if state.show_preview and is_note_modified(note) and note.controls and note.trend and note.modulation then
         local ctrl = note.controls
+        local coarse_shift = ctrl.center_pitch - note.avg_note
         local cp_poly = reaper.new_array(#note.frames * 2)
         local cp_idx = 1
         for i, frame in ipairs(note.frames) do
           local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
-          local effective_vib = 1.0 + (ctrl.vibrato_scale - 1.0) * vw
-          local target = ctrl.center_pitch
-                       + (note.trend[i] - note.avg_note) * ctrl.drift_scale
-                       + (note.modulation[i] * effective_vib)
+          local drift_corr = (note.trend[i] - note.avg_note) * (ctrl.drift_scale - 1.0)
+          local vib_corr = note.modulation[i] * (ctrl.vibrato_scale - 1.0) * vw
+          local target = frame.note + coarse_shift + drift_corr + vib_corr
           local x = px + ((frame.time - state.start_time) / duration) * w
           local y = py + h - ((target - min_note) / note_range) * h
           cp_poly[cp_idx] = x
@@ -1155,6 +1354,24 @@ local function loop()
     reaper.ImGui_PopItemWidth(ctx)
 
     reaper.ImGui_SameLine(ctx)
+    reaper.ImGui_PushItemWidth(ctx, 180)
+    if reaper.ImGui_BeginCombo(ctx, "##pitchmode", state.pitchmode_name) then
+      for i, entry in ipairs(PITCHMODE_FLAT) do
+        local is_selected = (state.preset_pitchmode_idx == i)
+        if reaper.ImGui_Selectable(ctx, entry.name, is_selected) then
+          state.preset_pitchmode_idx = i
+          state.pitchmode_value = entry.value
+          state.pitchmode_name = entry.name
+        end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Pitch Shift Algorithm — Elastique Soloist (Monophonic) recommended for vocals.\nSet automatically when applying correction.")
+    end
+    reaper.ImGui_PopItemWidth(ctx)
+
+    reaper.ImGui_SameLine(ctx)
     if reaper.ImGui_Button(ctx, "Analyze") then
       start_analysis()
     end
@@ -1230,10 +1447,21 @@ local function loop()
         local nearest = math.floor(ctrl.center_pitch + 0.5)
         local cents = math.floor((ctrl.center_pitch - nearest) * 100 + 0.5)
         local sign = cents >= 0 and "+" or ""
+        local is_mod = is_note_modified(sel)
+        local status_str = is_mod and "[Tuned]" or "[Untouched]"
         reaper.ImGui_Text(ctx, string.format(
-          "Selected: %s %s%d\xC2\xA2  |  Stability: %.0f%%  |  Vibrato: %.0f%%",
+          "Selected: %s %s%d\xC2\xA2  |  Stability: %.0f%%  |  Vibrato: %.0f%%  |  %s",
           midi_to_name(nearest), sign, cents, (1 - ctrl.drift_scale) * 100,
-          ctrl.vibrato_scale * 100))
+          ctrl.vibrato_scale * 100, status_str))
+        -- Onset debug info
+        if sel.onset_debug then
+          local od = sel.onset_debug
+          reaper.ImGui_TextDisabled(ctx, string.format(
+            "Onset: ramp=%.0fms  scoop=%.2fst  voicing_delay=%.0fms  |  %s | %s",
+            od.onset_ramp_ms, od.scoop_st, od.voicing_delay_ms,
+            od.is_legato_prev and "legato-in" or "attack",
+            od.is_legato_next and "legato-out" or "release"))
+        end
       else
         reaper.ImGui_TextDisabled(ctx,
           "Click a note block to select. Drag: center=pitch, left=stability, right=vibrato")
