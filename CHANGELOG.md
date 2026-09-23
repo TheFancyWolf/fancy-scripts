@@ -4,6 +4,16 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v1.1.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Scalpel Keyboard Controls:
+  - Arrow nudging: Up/Down = ±1 semitone, Shift+Up/Down = ±10 cents fine-tune
+  - Left/Right arrow keys: Jump note selection to previous/next note in phrase
+  - S key: Snap selected note to nearest exact semitone (0¢ deviation)
+  - Double-click pitch zone: Snap note to nearest semitone
+  - R / Backspace / Delete: Reset selected note back to [Untouched], clearing envelope points
+  - Spacebar passthrough: Triggers REAPER Play/Stop even when ImGui window has focus
+  - Info icon (ⓘ) in toolbar with keyboard shortcuts tooltip on hover
+  - Deduplicated Reset Selected button logic via shared helper function
+
 - **Fancy Pitch Correct v2.4.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Scale Intelligence:
   - Scale auto-detection: Krumhansl-Kessler key profiling from pitch histogram data
   - "Detect" button in toolbar: analyzes pitch frames and auto-sets root note + scale type

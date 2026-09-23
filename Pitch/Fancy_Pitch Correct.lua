@@ -1,8 +1,13 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 1.0.0
+-- @version 1.1.0
 -- @changelog
---   + Initial release
+--   + Arrow nudging: Up/Down = ±1 semitone, Shift+Up/Down = ±10 cents
+--   + Left/Right arrow: Jump selection to previous/next note
+--   + S key or double-click pitch zone: Snap note to nearest semitone (0¢)
+--   + R / Backspace / Delete: Reset selected note to [Untouched]
+--   + Spacebar passthrough: Triggers REAPER Play/Stop from ImGui window
+--   + Info icon in toolbar with keyboard shortcuts tooltip
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -157,11 +162,37 @@ local state = {
   sidebar_w = 200      -- resizable sidebar width
 }
 
+-- Robustly resolve a media item take by GUID with SWS and item-scan fallbacks
+local function resolve_take_by_guid(guid)
+  if not guid then return nil end
+  local take = reaper.GetMediaItemTakeByGUID(0, guid)
+  if take then return take end
+  if reaper.SNM_GetMediaItemTakeByGUID then
+    take = reaper.SNM_GetMediaItemTakeByGUID(0, guid)
+    if take then return take end
+  end
+  local num_items = reaper.CountMediaItems(0)
+  for i = 0, num_items - 1 do
+    local it = reaper.GetMediaItem(0, i)
+    if it then
+      local num_takes = reaper.CountTakes(it)
+      for t = 0, num_takes - 1 do
+        local tk = reaper.GetTake(it, t)
+        if tk then
+          local _, g = reaper.GetSetMediaItemTakeInfo_String(tk, "GUID", "", false)
+          if g == guid then return tk end
+        end
+      end
+    end
+  end
+  return nil
+end
+
 -- Resolve the target take reliably, even if the item becomes deselected in REAPER
 local function get_target_take(auto_select)
   local take = nil
   if state.target_take_guid then
-    take = reaper.GetMediaItemTakeByGUID(0, state.target_take_guid)
+    take = resolve_take_by_guid(state.target_take_guid)
   end
 
   if not take then
@@ -190,30 +221,62 @@ local function get_target_take(auto_select)
   return take, item
 end
 
--- Ensure the Take Pitch Envelope is active on the take, creating it if needed
-local function ensure_take_pitch_envelope(take, item)
+-- Ensure the Take Pitch Envelope is active on the take, creating it if needed.
+-- If force_unbypass is true (e.g. during analysis), guarantees it is active (ACT 1).
+local function ensure_take_pitch_envelope(take, item, force_unbypass)
   if not take or not item then return nil end
   local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
-  if env then return env end
+  local is_new = false
 
-  -- Item must be selected and take active for action to target it
-  local was_selected = reaper.IsMediaItemSelected(item)
-  if not was_selected then
-    reaper.SetMediaItemSelected(item, true)
+  if not env then
+    is_new = true
+    -- Item must be selected and take active for action to target it
+    local was_selected = reaper.IsMediaItemSelected(item)
+    if not was_selected then
+      reaper.SetMediaItemSelected(item, true)
+    end
+    reaper.SetActiveTake(take)
+
+    -- SWS command is "Show take pitch envelope" (explicit, non-toggling)
+    local sws_cmd = reaper.NamedCommandLookup("_S&M_TAKEENV10")
+    if sws_cmd > 0 then
+      reaper.Main_OnCommand(sws_cmd, 0)
+    else
+      -- Native REAPER command 41612: "Take: Toggle take pitch envelope"
+      reaper.Main_OnCommand(41612, 0)
+    end
+
+    reaper.UpdateArrange()
+    env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+
+    if not was_selected then
+      reaper.SetMediaItemSelected(item, false)
+    end
   end
-  reaper.SetActiveTake(take)
 
-  -- SWS command is "Show take pitch envelope" (explicit, non-toggling)
-  local sws_cmd = reaper.NamedCommandLookup("_S&M_TAKEENV10")
-  if sws_cmd > 0 then
-    reaper.Main_OnCommand(sws_cmd, 0)
-  else
-    -- Native REAPER command 41612: "Take: Toggle take pitch envelope"
-    reaper.Main_OnCommand(41612, 0)
+  -- Guarantee envelope is ACTIVE (unbypassed, ACT 1) and VISIBLE (VIS 1)
+  -- when newly created or when explicitly requested (e.g. upon analysis)
+  if env and (is_new or force_unbypass) then
+    local ok, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+    if ok and chunk then
+      local modified = false
+      if chunk:match("ACT%s+0") then
+        chunk = chunk:gsub("ACT%s+0", "ACT 1")
+        modified = true
+      end
+      if chunk:match("VIS%s+0") then
+        chunk = chunk:gsub("VIS%s+0", "VIS 1")
+        modified = true
+      end
+      if modified then
+        reaper.SetEnvelopeStateChunk(env, chunk, false)
+        reaper.UpdateItemInProject(item)
+        reaper.UpdateArrange()
+      end
+    end
   end
 
-  reaper.UpdateArrange()
-  return reaper.GetTakeEnvelopeByName(take, "Pitch")
+  return env
 end
 
 -------------------------------------------------------------------------------
@@ -403,7 +466,7 @@ local function start_analysis()
   state.progress = 0
 
   -- Ensure take pitch envelope is created and active on the take upfront
-  ensure_take_pitch_envelope(take, item)
+  ensure_take_pitch_envelope(take, item, true)
 end
 
 local function extract_note_features(note)
@@ -605,6 +668,10 @@ local function is_note_modified(note)
   return pitch_changed or fine_changed
 end
 
+-- Forward declaration; will be set after apply_envelope_to_take is defined
+local reset_selected_note
+local snap_selected_note
+
 -------------------------------------------------------------------------------
 -- MULTI-ITEM SESSION & PROJECT PERSISTENCE
 -------------------------------------------------------------------------------
@@ -661,20 +728,35 @@ local function is_take_pitch_bypassed(take)
   if not env then return false end
   local retval, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
   if retval and chunk then
-    return chunk:match("ACT 0") ~= nil
+    return chunk:match("ACT%s+0") ~= nil
   end
   return false
 end
 
 local function toggle_take_pitch_bypass(take)
   if not take then return end
+  local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
   local item = reaper.GetMediaItemTake_Item(take)
-  local env = ensure_take_pitch_envelope(take, item)
+  if not env and item then
+    env = ensure_take_pitch_envelope(take, item, true)
+  end
   if env then
-    reaper.SetCursorContext(2, env)
-    reaper.Main_OnCommand(40883, 0) -- Envelope: Toggle bypass
-    if item then reaper.UpdateItemInProject(item) end
-    reaper.UpdateArrange()
+    reaper.Undo_BeginBlock()
+    local ok, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+    if ok and chunk then
+      if chunk:match("ACT%s+0") then
+        chunk = chunk:gsub("ACT%s+0", "ACT 1")
+        if chunk:match("VIS%s+0") then
+          chunk = chunk:gsub("VIS%s+0", "VIS 1")
+        end
+      else
+        chunk = chunk:gsub("ACT%s+1", "ACT 0")
+      end
+      reaper.SetEnvelopeStateChunk(env, chunk, false)
+      if item then reaper.UpdateItemInProject(item) end
+      reaper.UpdateArrange()
+    end
+    reaper.Undo_EndBlock("Toggle Take Pitch Envelope Bypass", -1)
   end
 end
 
@@ -705,7 +787,7 @@ local function switch_active_target(guid, take_obj)
 
     local item = take_obj and reaper.GetMediaItemTake_Item(take_obj)
     if not item then
-      local t = reaper.GetMediaItemTakeByGUID(0, guid)
+      local t = resolve_take_by_guid(guid)
       item = t and reaper.GetMediaItemTake_Item(t)
     end
     if item and not reaper.IsMediaItemSelected(item) then
@@ -916,6 +998,26 @@ local function apply_envelope_to_take()
   end
 end
 
+-- Resets the selected note back to [Untouched], clearing its envelope contribution.
+reset_selected_note = function()
+  if not state.selected_note or not state.notes then return end
+  local sel = state.notes[state.selected_note]
+  if not sel or not sel.controls then return end
+  sel.controls.center_pitch = sel.avg_note
+  sel.controls.drift_scale = 1.0
+  sel.controls.vibrato_scale = 1.0
+  apply_envelope_to_take()
+end
+
+-- Snaps the selected note to the nearest exact semitone (0¢ deviation).
+snap_selected_note = function()
+  if not state.selected_note or not state.notes then return end
+  local sel = state.notes[state.selected_note]
+  if not sel or not sel.controls then return end
+  sel.controls.center_pitch = math.floor(sel.controls.center_pitch + 0.5)
+  apply_envelope_to_take()
+end
+
 local function run_hybrid_segmentation()
   state.notes = {}
   state.split_points = {} -- For debugging display
@@ -1090,7 +1192,7 @@ local function process_analysis_step()
       end
       if not found then table.insert(state.session_order, state.target_take_guid) end
 
-      local t = reaper.GetMediaItemTakeByGUID(0, state.target_take_guid)
+      local t = resolve_take_by_guid(state.target_take_guid)
       if t then save_take_data(t, take_data) end
     end
   elseif state.item_len > 0 then
@@ -1227,6 +1329,16 @@ local function draw_graph(draw_ctx, w, h)
       }
     else
       state.selected_note = nil
+      -- Click on empty canvas: move REAPER edit cursor to this time position
+      local rel_x = (mx - px) / w  -- 0..1 across canvas
+      rel_x = math.max(0, math.min(1, rel_x))
+      local item_time = state.start_time + rel_x * duration
+      -- Convert item-relative time to project time
+      local _, item = get_target_take(false)
+      if item then
+        local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        reaper.SetEditCurPos(item_pos + item_time, false, false)
+      end
     end
   end
 
@@ -1271,6 +1383,91 @@ local function draw_graph(draw_ctx, w, h)
         apply_envelope_to_take()
       end
       state.drag = nil
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- KEYBOARD CONTROLS (Scalpel Workflow)
+  ---------------------------------------------------------------------------
+  -- Guard: skip keyboard shortcuts if any widget (combo, input, slider)
+  -- is active — prevents arrow keys from leaking into toolbar combos.
+  local ok_aia, any_active = pcall(reaper.ImGui_IsAnyItemActive, draw_ctx)
+  local widget_capturing = ok_aia and any_active
+
+  if not state.drag and not widget_capturing and state.notes and #state.notes > 0 then
+    -- Resolve Shift modifier for fine-tune (cross-platform, no OS conflicts)
+    local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
+    local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+    local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
+
+    -- Up / Down: Nudge pitch (±1 semitone, or ±10 cents with Shift)
+    if state.selected_note and state.notes[state.selected_note] then
+      local sel = state.notes[state.selected_note]
+
+      if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_UpArrow()) then
+        get_target_take(true)
+        if has_shift then
+          sel.controls.center_pitch = sel.controls.center_pitch + 0.10  -- +10 cents
+        else
+          sel.controls.center_pitch = sel.controls.center_pitch + 1.0   -- +1 semitone
+        end
+        apply_envelope_to_take()
+      end
+
+      if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_DownArrow()) then
+        get_target_take(true)
+        if has_shift then
+          sel.controls.center_pitch = sel.controls.center_pitch - 0.10  -- -10 cents
+        else
+          sel.controls.center_pitch = sel.controls.center_pitch - 1.0   -- -1 semitone
+        end
+        apply_envelope_to_take()
+      end
+
+      -- S: Snap to nearest semitone
+      if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_S()) then
+        get_target_take(true)
+        snap_selected_note()
+      end
+
+      -- R / Backspace / Delete: Reset to [Untouched]
+      if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_R())
+        or reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_Backspace())
+        or reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_Delete()) then
+        get_target_take(true)
+        reset_selected_note()
+      end
+    end
+
+    -- Left / Right: Jump selection to previous / next note
+    if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_LeftArrow()) then
+      if state.selected_note and state.selected_note > 1 then
+        state.selected_note = state.selected_note - 1
+      elseif not state.selected_note then
+        state.selected_note = 1
+      end
+    end
+
+    if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_RightArrow()) then
+      if state.selected_note and state.selected_note < #state.notes then
+        state.selected_note = state.selected_note + 1
+      elseif not state.selected_note then
+        state.selected_note = 1
+      end
+    end
+
+    -- Spacebar: Pass through to REAPER Play/Stop
+    if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_Space()) then
+      reaper.Main_OnCommand(40044, 0)  -- Transport: Play/Stop
+    end
+  end
+
+  -- Double-click pitch zone: Snap to nearest semitone
+  if is_canvas_hovered and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
+    if state.hovered_note and state.hovered_zone == "pitch" then
+      state.selected_note = state.hovered_note
+      get_target_take(true)
+      snap_selected_note()
     end
   end
 
@@ -1537,8 +1734,177 @@ local function draw_graph(draw_ctx, w, h)
         0xFFFFFFBB, tip)
     end
   end
+  ---------------------------------------------------------------------------
+  -- PLAYHEAD CURSOR LINE
+  ---------------------------------------------------------------------------
+  local _, item_for_cursor = get_target_take(false)
+  if item_for_cursor then
+    local item_pos = reaper.GetMediaItemInfo_Value(item_for_cursor, "D_POSITION")
+    -- Use play position when playing, edit cursor when stopped
+    local play_state = reaper.GetPlayState()
+    local project_pos = (play_state & 1) ~= 0
+      and reaper.GetPlayPosition()
+      or  reaper.GetCursorPosition()
+    local item_rel = project_pos - item_pos
+    -- Only draw if cursor is within the item's time range
+    if item_rel >= state.start_time and item_rel <= state.end_time then
+      local cursor_x = px + ((item_rel - state.start_time) / duration) * w
+      reaper.ImGui_DrawList_AddLine(draw_list,
+        cursor_x, py, cursor_x, py + h, P.accent, 1.5)
+    end
+  end
 
   reaper.ImGui_DrawList_PopClipRect(draw_list)
+end
+
+local function strip_pitchenv_from_str(str)
+  local s_start = str:find("<PITCHENV")
+  if not s_start then return str end
+  local depth = 0
+  local pos = s_start
+  local s_end = nil
+  while pos <= #str do
+    local b_start, b_end, tag = str:find("([<>])", pos)
+    if not b_start then break end
+    if tag == "<" then
+      depth = depth + 1
+    elseif tag == ">" then
+      depth = depth - 1
+      if depth == 0 then
+        if str:sub(b_end + 1, b_end + 2) == "\r\n" then
+          s_end = b_end + 2
+        elseif str:sub(b_end + 1, b_end + 1) == "\n" then
+          s_end = b_end + 1
+        else
+          s_end = b_end
+        end
+        break
+      end
+    end
+    pos = b_end + 1
+  end
+
+  if s_end then
+    return str:sub(1, s_start - 1) .. str:sub(s_end + 1)
+  end
+  return str
+end
+
+local function remove_take_pitch_envelope_chunk(item, take_guid)
+  if not item then return end
+  local ok, chunk = reaper.GetItemStateChunk(item, "", false)
+  if not ok or not chunk or not chunk:find("<PITCHENV") then return end
+
+  local num_takes = reaper.CountTakes(item)
+  if num_takes <= 1 or not take_guid then
+    local new_chunk = strip_pitchenv_from_str(chunk)
+    reaper.SetItemStateChunk(item, new_chunk, false)
+    return
+  end
+
+  -- Multi-take item: split chunk at "\nTAKE" boundaries
+  local sections = {}
+  local last_pos = 1
+  while true do
+    local t_start = chunk:find("\nTAKE", last_pos)
+    if not t_start then
+      table.insert(sections, chunk:sub(last_pos))
+      break
+    end
+    table.insert(sections, chunk:sub(last_pos, t_start))
+    last_pos = t_start + 1
+  end
+
+  local modified = false
+  for i, sec in ipairs(sections) do
+    if sec:find(take_guid, 1, true) then
+      local new_sec = strip_pitchenv_from_str(sec)
+      if new_sec ~= sec then
+        sections[i] = new_sec
+        modified = true
+      end
+      break
+    end
+  end
+
+  if modified then
+    local new_chunk = table.concat(sections, "")
+    reaper.SetItemStateChunk(item, new_chunk, false)
+  end
+end
+
+local function remove_take_from_session(guid)
+  if not guid then return end
+
+  local data = state.session_takes[guid]
+  local take_name = (data and data.name) or "Take"
+  local take_obj = resolve_take_by_guid(guid)
+
+  reaper.Undo_BeginBlock()
+
+  if take_obj then
+    local item = reaper.GetMediaItemTake_Item(take_obj)
+
+    -- 1. Wipe all pitch envelope points and automation items first
+    local env = reaper.GetTakeEnvelopeByName(take_obj, "Pitch")
+    if env then
+      local ai_count = reaper.CountAutomationItems(env)
+      for a = ai_count - 1, 0, -1 do
+        reaper.DestroyAutomationItem(env, a)
+      end
+      reaper.DeleteEnvelopePointRange(env, -1000000, 1000000)
+      reaper.Envelope_SortPoints(env)
+    end
+
+    -- 2. Completely remove the <PITCHENV> block from the media item chunk
+    if item then
+      remove_take_pitch_envelope_chunk(item, guid)
+    end
+
+    -- 3. Reset pitch shift mode to project default (-1) and pitch offset to 0.0
+    reaper.SetMediaItemTakeInfo_Value(take_obj, "I_PITCHMODE", -1)
+    reaper.SetMediaItemTakeInfo_Value(take_obj, "D_PITCH", 0.0)
+
+    -- 4. Purge persistent project metadata on this take
+    reaper.GetSetMediaItemTakeInfo_String(take_obj, "P_EXT:fancy_pitch_data", "", true)
+
+    if item then
+      reaper.UpdateItemInProject(item)
+    end
+    reaper.UpdateArrange()
+  end
+
+  -- 5. Remove from session cache and order
+  state.session_takes[guid] = nil
+  for idx, g in ipairs(state.session_order) do
+    if g == guid then
+      table.remove(state.session_order, idx)
+      break
+    end
+  end
+
+  -- 6. If active target was this take, switch to next take or reset to empty
+  if state.target_take_guid == guid then
+    if #state.session_order > 0 then
+      local next_guid = state.session_order[1]
+      local next_take = resolve_take_by_guid(next_guid)
+      switch_active_target(next_guid, next_take)
+    else
+      state.target_take_guid = nil
+      state.target_take_name = nil
+      state.results = {}
+      state.notes = nil
+      state.selected_note = nil
+      state.hovered_note = nil
+      state.drag = nil
+      state.start_time = nil
+      state.end_time = nil
+      state.item_len = nil
+      state.sample_rate = nil
+    end
+  end
+
+  reaper.Undo_EndBlock(string.format("Delete %s from Pitch Session and Reset Take", take_name), -1)
 end
 
 local function render_session_sidebar(sidebar_ctx)
@@ -1554,11 +1920,14 @@ local function render_session_sidebar(sidebar_ctx)
 
   local to_remove = nil
 
-  for _, guid in ipairs(state.session_order) do
+    for _, guid in ipairs(state.session_order) do
     local data = state.session_takes[guid]
     if data then
       local is_active = (guid == state.target_take_guid)
-      local take_obj = reaper.GetMediaItemTakeByGUID(0, guid)
+      local take_obj = resolve_take_by_guid(guid)
+      if not take_obj and is_active then
+        take_obj = get_target_take(false)
+      end
 
       reaper.ImGui_PushID(sidebar_ctx, guid)
 
@@ -1572,11 +1941,12 @@ local function render_session_sidebar(sidebar_ctx)
 
       -- Selectable take name
       local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
-      local btn_reserve = 70 -- reserve space for bypass and remove buttons
+      local btn_reserve = 72 -- reserve space for bypass and remove buttons
       local name_w = math.max(30, avail_w - btn_reserve)
 
+      local sel_flags = reaper.ImGui_SelectableFlags_AllowOverlap and reaper.ImGui_SelectableFlags_AllowOverlap() or 0
       local sel_text = data.name or "Take"
-      if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "##sel", is_active, 0, name_w, 0) then
+      if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "##sel", is_active, sel_flags, name_w, 0) then
         switch_active_target(guid, take_obj)
       end
       if reaper.ImGui_IsItemHovered(sidebar_ctx) then
@@ -1592,7 +1962,7 @@ local function render_session_sidebar(sidebar_ctx)
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_ButtonHovered(), 0xDD5555FF)
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_ButtonActive(), 0xBB3333FF)
       end
-      if reaper.ImGui_SmallButton(sidebar_ctx, is_bp and "Byp" or "Act") then
+      if reaper.ImGui_SmallButton(sidebar_ctx, (is_bp and "Byp" or "Act") .. "##bp") then
         toggle_take_pitch_bypass(take_obj)
       end
       if is_bp then
@@ -1608,7 +1978,7 @@ local function render_session_sidebar(sidebar_ctx)
         to_remove = guid
       end
       if reaper.ImGui_IsItemHovered(sidebar_ctx) then
-        Theme.tooltip(sidebar_ctx, "Remove from session list")
+        Theme.tooltip(sidebar_ctx, "Remove from session, clear envelope, and reset take")
       end
 
       reaper.ImGui_PopID(sidebar_ctx)
@@ -1616,25 +1986,7 @@ local function render_session_sidebar(sidebar_ctx)
   end
 
   if to_remove then
-    state.session_takes[to_remove] = nil
-    for idx, g in ipairs(state.session_order) do
-      if g == to_remove then
-        table.remove(state.session_order, idx)
-        break
-      end
-    end
-    if state.target_take_guid == to_remove then
-      if #state.session_order > 0 then
-        local next_guid = state.session_order[1]
-        local next_take = reaper.GetMediaItemTakeByGUID(0, next_guid)
-        switch_active_target(next_guid, next_take)
-      else
-        state.target_take_guid = nil
-        state.target_take_name = nil
-        state.results = {}
-        state.notes = nil
-      end
-    end
+    remove_take_from_session(to_remove)
   end
 end
 
@@ -1644,7 +1996,7 @@ local function loop()
 
   process_analysis_step()
 
-  local visible, open = reaper.ImGui_Begin(ctx, 'Fancy Pitch Correct', true, reaper.ImGui_WindowFlags_None())
+  local visible, open = reaper.ImGui_Begin(ctx, 'Fancy Pitch Correct', true, reaper.ImGui_WindowFlags_NoNavInputs())
   if visible then
     reaper.ImGui_Text(ctx, "YIN Pitch Detection Test Bench")
     reaper.ImGui_Separator(ctx)
@@ -1763,6 +2115,21 @@ local function loop()
       reset_analysis()
     end
 
+    -- Keyboard shortcuts info icon
+    reaper.ImGui_SameLine(ctx)
+    Theme.icon_btn(ctx, "##kb_shortcuts_info", Theme.icons.info, {
+      preset = Theme.layout.icon_md,
+      tooltip = "Keyboard Shortcuts\n"
+        .. "─────────────────────────────\n"
+        .. "↑ / ↓           Nudge ±1 semitone\n"
+        .. "Shift + ↑/↓      Fine-tune ±10 cents\n"
+        .. "← / →           Select prev / next note\n"
+        .. "S               Snap to nearest semitone\n"
+        .. "Double-Click    Snap (in pitch zone)\n"
+        .. "R / Del          Reset note to original\n"
+        .. "Space           Play / Stop (REAPER)",
+    })
+
     if state.is_analyzing then
       reaper.ImGui_SameLine(ctx)
       reaper.ImGui_Text(ctx, string.format("Analyzing... %d%%", math.floor(state.progress * 100)))
@@ -1855,41 +2222,20 @@ local function loop()
       end
       reaper.ImGui_SameLine(ctx)
       if reaper.ImGui_Button(ctx, "Reset Selected") then
-        if state.selected_note and state.notes[state.selected_note] then
-          local sel = state.notes[state.selected_note]
-          sel.controls.center_pitch = sel.avg_note
-          sel.controls.drift_scale = 1.0
-          sel.controls.vibrato_scale = 1.0
-          apply_envelope_to_take()
-        end
+        reset_selected_note()
       end
       reaper.ImGui_SameLine(ctx)
       -- Check actual bypass state from envelope
-      local is_bypassed = false
-      local bp_take, bp_item = get_target_take(false)
-      if bp_take and bp_item then
-        local bp_env = reaper.GetTakeEnvelopeByName(bp_take, "Pitch")
-        if bp_env then
-          local retval, chunk = reaper.GetEnvelopeStateChunk(bp_env, "", false)
-          if retval then
-            is_bypassed = chunk:match("ACT 0") ~= nil
-          end
-        end
-      end
+      local bp_take = get_target_take(false)
+      local is_bypassed = is_take_pitch_bypassed(bp_take)
       if is_bypassed then
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0xCC4444FF)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), 0xDD5555FF)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), 0xBB3333FF)
       end
-      if reaper.ImGui_Button(ctx, is_bypassed and "Bypassed" or "Bypass") then
-        if bp_take and bp_item then
-          local bp_env = reaper.GetTakeEnvelopeByName(bp_take, "Pitch")
-          if bp_env then
-            reaper.SetCursorContext(2, bp_env)
-            reaper.Main_OnCommand(40883, 0) -- Envelope: Toggle bypass
-            reaper.UpdateItemInProject(bp_item)
-            reaper.UpdateArrange()
-          end
+      if reaper.ImGui_Button(ctx, (is_bypassed and "Bypassed" or "Bypass") .. "##top_bp") then
+        if bp_take then
+          toggle_take_pitch_bypass(bp_take)
         end
       end
       if is_bypassed then
