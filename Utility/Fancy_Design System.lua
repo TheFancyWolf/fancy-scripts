@@ -1,7 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.2.0
+-- @version 1.3.0
 -- @changelog
+--   + Added live interactive demonstration for Theme.tooltip_setting_widget()
 --   + Add live interactive demonstrations for Theme.progress_bar(), Theme.badge_button(), and Theme.combo()
 --   + Rebuild header using shared Theme.header() composite widget
 --   + Fix vertical alignment across header icon, title, subtitle, and controls
@@ -448,6 +449,7 @@ local function draw_icons_section()
     { "info",     Theme.icons.info },
     { "tri_down", Theme.icons.tri_down },
     { "tri_up",   Theme.icons.tri_up },
+    { "slider",   Theme.icons.slider },
   }
 
   -- Three size tiers deriving from icon presets
@@ -852,11 +854,22 @@ local function draw_widgets_section()
   reaper.ImGui_PopStyleColor(ctx, 1)
   vspace(L.xxxl)
 
-  -- settings_widget
-  Theme.section_divider(ctx, "Theme.settings_widget(ctx)")
+  -- settings_widget & tooltip_setting_widget
+  Theme.section_divider(ctx, "Theme.settings_widget(ctx) & Theme.tooltip_setting_widget(ctx)")
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "Theme mode combo box (shown in header above). Persists via ExtState.")
+  reaper.ImGui_Text(ctx, "Preferences controls that automatically persist state to global ExtState.")
   reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.sm)
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Theme Mode:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.settings_widget(ctx)
+  reaper.ImGui_SameLine(ctx, 0, L.xl)
+  Theme.align(ctx)
+  Theme.tooltip_setting_widget(ctx, {
+    label = "Show Tooltips##demo_tooltips_setting",
+    tooltip = "Toggle tooltips globally across all scripts (including this window)",
+  })
   vspace(L.xxxl)
 
   -- Alignment helpers
@@ -940,7 +953,7 @@ local function loop()
   local nc, nv = Theme.push(ctx, P)
   local pushed_default = Theme.push_font(ctx, fonts.default)
 
-  Theme.center_next_window(ctx, UI.win_w, UI.win_h)
+  Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
   local flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_NoTitleBar()
   local visible = reaper.ImGui_Begin(ctx, "Fancy Design System", nil, flags)
 

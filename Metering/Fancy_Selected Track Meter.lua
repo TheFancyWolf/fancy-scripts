@@ -285,6 +285,7 @@ local function GetReadoutStr(val)
 end
 
 local function DrawTooltip(ctx, text)
+    if not Theme.get_show_tooltips() then return end
     if reaper.ImGui_IsItemHovered(ctx) then
         reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), VisualSettings.Tooltip_Padding, VisualSettings.Tooltip_Padding)
         reaper.ImGui_PushFont(ctx, tooltip_font, VisualSettings.Tooltip_Font_Size)

@@ -4,7 +4,125 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
-### Added
+- **Fancy Pitch Correct v2.4.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Scale Intelligence:
+  - Scale auto-detection: Krumhansl-Kessler key profiling from pitch histogram data
+  - "Detect" button in toolbar: analyzes pitch frames and auto-sets root note + scale type
+  - "Measured" scale entry: auto-populated with the top detected pitch classes
+  - "Custom" scale: click piano keys to toggle individual pitch classes on/off
+  - Scale indicator dots on piano keys showing which notes are in the active scale
+  - Root note (0 / tonic) is protected — cannot be removed from Custom scale
+
+- **Fancy Pitch Correct v2.3.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Tool System:
+  - Multi-tool paradigm: Q=Selector, S=Split, J=Join, V=Shaper, X=Pan/Zoom
+  - Split tool: click on a note to split at cursor position, red preview line overlay
+  - Join tool: click on a note to merge with next, green boundary highlight overlay
+  - Pan/Zoom tool: dedicated navigation mode (all clicks become pan/zoom, no selection)
+  - Shaper tool: placeholder for future curve editing (acts like Selector)
+  - Active tool indicator in toolbar with tooltip showing all hotkeys
+  - Tool-specific cursor feedback and interaction dispatch
+
+- **Fancy Pitch Correct v2.2.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Transition Blocks & Smoothing:
+  - First-class transition blocks between adjacent notes (amber/gold overlay)
+  - Transition tension control: drag diamond handle vertically to adjust smoothness (0 = step, 1 = smooth S-curve)
+  - Transition curve rendering with cosine/linear interpolation path
+  - `M` key for progressive smoothing on selected transition (+15% per press)
+  - Transition data integrated into envelope writer (interpolated pitch points between note boundaries)
+  - Click on transition control point to select, drag to adjust, Escape to deselect
+  - Auto-generated after analysis, split, and merge operations
+
+- **Fancy Pitch Correct v2.1.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Selection & Navigation:
+  - Lasso/marquee selection: drag on empty area to select multiple notes at once
+  - Shift+lasso: additive selection mode (keeps existing selection)
+  - Cmd/Ctrl+click: toggle individual note without clearing selection
+  - Select All (`A` key), Deselect All (`Escape`)
+  - Arrow key navigation: `Left`/`Right` to step through notes sequentially
+  - Shift+Arrow: extend selection left/right
+  - Zoom to Selection (`Z` key, falls back to Fit All if nothing selected)
+  - Keyboard Undo/Redo (`Cmd+Z`, `Shift+Cmd+Z`)
+  - Lasso rectangle visual overlay with accent-colored fill and border
+
+- **Fancy Pitch Correct v2.0.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Per-Note Control Points:
+  - Per-note shaping controls: Correction % (right edge), Drift (left edge), Vibrato (top center), Tilt (Alt+edge)
+  - Per-frame pitch trace curve rendered within note blocks showing raw detected pitch
+  - Per-frame corrected pitch envelope output with drift/vibrato separation via moving-average trend line
+  - Envelope density selector: Low (20 pts/s), Medium (40 pts/s), High (100 pts/s) with persistent settings
+  - Control zone hit-testing with distinct cursor feedback per zone type
+  - Full shaping undo/redo support: all 6 fields (pitch_offset, correction_pct, drift_amount, vibrato_scale, level_db, tilt)
+  - Info bar shows active control zone name and all shaping parameter values on hover
+  - Compact pitch_frames cache serialization (v2 format, backward compatible with v1)
+  - Control point visual indicators (handles) on note blocks when hovered or selected
+  - Note label shows active shaping values (C%, D%, V%, T) alongside pitch name
+
+- **Fancy Pitch Correct v1.0.0 (`Pitch/Fancy_Pitch Correct.lua`)** — NEW:
+  - Monophonic pitch correction tool with visual piano-roll editor
+  - Pure Lua YIN pitch detection engine (no external dependencies)
+  - Audio waveform visualization rendered directly behind notes, centered along sung pitch
+  - Cents detune display: shows exact cents off from perfect equal temperament pitch on note blocks and info bar
+  - Full piano roll key labeling: all 12 chromatic notes labeled on keys (C, C#, D, D#, etc.)
+  - Fit to Screen: one-click button and `F` hotkey to auto-zoom and center viewport horizontally and vertically
+  - Drag notes up/down to adjust pitch; semitone snap (Cmd/Ctrl for fine 1-cent resolution)
+  - Live preview: pitch envelope updates during drag for real-time audible feedback
+  - Scale-constrained "Correct All" (10 scales: Major, Minor, Dorian, Blues, etc.)
+  - Note split and merge operations
+  - Script-level undo/redo stack (separate from REAPER undo)
+  - Toggleable 5ms transition smoothing between notes
+  - Analysis caching to JSON (notes + waveform) for instant re-open on same item
+  - Non-destructive pitch adjustment via take pitch envelope (action 41612)
+  - Fancy Scripts design system integration (dark/match-theme modes)
+  - Requirements: REAPER 7.0+, ReaImGui, SWS Extension
+
+- **Fancy Pan Snap v1.7.0 (`Routing/Fancy_Pan Snap.lua`)**:
+  - Multi-Project Tab Switching: Automatic session switch detection via `reaper.EnumProjects(-1)`, resetting parameter tracking and tooltips to prevent cross-session pointer leaks, dead memory reads, and ReaImGui desync
+  - Zero-Allocation Fast-Path Engine: Eliminated thousands of heap allocations per second during idle (avoiding table allocations, per-tick `GetTrackGUID`, per-tick `GetTrackName`, and string key concatenations)
+  - Pre-Cached Track Descriptors: Cached track GUIDs, track names, and parameter keys (`tinfo.key_pan`, `tinfo.key_width`, send keys), rebuilding only on project structure/state changes (`GetProjectStateChangeCount`)
+  - Mousewheel, Trackpad, and MIDI Controller Support: Implemented `mouse_down_seen` state tracking so wheel scrolling, rotary encoders, and control surfaces debounce smoothly (120ms) instead of snapping on every individual tick
+  - Context Lifecycle Hardening: Guarded `is_bypass_active` to only query `ImGui_GetKeyMods` when `hud_open` is active and context is validated; used precise `JS_Mouse_GetState(40)` for Shift/Alt DAW-wide modifier detection
+  - Periodic Stale Cleanup: Cleaned up deleted track pointers every 5 seconds without per-frame table scanning or allocation
+  - Action Lifecycle: Re-ordered `set_action_options` and guarded `atexit` ExtState clearing to ensure rock-solid toolbar toggle and multi-instance restarts
+- **Fancy Pan Snap v1.6.1 (`Routing/Fancy_Pan Snap.lua`)**:
+  - Fixed intermittent `ImGui_GetKeyMods: expected a valid ImGui_Context*` runtime error occurring during background execution when HUD was closed
+  - Added robust ReaImGui context lifecycle management (`ensure_imgui_context()` and `is_context_valid()`) using `reaper.ImGui_ValidatePtr` to prevent stale pointer access after ReaImGui GC
+  - Wrapped `reaper.ImGui_GetKeyMods` with `reaper.ImGui_ValidatePtr` and `pcall` fallback for crash-proof modifier detection
+- **Fancy Pan Snap v1.6.0 (`Routing/Fancy_Pan Snap.lua`)**:
+  - Added `50%` preset button to standard step increments and replaced `12.5%` (`5%`, `10%`, `20%`, `25%`, `50%`)
+  - Cleaned up header: removed "Auto Detent" subtitle and added dedicated `[Info]` and `[Settings]` modal dialog buttons matching Parameter Link layout
+  - Moved target parameters (`Track Pan`, `Track Width / Dual Pan`, `Send Pans`, `Include Master Track`) into the **Settings** modal popup dialog
+  - Converted the collapsible Overlay Styling drawer into an open, permanent **STYLING** section using standard section dividers
+  - Removed "STATUS & MONITOR" section and repositioned Shift/Alt bypass modifier hints and background execution tip directly under the master `ACTIVE (ON)` / `PAUSED (OFF)` button
+  - Added high-visibility red `[STOP]` utility button directly to the top master row beside the status monitor badge
+  - Added Info & Guide modal dialog with Quick Guide, Keyboard & Controls, and About tabs
+- **Fancy Pan Snap v1.5.0 (`Routing/Fancy_Pan Snap.lua`)**:
+  - Added dedicated **Overlay Styling & Theme** section letting users customize floating badge appearance by selecting REAPER theme elements and roles (not raw hex colors)
+  - Customizable theme elements: Background Surface (`Card`, `Panel`, `Window`, `Accent Tint`), Border Element (`Accent/Cursor`, `Secondary Blue`, `3D Frame`, `Green`, `Yellow`, `None`), Value Highlight Color, and Label Color
+  - Added Corner Rounding (`Rounded 4px`, `Pill 8px`, `Sharp 0px`) and Background Opacity (`40%`–`100%`) controls
+  - Built-in real-time **Live Overlay Preview** card inside the HUD demonstrating styling adjustments instantly
+  - Removed theme mode dropdown from the window header and relocated it directly into the Overlay Styling section for a cleaner header bar
+  - Dedicated "Reset Overlay Style" button to restore default theme element assignments
+  - Seamless background execution when closing the HUD menu window (`keep_in_background = true` by default with automatic configuration migration)
+  - Intelligent 3-state toggle action lifecycle (`set_action_options(3)`): re-triggering the action or clicking the toolbar button while running in the background re-opens the HUD menu immediately
+  - Re-triggering the action or clicking the toolbar button while the HUD is already open toggles the script off cleanly
+  - Added explicit "Stop Utility & Exit" action button in the Settings drawer to terminate background execution directly from the GUI
+  - Replaced native OS tooltips (`reaper.TrackCtl_SetToolTip`) with a smooth, GPU-rendered ReaImGui floating cursor badge, eliminating macOS window flashing and white/black box artifacts
+  - Completely decoupled live mouse dragging from REAPER parameter writes so native TCP/MCP knob turning remains 100% smooth without rubber-banding or value fighting
+  - Real-time detent preview displayed directly beside the mouse cursor showing track name, parameter, and target snapped value (e.g. `Lead Vocal • Pan → 20% L (10%)`)
+  - Clean snap-on-release execution with a single consolidated undo point (`Utils.undo_block`)
+  - Background auto-snap engine quantizes Track Pan, Track Width, and Send Pans across all tracks to configurable percentage increments (default 10%)
+  - Smart motion and release detection with instant snap on mouse button release (`JS_Mouse_GetState`) and fallback 120ms debounce settling timer
+  - Shift/Alt key modifier detection to temporarily bypass snapping for freehand fine panning
+  - Compact ReaImGui HUD interface with quick presets (5%, 10%, 12.5%, 20%, 25%), custom step slider, target selectors, and live activity card
+  - Single-instance enforcement, ExtState persistence, and REAPER toolbar toggle state integration (`Utils.init_toolbar_toggle()`)
+- **Global Tooltip Preference (`_lib/theme.lua`)**:
+  - Added global tooltip visibility state persisted via REAPER ExtState (`FancyScripts`, `show_tooltips`) and cached in memory with cache invalidation support
+  - Added `Theme.get_show_tooltips()`, `Theme.set_show_tooltips(enabled)` and developer aliases `Theme.get_tooltips_enabled()`, `Theme.set_tooltips_enabled()`, `Theme.tooltips_enabled()`
+  - Added `Theme.tooltip_setting_widget(ctx, [opts])` standardized checkbox component for toggling tooltips in settings panels
+  - Updated `Theme.tooltip()` to automatically suppress all tooltips across built-in widgets (`icon_btn`, `section_divider`, `badge`, `toggle_button`, `combo`, `header`) when disabled
+- **Fancy Parameter Link v5.4.0**:
+  - Added "Show Tooltips" preference checkbox in the Settings & Preferences modal under "UI Density & Appearance"
+  - Updated "Last Touched" button custom tooltip to respect global tooltip visibility
+- **Fancy Design System v1.3.0**:
+  - Added live interactive demonstration for `Theme.tooltip_setting_widget()` alongside theme mode controls
+- **Fancy Selected Track Meter**:
+  - Updated `DrawTooltip` to respect global `Theme.get_show_tooltips()` preference
 - **Shared Library (`_lib/`)** — shared modules loaded via `require()`
   - `theme.lua` — 2-mode palette builder (Fancy Dark / Match Theme), shared font management, ImGui push/pop, settings combo widget
   - `json.lua` — lightweight JSON encoder/decoder (consolidated from inline copies)

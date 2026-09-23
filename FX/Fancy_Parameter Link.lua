@@ -1,7 +1,9 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.3.0
+-- @version 5.4.0
 -- @changelog
+--   + Added global Show Tooltips option in Settings
+--   + Respect global tooltip visibility setting for Last Touched preview
 --   + Bundled 1x and 2x Retina toolbar icons (toolbar_fancy_parameter_link.png)
 --   + Active toolbar button state while script is running
 -- @about
@@ -1241,7 +1243,7 @@ local function draw_link_builder()
   if reaper.ImGui_Button(ctx, "Last Touched##lb_lt", 100, 0) then
     use_last_touched_builder()
   end
-  if reaper.ImGui_IsItemHovered(ctx) then
+  if reaper.ImGui_IsItemHovered(ctx) and Theme.get_show_tooltips() then
     poll_last_touched()
     if reaper.ImGui_BeginTooltip(ctx) then
       reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.tooltip_wrap)
@@ -1409,6 +1411,7 @@ local function draw_preset_modal()
   end
 
   Theme.center_next_window(ctx, L.modal_lg.w, 420)
+  Theme.modal_scrim(ctx, "Preset Library##preset_mgr_modal")
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Preset Library##preset_mgr_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
@@ -1507,6 +1510,7 @@ local function draw_info_modal()
   end
 
   Theme.center_next_window(ctx, 600, 380)
+  Theme.modal_scrim(ctx, "Fancy Parameter Link -- Info & Guide##info_modal")
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Fancy Parameter Link -- Info & Guide##info_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
@@ -1663,6 +1667,7 @@ local function draw_settings_modal()
   end
 
   Theme.center_next_window(ctx, 620, 560)
+  Theme.modal_scrim(ctx, "Settings & Preferences##settings_modal")
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Settings & Preferences##settings_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
     if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
@@ -1720,6 +1725,9 @@ local function draw_settings_modal()
     reaper.ImGui_Text(ctx, "Theme Mode:")
     reaper.ImGui_SameLine(ctx, 0, L.lg)
     Theme.settings_widget(ctx, { label = "##theme_mode_settings" })
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.tooltip_setting_widget(ctx, { label = "Show Tooltips##pl_tooltips" })
 
     reaper.ImGui_Spacing(ctx)
     Theme.align(ctx)
@@ -1813,7 +1821,7 @@ local function draw_main()
     _current_proj = cur_proj
   end
 
-  reaper.ImGui_SetNextWindowSize(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
+  Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
 
   local vis, op = reaper.ImGui_Begin(ctx, "Fancy Parameter Link", true, reaper.ImGui_WindowFlags_NoCollapse())
   if vis then

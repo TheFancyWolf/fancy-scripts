@@ -27,9 +27,10 @@
 --   Controls:   slider_grab_active            (slider grab while dragging)
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
 --
--- THEME MODES -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
+-- THEME MODES & PREFS -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
 --   MODE_FANCY="fancy"  Curated dark, purple accent
 --   MODE_MATCH="match"  Everything from REAPER theme (including edit cursor accent)
+--   Theme.get_show_tooltips() / .set_show_tooltips(bool) Global tooltip visibility
 --
 -- LAYOUT TOKENS -- Theme.layout.*
 --   Scale:      xs=2  sm=4  md=8  lg=12  xl=16  xxl=24  xxxl=32 (unified scale)
@@ -67,7 +68,7 @@
 --           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing
 --
 -- ICONS -- function(dl, cx, cy, half_size, color)
---   Theme.icons: play, pause, close, plus, info, tri_down, tri_up
+--   Theme.icons: play, pause, close, plus, info, tri_down, tri_up, slider
 --
 -- WIDGETS
 --   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip
@@ -100,8 +101,9 @@
 --   hcenter(ctx, item_w)               Cursor X: center next item
 --
 -- SETTINGS
---   settings_widget(ctx, [opts])       Reactive theme mode combo (opts: w, label, align, margin)
---   calc_combo_width(ctx, items, [p])  Calculates reactive width from font metrics + labels
+--   settings_widget(ctx, [opts])        Reactive theme mode combo (opts: w, label, align, margin)
+--   tooltip_setting_widget(ctx, [opts]) Global show tooltips checkbox (opts: label)
+--   calc_combo_width(ctx, items, [p])   Calculates reactive width from font metrics + labels
 --
 -- MINIMAL TEMPLATE:
 --   local Theme = require("theme")
@@ -193,22 +195,24 @@ Theme.darken = darken
 Theme.bgr_to_rgba = bgr_to_rgba
 
 -------------------------------------------------------------------------------
--- 2. THEME MODE CONSTANTS & PALETTE CACHE
+-- 2. THEME MODE & PREFERENCE CONSTANTS & CACHE
 -------------------------------------------------------------------------------
 Theme.MODE_FANCY = "fancy"  -- Curated Fancy Scripts palette (default)
 Theme.MODE_MATCH = "match"  -- Everything from REAPER theme (including edit cursor accent)
 
-local EXTSTATE_SECTION = "FancyScripts"
-local EXTSTATE_KEY     = "theme_mode"
+local EXTSTATE_SECTION       = "FancyScripts"
+local EXTSTATE_KEY_THEME     = "theme_mode"
+local EXTSTATE_KEY_TOOLTIPS  = "show_tooltips"
 
 local _cached_palette = nil
 local _cached_mode = nil
+local _cached_show_tooltips = nil
 
 --- Returns the current theme mode from global ExtState (cached in memory).
 --- @return string  One of "fancy" or "match"
 function Theme.get_mode()
   if _cached_mode then return _cached_mode end
-  local mode = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_KEY)
+  local mode = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_KEY_THEME)
   if mode == Theme.MODE_MATCH or mode == "full" then
     _cached_mode = Theme.MODE_MATCH
   else
@@ -220,16 +224,43 @@ end
 --- Sets the global theme mode (persists across sessions and updates cache).
 --- @param mode string  One of Theme.MODE_FANCY, Theme.MODE_MATCH
 function Theme.set_mode(mode)
-  reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEY, mode, true)
+  reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEY_THEME, mode, true)
   _cached_mode = mode
   _cached_palette = Theme.build_palette()
 end
 
---- Forces the internal widget palette cache to rebuild.
---- Call after Theme.set_mode() or when live REAPER theme colors change.
+--- Returns whether tooltips are enabled from global ExtState (cached in memory).
+--- @return boolean  true if tooltips are enabled (default: true)
+function Theme.get_show_tooltips()
+  if _cached_show_tooltips ~= nil then return _cached_show_tooltips end
+  local val = reaper.GetExtState(EXTSTATE_SECTION, EXTSTATE_KEY_TOOLTIPS)
+  if val == "0" or val == "false" or val == "off" then
+    _cached_show_tooltips = false
+  else
+    _cached_show_tooltips = true
+  end
+  return _cached_show_tooltips
+end
+
+--- Sets whether tooltips are enabled globally (persists across sessions and updates cache).
+--- @param enabled boolean
+function Theme.set_show_tooltips(enabled)
+  local val = enabled and "1" or "0"
+  reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEY_TOOLTIPS, val, true)
+  _cached_show_tooltips = not not enabled
+end
+
+-- Aliases for developer convenience
+Theme.get_tooltips_enabled = Theme.get_show_tooltips
+Theme.set_tooltips_enabled = Theme.set_show_tooltips
+Theme.tooltips_enabled     = Theme.get_show_tooltips
+
+--- Forces the internal widget palette and preferences cache to rebuild.
+--- Call after Theme.set_mode(), Theme.set_show_tooltips(), or when live REAPER theme colors change.
 function Theme.invalidate_palette()
   _cached_palette = nil
   _cached_mode = nil
+  _cached_show_tooltips = nil
 end
 
 -------------------------------------------------------------------------------
@@ -351,8 +382,8 @@ function Theme.build_palette(overrides)
   -- Derive structural colors
   -- sep = Separator lines (20% accent): Separator
   P.sep    = overrides.sep    or with_alpha(P.accent, 0.20)
-  -- dim_bg = Modal overlay background (85% bg): ModalWindowDimBg
-  P.dim_bg = overrides.dim_bg or with_alpha(P.bg, 0.85)
+  -- dim_bg = Modal overlay background (85% darkened bg): ModalWindowDimBg
+  P.dim_bg = overrides.dim_bg or with_alpha(darken(P.bg, 0.70), 0.85)
 
   -- Derive table row colors from panel/card
   -- table_row = Default row bg (darkened panel): TableRowBg
@@ -469,7 +500,7 @@ function Theme.push(ctx, palette)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrabActive(),     P.slider_grab_active)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_CheckMark(),            P.accent)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PopupBg(),              P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ModalWindowDimBg(),     P.dim_bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ModalWindowDimBg(),     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(),            P.sep)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorHovered(),     P.accent_h)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorActive(),      P.accent)
@@ -710,6 +741,30 @@ function Theme.icons.tri_up(dl, cx, cy, hs, col)
     ox, oy - math.floor(hs * 0.6), col)
 end
 
+--- Slider / faders icon (horizontal rails with knobs).
+--- Use for: sliders, pan, volume, mixer controls.
+function Theme.icons.slider(dl, cx, cy, hs, col)
+  local ox = math.floor(cx)
+  local oy = math.floor(cy)
+  local s = math.floor(hs * 0.85)
+  local th = math.max(1.0, math.floor(hs * 0.22 + 0.5))
+  local kw = math.max(2, math.floor(hs * 0.32 + 0.5))
+  local kh = math.max(3, math.floor(hs * 0.6 + 0.5))
+  local y_off = math.floor(hs * 0.45 + 0.5)
+
+  -- Top rail + knob
+  reaper.ImGui_DrawList_AddLine(dl, ox - s, oy - y_off, ox + s, oy - y_off, col, th)
+  reaper.ImGui_DrawList_AddRectFilled(dl,
+    ox - math.floor(s * 0.35) - kw, oy - y_off - kh,
+    ox - math.floor(s * 0.35) + kw, oy - y_off + kh, col, 1)
+
+  -- Bottom rail + knob
+  reaper.ImGui_DrawList_AddLine(dl, ox - s, oy + y_off, ox + s, oy + y_off, col, th)
+  reaper.ImGui_DrawList_AddRectFilled(dl,
+    ox + math.floor(s * 0.35) - kw, oy + y_off - kh,
+    ox + math.floor(s * 0.35) + kw, oy + y_off + kh, col, 1)
+end
+
 -------------------------------------------------------------------------------
 -- 11. WIDGET COMPONENTS
 -------------------------------------------------------------------------------
@@ -721,6 +776,52 @@ end
 -- Palette accessor for widgets: delegates to Theme.get_palette().
 local function _get_palette()
   return Theme.get_palette()
+end
+
+--- Draws a manual fullscreen dim overlay (scrim) behind a modal popup.
+---
+--- Call BEFORE `ImGui_BeginPopupModal` while inside the parent window's
+--- `Begin`/`End` block.  The scrim is drawn on the parent window's draw
+--- list with a fullscreen clip rect, so it renders behind the modal but
+--- over the parent — exactly replicating Dear ImGui's built-in behaviour
+--- without the first-frame colour lag that occurs in ReaImGui.
+---
+--- Theme.push() sets ImGuiCol_ModalWindowDimBg to transparent, so the
+--- built-in mechanism never fires. Use this function everywhere instead.
+---
+--- **Standard pattern:**
+--- ```
+--- Theme.modal_scrim(ctx, "My Modal##id")
+--- local visible = reaper.ImGui_BeginPopupModal(ctx, "My Modal##id", ...)
+--- ```
+---
+---
+--- @param ctx  userdata  ImGui context
+--- @param popup_name string  Exact popup ID (same string passed to OpenPopup / BeginPopupModal)
+local _scrim_was_open = {}
+function Theme.modal_scrim(ctx, popup_name)
+  local is_open = reaper.ImGui_IsPopupOpen(ctx, popup_name)
+  if not is_open then
+    _scrim_was_open[popup_name] = nil
+    return
+  end
+  -- Skip the very first frame the popup appears — Dear ImGui hides the
+  -- modal window for one frame on creation (HiddenFramesCannotSkipItems).
+  -- Drawing the scrim on that frame produces a dark flash with no modal.
+  if not _scrim_was_open[popup_name] then
+    _scrim_was_open[popup_name] = true
+    return
+  end
+  local P = _get_palette()
+  local dl = reaper.ImGui_GetWindowDrawList(ctx)
+  -- Expand clip rect to cover the entire screen (not just the parent window)
+  reaper.ImGui_DrawList_PushClipRectFullScreen(dl)
+  -- Get the parent window's viewport bounds for the fill rect
+  local vp = reaper.ImGui_GetWindowViewport(ctx)
+  local vp_x, vp_y = reaper.ImGui_Viewport_GetPos(vp)
+  local vp_w, vp_h = reaper.ImGui_Viewport_GetSize(vp)
+  reaper.ImGui_DrawList_AddRectFilled(dl, vp_x, vp_y, vp_x + vp_w, vp_y + vp_h, P.dim_bg)
+  reaper.ImGui_DrawList_PopClipRect(dl)
 end
 
 --- Low-level: vertically centers the next item within a row of a given height.
@@ -905,12 +1006,14 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
 end
 
 --- Renders a tooltip with automatic text wrapping.
+--- Respects the global Theme.get_show_tooltips() setting.
 --- Uses consistent padding from layout tokens.
 ---
 --- @param ctx userdata  ImGui context
 --- @param text string  Tooltip text content
 --- @param max_w number|nil  Max wrap width (default: Theme.layout.tooltip_wrap)
 function Theme.tooltip(ctx, text, max_w)
+  if not Theme.get_show_tooltips() then return end
   max_w = max_w or Theme.layout.tooltip_wrap
   if reaper.ImGui_BeginTooltip(ctx) then
     reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + max_w)
@@ -1623,10 +1726,15 @@ end
 --- Centers the next ImGui window on the active window (or viewport if none is active).
 --- Call immediately before ImGui_Begin or ImGui_BeginPopupModal.
 ---
---- @param ctx userdata  ImGui context
---- @param w number|nil  Window width in pixels (optional)
---- @param h number|nil  Window height in pixels (optional)
-function Theme.center_next_window(ctx, w, h)
+--- When `h` is 0 or nil, the window width is locked to `w` via
+--- SetNextWindowSizeConstraints while height is left free to fit content.
+---
+--- @param ctx  userdata      ImGui context
+--- @param w    number|nil    Window width in pixels (optional)
+--- @param h    number|nil    Window height in pixels (0 or nil = auto-fit height)
+--- @param cond number|nil    ImGui condition flag (default: Cond_Appearing; use Cond_Once for main windows)
+function Theme.center_next_window(ctx, w, h, cond)
+  cond = cond or reaper.ImGui_Cond_Appearing()
   local cx, cy
   local ok_p, wx, wy = pcall(reaper.ImGui_GetWindowPos, ctx)
   local ok_s, ww, wh = pcall(reaper.ImGui_GetWindowSize, ctx)
@@ -1641,9 +1749,15 @@ function Theme.center_next_window(ctx, w, h)
     cy = vp_y + vp_h * 0.5
   end
 
-  reaper.ImGui_SetNextWindowPos(ctx, cx, cy, reaper.ImGui_Cond_Appearing(), 0.5, 0.5)
-  if w and h and w > 0 and h > 0 then
-    reaper.ImGui_SetNextWindowSize(ctx, w, h, reaper.ImGui_Cond_Appearing())
+  reaper.ImGui_SetNextWindowPos(ctx, cx, cy, cond, 0.5, 0.5)
+  if w and w > 0 then
+    if h and h > 0 then
+      -- Fixed width and height
+      reaper.ImGui_SetNextWindowSize(ctx, w, h, cond)
+    else
+      -- Fixed width, auto-fit height: constrain width exactly, leave height free
+      reaper.ImGui_SetNextWindowSizeConstraints(ctx, w, 0, w, 1e6)
+    end
   end
 end
 
@@ -1749,6 +1863,28 @@ function Theme.settings_widget(ctx, opts)
   return changed, w
 end
 
+--- Renders a standardized checkbox to toggle global tooltips on or off.
+--- Reads and persists state to global ExtState automatically.
+--- @param ctx userdata  ImGui context
+--- @param opts table|nil  Optional overrides:
+---   opts.label   (string) Checkbox label (default: "Show Tooltips")
+---   opts.tooltip (string) Hover tooltip for the setting itself (optional)
+--- @return boolean changed  true if the value was toggled
+--- @return boolean enabled  current tooltip state
+function Theme.tooltip_setting_widget(ctx, opts)
+  opts = opts or {}
+  local label = opts.label or "Show Tooltips##fancy_tooltips_toggle"
+  local cur = Theme.get_show_tooltips()
+  local changed, new_val = reaper.ImGui_Checkbox(ctx, label, cur)
+  if changed then
+    Theme.set_show_tooltips(new_val)
+  end
+  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+    Theme.tooltip(ctx, opts.tooltip)
+  end
+  return changed, new_val
+end
+
 -------------------------------------------------------------------------------
 -- 13. WINDOW HEADER WIDGET
 -------------------------------------------------------------------------------
@@ -1795,7 +1931,23 @@ function Theme.header(ctx, opts)
   local has_icon = (opts.icon_fn ~= false)
   if has_icon then
     if type(opts.icon_fn) == "function" then
-      opts.icon_fn(ctx, brand_sz, hdr_h)
+      local is_drawlist_icon = false
+      for _, fn in pairs(Theme.icons) do
+        if fn == opts.icon_fn then
+          is_drawlist_icon = true
+          break
+        end
+      end
+      if is_drawlist_icon then
+        local dl = reaper.ImGui_GetWindowDrawList(ctx)
+        local x, y = reaper.ImGui_GetCursorScreenPos(ctx)
+        local cx = x + brand_sz * 0.5
+        local cy = y + hdr_h * 0.5
+        opts.icon_fn(dl, cx, cy, brand_sz * 0.45, opts.icon_color or P.accent)
+        reaper.ImGui_Dummy(ctx, brand_sz, hdr_h)
+      else
+        opts.icon_fn(ctx, brand_sz, hdr_h)
+      end
     else
       Theme.brand_icon(ctx, brand_sz, hdr_h)
     end
