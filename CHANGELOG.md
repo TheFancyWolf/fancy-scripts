@@ -4,6 +4,31 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.2.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Multi-Note Selection & Batch Operations (Milestone 4):
+  - Marquee Box Select: Click and drag on empty canvas to select multiple notes with real-time accent box, note count indicator, and AABB intersection
+  - Additive Marquee: Shift+drag adds newly intersected notes to existing selection without clearing prior selections
+  - Multi-Note Drag: Move pitch center, stability (drift), or vibrato across all selected notes simultaneously
+  - Phrase Interval Preservation: Shift-snap snaps anchor note to nearest semitone while strictly preserving the musical intervals of all other selected notes
+  - Select All (Cmd/Ctrl + A): Fast phrase-wide selection via keyboard shortcut and toolbar action button
+  - Cmd/Ctrl + Click: Toggle individual notes in and out of multi-selection
+  - Deselect All (Escape): Instant clearing of active selection
+  - Shift + Left / Right Arrow: Expand selection range across adjacent notes
+  - Multi-Note Double Click: Double-clicking pitch zone snaps all selected notes to nearest semitones
+  - Dynamic Status Readout: Displays total notes selected, cumulative duration, anchor note pitch, and batch tuned/untouched counter
+  - Contextual Toolbar Actions: Dynamic note count indicators on Quantize (%d) (Q) and Reset (%d) buttons
+  - Updated Keyboard Shortcuts Tooltip: Documents Cmd/Ctrl+A, Escape, and Marquee Drag
+
+- **Fancy Pitch Correct v2.1.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Scale Snapping & Piano Roll In-Scale Tinting (Milestone 3):
+  - Key & Scale Selector: Dropdowns for musical Key (C, D, etc.) and Scale (Major, Natural Minor, Dorian, Pentatonic, Minor Pentatonic, Chromatic)
+  - Visual Piano Roll Tinting: In-scale note rows highlighted with subtle theme accent tinting; out-of-scale rows and piano keys dimmed
+  - Root Key Highlighting: Distinct tonic accent strip on piano keys and enhanced tinting on root pitch rows
+  - Quantize Key (Q): Snaps selected note(s) to the nearest valid in-scale pitch
+  - Quantize (Q) action bar button with contextual enable/disable and dynamic key/scale tooltip
+  - Batch Quantize, Snap, and Reset: Supports both single note and multi-note Shift+Click selections
+  - Status display: Real-time `[In Scale]` vs `[Out of Scale]` indicator on the active note inspection bar
+  - Persistence: Stores musical Key and Scale per-take in take JSON data and globally across sessions via REAPER ExtState
+  - Keyboard Shortcuts Tooltip: Updated with `Q` shortcut entry
+
 - **Fancy Pitch Correct v2.0.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Note Topology (Milestone 2):
   - Split Note (X key): Cuts a note into two independent notes at the edit cursor, automatically re-extracts features for both halves
   - Merge Notes (M key or button): Glues contiguous selected notes back into a single entity with gap frame recovery from raw analysis data
