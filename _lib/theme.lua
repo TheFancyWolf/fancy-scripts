@@ -68,7 +68,7 @@
 --           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing
 --
 -- ICONS -- function(dl, cx, cy, half_size, color)
---   Theme.icons: play, pause, close, plus, info, tri_down, tri_up, slider
+--   Theme.icons: play, pause, close, plus, info, tri_down, tri_up, tri_left, tri_right, slider, gear
 --
 -- WIDGETS
 --   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip
@@ -763,6 +763,55 @@ function Theme.icons.slider(dl, cx, cy, hs, col)
   reaper.ImGui_DrawList_AddRectFilled(dl,
     ox + math.floor(s * 0.35) - kw, oy + y_off - kh,
     ox + math.floor(s * 0.35) + kw, oy + y_off + kh, col, 1)
+end
+
+--- ◂ Triangle left (leftward-pointing).
+--- Use for: collapse drawer, back/previous navigation.
+function Theme.icons.tri_left(dl, cx, cy, hs, col)
+  local ox, oy = math.floor(cx), math.floor(cy)
+  reaper.ImGui_DrawList_AddTriangleFilled(dl,
+    ox + math.floor(hs * 0.4), oy - math.floor(hs * 0.7),
+    ox + math.floor(hs * 0.4), oy + math.floor(hs * 0.7),
+    ox - math.floor(hs * 0.6), oy, col)
+end
+
+--- ▸ Triangle right (rightward-pointing).
+--- Use for: expand drawer, forward/next navigation.
+function Theme.icons.tri_right(dl, cx, cy, hs, col)
+  local ox, oy = math.floor(cx), math.floor(cy)
+  reaper.ImGui_DrawList_AddTriangleFilled(dl,
+    ox - math.floor(hs * 0.4), oy - math.floor(hs * 0.7),
+    ox - math.floor(hs * 0.4), oy + math.floor(hs * 0.7),
+    ox + math.floor(hs * 0.6), oy, col)
+end
+
+--- ⚙ Gear / cog icon (central ring with radiating teeth).
+--- Use for: settings, configuration, preferences modals.
+function Theme.icons.gear(dl, cx, cy, hs, col)
+  local ox = math.floor(cx)
+  local oy = math.floor(cy)
+  local s = hs * 0.9
+  local r_outer = s
+  local r_inner = s * 0.70
+  local r_hole  = s * 0.32
+  local tooth_th = math.max(1.5, s * 0.35)
+  local ring_th  = r_inner - r_hole
+  local mid_r    = (r_inner + r_hole) * 0.5
+
+  -- 6 teeth radiating outward from the ring
+  for i = 0, 5 do
+    local angle = i * (math.pi / 3)
+    local cos_a = math.cos(angle)
+    local sin_a = math.sin(angle)
+    local x1 = ox + (r_inner - 0.5) * cos_a
+    local y1 = oy + (r_inner - 0.5) * sin_a
+    local x2 = ox + r_outer * cos_a
+    local y2 = oy + r_outer * sin_a
+    reaper.ImGui_DrawList_AddLine(dl, x1, y1, x2, y2, col, tooth_th)
+  end
+
+  -- Central ring
+  reaper.ImGui_DrawList_AddCircle(dl, ox, oy, mid_r, col, 16, ring_th)
 end
 
 -------------------------------------------------------------------------------

@@ -4,6 +4,27 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.4.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Production UX Modern Studio Dock Layout:
+  - Unified Single Top Bar: Consolidated title, settings, info, close, take badge, musical key, scale, analyze, and reset onto a single high-efficiency row, maximizing vertical canvas real estate
+  - Track Color Matching: Target take badge background dynamically retrieves and displays the active track's REAPER color via `GetTrackColor()` and `Theme.bgr_to_rgba()`, with automatic luminance contrast adjustment for text
+  - Eliminated Dead Vertical Spacing: Removed redundant `NewLine` and `Spacing` calls between top toolbar and piano roll canvas, and between canvas and bottom footer, ensuring seamless edge-to-edge layout
+  - Bottom Footer Sizing & No Cutoff: Refactored canvas height budgeting (`total_h = math.max(60, avail_h - footer_h)`) and dynamic button right-alignment, ensuring all footer controls and text fit completely without clipping in docked windows
+  - Generous Button Widths: Widened Analyze (`96px`), Reset (`66px`), Layers (`80px`), Quantize (`98px`), Split (`74px`), Merge (`78px`), Reset (`80px`), and Select All (`86px`) buttons to comfortably fit all label variations
+  - Text Wrapping in Pitched Items: Replaced raw text clipping with `ImGui_TextWrapped()` when the drawer is empty
+  - ReaImGui & REAPER Docker Integration: Enabled `ImGui_ConfigFlags_DockingEnable()` at context creation, restored native window title bar/dock tabs, and used `ImGui_Cond_Once()` for initial window centering so users can dock the window into any REAPER docker tab, drag between dockers, or float seamlessly
+  - Redesigned Active/Bypassed State: Removed toolbar bypass toggle; added REAPER FX chain-style checkboxes to the left of each item in the Pitched Items drawer; rendered a dimmed canvas with a centered "BYPASSED" overlay badge when inactive
+  - Collapsible Drawer Tag: Replaced top toolbar button with an edge tab tag button (`◀`) on the canvas boundary when the drawer is closed
+  - Full-Width Item Selection Bar: Active item highlight bar now spans across the entire row encompassing checkbox, name, and delete button; removed obsolete `>` arrow marker
+  - Centered Empty Canvas State: Centered "No data. Select an item and click Analyze." with a large "Analyze Item" button centered above it
+  - Full Session Wipe: Added "Wipe Entire Session (All Items)" button to Settings modal to completely clear take envelopes, chunks, and metadata across all items
+  - High-Contrast Text: Ensured 100% white (`0xFFFFFFFF`) text on all dropdowns, buttons, and badges for perfect legibility across all theme modes
+  - Toolbar Streamlining: Removed redundant "Apply to Take" button (live auto-commit writes to take envelope continuously)
+  - Display Layers Popover: Replaced 7 sprawling checkboxes with a clean, space-efficient `Layers ▾` dropdown menu
+  - Bottom Contextual Inspector Dock: Real-time badges for note pitch, in/out-of-scale status, drift stability %, vibrato %, transition ms, and tuning status, alongside right-aligned quick actions (Quantize, Split, Merge, Reset, Select All)
+  - Audio Engine & Settings Modal: Dedicated modal dialog (`Theme.modal_scrim`) housing Vocal Range, Detection Strictness, Quality, REAPER Pitch Shift algorithm selector, Advanced DSP parameters, theme switcher, and onset diagnostic toggle
+  - Keyboard Shortcuts & Help Modal: Interactive shortcut reference dialog accessible from the header info button
+  - Design System Additions (`_lib/theme.lua`): Added vector `Theme.icons.gear`, `Theme.icons.tri_left`, and `Theme.icons.tri_right` primitives
+
 - **Fancy Pitch Correct v2.3.0 (`Pitch/Fancy_Pitch Correct.lua`)** — High-Fidelity Note Blending, Stability & Vibrato Engine:
   - S-Curve Note Blending: Seamless smoothstep Hermite transitions ($3t^2 - 2t^3$, 35ms default) across all note boundaries, including transitions to/from untouched notes and silence onsets, eliminating 1ms cliff artifacts and phase vocoder chirps
   - True Stability Drift Correction: Samples the continuous drift cancellation trajectory ($E_{\text{drift}}(t) = (\text{center} - \text{trend}(t)) \cdot (1 - \text{drift\_scale})$) into REAPER Take Pitch Envelope with sub-cent accuracy, ensuring 100% Stability audibly flattens pitch drift to match the visual preview

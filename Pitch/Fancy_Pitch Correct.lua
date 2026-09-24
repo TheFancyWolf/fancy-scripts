@@ -1,7 +1,14 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.3.0
+-- @version 2.4.0
 -- @changelog
+--   + Production UX: Streamlined Modern Studio Dock layout maximizing vertical and horizontal piano roll canvas
+--   + Integrated Theme.header with custom title bar, branding, and responsive window controls
+--   + Pitched Items Panel: Renamed from Session Takes with collapsible flyout drawer and live count indicator
+--   + Bottom Contextual Inspector: Clean note pitch badges, scale indicator, drift/vibrato/transition status, and quick action bar
+--   + Audio Engine & Settings Modal: Dedicated modal for vocal range, detection strictness, quality, REAPER pitch shift algorithm, and advanced DSP parameters
+--   + Keyboard Shortcuts & Help Modal: Accessible via header info button
+--   + Layers Popover: Consolidated display toggles into a clean dropdown
 --   + High-Fidelity Note Blending: S-curve smoothstep transitions (35ms default) across all note boundaries, eliminating 1ms cliff artifacts and vocoder chirps
 --   + True Stability Drift Correction: Continuous pitch drift tracking sampled with sub-cent RDP decimation into REAPER Take Pitch Envelope
 --   + Natural Vibrato Modeling: Zero-phase Gaussian filter separates slow drift from vibrato; hysteresis gate and smooth envelope follower prevent chattering
@@ -9,13 +16,6 @@
 --   + UI / Audio Parity: Green preview line and take envelope points generated from identical continuous trajectory
 --   + Transition Readout: Displays transition duration in active note status readout
 --   + Multi-Note Selection & Batch Operations (Milestone 4)
---   + Marquee Box Select: Click and drag on empty canvas to select multiple notes with live accent box and note count
---   + Multi-Note Drag: Move pitch center or stability (drift) across all selected notes simultaneously
---   + Multi-Note Interval Preservation: Shift-snap snaps anchor note while strictly preserving musical intervals of all selected notes
---   + Select All (Cmd/Ctrl + A): Fast phrase-wide selection via keyboard shortcut and toolbar action button
---   + Cmd/Ctrl + Click to toggle notes in/out of multi-selection, Escape to deselect all, Shift+Arrow to expand selection range
---   + Real-time multi-note status readout with note count, total duration, anchor note pitch, and batch tuning status
---   + Contextual action bar count indicators on Quantize (%d) (Q) and Reset (%d) buttons
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -39,7 +39,13 @@ package.path = script_dir .. "../_lib/?.lua;" .. package.path
 local Theme = require("theme")
 local JSON  = require("json")
 
-local ctx = reaper.ImGui_CreateContext('Fancy Pitch Correct')
+local dock_flag = (reaper.ImGui_ConfigFlags_DockingEnable and reaper.ImGui_ConfigFlags_DockingEnable()) or 0
+local ctx = reaper.ImGui_CreateContext('Fancy Pitch Correct', dock_flag)
+local fonts = Theme.create_fonts(ctx)
+Theme.attach_fonts(ctx, fonts)
+
+local show_settings_modal = false
+local show_info_modal = false
 
 local VOCAL_RANGES = {
   { name = "Generic Vocal", min = 65,  max = 1000 },
@@ -210,10 +216,12 @@ local state = {
   target_take_guid = nil,
   target_take_name = nil,
 
-  -- Multi-item Session state
+  -- Multi-item Pitched Items state
   session_takes = {},  -- [guid] = take_data table
   session_order = {},  -- array of guids
   sidebar_w = 200,     -- resizable sidebar width
+  sidebar_open = true, -- Pitched Items drawer visibility (defaults open)
+  show_onset_debug = false, -- opt-in onset diagnostic readout
 
   -- Key & Scale state
   key_idx = 1,       -- 1..12 (1 = C)
@@ -239,7 +247,7 @@ local function is_pitch_in_scale(pitch_class)
   return state.scale_pc_set[pc] == true
 end
 
--- Initialize key & scale preferences from ExtState
+-- Initialize key, scale, and sidebar preferences from ExtState
 do
   local saved_key = tonumber(reaper.GetExtState("FancyScripts", "pitch_key_idx"))
   local saved_scale = tonumber(reaper.GetExtState("FancyScripts", "pitch_scale_idx"))
@@ -250,6 +258,13 @@ do
     state.scale_idx = saved_scale
   end
   update_scale_pitch_classes()
+
+  local saved_sidebar = reaper.GetExtState("FancyScripts", "pitch_sidebar_open")
+  if saved_sidebar == "0" or saved_sidebar == "false" then
+    state.sidebar_open = false
+  else
+    state.sidebar_open = true
+  end
 end
 
 -- Robustly resolve a media item take by GUID with SWS and item-scan fallbacks
@@ -309,6 +324,44 @@ local function get_target_take(auto_select)
   end
 
   return take, item
+end
+
+--- Get effective track color for active take/item, converting native REAPER color to ImGui RGBA
+local function get_target_track_color(take, item)
+  if not take then return nil end
+  if not item then
+    item = reaper.GetMediaItemTake_Item(take)
+  end
+  if not item then return nil end
+
+  -- 1. Check track color explicitly first
+  local track = reaper.GetMediaItem_Track(item)
+  if track then
+    local tr_col = reaper.GetTrackColor(track)
+    if tr_col and tr_col ~= 0 then
+      return Theme.bgr_to_rgba(tr_col)
+    end
+  end
+
+  -- 2. Fall back to displayed item color if track has default 0
+  if reaper.GetDisplayedMediaItemColor then
+    local disp_col = reaper.GetDisplayedMediaItemColor(item)
+    if disp_col and disp_col ~= 0 then
+      return Theme.bgr_to_rgba(disp_col)
+    end
+  end
+
+  return nil
+end
+
+--- Returns dark text for high-luminance background colors and white text for dark/mid backgrounds
+local function get_contrasting_text_color(rgba)
+  if not rgba then return 0xFFFFFFFF end
+  local r = ((rgba >> 24) & 0xFF) / 255
+  local g = ((rgba >> 16) & 0xFF) / 255
+  local b = ((rgba >> 8) & 0xFF) / 255
+  local lum = 0.299 * r + 0.587 * g + 0.114 * b
+  return (lum > 0.6) and 0x141418FF or 0xFFFFFFFF
 end
 
 -- Ensure the Take Pitch Envelope is active on the take, creating it if needed.
@@ -1312,6 +1365,11 @@ reset_selected_note = function()
   if #indices == 0 and state.selected_note and state.notes[state.selected_note] then
     table.insert(indices, state.selected_note)
   end
+  if #indices == 0 then
+    for i = 1, #state.notes do
+      table.insert(indices, i)
+    end
+  end
   if #indices == 0 then return end
 
   for _, idx in ipairs(indices) do
@@ -1848,8 +1906,8 @@ local function draw_graph(draw_ctx, w, h)
   local is_canvas_hovered = reaper.ImGui_IsItemHovered(draw_ctx)
 
   -- Draw background
-  reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + h, 0x1A1A1AFF)
-  reaper.ImGui_DrawList_AddRect(draw_list, px, py, px + w, py + h, 0x444444FF)
+  reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + h, P.bg)
+  reaper.ImGui_DrawList_AddRect(draw_list, px, py, px + w, py + h, P.border)
 
   local piano_w = 40
   local full_px = px
@@ -1859,9 +1917,58 @@ local function draw_graph(draw_ctx, w, h)
 
   reaper.ImGui_DrawList_PushClipRect(draw_list, full_px, py, full_px + full_w, py + h, true)
 
+  local target_take = get_target_take(false)
+  local is_bypassed = is_take_pitch_bypassed(target_take)
+
   if #state.results == 0 then
-    reaper.ImGui_DrawList_AddText(draw_list, px + 10, py + 10, P.text,
-      "No data. Select an item and click Analyze.")
+    local cx = full_px + full_w * 0.5
+    local cy = py + h * 0.5
+
+    local btn_w = 180
+    local btn_h = 42
+    local gap = 14
+
+    local msg = "No data. Select an item and click Analyze."
+    local text_w, text_h = reaper.ImGui_CalcTextSize(draw_ctx, msg)
+    local total_block_h = btn_h + gap + text_h
+    local start_y = cy - total_block_h * 0.5
+
+    local btn_x = cx - btn_w * 0.5
+    local btn_y = start_y
+
+    local can_analyze = (target_take ~= nil and not state.is_analyzing)
+    local mx, my = reaper.ImGui_GetMousePos(draw_ctx)
+    local is_btn_hov = can_analyze and is_canvas_hovered and (mx >= btn_x and mx <= btn_x + btn_w and my >= btn_y and my <= btn_y + btn_h)
+    local is_btn_down = is_btn_hov and reaper.ImGui_IsMouseDown(draw_ctx, 0)
+    if is_btn_hov and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+      start_analysis()
+    end
+
+    -- Draw button background & border
+    local btn_bg = not can_analyze and P.card
+      or (is_btn_down and P.accent or (is_btn_hov and P.accent_h or P.accent_d))
+    local btn_border = is_btn_hov and P.accent or P.border
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, btn_x, btn_y, btn_x + btn_w, btn_y + btn_h, btn_bg, 6.0)
+    reaper.ImGui_DrawList_AddRect(draw_list, btn_x, btn_y, btn_x + btn_w, btn_y + btn_h, btn_border, 6.0, 0, 1.5)
+
+    -- Draw button text
+    local btn_txt = "Analyze Item"
+    local pushed_btn_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)
+    local btw, bth = reaper.ImGui_CalcTextSize(draw_ctx, btn_txt)
+    Theme.pop_font(draw_ctx, pushed_btn_font)
+
+    local btn_txt_col = can_analyze and 0xFFFFFFFF or P.text_dim
+    reaper.ImGui_DrawList_AddText(draw_list, cx - btw * 0.5, btn_y + (btn_h - bth) * 0.5, btn_txt_col, btn_txt)
+
+    if is_btn_hov then
+      Theme.tooltip(draw_ctx, "Run YIN pitch detection on selected audio item")
+    end
+
+    -- Centered text below button
+    local text_x = cx - text_w * 0.5
+    local text_y = btn_y + btn_h + gap
+    reaper.ImGui_DrawList_AddText(draw_list, text_x, text_y, P.text_dim, msg)
+
     reaper.ImGui_DrawList_PopClipRect(draw_list)
     return
   end
@@ -1910,7 +2017,7 @@ local function draw_graph(draw_ctx, w, h)
 
   -- Hit-test: find hovered note, zone, and edge handles
   local edge_handle_px = 5 -- pixels for edge grab zone
-  if is_canvas_hovered and not state.drag and not state.edge_drag and not state.marquee and state.notes then
+  if is_canvas_hovered and not is_bypassed and not state.drag and not state.edge_drag and not state.marquee and state.notes then
     state.hovered_note = nil
     state.hovered_zone = nil
     state.hovered_edge = nil
@@ -1958,14 +2065,14 @@ local function draw_graph(draw_ctx, w, h)
     if state.hovered_edge then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeEW())
     end
-  elseif not is_canvas_hovered and not state.drag and not state.edge_drag and not state.marquee then
+  elseif (not is_canvas_hovered or is_bypassed) and not state.drag and not state.edge_drag and not state.marquee then
     state.hovered_note = nil
     state.hovered_zone = nil
     state.hovered_edge = nil
   end
 
   -- Click: select note (Shift/Cmd/Ctrl = multi-select), begin drag, edge drag, or marquee box select
-  if is_canvas_hovered and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+  if is_canvas_hovered and not is_bypassed and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
     get_target_take(true)
 
     -- Resolve modifiers for selection modes (cross-platform macOS/Win/Linux)
@@ -2842,6 +2949,35 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- Bypassed Overlay
+  if is_bypassed then
+    local scrim_col = Theme.with_alpha(P.bg, 0.75)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, py, full_px + full_w, py + h, scrim_col)
+
+    local cx = full_px + full_w * 0.5
+    local cy = py + h * 0.5
+    local badge_w = 200
+    local badge_h = 60
+    local bx1 = cx - badge_w * 0.5
+    local by1 = cy - badge_h * 0.5
+    local bx2 = cx + badge_w * 0.5
+    local by2 = cy + badge_h * 0.5
+
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, bx1, by1, bx2, by2, P.card, 6.0)
+    reaper.ImGui_DrawList_AddRect(draw_list, bx1, by1, bx2, by2, P.red, 6.0, 0, 1.5)
+
+    local txt_main = "BYPASSED"
+    local pushed_bp_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)
+    local tw, th = reaper.ImGui_CalcTextSize(draw_ctx, txt_main)
+    Theme.pop_font(draw_ctx, pushed_bp_font)
+
+    local sub_txt = "Take pitch envelope is bypassed"
+    local stw, _ = reaper.ImGui_CalcTextSize(draw_ctx, sub_txt)
+
+    reaper.ImGui_DrawList_AddText(draw_list, cx - tw * 0.5, by1 + 10, P.red_l, txt_main)
+    reaper.ImGui_DrawList_AddText(draw_list, cx - stw * 0.5, by1 + 14 + th, P.text_dim, sub_txt)
+  end
+
   reaper.ImGui_DrawList_PopClipRect(draw_list)
 end
 
@@ -2997,20 +3133,53 @@ local function remove_take_from_session(guid)
   reaper.Undo_EndBlock(string.format("Delete %s from Pitch Session and Reset Take", take_name), -1)
 end
 
-local function render_session_sidebar(sidebar_ctx)
-  local P = Theme.get_palette()
+local function wipe_entire_session()
+  local order_copy = {}
+  for _, guid in ipairs(state.session_order) do
+    table.insert(order_copy, guid)
+  end
+  for _, guid in ipairs(order_copy) do
+    remove_take_from_session(guid)
+  end
+  reset_analysis()
+  state.session_takes = {}
+  state.session_order = {}
+end
 
-  reaper.ImGui_Text(sidebar_ctx, string.format("Session Takes (%d)", #state.session_order))
+local function render_pitched_items_sidebar(sidebar_ctx)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+
+  Theme.align(sidebar_ctx)
+  reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
+  reaper.ImGui_Text(sidebar_ctx, string.format("Pitched Items (%d)", #state.session_order))
+  reaper.ImGui_PopStyleColor(sidebar_ctx, 1)
+
+  reaper.ImGui_SameLine(sidebar_ctx)
+  local close_sz = L.icon_sm.size + L.icon_sm.pad * 2
+  Theme.right_align(sidebar_ctx, close_sz)
+  Theme.align(sidebar_ctx, nil, close_sz)
+  if Theme.icon_btn(sidebar_ctx, "##close_items_panel", Theme.icons.tri_right, {
+    preset = L.icon_sm,
+    tooltip = "Hide Pitched Items panel"
+  }) then
+    state.sidebar_open = false
+    reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "0", true)
+  end
+
   reaper.ImGui_Separator(sidebar_ctx)
 
   if #state.session_order == 0 then
-    reaper.ImGui_TextDisabled(sidebar_ctx, "No takes stored.\n\nSelect an audio item in REAPER and click Analyze.")
+    reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Text(), P.text_dim)
+    reaper.ImGui_TextWrapped(sidebar_ctx, "No pitched items stored.\n\nSelect an audio item in REAPER and click Analyze.")
+    reaper.ImGui_PopStyleColor(sidebar_ctx, 1)
     return
   end
 
   local to_remove = nil
+  local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
 
-    for _, guid in ipairs(state.session_order) do
+  for _, guid in ipairs(state.session_order) do
     local data = state.session_takes[guid]
     if data then
       local is_active = (guid == state.target_take_guid)
@@ -3021,54 +3190,61 @@ local function render_session_sidebar(sidebar_ctx)
 
       reaper.ImGui_PushID(sidebar_ctx, guid)
 
-      -- Active marker
+      local rx, ry = reaper.ImGui_GetCursorScreenPos(sidebar_ctx)
+      local row_h = reaper.ImGui_GetFrameHeight(sidebar_ctx) + 2
+
+      -- Full-width highlight bar encompassing all row buttons
       if is_active then
-        reaper.ImGui_TextColored(sidebar_ctx, P.accent, ">")
-      else
-        reaper.ImGui_TextDisabled(sidebar_ctx, " ")
-      end
-      reaper.ImGui_SameLine(sidebar_ctx)
-
-      -- Selectable take name
-      local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
-      local btn_reserve = 72 -- reserve space for bypass and remove buttons
-      local name_w = math.max(30, avail_w - btn_reserve)
-
-      local sel_flags = reaper.ImGui_SelectableFlags_AllowOverlap and reaper.ImGui_SelectableFlags_AllowOverlap() or 0
-      local sel_text = data.name or "Take"
-      if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "##sel", is_active, sel_flags, name_w, 0) then
-        switch_active_target(guid, take_obj)
-      end
-      if reaper.ImGui_IsItemHovered(sidebar_ctx) then
-        Theme.tooltip(sidebar_ctx, string.format("Take: %s\nNotes: %d\nClick to switch editing target",
-          data.name or "Take", data.notes and #data.notes or 0))
+        local dl = reaper.ImGui_GetWindowDrawList(sidebar_ctx)
+        reaper.ImGui_DrawList_AddRectFilled(dl, rx - 2, ry, rx + avail_w + 2, ry + row_h, Theme.with_alpha(P.accent, 0.22), 4.0)
+        reaper.ImGui_DrawList_AddRect(dl, rx - 2, ry, rx + avail_w + 2, ry + row_h, Theme.with_alpha(P.accent, 0.55), 4.0)
       end
 
-      -- Bypass button
-      reaper.ImGui_SameLine(sidebar_ctx)
+      -- Checkbox on the left: mirrors REAPER FX chain
+      Theme.align(sidebar_ctx)
       local is_bp = is_take_pitch_bypassed(take_obj)
-      if is_bp then
-        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Button(), 0xCC4444FF)
-        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_ButtonHovered(), 0xDD5555FF)
-        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_ButtonActive(), 0xBB3333FF)
-      end
-      if reaper.ImGui_SmallButton(sidebar_ctx, (is_bp and "Byp" or "Act") .. "##bp") then
+      local is_enabled = not is_bp
+      local cb_changed, new_en = reaper.ImGui_Checkbox(sidebar_ctx, "##bp", is_enabled)
+      if cb_changed then
         toggle_take_pitch_bypass(take_obj)
       end
-      if is_bp then
-        reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
-      end
       if reaper.ImGui_IsItemHovered(sidebar_ctx) then
-        Theme.tooltip(sidebar_ctx, is_bp and "Envelope Bypassed — click to re-enable" or "Envelope Active — click to bypass")
+        Theme.tooltip(sidebar_ctx, new_en and "Envelope Active — click to bypass take envelope" or "Envelope Bypassed — click to enable take envelope")
       end
 
-      -- Remove button
-      reaper.ImGui_SameLine(sidebar_ctx)
-      if reaper.ImGui_SmallButton(sidebar_ctx, "x##del") then
-        to_remove = guid
+      reaper.ImGui_SameLine(sidebar_ctx, 0, L.xs)
+
+      -- Selectable take name in center
+      local del_btn_w = 20
+      local cur_x = reaper.ImGui_GetCursorPosX(sidebar_ctx)
+      local name_w = math.max(30, avail_w - cur_x - del_btn_w - L.xs)
+
+      local sel_flags = reaper.ImGui_SelectableFlags_AllowOverlap and reaper.ImGui_SelectableFlags_AllowOverlap() or 0
+      local sel_text = data.name or "Item"
+      Theme.align(sidebar_ctx)
+      local text_col = is_active and 0xFFFFFFFF or P.text
+      reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Text(), text_col)
+      if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "##sel", false, sel_flags, name_w, 0) then
+        switch_active_target(guid, take_obj)
       end
+      reaper.ImGui_PopStyleColor(sidebar_ctx, 1)
+
       if reaper.ImGui_IsItemHovered(sidebar_ctx) then
-        Theme.tooltip(sidebar_ctx, "Remove from session, clear envelope, and reset take")
+        Theme.tooltip(sidebar_ctx, string.format("Item: %s\nNotes: %d\nClick to switch editing target",
+          data.name or "Item", data.notes and #data.notes or 0))
+      end
+
+      -- Delete button on right
+      reaper.ImGui_SameLine(sidebar_ctx, 0, L.xs)
+      Theme.align(sidebar_ctx)
+      if Theme.icon_btn(sidebar_ctx, "##del", Theme.icons.close, {
+        size = 12,
+        pad = 3,
+        color = P.text_dim,
+        hover_color = P.red,
+        tooltip = "Remove from session, clear envelope, and reset take"
+      }) then
+        to_remove = guid
       end
 
       reaper.ImGui_PopID(sidebar_ctx)
@@ -3080,16 +3256,495 @@ local function render_session_sidebar(sidebar_ctx)
   end
 end
 
-local function loop()
+local function draw_settings_modal()
+  local P = Theme.get_palette()
+  local L = Theme.layout
   local _
-  Theme.push(ctx)
 
+  if show_settings_modal then
+    reaper.ImGui_OpenPopup(ctx, "Settings & Audio Engine##settings_modal")
+    show_settings_modal = false
+  end
+
+  Theme.center_next_window(ctx, 480, 560, reaper.ImGui_Cond_Appearing())
+  Theme.modal_scrim(ctx, "Settings & Audio Engine##settings_modal")
+  local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Settings & Audio Engine##settings_modal", true, reaper.ImGui_WindowFlags_AlwaysAutoResize())
+  if visible then
+    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) or not open then
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+
+    reaper.ImGui_Spacing(ctx)
+
+    Theme.section_divider(ctx, "Pitch Shift Engine", { color = P.yellow })
+    Theme.align(ctx)
+    reaper.ImGui_Text(ctx, "Algorithm:")
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+    reaper.ImGui_PushItemWidth(ctx, 280)
+    if reaper.ImGui_BeginCombo(ctx, "##settings_pitchmode", state.pitchmode_name) then
+      for i, entry in ipairs(PITCHMODE_FLAT) do
+        local is_selected = (state.preset_pitchmode_idx == i)
+        if reaper.ImGui_Selectable(ctx, entry.name, is_selected) then
+          state.preset_pitchmode_idx = i
+          state.pitchmode_value = entry.value
+          state.pitchmode_name = entry.name
+        end
+        if is_selected then reaper.ImGui_SetItemDefaultFocus(ctx) end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    reaper.ImGui_PopItemWidth(ctx)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Pitch Shift Algorithm — Elastique Soloist (Monophonic) is recommended for vocals.\nApplied automatically to the take when writing envelopes.")
+    end
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Analysis & Detection Presets", { color = P.yellow })
+
+    Theme.align(ctx)
+    reaper.ImGui_Text(ctx, "Vocal Range:")
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+    reaper.ImGui_PushItemWidth(ctx, 160)
+    if reaper.ImGui_BeginCombo(ctx, "##settings_range", VOCAL_RANGES[state.preset_range_idx].name) then
+      for i, range in ipairs(VOCAL_RANGES) do
+        if reaper.ImGui_Selectable(ctx, range.name, state.preset_range_idx == i) then
+          state.preset_range_idx = i
+          state.min_freq = range.min
+          state.max_freq = range.max
+        end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    reaper.ImGui_PopItemWidth(ctx)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Vocal Range — limits frequency search to avoid octave jump errors")
+    end
+
+    Theme.align(ctx)
+    reaper.ImGui_Text(ctx, "Strictness:")
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+    reaper.ImGui_PushItemWidth(ctx, 160)
+    if reaper.ImGui_BeginCombo(ctx, "##settings_mode", DETECTION_MODES[state.preset_mode_idx].name) then
+      for i, mode in ipairs(DETECTION_MODES) do
+        if reaper.ImGui_Selectable(ctx, mode.name, state.preset_mode_idx == i) then
+          state.preset_mode_idx = i
+          state.threshold = mode.threshold
+        end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    reaper.ImGui_PopItemWidth(ctx)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Detection Mode — confidence threshold for pitched note detection")
+    end
+
+    Theme.align(ctx)
+    reaper.ImGui_Text(ctx, "Quality / CPU:")
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+    reaper.ImGui_PushItemWidth(ctx, 160)
+    if reaper.ImGui_BeginCombo(ctx, "##settings_quality", QUALITY_MODES[state.preset_quality_idx].name) then
+      for i, mode in ipairs(QUALITY_MODES) do
+        if reaper.ImGui_Selectable(ctx, mode.name, state.preset_quality_idx == i) then
+          state.preset_quality_idx = i
+          state.block_size = mode.block
+          state.hop_size = mode.hop
+        end
+      end
+      reaper.ImGui_EndCombo(ctx)
+    end
+    reaper.ImGui_PopItemWidth(ctx)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Quality / CPU — time vs frequency resolution trade-off")
+    end
+
+    reaper.ImGui_Spacing(ctx)
+    if Theme.collapsing_header(ctx, "Advanced DSP Parameters") then
+      reaper.ImGui_Indent(ctx, L.md)
+      _, state.block_size = reaper.ImGui_InputInt(ctx, "Block Size##dsp", state.block_size)
+      if reaper.ImGui_IsItemHovered(ctx) then
+        Theme.tooltip(ctx, "Samples analyzed per window (e.g. 512, 1024, 2048).")
+      end
+      _, state.hop_size = reaper.ImGui_InputInt(ctx, "Hop Size##dsp", state.hop_size)
+      if reaper.ImGui_IsItemHovered(ctx) then
+        Theme.tooltip(ctx, "Samples to advance between analysis windows.")
+      end
+      _, state.threshold = reaper.ImGui_SliderDouble(ctx, "YIN Threshold##dsp", state.threshold, 0.05, 0.5, "%.2f")
+      if reaper.ImGui_IsItemHovered(ctx) then
+        Theme.tooltip(ctx, "Confidence threshold for pitch detection (lower = stricter).")
+      end
+      _, state.min_freq = reaper.ImGui_SliderDouble(ctx, "Min Freq (Hz)##dsp", state.min_freq, 20, 200, "%.0f Hz")
+      _, state.max_freq = reaper.ImGui_SliderDouble(ctx, "Max Freq (Hz)##dsp", state.max_freq, 200, 2000, "%.0f Hz")
+      reaper.ImGui_Unindent(ctx, L.md)
+    end
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Appearance & Options", { color = P.yellow })
+
+    Theme.align(ctx)
+    Theme.settings_widget(ctx, { label = "Theme Mode" })
+
+    Theme.align(ctx)
+    Theme.tooltip_setting_widget(ctx, { label = "Show Tooltips" })
+
+    Theme.align(ctx)
+    _, state.show_onset_debug = reaper.ImGui_Checkbox(ctx, "Show Onset Diagnostics in Status Bar", state.show_onset_debug)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Displays onset ramp, scoop depth, and voicing delay details in the bottom status dock.")
+    end
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Reset & Clear", { color = P.red })
+    Theme.align(ctx)
+    if reaper.ImGui_Button(ctx, "Clear Active Take Envelope##reset_take", 200, 0) then
+      reset_analysis()
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Clears analysis cache and deletes pitch envelope points from the active take")
+    end
+
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
+    Theme.align(ctx)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), P.red_d)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), P.red_h)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), P.red)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
+    if reaper.ImGui_Button(ctx, "Wipe Entire Session (All Items)##reset_all", 230, 0) then
+      wipe_entire_session()
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+    reaper.ImGui_PopStyleColor(ctx, 4)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "WARNING: Clears all pitch envelopes, metadata, and resets all items stored in this session.")
+    end
+
+    reaper.ImGui_Spacing(ctx)
+    reaper.ImGui_Separator(ctx)
+    reaper.ImGui_Spacing(ctx)
+
+    local btn_done_w = 120
+    Theme.hcenter(ctx, btn_done_w)
+    if reaper.ImGui_Button(ctx, "Done##settings_done", btn_done_w, 0) then
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+
+    reaper.ImGui_EndPopup(ctx)
+  end
+end
+
+local function draw_info_modal()
+  local P = Theme.get_palette()
+
+  if show_info_modal then
+    reaper.ImGui_OpenPopup(ctx, "Keyboard Shortcuts & Help##info_modal")
+    show_info_modal = false
+  end
+
+  Theme.center_next_window(ctx, 480, 520, reaper.ImGui_Cond_Appearing())
+  Theme.modal_scrim(ctx, "Keyboard Shortcuts & Help##info_modal")
+  local visible, open = reaper.ImGui_BeginPopupModal(ctx, "Keyboard Shortcuts & Help##info_modal", true, reaper.ImGui_WindowFlags_AlwaysAutoResize())
+  if visible then
+    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) or not open then
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Selection & Navigation", { color = P.yellow })
+
+    local function shortcut_row(key_str, desc_str)
+      Theme.align(ctx)
+      reaper.ImGui_TextColored(ctx, P.accent, key_str)
+      reaper.ImGui_SameLine(ctx)
+      Theme.right_align(ctx, 280)
+      Theme.align(ctx)
+      reaper.ImGui_Text(ctx, desc_str)
+    end
+
+    shortcut_row("Cmd / Ctrl + A", "Select all notes in phrase")
+    shortcut_row("Escape", "Deselect all notes")
+    shortcut_row("Marquee Drag", "Box select notes (Shift=Add)")
+    shortcut_row("Shift + Click", "Range select notes")
+    shortcut_row("Cmd / Ctrl + Click", "Toggle note in/out of selection")
+    shortcut_row("← / →", "Select previous / next note (Shift=Extend)")
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Pitch & Note Editing", { color = P.yellow })
+
+    shortcut_row("Drag Center Zone", "Shift note pitch (semitones / fine cents)")
+    shortcut_row("Drag Left Zone", "Adjust drift stability tracking")
+    shortcut_row("Drag Right Zone", "Scale natural vibrato depth")
+    shortcut_row("Drag Note Edge", "Trim note start / end boundary")
+    shortcut_row("↑ / ↓", "Nudge pitch ±1 semitone")
+    shortcut_row("Shift + ↑ / ↓", "Fine-tune pitch ±10 cents")
+    shortcut_row("S / Double-Click", "Snap note to nearest semitone")
+    shortcut_row("Q", "Quantize selected note(s) to scale")
+    shortcut_row("R / Delete", "Reset note(s) to original detected pitch")
+
+    reaper.ImGui_Spacing(ctx)
+    Theme.section_divider(ctx, "Note Topology & REAPER Transport", { color = P.yellow })
+
+    shortcut_row("X", "Split note at REAPER edit cursor")
+    shortcut_row("M", "Merge 2+ contiguous selected notes")
+    shortcut_row("Space", "Play / Stop REAPER transport")
+
+    reaper.ImGui_Spacing(ctx)
+    reaper.ImGui_Separator(ctx)
+    reaper.ImGui_Spacing(ctx)
+
+    local btn_close_w = 120
+    Theme.hcenter(ctx, btn_close_w)
+    if reaper.ImGui_Button(ctx, "Close##info_close", btn_close_w, 0) then
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+
+    reaper.ImGui_EndPopup(ctx)
+  end
+end
+
+local function render_bottom_dock(dock_ctx)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+
+  local has_data = (#state.results > 0 and state.notes and #state.notes > 0)
+  if not has_data then
+    Theme.align(dock_ctx)
+    reaper.ImGui_TextDisabled(dock_ctx, "Ready to analyze selected item.")
+    return
+  end
+
+  local sel_count = 0
+  for _ in pairs(state.selected_notes) do sel_count = sel_count + 1 end
+  if sel_count == 0 and state.selected_note and state.notes[state.selected_note] then
+    sel_count = 1
+  end
+
+  -- Left: Selection Status & Note Properties
+  if sel_count > 1 then
+    local mod_count = 0
+    local total_dur = 0
+    for idx in pairs(state.selected_notes) do
+      local n = state.notes[idx]
+      if n then
+        if is_note_modified(n) then mod_count = mod_count + 1 end
+        total_dur = total_dur + (n.end_time - n.start_time)
+      end
+    end
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, string.format("%d Notes (%.2fs)", sel_count, total_dur), {
+      color = P.accent_l,
+      bg = P.accent_d,
+      tooltip = "Selected notes count and cumulative duration"
+    })
+    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+    if state.selected_note and state.notes[state.selected_note] then
+      local pn = state.notes[state.selected_note]
+      local p_nearest = math.floor(pn.controls.center_pitch + 0.5)
+      local p_cents = math.floor((pn.controls.center_pitch - p_nearest) * 100 + 0.5)
+      local p_sign = p_cents >= 0 and "+" or ""
+      Theme.align(dock_ctx)
+      Theme.badge(dock_ctx, string.format("Anchor: %s %s%d¢", midi_to_name(p_nearest), p_sign, p_cents), {
+        tooltip = "Anchor note for relative transposition and interval snapping"
+      })
+      reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+    end
+    local status_str = mod_count > 0 and string.format("%d/%d Tuned", mod_count, sel_count) or "Untouched"
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, status_str, {
+      color = mod_count > 0 and P.green_l or P.text_dim,
+      bg = mod_count > 0 and P.green_d or P.card,
+      tooltip = "Number of modified notes in selection"
+    })
+  elseif sel_count == 1 and state.selected_note and state.notes[state.selected_note] then
+    local sel = state.notes[state.selected_note]
+    local ctrl = sel.controls
+    local nearest = math.floor(ctrl.center_pitch + 0.5)
+    local cents = math.floor((ctrl.center_pitch - nearest) * 100 + 0.5)
+    local sign = cents >= 0 and "+" or ""
+    local is_mod = is_note_modified(sel)
+    local is_chrom = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic")
+    local in_scale = is_pitch_in_scale(nearest % 12)
+
+    local note_label = string.format("%s %s%d¢", midi_to_name(nearest), sign, cents)
+    local note_col = (is_chrom or in_scale) and P.green_l or P.yellow_l
+    local note_bg  = (is_chrom or in_scale) and P.green_d or Theme.with_alpha(P.yellow, 0.22)
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, note_label, {
+      color = note_col,
+      bg = note_bg,
+      tooltip = string.format("Note Pitch: %s\nDeviation: %s%d cents\nScale: %s",
+        midi_to_name(nearest), sign, cents, is_chrom and "Chromatic" or (in_scale and "In Scale" or "Out of Scale"))
+    })
+
+    if not is_chrom then
+      reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+      Theme.align(dock_ctx)
+      Theme.badge(dock_ctx, in_scale and "In Scale" or "Out of Scale", {
+        color = in_scale and P.green_l or P.yellow_l,
+        bg = in_scale and P.green_d or Theme.with_alpha(P.yellow, 0.22)
+      })
+    end
+
+    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, string.format("Stability: %.0f%%", (1 - ctrl.drift_scale) * 100), {
+      tooltip = "Pitch stability / drift correction (Drag left zone of note block)"
+    })
+
+    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, string.format("Vibrato: %.0f%%", ctrl.vibrato_scale * 100), {
+      tooltip = "Vibrato depth scale (Drag right zone of note block)"
+    })
+
+    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, string.format("Trans: %.0fms", ctrl.transition_ms or 35), {
+      tooltip = "S-curve smoothstep transition duration into next note"
+    })
+
+    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+    Theme.align(dock_ctx)
+    Theme.badge(dock_ctx, is_mod and "Tuned" or "Original", {
+      color = is_mod and P.green_l or P.text_dim,
+      bg = is_mod and P.green_d or P.card
+    })
+
+    -- Optional onset debug info
+    if state.show_onset_debug and sel.onset_debug then
+      local od = sel.onset_debug
+      reaper.ImGui_SameLine(dock_ctx, 0, L.md)
+      Theme.align(dock_ctx)
+      reaper.ImGui_TextDisabled(dock_ctx, string.format("[ramp=%.0fms scoop=%.2fst delay=%.0fms]",
+        od.onset_ramp_ms, od.scoop_st, od.voicing_delay_ms))
+    end
+  else
+    Theme.align(dock_ctx)
+    reaper.ImGui_TextDisabled(dock_ctx, "Click note to select  •  Marquee drag to box select  •  Cmd+A to select all")
+  end
+
+  -- Right: Action Buttons
+  local btn_q_w = 98
+  local btn_split_w = 74
+  local btn_merge_w = 78
+  local btn_reset_w = 80
+  local btn_all_w = 86
+  local act_w = btn_q_w + btn_split_w + btn_merge_w + btn_reset_w + btn_all_w + (L.sm * 4)
+
+  reaper.ImGui_SameLine(dock_ctx)
+  local cur_x = reaper.ImGui_GetCursorPosX(dock_ctx)
+  local avail_dock_w = reaper.ImGui_GetContentRegionAvail(dock_ctx)
+  local target_x = cur_x + avail_dock_w - act_w
+  if target_x > cur_x + L.md then
+    reaper.ImGui_SetCursorPosX(dock_ctx, target_x)
+  end
+
+  -- Quantize (Q)
+  local has_sel = (sel_count > 0)
+  if not has_sel then reaper.ImGui_BeginDisabled(dock_ctx) end
+  local q_label = sel_count > 1 and string.format("Quantize (%d)", sel_count) or "Quantize (Q)"
+  if reaper.ImGui_Button(dock_ctx, q_label .. "##dock_q", btn_q_w, 0) then
+    get_target_take(true)
+    quantize_selected_notes_to_scale()
+  end
+  if reaper.ImGui_IsItemHovered(dock_ctx) then
+    Theme.tooltip(dock_ctx, string.format("Quantize %s to nearest %s %s pitch (Q)",
+      sel_count > 1 and string.format("%d selected notes", sel_count) or "selected note",
+      SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name))
+  end
+  if not has_sel then reaper.ImGui_EndDisabled(dock_ctx) end
+
+  -- Split (X)
+  local can_split = false
+  if state.selected_note and state.notes[state.selected_note] then
+    local sn = state.notes[state.selected_note]
+    local _, si = get_target_take(false)
+    if si then
+      local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
+      local ec = reaper.GetCursorPosition() - ip
+      can_split = ec > sn.start_time and ec < sn.end_time
+    end
+  end
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  if not can_split then reaper.ImGui_BeginDisabled(dock_ctx) end
+  if reaper.ImGui_Button(dock_ctx, "Split (X)##dock_x", btn_split_w, 0) then
+    if state.selected_note and state.notes[state.selected_note] then
+      local sn = state.notes[state.selected_note]
+      local _, si = get_target_take(false)
+      if si then
+        local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
+        local ec = reaper.GetCursorPosition() - ip
+        if ec > sn.start_time and ec < sn.end_time then
+          get_target_take(true)
+          split_note_at(state.selected_note, ec)
+        end
+      end
+    end
+  end
+  if reaper.ImGui_IsItemHovered(dock_ctx) then
+    Theme.tooltip(dock_ctx, "Split selected note at REAPER edit cursor (X)")
+  end
+  if not can_split then reaper.ImGui_EndDisabled(dock_ctx) end
+
+  -- Merge (M)
+  local can_merge = (sel_count >= 2)
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  if not can_merge then reaper.ImGui_BeginDisabled(dock_ctx) end
+  if reaper.ImGui_Button(dock_ctx, "Merge (M)##dock_m", btn_merge_w, 0) then
+    get_target_take(true)
+    merge_selected_notes()
+  end
+  if reaper.ImGui_IsItemHovered(dock_ctx) then
+    Theme.tooltip(dock_ctx, "Merge 2 or more contiguous selected notes into one (M)")
+  end
+  if not can_merge then reaper.ImGui_EndDisabled(dock_ctx) end
+
+  -- Reset (R)
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  if not has_sel then reaper.ImGui_BeginDisabled(dock_ctx) end
+  local r_label = sel_count > 1 and string.format("Reset (%d)", sel_count) or "Reset (R)"
+  if reaper.ImGui_Button(dock_ctx, r_label .. "##dock_r", btn_reset_w, 0) then
+    reset_selected_note()
+  end
+  if reaper.ImGui_IsItemHovered(dock_ctx) then
+    Theme.tooltip(dock_ctx, "Reset selected note(s) to original pitch/drift/vibrato (R)")
+  end
+  if not has_sel then reaper.ImGui_EndDisabled(dock_ctx) end
+
+  -- Select All
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  if reaper.ImGui_Button(dock_ctx, "Select All##dock_all", btn_all_w, 0) then
+    state.selected_notes = {}
+    for i = 1, #state.notes do
+      state.selected_notes[i] = true
+    end
+    if not state.selected_note or not state.selected_notes[state.selected_note] then
+      state.selected_note = 1
+    end
+  end
+  if reaper.ImGui_IsItemHovered(dock_ctx) then
+    Theme.tooltip(dock_ctx, "Select all notes in phrase (Cmd/Ctrl + A)")
+  end
+end
+
+local function loop_body()
+  local _
   process_analysis_step()
 
-  local visible, open = reaper.ImGui_Begin(ctx, 'Fancy Pitch Correct', true, reaper.ImGui_WindowFlags_NoNavInputs())
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local nc, nv = Theme.push(ctx, P)
+  local pushed_font = Theme.push_font(ctx, fonts.default)
+
+  Theme.center_next_window(ctx, 920, 620, reaper.ImGui_Cond_Once())
+  local win_flags = reaper.ImGui_WindowFlags_NoCollapse()
+    | reaper.ImGui_WindowFlags_NoScrollbar()
+    | reaper.ImGui_WindowFlags_NoNavInputs()
+
+  local visible, open = reaper.ImGui_Begin(ctx, 'Fancy Pitch Correct', true, win_flags)
   if visible then
-    reaper.ImGui_Text(ctx, "YIN Pitch Detection Test Bench")
-    reaper.ImGui_Separator(ctx)
+    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
+      open = false
+    end
 
     -- Automatic selection tracking from REAPER:
     -- If a new item is selected in REAPER, switch to it (from cache) or prepare for analysis
@@ -3118,169 +3773,67 @@ local function loop()
       end
     end
 
-    -- Target item status header
-    local target_take = get_target_take(false)
-    if target_take and state.target_take_name then
-      local P = Theme.get_palette()
-      reaper.ImGui_TextColored(ctx, P.accent, "Target:")
-      reaper.ImGui_SameLine(ctx)
-      local is_analyzed = state.notes and #state.notes > 0
-      local status_label = is_analyzed and " (Active)" or " (Ready to analyze — click Analyze)"
-      reaper.ImGui_Text(ctx, state.target_take_name .. status_label)
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Active editing target. Stored in Session Takes list on the right.")
-      end
+    local target_take, target_item = get_target_take(false)
+    local has_target = (target_take ~= nil and state.target_take_name ~= nil)
+    local has_notes = (state.notes and #state.notes > 0)
+
+    -- 1. Unified Single Top Bar
+    local brand_sz = 24
+    local icon_sz = L.icon_md.size + L.icon_md.pad * 2
+    local row_h = math.max(L.row_h, brand_sz, icon_sz, reaper.ImGui_GetFrameHeight(ctx))
+
+    -- Brand Icon
+    Theme.brand_icon(ctx, brand_sz, row_h)
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
+
+    -- "FANCY"
+    local pushed_b = Theme.push_font(ctx, fonts.large_bold)
+    Theme.align(ctx, row_h)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
+    reaper.ImGui_Text(ctx, "FANCY")
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    Theme.pop_font(ctx, pushed_b)
+    reaper.ImGui_SameLine(ctx, 0, L.xs)
+
+    -- "PITCH CORRECT"
+    local pushed_title = Theme.push_font(ctx, fonts.large)
+    Theme.align(ctx, row_h)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
+    reaper.ImGui_Text(ctx, "PITCH CORRECT")
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    Theme.pop_font(ctx, pushed_title)
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+
+    -- Target Item Badge
+    Theme.align(ctx, row_h)
+    if has_target then
+      local track_col = get_target_track_color(target_take, target_item)
+      local badge_bg = track_col or (has_notes and P.accent_d or Theme.with_alpha(P.yellow, 0.25))
+      local badge_txt_col = track_col and get_contrasting_text_color(track_col) or 0xFFFFFFFF
+      Theme.badge(ctx, state.target_take_name, {
+        color = badge_txt_col,
+        text_color = badge_txt_col,
+        bg = badge_bg,
+        tooltip = string.format("Active Target: %s\nStatus: %s\nSelect any audio item in REAPER to switch target.",
+          state.target_take_name, has_notes and "Analyzed & Active" or "Ready to Analyze")
+      })
     else
-      reaper.ImGui_TextDisabled(ctx, "Target: None (Select an audio item in REAPER)")
+      Theme.badge(ctx, "No Target Item", {
+        color = 0xFFFFFFFF,
+        bg = P.card,
+        tooltip = "Select an audio item in REAPER to pitch-correct."
+      })
     end
-    reaper.ImGui_Separator(ctx)
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
 
+    -- Dropdowns and Buttons in crisp bright white text
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
 
-    -- Compact preset combos (no labels) + action buttons
-    reaper.ImGui_PushItemWidth(ctx, 100)
-    if reaper.ImGui_BeginCombo(ctx, "##range", VOCAL_RANGES[state.preset_range_idx].name) then
-      for i, range in ipairs(VOCAL_RANGES) do
-        if reaper.ImGui_Selectable(ctx, range.name, state.preset_range_idx == i) then
-          state.preset_range_idx = i
-          state.min_freq = range.min
-          state.max_freq = range.max
-        end
-      end
-      reaper.ImGui_EndCombo(ctx)
-    end
-    if reaper.ImGui_IsItemHovered(ctx) then
-      Theme.tooltip(ctx, "Vocal Range — limits frequency search to avoid octave errors")
-    end
-    reaper.ImGui_SameLine(ctx)
-    if reaper.ImGui_BeginCombo(ctx, "##mode", DETECTION_MODES[state.preset_mode_idx].name) then
-      for i, mode in ipairs(DETECTION_MODES) do
-        if reaper.ImGui_Selectable(ctx, mode.name, state.preset_mode_idx == i) then
-          state.preset_mode_idx = i
-          state.threshold = mode.threshold
-        end
-      end
-      reaper.ImGui_EndCombo(ctx)
-    end
-    if reaper.ImGui_IsItemHovered(ctx) then
-      Theme.tooltip(ctx, "Detection Mode — strictness for pitched note detection")
-    end
-    reaper.ImGui_SameLine(ctx)
-    if reaper.ImGui_BeginCombo(ctx, "##quality", QUALITY_MODES[state.preset_quality_idx].name) then
-      for i, mode in ipairs(QUALITY_MODES) do
-        if reaper.ImGui_Selectable(ctx, mode.name, state.preset_quality_idx == i) then
-          state.preset_quality_idx = i
-          state.block_size = mode.block
-          state.hop_size = mode.hop
-        end
-      end
-      reaper.ImGui_EndCombo(ctx)
-    end
-    if reaper.ImGui_IsItemHovered(ctx) then
-      Theme.tooltip(ctx, "Quality / CPU — time vs frequency resolution trade-off")
-    end
-    reaper.ImGui_PopItemWidth(ctx)
-
-    reaper.ImGui_SameLine(ctx)
-    reaper.ImGui_PushItemWidth(ctx, 200)
-    if reaper.ImGui_BeginCombo(ctx, "##pitchmode", state.pitchmode_name) then
-      for i, entry in ipairs(PITCHMODE_FLAT) do
-        local is_selected = (state.preset_pitchmode_idx == i)
-        if reaper.ImGui_Selectable(ctx, entry.name, is_selected) then
-          state.preset_pitchmode_idx = i
-          state.pitchmode_value = entry.value
-          state.pitchmode_name = entry.name
-        end
-        if is_selected then
-          reaper.ImGui_SetItemDefaultFocus(ctx)
-        end
-      end
-      reaper.ImGui_EndCombo(ctx)
-    end
-    if reaper.ImGui_IsItemHovered(ctx) then
-      Theme.tooltip(ctx, "Pitch Shift Algorithm — Elastique Soloist (Monophonic) recommended for vocals.\nSet automatically when applying correction.")
-    end
-    reaper.ImGui_PopItemWidth(ctx)
-
-    reaper.ImGui_SameLine(ctx)
-    if reaper.ImGui_Button(ctx, "Analyze") then
-      start_analysis()
-    end
-    reaper.ImGui_SameLine(ctx)
-    if reaper.ImGui_Button(ctx, "Reset") then
-      reset_analysis()
-    end
-
-    -- Keyboard shortcuts info icon
-    reaper.ImGui_SameLine(ctx)
-    Theme.icon_btn(ctx, "##kb_shortcuts_info", Theme.icons.info, {
-      preset = Theme.layout.icon_md,
-      tooltip = "Keyboard Shortcuts\n"
-        .. "─────────────────────────────\n"
-        .. "Cmd/Ctrl + A    Select all notes\n"
-        .. "Escape          Deselect all\n"
-        .. "Marquee Drag    Box select notes (Shift=add)\n"
-        .. "Shift+Click     Range select notes\n"
-        .. "Cmd/Ctrl+Click  Toggle note selection\n"
-        .. "Drag (multi)    Move pitch or stability together\n"
-        .. "↑ / ↓           Nudge ±1 semitone\n"
-        .. "Shift + ↑/↓      Fine-tune ±10 cents\n"
-        .. "← / →           Select prev / next (Shift=extend)\n"
-        .. "S               Snap to nearest semitone\n"
-        .. "Q               Quantize to scale\n"
-        .. "Double-Click    Snap (in pitch zone)\n"
-        .. "R / Del          Reset note to original\n"
-        .. "X               Split note at edit cursor\n"
-        .. "M               Merge selected notes\n"
-        .. "Drag Edge       Trim note start/end\n"
-        .. "Space           Play / Stop (REAPER)",
-    })
-
-    if state.is_analyzing then
-      reaper.ImGui_SameLine(ctx)
-      reaper.ImGui_Text(ctx, string.format("Analyzing... %d%%", math.floor(state.progress * 100)))
-      reaper.ImGui_ProgressBar(ctx, state.progress, -1, 14)
-    end
-
-    -- Advanced DSP Parameters (toggle)
-    _, state.advanced_mode = reaper.ImGui_Checkbox(ctx, "Show Advanced DSP Parameters", state.advanced_mode)
-
-    if state.advanced_mode then
-      reaper.ImGui_Indent(ctx, 10)
-      _, state.block_size = reaper.ImGui_InputInt(ctx, "Block Size", state.block_size)
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "The number of samples analyzed per window. Larger sizes provide better low-frequency resolution but reduce time precision.")
-      end
-
-      _, state.hop_size = reaper.ImGui_InputInt(ctx, "Hop Size", state.hop_size)
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "The number of samples to advance between analysis windows. Smaller values increase time resolution but use more CPU.")
-      end
-
-      _, state.threshold = reaper.ImGui_SliderDouble(ctx, "YIN Threshold", state.threshold, 0.05, 0.5)
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Confidence threshold for pitch detection. Lower values are stricter, reducing false positives but potentially missing quiet or breathy notes.")
-      end
-
-      _, state.min_freq = reaper.ImGui_SliderDouble(ctx, "Min Freq (Hz)", state.min_freq, 20, 200)
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "The lowest expected frequency. Limits the maximum lag time analyzed by the algorithm.")
-      end
-
-      _, state.max_freq = reaper.ImGui_SliderDouble(ctx, "Max Freq (Hz)", state.max_freq, 200, 2000)
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "The highest expected frequency. Limits the minimum lag time analyzed by the algorithm.")
-      end
-      reaper.ImGui_Unindent(ctx, 10)
-    end
-
-    reaper.ImGui_Separator(ctx)
-
-    local P = Theme.get_palette()
-
-    -- Key & Scale Selector (Milestone 3)
-    reaper.ImGui_TextColored(ctx, P.accent, "Key:")
-    reaper.ImGui_SameLine(ctx)
-    reaper.ImGui_PushItemWidth(ctx, 75)
+    -- Musical Key
+    Theme.align(ctx, row_h)
+    reaper.ImGui_TextColored(ctx, P.accent_l, "Key:")
+    reaper.ImGui_SameLine(ctx, 0, L.xs)
+    reaper.ImGui_PushItemWidth(ctx, 52)
     if reaper.ImGui_BeginCombo(ctx, "##key_selector", SCALE_KEYS[state.key_idx].display) then
       for i, k_info in ipairs(SCALE_KEYS) do
         local is_sel = (state.key_idx == i)
@@ -3297,11 +3850,13 @@ local function loop()
       Theme.tooltip(ctx, "Musical Key (Root Pitch Class)")
     end
     reaper.ImGui_PopItemWidth(ctx)
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
 
-    reaper.ImGui_SameLine(ctx)
-    reaper.ImGui_TextColored(ctx, P.accent, "Scale:")
-    reaper.ImGui_SameLine(ctx)
-    reaper.ImGui_PushItemWidth(ctx, 130)
+    -- Musical Scale
+    Theme.align(ctx, row_h)
+    reaper.ImGui_TextColored(ctx, P.accent_l, "Scale:")
+    reaper.ImGui_SameLine(ctx, 0, L.xs)
+    reaper.ImGui_PushItemWidth(ctx, 95)
     if reaper.ImGui_BeginCombo(ctx, "##scale_selector", SCALE_DEFINITIONS[state.scale_idx].name) then
       for i, s_def in ipairs(SCALE_DEFINITIONS) do
         local is_sel = (state.scale_idx == i)
@@ -3318,251 +3873,196 @@ local function loop()
       Theme.tooltip(ctx, "Musical Scale — highlights in-scale piano roll rows and sets target for Quantize (Q)")
     end
     reaper.ImGui_PopItemWidth(ctx)
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
 
-    reaper.ImGui_SameLine(ctx)
-    reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_SameLine(ctx)
+    -- Analyze / Progress
+    Theme.align(ctx, row_h)
+    if state.is_analyzing then
+      reaper.ImGui_ProgressBar(ctx, state.progress, 90, 0, string.format("%d%%", math.floor(state.progress * 100)))
+    else
+      if not has_target then reaper.ImGui_BeginDisabled(ctx) end
+      local analyze_label = has_notes and "Re-Analyze" or "Analyze"
+      local analyze_btn_w = 96
+      if reaper.ImGui_Button(ctx, analyze_label .. "##top_analyze", analyze_btn_w, 0) then
+        start_analysis()
+      end
+      if reaper.ImGui_IsItemHovered(ctx) then
+        Theme.tooltip(ctx, has_notes and "Re-run YIN pitch detection on the active target item" or "Run YIN pitch detection on the selected audio item")
+      end
+      if not has_target then reaper.ImGui_EndDisabled(ctx) end
+    end
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
 
-    -- Visualization toggles
-    if #state.results > 0 then
-      _, state.show_note_blocks = reaper.ImGui_Checkbox(ctx, "Blocks", state.show_note_blocks)
-      reaper.ImGui_SameLine(ctx)
-      _, state.show_raw_pitch = reaper.ImGui_Checkbox(ctx, "Pitch", state.show_raw_pitch)
-      reaper.ImGui_SameLine(ctx)
-      _, state.show_trend = reaper.ImGui_Checkbox(ctx, "Trend", state.show_trend)
-      reaper.ImGui_SameLine(ctx)
-      _, state.show_smart_spots = reaper.ImGui_Checkbox(ctx, "Spots", state.show_smart_spots)
-      reaper.ImGui_SameLine(ctx)
-      _, state.show_split_points = reaper.ImGui_Checkbox(ctx, "Splits", state.show_split_points)
-      reaper.ImGui_SameLine(ctx)
-      _, state.show_preview = reaper.ImGui_Checkbox(ctx, "Preview", state.show_preview)
-      reaper.ImGui_SameLine(ctx)
-      _, state.show_vibrato_regions = reaper.ImGui_Checkbox(ctx, "Vibrato", state.show_vibrato_regions)
+    -- Reset Button
+    Theme.align(ctx, row_h)
+    if not has_notes then reaper.ImGui_BeginDisabled(ctx) end
+    local reset_btn_w = 66
+    if reaper.ImGui_Button(ctx, "Reset##top_reset", reset_btn_w, 0) then
+      reset_selected_note()
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Reset selected note(s) to original pitch, or reset all notes if none selected")
+    end
+    if not has_notes then reaper.ImGui_EndDisabled(ctx) end
+
+    reaper.ImGui_PopStyleColor(ctx, 1)
+
+    -- Right-Aligned Controls: Layers, Settings, Info, Close
+    local layers_btn_w = 80
+    local right_w = layers_btn_w + L.sm + icon_sz + L.xs + icon_sz + L.xs + icon_sz
+    reaper.ImGui_SameLine(ctx)
+    Theme.right_align(ctx, right_w)
+
+    -- Layers ▾
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFFFFFFFF)
+    Theme.align(ctx, row_h)
+    if reaper.ImGui_Button(ctx, "Layers ▾##top_layers", layers_btn_w, 0) then
+      reaper.ImGui_OpenPopup(ctx, "##layers_popup")
+    end
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    if reaper.ImGui_IsItemHovered(ctx) then
+      Theme.tooltip(ctx, "Toggle visual display layers on the piano roll canvas")
     end
 
-    if #state.results > 0 and state.notes and #state.notes > 0 then
+    if reaper.ImGui_BeginPopup(ctx, "##layers_popup") then
+      Theme.align(ctx)
+      reaper.ImGui_TextColored(ctx, P.accent, "Display Layers")
       reaper.ImGui_Separator(ctx)
-
-      local sel_count = 0
-      for _ in pairs(state.selected_notes) do sel_count = sel_count + 1 end
-      if sel_count == 0 and state.selected_note and state.notes[state.selected_note] then
-        sel_count = 1
-      end
-
-      if sel_count > 1 then
-        local mod_count = 0
-        local total_dur = 0
-        for idx in pairs(state.selected_notes) do
-          local n = state.notes[idx]
-          if n then
-            if is_note_modified(n) then mod_count = mod_count + 1 end
-            total_dur = total_dur + (n.end_time - n.start_time)
-          end
-        end
-        local status_str = mod_count > 0 and string.format("[%d/%d Tuned]", mod_count, sel_count) or "[Untouched]"
-        local anchor_str = ""
-        if state.selected_note and state.notes[state.selected_note] then
-          local pn = state.notes[state.selected_note]
-          local p_nearest = math.floor(pn.controls.center_pitch + 0.5)
-          local p_cents = math.floor((pn.controls.center_pitch - p_nearest) * 100 + 0.5)
-          local p_sign = p_cents >= 0 and "+" or ""
-          anchor_str = string.format("  |  Anchor: %s %s%d\xC2\xA2", midi_to_name(p_nearest), p_sign, p_cents)
-        end
-        reaper.ImGui_Text(ctx, string.format(
-          "Selected: %d notes (%.2fs)%s  |  %s  |  Drag pitch/stability together  |  Esc to clear",
-          sel_count, total_dur, anchor_str, status_str))
-      elseif state.selected_note and state.notes[state.selected_note] then
-        local sel = state.notes[state.selected_note]
-        local ctrl = sel.controls
-        local nearest = math.floor(ctrl.center_pitch + 0.5)
-        local cents = math.floor((ctrl.center_pitch - nearest) * 100 + 0.5)
-        local sign = cents >= 0 and "+" or ""
-        local is_mod = is_note_modified(sel)
-        local status_str = is_mod and "[Tuned]" or "[Untouched]"
-        local is_chrom = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic")
-        local scale_str = is_chrom and "" or (is_pitch_in_scale(nearest % 12) and "  |  [In Scale]" or "  |  [Out of Scale]")
-        reaper.ImGui_Text(ctx, string.format(
-          "Selected: %s %s%d\xC2\xA2%s  |  Stability: %.0f%%  |  Vibrato: %.0f%%  |  Transition: %.0fms  |  %s",
-          midi_to_name(nearest), sign, cents, scale_str, (1 - ctrl.drift_scale) * 100,
-          ctrl.vibrato_scale * 100, ctrl.transition_ms or 35, status_str))
-        -- Onset debug info
-        if sel.onset_debug then
-          local od = sel.onset_debug
-          reaper.ImGui_TextDisabled(ctx, string.format(
-            "Onset: ramp=%.0fms  scoop=%.2fst  voicing_delay=%.0fms  |  %s | %s",
-            od.onset_ramp_ms, od.scoop_st, od.voicing_delay_ms,
-            od.is_legato_prev and "legato-in" or "attack",
-            od.is_legato_next and "legato-out" or "release"))
-        end
-      else
-        reaper.ImGui_TextDisabled(ctx,
-          "Click note to select  |  Shift+Click / Marquee drag to multi-select  |  Cmd+A to select all")
-      end
-
-      if reaper.ImGui_Button(ctx, "Apply to Take Pitch Envelope") then
-        apply_envelope_to_take()
-      end
-      reaper.ImGui_SameLine(ctx)
-      local reset_label = sel_count > 1 and string.format("Reset (%d)", sel_count) or "Reset Selected"
-      if reaper.ImGui_Button(ctx, reset_label) then
-        reset_selected_note()
-      end
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Reset selected note(s) to original pitch/drift/vibrato (R)")
-      end
-      reaper.ImGui_SameLine(ctx)
-
-      -- Quantize Key (Q) button (Milestone 3)
-      local has_selection = sel_count > 0
-      if not has_selection then
-        reaper.ImGui_BeginDisabled(ctx)
-      end
-      local quant_label = sel_count > 1 and string.format("Quantize (%d) (Q)", sel_count) or "Quantize (Q)"
-      if reaper.ImGui_Button(ctx, quant_label) then
-        get_target_take(true)
-        quantize_selected_notes_to_scale()
-      end
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, string.format("Quantize %s to nearest %s %s pitch (Q)",
-          sel_count > 1 and string.format("%d selected notes", sel_count) or "selected note",
-          SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name))
-      end
-      if not has_selection then
-        reaper.ImGui_EndDisabled(ctx)
-      end
-      reaper.ImGui_SameLine(ctx)
-
-      -- Select All button (Milestone 4)
-      if reaper.ImGui_Button(ctx, "Select All") then
-        state.selected_notes = {}
-        for i = 1, #state.notes do
-          state.selected_notes[i] = true
-        end
-        if not state.selected_note or not state.selected_notes[state.selected_note] then
-          state.selected_note = 1
-        end
-      end
-      if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, "Select all notes in phrase (Cmd/Ctrl + A)")
-      end
-      reaper.ImGui_SameLine(ctx)
-
-      -- Split button (enabled when note selected and edit cursor is within it)
-      local can_split = false
-      if state.selected_note and state.notes[state.selected_note] then
-        local sn = state.notes[state.selected_note]
-        local _, si = get_target_take(false)
-        if si then
-          local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
-          local ec = reaper.GetCursorPosition() - ip
-          can_split = ec > sn.start_time and ec < sn.end_time
-        end
-      end
-      if not can_split then
-        reaper.ImGui_BeginDisabled(ctx)
-      end
-      if reaper.ImGui_Button(ctx, "Split (X)") then
-        if state.selected_note and state.notes[state.selected_note] then
-          local sn = state.notes[state.selected_note]
-          local _, si = get_target_take(false)
-          if si then
-            local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
-            local ec = reaper.GetCursorPosition() - ip
-            if ec > sn.start_time and ec < sn.end_time then
-              get_target_take(true)
-              split_note_at(state.selected_note, ec)
-            end
-          end
-        end
-      end
-      if not can_split then
-        reaper.ImGui_EndDisabled(ctx)
-      end
-      reaper.ImGui_SameLine(ctx)
-
-      -- Merge button (enabled when 2+ contiguous notes selected)
-      local can_merge = sel_count >= 2
-      if not can_merge then
-        reaper.ImGui_BeginDisabled(ctx)
-      end
-      if reaper.ImGui_Button(ctx, "Merge (M)") then
-        get_target_take(true)
-        merge_selected_notes()
-      end
-      if not can_merge then
-        reaper.ImGui_EndDisabled(ctx)
-      end
-      reaper.ImGui_SameLine(ctx)
-      -- Check actual bypass state from envelope
-      local bp_take = get_target_take(false)
-      local is_bypassed = is_take_pitch_bypassed(bp_take)
-      if is_bypassed then
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0xCC4444FF)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), 0xDD5555FF)
-        reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), 0xBB3333FF)
-      end
-      if reaper.ImGui_Button(ctx, (is_bypassed and "Bypassed" or "Bypass") .. "##top_bp") then
-        if bp_take then
-          toggle_take_pitch_bypass(bp_take)
-        end
-      end
-      if is_bypassed then
-        reaper.ImGui_PopStyleColor(ctx, 3)
-      end
-      reaper.ImGui_Separator(ctx)
+      _, state.show_note_blocks = reaper.ImGui_Checkbox(ctx, "Note Blocks", state.show_note_blocks)
+      _, state.show_raw_pitch = reaper.ImGui_Checkbox(ctx, "Pitch Trace (Orange)", state.show_raw_pitch)
+      _, state.show_preview = reaper.ImGui_Checkbox(ctx, "Preview Curve (Green)", state.show_preview)
+      _, state.show_smart_spots = reaper.ImGui_Checkbox(ctx, "Pitch Center Spots", state.show_smart_spots)
+      _, state.show_vibrato_regions = reaper.ImGui_Checkbox(ctx, "Vibrato Shading", state.show_vibrato_regions)
+      _, state.show_trend = reaper.ImGui_Checkbox(ctx, "Trend Line", state.show_trend)
+      _, state.show_split_points = reaper.ImGui_Checkbox(ctx, "Split Markers", state.show_split_points)
+      reaper.ImGui_EndPopup(ctx)
     end
 
-    -- Main body layout: Piano roll graph (left) + Resizable Splitter + Session Takes Sidebar (right)
+    -- Settings
+    reaper.ImGui_SameLine(ctx, 0, L.xs)
+    Theme.align(ctx, row_h, icon_sz)
+    if Theme.icon_btn(ctx, "##hdr_settings", Theme.icons.gear, { preset = L.icon_md, tooltip = "Settings & Audio Engine" }) then
+      show_settings_modal = true
+    end
+
+    -- Info
+    reaper.ImGui_SameLine(ctx, 0, L.xs)
+    Theme.align(ctx, row_h, icon_sz)
+    if Theme.icon_btn(ctx, "##hdr_info", Theme.icons.info, { preset = L.icon_md, tooltip = "Keyboard Shortcuts & Help" }) then
+      show_info_modal = true
+    end
+
+    -- Close
+    reaper.ImGui_SameLine(ctx, 0, L.xs)
+    Theme.align(ctx, row_h, icon_sz)
+    if Theme.icon_btn(ctx, "##hdr_close", Theme.icons.close, { preset = L.icon_md, tooltip = "Close Pitch Correct (Esc)" }) then
+      open = false
+    end
+
+    reaper.ImGui_Separator(ctx)
+
+    -- 2. Main Body: Canvas + (optional) Pitched Items Sidebar
     local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-    local total_h = math.max(120, avail_h - 10)
+    local footer_h = reaper.ImGui_GetFrameHeight(ctx) + L.sm * 2 + 2
+    local total_h = math.max(60, avail_h - footer_h)
 
     local min_graph_w = 200
-    local min_sidebar_w = 140
+    local min_sidebar_w = 160
     local splitter_w = 6
-    local max_sidebar_w = math.max(min_sidebar_w, avail_w - min_graph_w - splitter_w)
 
-    state.sidebar_w = math.max(min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w or 200))
-    local graph_w = math.max(min_graph_w, avail_w - state.sidebar_w - splitter_w)
+    if state.sidebar_open then
+      local max_sidebar_w = math.max(min_sidebar_w, avail_w - min_graph_w - splitter_w)
+      state.sidebar_w = math.max(min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w or 220))
+      local graph_w = math.max(min_graph_w, avail_w - state.sidebar_w - splitter_w)
 
-    if total_h > 80 then
-      -- Left: Piano roll canvas
-      draw_graph(ctx, graph_w, total_h)
+      if total_h > 80 then
+        -- Left: Piano roll canvas
+        draw_graph(ctx, graph_w, total_h)
 
-      reaper.ImGui_SameLine(ctx, 0, 0)
+        reaper.ImGui_SameLine(ctx, 0, 0)
 
-      -- Center: Resizable Splitter
-      reaper.ImGui_InvisibleButton(ctx, "##v_splitter", splitter_w, total_h)
-      local is_split_hov = reaper.ImGui_IsItemHovered(ctx)
-      local is_split_act = reaper.ImGui_IsItemActive(ctx)
-      if is_split_hov or is_split_act then
-        reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_ResizeEW())
+        -- Center: Resizable Splitter
+        reaper.ImGui_InvisibleButton(ctx, "##v_splitter", splitter_w, total_h)
+        local is_split_hov = reaper.ImGui_IsItemHovered(ctx)
+        local is_split_act = reaper.ImGui_IsItemActive(ctx)
+        if is_split_hov or is_split_act then
+          reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_ResizeEW())
+        end
+        if is_split_act then
+          local delta_x = select(1, reaper.ImGui_GetMouseDelta(ctx))
+          state.sidebar_w = math.max(min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w - delta_x))
+        end
+        -- Draw splitter visual bar
+        local split_dl = reaper.ImGui_GetWindowDrawList(ctx)
+        local sp_min_x, sp_min_y = reaper.ImGui_GetItemRectMin(ctx)
+        local sp_max_x, sp_max_y = reaper.ImGui_GetItemRectMax(ctx)
+        local sp_mid_x = (sp_min_x + sp_max_x) * 0.5
+        local sp_col = is_split_act and P.accent or (is_split_hov and P.accent_h or P.sep)
+        reaper.ImGui_DrawList_AddLine(split_dl, sp_mid_x, sp_min_y, sp_mid_x, sp_max_y, sp_col, is_split_act and 2.0 or 1.0)
+
+        reaper.ImGui_SameLine(ctx, 0, 0)
+
+        -- Right: Pitched Items Sidebar
+        local child_border = reaper.ImGui_ChildFlags_Border and reaper.ImGui_ChildFlags_Border() or (reaper.ImGui_ChildFlags_Borders and reaper.ImGui_ChildFlags_Borders() or 0)
+        if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", state.sidebar_w, total_h, child_border) then
+          render_pitched_items_sidebar(ctx)
+          reaper.ImGui_EndChild(ctx)
+        end
       end
-      if is_split_act then
-        local delta_x = select(1, reaper.ImGui_GetMouseDelta(ctx))
-        state.sidebar_w = math.max(min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w - delta_x))
-      end
-      -- Draw splitter visual bar
-      local split_dl = reaper.ImGui_GetWindowDrawList(ctx)
-      local sp_min_x, sp_min_y = reaper.ImGui_GetItemRectMin(ctx)
-      local sp_max_x, sp_max_y = reaper.ImGui_GetItemRectMax(ctx)
-      local sp_mid_x = (sp_min_x + sp_max_x) * 0.5
-      local sp_col = is_split_act and P.accent or (is_split_hov and P.accent_h or P.sep)
-      reaper.ImGui_DrawList_AddLine(split_dl, sp_mid_x, sp_min_y, sp_mid_x, sp_max_y, sp_col, is_split_act and 2.0 or 1.0)
+    else
+      -- Drawer is closed: render canvas + button tag on right edge
+      local tag_w = 20
+      if total_h > 80 then
+        draw_graph(ctx, avail_w - tag_w, total_h)
 
-      reaper.ImGui_SameLine(ctx, 0, 0)
+        reaper.ImGui_SameLine(ctx, 0, 0)
 
-      -- Right: Session Takes Sidebar
-      local child_border = reaper.ImGui_ChildFlags_Border and reaper.ImGui_ChildFlags_Border() or (reaper.ImGui_ChildFlags_Borders and reaper.ImGui_ChildFlags_Borders() or 0)
-      if reaper.ImGui_BeginChild(ctx, "##session_sidebar", state.sidebar_w, total_h, child_border) then
-        render_session_sidebar(ctx)
-        reaper.ImGui_EndChild(ctx)
+        local tag_dl = reaper.ImGui_GetWindowDrawList(ctx)
+        local tx, ty = reaper.ImGui_GetCursorScreenPos(ctx)
+
+        -- Background strip & border
+        reaper.ImGui_DrawList_AddRectFilled(tag_dl, tx, ty, tx + tag_w, ty + total_h, P.card)
+        reaper.ImGui_DrawList_AddLine(tag_dl, tx, ty, tx, ty + total_h, P.sep)
+
+        -- Centered tag button
+        local tag_btn_sz = 16
+        local by = ty + (total_h - tag_btn_sz) * 0.5
+        reaper.ImGui_SetCursorScreenPos(ctx, tx + 2, by)
+        if Theme.icon_btn(ctx, "##open_items_tag", Theme.icons.tri_left, {
+          size = 12,
+          pad = 2,
+          tooltip = string.format("Show Pitched Items (%d)", #state.session_order)
+        }) then
+          state.sidebar_open = true
+          reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "1", true)
+        end
       end
     end
 
-    reaper.ImGui_End(ctx)
+    reaper.ImGui_Separator(ctx)
+
+    -- 4. Bottom Row: Inspector & Action Bar
+    render_bottom_dock(ctx)
   end
 
-  Theme.pop(ctx)
+  -- 5. Render Modals
+  draw_settings_modal()
+  draw_info_modal()
+
+  reaper.ImGui_End(ctx)
+
+  Theme.pop_font(ctx, pushed_font)
+  Theme.pop(ctx, nc, nv)
+
+  return open
+end
+
+local function loop()
+  local ok, open = xpcall(loop_body, debug.traceback)
+  if not ok then
+    reaper.ShowConsoleMsg("Fancy Pitch Correct Error: " .. tostring(open) .. "\n")
+    return
+  end
 
   if open then
     reaper.defer(loop)
