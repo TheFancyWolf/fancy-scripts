@@ -4,6 +4,17 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.0.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Note Topology (Milestone 2):
+  - Split Note (X key): Cuts a note into two independent notes at the edit cursor, automatically re-extracts features for both halves
+  - Merge Notes (M key or button): Glues contiguous selected notes back into a single entity with gap frame recovery from raw analysis data
+  - Edge Trimming: Drag left/right edges of any note to adjust boundaries with live preview; commits frame re-filtering and feature re-extraction on release
+  - Multi-select: Shift+Click for range selection; merge operates on all selected notes
+  - Tuning intent preservation: Split/merge carry forward the user's pitch offset, drift scale, and vibrato scale via `preserve_controls` parameter on `extract_note_features`
+  - Visual edge handles: Small grab rectangles on note block edges, brighten on hover, accent color during drag
+  - Split/Merge buttons in toolbar action bar with contextual enable/disable (greyed when unavailable)
+  - Updated keyboard shortcuts info tooltip with all new interactions
+  - `ResizeEW` cursor feedback when hovering edge trim handles
+
 - **Fancy Pitch Correct v1.1.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Scalpel Keyboard Controls:
   - Arrow nudging: Up/Down = ±1 semitone, Shift+Up/Down = ±10 cents fine-tune
   - Left/Right arrow keys: Jump note selection to previous/next note in phrase

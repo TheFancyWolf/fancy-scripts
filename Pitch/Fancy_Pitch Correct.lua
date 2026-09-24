@@ -1,13 +1,15 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 1.1.0
+-- @version 2.0.0
 -- @changelog
---   + Arrow nudging: Up/Down = ±1 semitone, Shift+Up/Down = ±10 cents
---   + Left/Right arrow: Jump selection to previous/next note
---   + S key or double-click pitch zone: Snap note to nearest semitone (0¢)
---   + R / Backspace / Delete: Reset selected note to [Untouched]
---   + Spacebar passthrough: Triggers REAPER Play/Stop from ImGui window
---   + Info icon in toolbar with keyboard shortcuts tooltip
+--   + Note Topology: Split, Merge & Edge Trimming (Milestone 2)
+--   + Split Note (X key): Cuts note at edit cursor position, re-extracts features for both halves
+--   + Merge Notes (M key or button): Glues contiguous selected notes with gap frame recovery
+--   + Edge Trimming: Drag left/right note edges to adjust boundaries with live preview
+--   + Multi-select: Shift+Click for range selection, merge operates on all selected
+--   + Split/Merge buttons in toolbar with contextual enable/disable
+--   + Visual edge handles on note blocks with hover/drag highlighting
+--   + Tuning intent preserved across split/merge (pitch offset, drift, vibrato)
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -58,27 +60,32 @@ local PITCH_SHIFT_MODES = {}
 local DEFAULT_PITCH_MODE_IDX = 1
 do
   local mode_idx = 0
-  while true do
+  local consecutive_fails = 0
+  while mode_idx < 64 do
     local retval, name = reaper.EnumPitchShiftModes(mode_idx)
-    if not retval or not name or name == "" then break end
-    local submodes = {}
-    local sub_idx = 0
-    while true do
-      local sub_name = reaper.EnumPitchShiftSubModes(mode_idx, sub_idx)
-      if not sub_name or sub_name == "" then break end
-      local packed = (mode_idx << 16) | sub_idx
-      table.insert(submodes, { name = sub_name, value = packed })
-      -- Detect Soloist Monophonic as default
-      if name:lower():find("soloist") and sub_name:lower():find("mono") then
-        DEFAULT_PITCH_MODE_IDX = #PITCH_SHIFT_MODES + 1
-      end
-      sub_idx = sub_idx + 1
-    end
-    if #submodes > 0 then
-      table.insert(PITCH_SHIFT_MODES, { name = name, submodes = submodes })
+    if not retval then
+      consecutive_fails = consecutive_fails + 1
+      if consecutive_fails >= 5 then break end
     else
-      local packed = (mode_idx << 16)
-      table.insert(PITCH_SHIFT_MODES, { name = name, submodes = { { name = "Default", value = packed } } })
+      consecutive_fails = 0
+      -- Supported modes return a valid name; unsupported modes return nil / empty string
+      if name and name ~= "" then
+        local submodes = {}
+        local sub_idx = 0
+        while sub_idx < 128 do
+          local sub_name = reaper.EnumPitchShiftSubModes(mode_idx, sub_idx)
+          if not sub_name or sub_name == "" then break end
+          local packed = (mode_idx << 16) | sub_idx
+          table.insert(submodes, { name = sub_name, value = packed })
+          sub_idx = sub_idx + 1
+        end
+        if #submodes > 0 then
+          table.insert(PITCH_SHIFT_MODES, { name = name, submodes = submodes })
+        else
+          local packed = (mode_idx << 16)
+          table.insert(PITCH_SHIFT_MODES, { name = name, submodes = { { name = "Default", value = packed } } })
+        end
+      end
     end
     mode_idx = mode_idx + 1
   end
@@ -91,11 +98,24 @@ for _, mode in ipairs(PITCH_SHIFT_MODES) do
   end
 end
 
--- Find the Soloist Monophonic entry in the flat list
+-- Find best Soloist Monophonic entry in the flat list:
+-- 1. Prefer exact "Soloist ... - Monophonic" (standard mono, not Mid/Side or Multi-Stereo)
 for i, entry in ipairs(PITCHMODE_FLAT) do
-  if entry.name:lower():find("soloist") and entry.name:lower():find("mono") then
+  local lower = entry.name:lower()
+  if lower:find("soloist") and lower:match("%-%s*monophonic$") then
     DEFAULT_PITCH_MODE_IDX = i
     break
+  end
+end
+
+-- 2. Fallback to any entry with both "soloist" and "mono"
+if DEFAULT_PITCH_MODE_IDX == 1 then
+  for i, entry in ipairs(PITCHMODE_FLAT) do
+    local lower = entry.name:lower()
+    if lower:find("soloist") and lower:find("mono") then
+      DEFAULT_PITCH_MODE_IDX = i
+      break
+    end
   end
 end
 
@@ -140,8 +160,11 @@ local state = {
   -- Interaction state
   hovered_note = nil,   -- index of note block under cursor
   hovered_zone = nil,   -- "drift" / "pitch" / "vibrato"
-  selected_note = nil,  -- index of currently selected note
+  hovered_edge = nil,   -- { note_idx, edge ("left"/"right") } for edge trimming
+  selected_note = nil,  -- index of primary selected note (for single-note ops)
+  selected_notes = {},  -- set { [note_idx] = true } for multi-select (merge)
   drag = nil,           -- { note_idx, zone, start_mouse_y, original_value, dirty }
+  edge_drag = nil,      -- { note_idx, edge, start_mouse_x, original_time, dirty }
 
   -- Visualization toggles
   show_note_blocks = true,
@@ -469,7 +492,7 @@ local function start_analysis()
   ensure_take_pitch_envelope(take, item, true)
 end
 
-local function extract_note_features(note)
+local function extract_note_features(note, preserve_controls)
   if note.count == 0 then return end
 
   -- 1. Extract raw pitch array
@@ -640,6 +663,13 @@ local function extract_note_features(note)
     transition_ms = 15
   }
 
+  -- Restore user tuning offsets when splitting/merging notes
+  if preserve_controls then
+    for k, v in pairs(preserve_controls) do
+      note.controls[k] = v
+    end
+  end
+
   -- 7. ONSET ANALYSIS — scoop magnitude and voiced start detection
   local scoop_frames = math.min(10, math.floor(#raw_pitch * 0.3))
   local scoop_sum = 0
@@ -671,6 +701,9 @@ end
 -- Forward declaration; will be set after apply_envelope_to_take is defined
 local reset_selected_note
 local snap_selected_note
+local split_note_at
+local merge_selected_notes
+local trim_note_edge
 
 -------------------------------------------------------------------------------
 -- MULTI-ITEM SESSION & PROJECT PERSISTENCE
@@ -1018,6 +1051,296 @@ snap_selected_note = function()
   apply_envelope_to_take()
 end
 
+-------------------------------------------------------------------------------
+-- NOTE TOPOLOGY: SPLIT, MERGE & EDGE TRIMMING
+-------------------------------------------------------------------------------
+
+-- Splits the note at note_idx into two independent notes at split_time.
+-- Preserves user tuning offsets on both halves and re-extracts features.
+split_note_at = function(note_idx, split_time)
+  if not state.notes or not state.notes[note_idx] then return end
+  local note = state.notes[note_idx]
+  if not note.frames or #note.frames < 6 then return end -- need at least 3 per half
+  if split_time <= note.start_time or split_time >= note.end_time then return end
+
+  -- Partition frames
+  local frames_a = {}
+  local frames_b = {}
+  for _, frame in ipairs(note.frames) do
+    if frame.time < split_time then
+      table.insert(frames_a, frame)
+    else
+      table.insert(frames_b, frame)
+    end
+  end
+
+  -- Validate minimum size (3 frames, ~35ms)
+  if #frames_a < 3 or #frames_b < 3 then
+    reaper.ShowConsoleMsg("Split: both halves need at least 3 frames.\n")
+    return
+  end
+
+  -- Preserve the user's pitch offset (semitones from original avg)
+  local old_ctrl = note.controls
+  local pitch_offset = old_ctrl and (old_ctrl.center_pitch - note.avg_note) or 0
+
+  -- Build note A (left half)
+  local sum_a = 0
+  for _, f in ipairs(frames_a) do sum_a = sum_a + f.note end
+  local avg_a = sum_a / #frames_a
+  local note_a = {
+    start_time = frames_a[1].time,
+    end_time = frames_a[#frames_a].time,
+    sum_note = sum_a,
+    count = #frames_a,
+    avg_note = avg_a,
+    display_note = math.floor(avg_a + 0.5),
+    frames = frames_a,
+  }
+  extract_note_features(note_a, {
+    center_pitch = avg_a + pitch_offset,
+    drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
+    vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or 15,
+  })
+
+  -- Build note B (right half)
+  local sum_b = 0
+  for _, f in ipairs(frames_b) do sum_b = sum_b + f.note end
+  local avg_b = sum_b / #frames_b
+  local note_b = {
+    start_time = frames_b[1].time,
+    end_time = frames_b[#frames_b].time,
+    sum_note = sum_b,
+    count = #frames_b,
+    avg_note = avg_b,
+    display_note = math.floor(avg_b + 0.5),
+    frames = frames_b,
+  }
+  extract_note_features(note_b, {
+    center_pitch = avg_b + pitch_offset,
+    drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
+    vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or 15,
+  })
+
+  -- Splice into notes array
+  state.notes[note_idx] = note_a
+  table.insert(state.notes, note_idx + 1, note_b)
+
+  -- Update selection: select left half, adjust any indices above split
+  state.selected_note = note_idx
+  state.selected_notes = { [note_idx] = true }
+
+  apply_envelope_to_take()
+end
+
+-- Merges all contiguous selected notes into a single note.
+-- Uses duration-weighted pitch averaging to preserve user tuning intent.
+merge_selected_notes = function()
+  if not state.notes or not state.selected_notes then return end
+
+  -- Collect and sort selected indices
+  local indices = {}
+  for idx in pairs(state.selected_notes) do
+    if state.notes[idx] then
+      table.insert(indices, idx)
+    end
+  end
+  table.sort(indices)
+
+  if #indices < 2 then return end -- need at least 2 notes to merge
+
+  -- Validate contiguity: indices must be consecutive
+  for i = 2, #indices do
+    if indices[i] ~= indices[i - 1] + 1 then
+      reaper.ShowConsoleMsg("Merge: selected notes must be adjacent.\n")
+      return
+    end
+  end
+
+  -- Validate gap size: no gap > 300ms between any pair
+  for i = 2, #indices do
+    local prev_note = state.notes[indices[i - 1]]
+    local curr_note = state.notes[indices[i]]
+    local gap = curr_note.start_time - prev_note.end_time
+    if gap > 0.3 then
+      reaper.ShowConsoleMsg("Merge: gap between notes exceeds 300ms.\n")
+      return
+    end
+  end
+
+  local first_note = state.notes[indices[1]]
+  local last_note = state.notes[indices[#indices]]
+
+  -- Concatenate frames from all selected notes + recover gap frames
+  local merged_frames = {}
+  for i, idx in ipairs(indices) do
+    local n = state.notes[idx]
+
+    -- Before this note (except the first), try to recover gap frames
+    if i > 1 then
+      local prev_n = state.notes[indices[i - 1]]
+      local gap_start = prev_n.end_time
+      local gap_end = n.start_time
+      if gap_end > gap_start then
+        for _, frame in ipairs(state.results) do
+          if frame.time > gap_start and frame.time < gap_end
+              and frame.note and frame.rms and frame.rms > 0.005 then
+            table.insert(merged_frames, frame)
+          end
+        end
+      end
+    end
+
+    -- Add this note's frames
+    for _, frame in ipairs(n.frames) do
+      table.insert(merged_frames, frame)
+    end
+  end
+
+  if #merged_frames < 3 then return end
+
+  -- Duration-weighted pitch target from user tuning
+  local total_dur = 0
+  local weighted_pitch = 0
+  local weighted_drift = 0
+  local weighted_vibrato = 0
+  for _, idx in ipairs(indices) do
+    local n = state.notes[idx]
+    local dur = n.end_time - n.start_time
+    total_dur = total_dur + dur
+    if n.controls then
+      weighted_pitch = weighted_pitch + n.controls.center_pitch * dur
+      weighted_drift = weighted_drift + n.controls.drift_scale * dur
+      weighted_vibrato = weighted_vibrato + n.controls.vibrato_scale * dur
+    else
+      weighted_pitch = weighted_pitch + n.avg_note * dur
+      weighted_drift = weighted_drift + 1.0 * dur
+      weighted_vibrato = weighted_vibrato + 1.0 * dur
+    end
+  end
+
+  local sum_note = 0
+  for _, f in ipairs(merged_frames) do sum_note = sum_note + f.note end
+  local avg_note = sum_note / #merged_frames
+
+  local merged = {
+    start_time = first_note.start_time,
+    end_time = last_note.end_time,
+    sum_note = sum_note,
+    count = #merged_frames,
+    avg_note = avg_note,
+    display_note = math.floor(avg_note + 0.5),
+    frames = merged_frames,
+  }
+
+  extract_note_features(merged, {
+    center_pitch = total_dur > 0 and (weighted_pitch / total_dur) or avg_note,
+    drift_scale = total_dur > 0 and (weighted_drift / total_dur) or 1.0,
+    vibrato_scale = total_dur > 0 and (weighted_vibrato / total_dur) or 1.0,
+    transition_ms = first_note.controls and first_note.controls.transition_ms or 15,
+  })
+
+  -- Replace in array: put merged note at first index, remove the rest
+  local first_idx = indices[1]
+  state.notes[first_idx] = merged
+  for i = #indices, 2, -1 do
+    table.remove(state.notes, indices[i])
+  end
+
+  -- Update selection
+  state.selected_note = first_idx
+  state.selected_notes = { [first_idx] = true }
+
+  apply_envelope_to_take()
+end
+
+-- Trims the left or right edge of a note to a new time boundary.
+-- Filters or extends frames, preserves pitch offset, re-extracts features.
+trim_note_edge = function(note_idx, edge, new_time)
+  if not state.notes or not state.notes[note_idx] then return end
+  local note = state.notes[note_idx]
+  if not note.frames or #note.frames < 3 then return end
+
+  local min_dur = 0.05 -- 50ms minimum note duration
+  local gap_margin = 0.005 -- 5ms gap to prevent overlap
+
+  -- Clamp to prevent overlap with neighbors
+  if edge == "left" then
+    local prev_note = state.notes[note_idx - 1]
+    local min_t = prev_note and (prev_note.end_time + gap_margin) or 0
+    local max_t = note.end_time - min_dur
+    new_time = math.max(min_t, math.min(max_t, new_time))
+  elseif edge == "right" then
+    local next_note = state.notes[note_idx + 1]
+    local min_t = note.start_time + min_dur
+    local max_t = next_note and (next_note.start_time - gap_margin) or state.end_time
+    new_time = math.max(min_t, math.min(max_t, new_time))
+  else
+    return
+  end
+
+  -- Preserve pitch offset
+  local old_ctrl = note.controls
+  local pitch_offset = old_ctrl and (old_ctrl.center_pitch - note.avg_note) or 0
+
+  -- Rebuild frames within the new boundary
+  local new_start = (edge == "left") and new_time or note.start_time
+  local new_end = (edge == "right") and new_time or note.end_time
+
+  -- Collect frames: from existing note + from state.results for any extensions
+  local frame_set = {} -- time → frame (deduplicate)
+  for _, frame in ipairs(note.frames) do
+    if frame.time >= new_start and frame.time <= new_end then
+      frame_set[frame.time] = frame
+    end
+  end
+
+  -- If extending, pull in unassigned frames from the raw results pool
+  if (edge == "left" and new_time < note.start_time)
+      or (edge == "right" and new_time > note.end_time) then
+    for _, frame in ipairs(state.results) do
+      if frame.time >= new_start and frame.time <= new_end
+          and frame.note and frame.rms and frame.rms > 0.005
+          and not frame_set[frame.time] then
+        frame_set[frame.time] = frame
+      end
+    end
+  end
+
+  -- Sort frames by time
+  local new_frames = {}
+  for _, frame in pairs(frame_set) do
+    table.insert(new_frames, frame)
+  end
+  table.sort(new_frames, function(a, b) return a.time < b.time end)
+
+  if #new_frames < 3 then return end -- too few frames remaining
+
+  -- Rebuild note
+  local sum_note = 0
+  for _, f in ipairs(new_frames) do sum_note = sum_note + f.note end
+  local avg_note = sum_note / #new_frames
+
+  note.start_time = new_start
+  note.end_time = new_end
+  note.frames = new_frames
+  note.sum_note = sum_note
+  note.count = #new_frames
+  note.avg_note = avg_note
+  note.display_note = math.floor(avg_note + 0.5)
+
+  extract_note_features(note, {
+    center_pitch = avg_note + pitch_offset,
+    drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
+    vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or 15,
+  })
+
+  apply_envelope_to_take()
+end
+
 local function run_hybrid_segmentation()
   state.notes = {}
   state.split_points = {} -- For debugging display
@@ -1274,10 +1597,12 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   local mx, my = reaper.ImGui_GetMousePos(draw_ctx)
 
-  -- Hit-test: find hovered note and zone
-  if is_canvas_hovered and not state.drag and state.notes then
+  -- Hit-test: find hovered note, zone, and edge handles
+  local edge_handle_px = 5 -- pixels for edge grab zone
+  if is_canvas_hovered and not state.drag and not state.edge_drag and state.notes then
     state.hovered_note = nil
     state.hovered_zone = nil
+    state.hovered_edge = nil
     for n_idx, note in ipairs(state.notes) do
       if note.controls then
         local cp = note.controls.center_pitch
@@ -1286,6 +1611,22 @@ local function draw_graph(draw_ctx, w, h)
         local top_y = py + h - ((cp + 0.5 - min_note) / note_range) * h
         local bot_y = py + h - ((cp - 0.5 - min_note) / note_range) * h
 
+        -- Check edge handles first (higher priority than zone hover)
+        if my >= top_y and my <= bot_y then
+          if math.abs(mx - sx) <= edge_handle_px then
+            state.hovered_edge = { note_idx = n_idx, edge = "left" }
+            state.hovered_note = n_idx
+            state.hovered_zone = nil
+            break
+          elseif math.abs(mx - ex) <= edge_handle_px then
+            state.hovered_edge = { note_idx = n_idx, edge = "right" }
+            state.hovered_note = n_idx
+            state.hovered_zone = nil
+            break
+          end
+        end
+
+        -- Standard zone hit-test (only if no edge match)
         if mx >= sx and mx <= ex and my >= top_y and my <= bot_y then
           state.hovered_note = n_idx
           local block_w = ex - sx
@@ -1301,34 +1642,78 @@ local function draw_graph(draw_ctx, w, h)
         end
       end
     end
-  elseif not is_canvas_hovered and not state.drag then
+
+    -- Set cursor for edge hover
+    if state.hovered_edge then
+      reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeEW())
+    end
+  elseif not is_canvas_hovered and not state.drag and not state.edge_drag then
     state.hovered_note = nil
     state.hovered_zone = nil
+    state.hovered_edge = nil
   end
 
-  -- Click: select note and begin drag, or deselect
+  -- Click: select note (Shift = multi-select), begin drag or edge drag, or deselect
   if is_canvas_hovered and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
     get_target_take(true)
-    if state.hovered_note then
-      state.selected_note = state.hovered_note
-      local note = state.notes[state.hovered_note]
-      local original_val
-      if state.hovered_zone == "pitch" then
-        original_val = note.controls.center_pitch
-      elseif state.hovered_zone == "drift" then
-        original_val = note.controls.drift_scale
-      else
-        original_val = note.controls.vibrato_scale
-      end
-      state.drag = {
-        note_idx = state.hovered_note,
-        zone = state.hovered_zone,
-        start_mouse_y = my,
-        original_value = original_val,
+
+    -- Resolve Shift modifier for multi-select
+    local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
+    local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+    local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
+
+    if state.hovered_edge then
+      -- Edge click → start edge drag (trimming)
+      local he = state.hovered_edge
+      local note = state.notes[he.note_idx]
+      state.selected_note = he.note_idx
+      state.selected_notes = { [he.note_idx] = true }
+      state.edge_drag = {
+        note_idx = he.note_idx,
+        edge = he.edge,
+        start_mouse_x = mx,
+        original_time = (he.edge == "left") and note.start_time or note.end_time,
         dirty = false
       }
+    elseif state.hovered_note then
+      -- Note click → update selection and start pitch/drift/vibrato drag
+      if has_shift and state.selected_note then
+        -- Shift+Click: range select from primary to clicked note
+        local lo = math.min(state.selected_note, state.hovered_note)
+        local hi = math.max(state.selected_note, state.hovered_note)
+        state.selected_notes = {}
+        for i = lo, hi do
+          state.selected_notes[i] = true
+        end
+        -- Primary stays at the anchor, not the new click
+      else
+        -- Normal click: single select
+        state.selected_note = state.hovered_note
+        state.selected_notes = { [state.hovered_note] = true }
+      end
+
+      -- Only start drag on normal click, not Shift+Click (which is selection-only)
+      if not has_shift then
+        local note = state.notes[state.hovered_note]
+        local original_val
+        if state.hovered_zone == "pitch" then
+          original_val = note.controls.center_pitch
+        elseif state.hovered_zone == "drift" then
+          original_val = note.controls.drift_scale
+        else
+          original_val = note.controls.vibrato_scale
+        end
+        state.drag = {
+          note_idx = state.hovered_note,
+          zone = state.hovered_zone,
+          start_mouse_y = my,
+          original_value = original_val,
+          dirty = false
+        }
+      end
     else
       state.selected_note = nil
+      state.selected_notes = {}
       -- Click on empty canvas: move REAPER edit cursor to this time position
       local rel_x = (mx - px) / w  -- 0..1 across canvas
       rel_x = math.max(0, math.min(1, rel_x))
@@ -1386,6 +1771,64 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- Process active edge drag (trimming)
+  if state.edge_drag then
+    reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeEW())
+    local delta_x = mx - state.edge_drag.start_mouse_x
+    if math.abs(delta_x) > 3 then -- horizontal dead zone
+      state.edge_drag.dirty = true
+      -- Convert pixel delta to time delta
+      local delta_time = (delta_x / w) * duration
+      local new_time = state.edge_drag.original_time + delta_time
+      -- Live preview: update note boundary directly (no feature re-extraction during drag)
+      local ed_note = state.notes[state.edge_drag.note_idx]
+      if ed_note then
+        if state.edge_drag.edge == "left" then
+          -- Clamp: don't go past end_time - 50ms, don't overlap previous note
+          local prev_note = state.notes[state.edge_drag.note_idx - 1]
+          local min_t = prev_note and (prev_note.end_time + 0.005) or 0
+          new_time = math.max(min_t, math.min(ed_note.end_time - 0.05, new_time))
+          ed_note.start_time = new_time
+        else
+          -- Clamp: don't go before start_time + 50ms, don't overlap next note
+          local next_note = state.notes[state.edge_drag.note_idx + 1]
+          local max_t = next_note and (next_note.start_time - 0.005) or state.end_time
+          new_time = math.max(ed_note.start_time + 0.05, math.min(max_t, new_time))
+          ed_note.end_time = new_time
+        end
+      end
+    end
+
+    -- End edge drag → commit trim
+    if reaper.ImGui_IsMouseReleased(draw_ctx, 0) then
+      if state.edge_drag.dirty then
+        local ed = state.edge_drag
+        local ed_note = state.notes[ed.note_idx]
+        -- Capture the dragged-to position before restoring original boundary
+        local target_time = (ed.edge == "left") and ed_note.start_time or ed_note.end_time
+        -- Restore original boundary so trim_note_edge can detect extend vs shrink
+        if ed.edge == "left" then
+          ed_note.start_time = ed.original_time
+        else
+          ed_note.end_time = ed.original_time
+        end
+        trim_note_edge(ed.note_idx, ed.edge, target_time)
+      else
+        -- No movement beyond dead zone — restore boundary in case of micro-drift
+        local ed = state.edge_drag
+        local ed_note = state.notes[ed.note_idx]
+        if ed_note then
+          if ed.edge == "left" then
+            ed_note.start_time = ed.original_time
+          else
+            ed_note.end_time = ed.original_time
+          end
+        end
+      end
+      state.edge_drag = nil
+    end
+  end
+
   ---------------------------------------------------------------------------
   -- KEYBOARD CONTROLS (Scalpel Workflow)
   ---------------------------------------------------------------------------
@@ -1394,7 +1837,7 @@ local function draw_graph(draw_ctx, w, h)
   local ok_aia, any_active = pcall(reaper.ImGui_IsAnyItemActive, draw_ctx)
   local widget_capturing = ok_aia and any_active
 
-  if not state.drag and not widget_capturing and state.notes and #state.notes > 0 then
+  if not state.drag and not state.edge_drag and not widget_capturing and state.notes and #state.notes > 0 then
     -- Resolve Shift modifier for fine-tune (cross-platform, no OS conflicts)
     local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
     local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
@@ -1437,22 +1880,49 @@ local function draw_graph(draw_ctx, w, h)
         get_target_take(true)
         reset_selected_note()
       end
+
+      -- X: Split note at edit cursor position
+      if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_X()) then
+        local _, item = get_target_take(false)
+        if item then
+          local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+          local cursor = reaper.GetCursorPosition() - item_pos
+          if cursor > sel.start_time and cursor < sel.end_time then
+            get_target_take(true)
+            split_note_at(state.selected_note, cursor)
+          end
+        end
+      end
+    end
+
+    -- M: Merge selected notes (requires 2+ contiguous selected)
+    if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_M()) then
+      local sel_count = 0
+      for _ in pairs(state.selected_notes) do sel_count = sel_count + 1 end
+      if sel_count >= 2 then
+        get_target_take(true)
+        merge_selected_notes()
+      end
     end
 
     -- Left / Right: Jump selection to previous / next note
     if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_LeftArrow()) then
       if state.selected_note and state.selected_note > 1 then
         state.selected_note = state.selected_note - 1
+        state.selected_notes = { [state.selected_note] = true }
       elseif not state.selected_note then
         state.selected_note = 1
+        state.selected_notes = { [1] = true }
       end
     end
 
     if reaper.ImGui_IsKeyPressed(draw_ctx, reaper.ImGui_Key_RightArrow()) then
       if state.selected_note and state.selected_note < #state.notes then
         state.selected_note = state.selected_note + 1
+        state.selected_notes = { [state.selected_note] = true }
       elseif not state.selected_note then
         state.selected_note = 1
+        state.selected_notes = { [1] = true }
       end
     end
 
@@ -1466,6 +1936,7 @@ local function draw_graph(draw_ctx, w, h)
   if is_canvas_hovered and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
     if state.hovered_note and state.hovered_zone == "pitch" then
       state.selected_note = state.hovered_note
+      state.selected_notes = { [state.hovered_note] = true }
       get_target_take(true)
       snap_selected_note()
     end
@@ -1513,7 +1984,7 @@ local function draw_graph(draw_ctx, w, h)
         local block_w = ex - sx
         local zone_w = math.max(12, block_w * 0.25)
 
-        local is_selected = (state.selected_note == n_idx)
+        local is_selected = state.selected_notes[n_idx] or false
         local is_hov = (state.hovered_note == n_idx)
         local is_mod = is_note_modified(note)
 
@@ -1561,6 +2032,34 @@ local function draw_graph(draw_ctx, w, h)
             sx + zone_w, top_y, sx + zone_w, bot_y, 0xFFFFFF33)
           reaper.ImGui_DrawList_AddLine(draw_list,
             ex - zone_w, top_y, ex - zone_w, bot_y, 0xFFFFFF33)
+
+          -- Edge trim handles (visible grab zones)
+          local handle_w = 3
+          local left_handle_col = 0xFFFFFF55
+          local right_handle_col = 0xFFFFFF55
+
+          -- Brighten the hovered edge
+          if state.hovered_edge and state.hovered_edge.note_idx == n_idx then
+            if state.hovered_edge.edge == "left" then
+              left_handle_col = 0xFFFFFFCC
+            else
+              right_handle_col = 0xFFFFFFCC
+            end
+          end
+
+          -- During edge drag, brighten the active edge
+          if state.edge_drag and state.edge_drag.note_idx == n_idx then
+            if state.edge_drag.edge == "left" then
+              left_handle_col = P.accent
+            else
+              right_handle_col = P.accent
+            end
+          end
+
+          reaper.ImGui_DrawList_AddRectFilled(draw_list,
+            sx - 1, top_y, sx + handle_w, bot_y, left_handle_col)
+          reaper.ImGui_DrawList_AddRectFilled(draw_list,
+            ex - handle_w, top_y, ex + 1, bot_y, right_handle_col)
         end
 
         -- Note label: name + cents deviation (always visible)
@@ -2089,7 +2588,7 @@ local function loop()
     reaper.ImGui_PopItemWidth(ctx)
 
     reaper.ImGui_SameLine(ctx)
-    reaper.ImGui_PushItemWidth(ctx, 180)
+    reaper.ImGui_PushItemWidth(ctx, 200)
     if reaper.ImGui_BeginCombo(ctx, "##pitchmode", state.pitchmode_name) then
       for i, entry in ipairs(PITCHMODE_FLAT) do
         local is_selected = (state.preset_pitchmode_idx == i)
@@ -2097,6 +2596,9 @@ local function loop()
           state.preset_pitchmode_idx = i
           state.pitchmode_value = entry.value
           state.pitchmode_name = entry.name
+        end
+        if is_selected then
+          reaper.ImGui_SetItemDefaultFocus(ctx)
         end
       end
       reaper.ImGui_EndCombo(ctx)
@@ -2127,6 +2629,10 @@ local function loop()
         .. "S               Snap to nearest semitone\n"
         .. "Double-Click    Snap (in pitch zone)\n"
         .. "R / Del          Reset note to original\n"
+        .. "X               Split note at edit cursor\n"
+        .. "M               Merge selected notes\n"
+        .. "Shift+Click     Multi-select notes\n"
+        .. "Drag Edge       Trim note start/end\n"
         .. "Space           Play / Stop (REAPER)",
     })
 
@@ -2214,7 +2720,7 @@ local function loop()
         end
       else
         reaper.ImGui_TextDisabled(ctx,
-          "Click a note block to select. Drag: center=pitch, left=stability, right=vibrato")
+          "Click note to select  |  Shift+Click to multi-select  |  Drag edges to trim")
       end
 
       if reaper.ImGui_Button(ctx, "Apply to Take Pitch Envelope") then
@@ -2223,6 +2729,55 @@ local function loop()
       reaper.ImGui_SameLine(ctx)
       if reaper.ImGui_Button(ctx, "Reset Selected") then
         reset_selected_note()
+      end
+      reaper.ImGui_SameLine(ctx)
+
+      -- Split button (enabled when note selected and edit cursor is within it)
+      local can_split = false
+      if state.selected_note and state.notes[state.selected_note] then
+        local sn = state.notes[state.selected_note]
+        local _, si = get_target_take(false)
+        if si then
+          local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
+          local ec = reaper.GetCursorPosition() - ip
+          can_split = ec > sn.start_time and ec < sn.end_time
+        end
+      end
+      if not can_split then
+        reaper.ImGui_BeginDisabled(ctx)
+      end
+      if reaper.ImGui_Button(ctx, "Split (X)") then
+        if state.selected_note and state.notes[state.selected_note] then
+          local sn = state.notes[state.selected_note]
+          local _, si = get_target_take(false)
+          if si then
+            local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
+            local ec = reaper.GetCursorPosition() - ip
+            if ec > sn.start_time and ec < sn.end_time then
+              get_target_take(true)
+              split_note_at(state.selected_note, ec)
+            end
+          end
+        end
+      end
+      if not can_split then
+        reaper.ImGui_EndDisabled(ctx)
+      end
+      reaper.ImGui_SameLine(ctx)
+
+      -- Merge button (enabled when 2+ contiguous notes selected)
+      local sel_count = 0
+      for _ in pairs(state.selected_notes) do sel_count = sel_count + 1 end
+      local can_merge = sel_count >= 2
+      if not can_merge then
+        reaper.ImGui_BeginDisabled(ctx)
+      end
+      if reaper.ImGui_Button(ctx, "Merge (M)") then
+        get_target_take(true)
+        merge_selected_notes()
+      end
+      if not can_merge then
+        reaper.ImGui_EndDisabled(ctx)
       end
       reaper.ImGui_SameLine(ctx)
       -- Check actual bypass state from envelope
