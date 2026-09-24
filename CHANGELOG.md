@@ -4,6 +4,16 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.3.0 (`Pitch/Fancy_Pitch Correct.lua`)** — High-Fidelity Note Blending, Stability & Vibrato Engine:
+  - S-Curve Note Blending: Seamless smoothstep Hermite transitions ($3t^2 - 2t^3$, 35ms default) across all note boundaries, including transitions to/from untouched notes and silence onsets, eliminating 1ms cliff artifacts and phase vocoder chirps
+  - True Stability Drift Correction: Samples the continuous drift cancellation trajectory ($E_{\text{drift}}(t) = (\text{center} - \text{trend}(t)) \cdot (1 - \text{drift\_scale})$) into REAPER Take Pitch Envelope with sub-cent accuracy, ensuring 100% Stability audibly flattens pitch drift to match the visual preview
+  - Zero-Phase Drift & Vibrato Filter: Replaces crude simple moving average (SMA) with symmetric zero-phase Gaussian filtering ($\sigma = 7.0$ frames, ~2 Hz cutoff), eliminating vibrato ripple from the trend line and preserving pristine vibrato waveforms
+  - Anti-Chatter Vibrato Detection: Dual-threshold Schmitt trigger hysteresis and asymmetric envelope follower (~100ms attack, ~60ms release) prevent flickering and odd-spot vibrato highlights during sustained singing
+  - Robust Core Pitch Center: Calculates `avg_note` from an RMS-energy-weighted interior window (12% to 88%), preventing onset scoops and release sags from pulling the target pitch off-center
+  - Adaptive Envelope Decimation (RDP): Functional Ramer-Douglas-Peucker polyline simplification converts continuous mathematical trajectories into the minimal optimal set of REAPER Bezier points with $<1$ cent tolerance
+  - UI / Audio Parity: Preview line in graph and actual take envelope points share identical mathematical formulation
+  - Transition Readout: Displays transition duration in milliseconds in the active note status inspector
+
 - **Fancy Pitch Correct v2.2.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Multi-Note Selection & Batch Operations (Milestone 4):
   - Marquee Box Select: Click and drag on empty canvas to select multiple notes with real-time accent box, note count indicator, and AABB intersection
   - Additive Marquee: Shift+drag adds newly intersected notes to existing selection without clearing prior selections

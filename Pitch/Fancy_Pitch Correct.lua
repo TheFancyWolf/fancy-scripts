@@ -1,7 +1,13 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.2.0
+-- @version 2.3.0
 -- @changelog
+--   + High-Fidelity Note Blending: S-curve smoothstep transitions (35ms default) across all note boundaries, eliminating 1ms cliff artifacts and vocoder chirps
+--   + True Stability Drift Correction: Continuous pitch drift tracking sampled with sub-cent RDP decimation into REAPER Take Pitch Envelope
+--   + Natural Vibrato Modeling: Zero-phase Gaussian filter separates slow drift from vibrato; hysteresis gate and smooth envelope follower prevent chattering
+--   + Robust Energy-Weighted Pitch Center: Excludes onset scoops and release sag to calculate true stable pitch center
+--   + UI / Audio Parity: Green preview line and take envelope points generated from identical continuous trajectory
+--   + Transition Readout: Displays transition duration in active note status readout
 --   + Multi-Note Selection & Batch Operations (Milestone 4)
 --   + Marquee Box Select: Click and drag on empty canvas to select multiple notes with live accent box and note count
 --   + Multi-Note Drag: Move pitch center or stability (drift) across all selected notes simultaneously
@@ -556,8 +562,145 @@ local function start_analysis()
   ensure_take_pitch_envelope(take, item, true)
 end
 
+-------------------------------------------------------------------------------
+-- 3. SIGNAL PROCESSING & PITCH EXTRACTION HELPERS
+-------------------------------------------------------------------------------
+
+local function gaussian_filter(arr, sigma_frames)
+  local n = #arr
+  if n == 0 then return {} end
+  if n == 1 then return { arr[1] } end
+  local res = {}
+  local radius = math.max(1, math.ceil(sigma_frames * 2.5))
+  for i = 1, n do
+    local sum, w_sum = 0, 0
+    for j = math.max(1, i - radius), math.min(n, i + radius) do
+      local dist = (i - j) / sigma_frames
+      local w = math.exp(-0.5 * dist * dist)
+      sum = sum + arr[j] * w
+      w_sum = w_sum + w
+    end
+    res[i] = sum / w_sum
+  end
+  return res
+end
+
+local function smoothstep(u)
+  local c = math.max(0, math.min(1, u))
+  return c * c * (3 - 2 * c)
+end
+
+local function rdp_simplify(points, epsilon)
+  if #points <= 2 then return points end
+
+  local function perpendicular_dist(pt, l1, l2)
+    local dx = l2.time - l1.time
+    if dx <= 0.00001 then
+      return math.abs(pt.val - l1.val)
+    end
+    local u = (pt.time - l1.time) / dx
+    local py = l1.val + u * (l2.val - l1.val)
+    return math.abs(pt.val - py)
+  end
+
+  local function rdp_recursive(pts, first, last, eps, out)
+    local dmax = 0
+    local index = 0
+    for i = first + 1, last - 1 do
+      local d = perpendicular_dist(pts[i], pts[first], pts[last])
+      if d > dmax then
+        index = i
+        dmax = d
+      end
+    end
+    if dmax > eps then
+      rdp_recursive(pts, first, index, eps, out)
+      table.insert(out, pts[index])
+      rdp_recursive(pts, index, last, eps, out)
+    end
+  end
+
+  local out = { points[1] }
+  rdp_recursive(points, 1, #points, epsilon, out)
+  table.insert(out, points[#points])
+  table.sort(out, function(a, b) return a.time < b.time end)
+
+  local dedup = { out[1] }
+  for i = 2, #out do
+    if out[i].time > dedup[#dedup].time + 0.0001 then
+      table.insert(dedup, out[i])
+    end
+  end
+  return dedup
+end
+
+local function compute_vibrato_weights(mod, frame_dur, total_dur)
+  local n = #mod
+  local weights = {}
+  for i = 1, n do weights[i] = 0.0 end
+  if n < 8 then return weights end
+
+  local half_win = math.max(2, math.floor(0.12 / frame_dur)) -- ~240ms window
+  local raw_gate = {}
+  local is_active = false
+
+  for i = 1, n do
+    local t = (i - 1) * frame_dur
+    -- Onset & offset exclusion (pitch settling and release tail are not vibrato)
+    if t < 0.10 or t > (total_dur - 0.06) then
+      raw_gate[i] = false
+      is_active = false
+    else
+      local w_start = math.max(1, i - half_win)
+      local w_end = math.min(n, i + half_win)
+      local count = w_end - w_start + 1
+      local sum_sq = 0
+      local zc = 0
+      for j = w_start, w_end do
+        sum_sq = sum_sq + mod[j] * mod[j]
+        if j > w_start and (mod[j] >= 0) ~= (mod[j-1] >= 0) then
+          zc = zc + 1
+        end
+      end
+      local rms = math.sqrt(sum_sq / count)
+      local win_time = count * frame_dur
+      local freq = win_time > 0 and (zc / (2 * win_time)) or 0
+      local is_periodic = (freq >= 3.5 and freq <= 8.5 and zc >= 2)
+
+      -- Schmitt trigger (turn on at 0.045 st / 4.5 cents, hold down to 0.028 st / 2.8 cents)
+      if not is_active then
+        if is_periodic and rms >= 0.045 then
+          is_active = true
+        end
+      else
+        if not is_periodic or rms < 0.028 then
+          is_active = false
+        end
+      end
+      raw_gate[i] = is_active
+    end
+  end
+
+  -- Asymmetric envelope follower (Attack: ~100ms, Release: ~60ms)
+  local attack_coef = math.exp(-frame_dur / 0.10)
+  local release_coef = math.exp(-frame_dur / 0.06)
+  local current_env = 0.0
+
+  for i = 1, n do
+    local target = raw_gate[i] and 1.0 or 0.0
+    if target > current_env then
+      current_env = target + (current_env - target) * attack_coef
+    else
+      current_env = target + (current_env - target) * release_coef
+    end
+    weights[i] = current_env > 0.05 and current_env or 0.0
+  end
+
+  return weights
+end
+
 local function extract_note_features(note, preserve_controls)
-  if note.count == 0 then return end
+  if note.count == 0 or not note.frames or #note.frames == 0 then return end
 
   -- 1. Extract raw pitch array
   local raw_pitch = {}
@@ -581,35 +724,36 @@ local function extract_note_features(note, preserve_controls)
   filtered[#raw_pitch] = raw_pitch[#raw_pitch]
   raw_pitch = filtered
 
-  -- Simple moving average helper
-  local function get_sma(arr, win_size)
-    local res = {}
-    local half = math.floor(win_size / 2)
-    for i = 1, #arr do
-      local sum = 0
-      local count = 0
-      for j = math.max(1, i - half), math.min(#arr, i + half) do
-        sum = sum + arr[j]
-        count = count + 1
-      end
-      res[i] = sum / count
-    end
-    return res
-  end
+  -- 2. Zero-phase Gaussian filtering for smooth pitch and low-frequency drift trend
+  --    Smooth pitch (sigma ~1.5 frames) removes micro-jitters without phase distortion
+  --    Trend (sigma ~7.0 frames, ~2 Hz cutoff) isolates slow drift without vibrato ripple
+  local smooth_pitch = gaussian_filter(raw_pitch, 1.5)
+  local trend = gaussian_filter(raw_pitch, 7.0)
 
-  -- 2. Calculate Trend (Heavy smoothing to find the true center, ~240ms window)
-  local trend = get_sma(raw_pitch, 21)
-
-  -- 3. Calculate smooth pitch (Light smoothing to remove YIN micro-jitters, ~58ms window)
-  local smooth_pitch = get_sma(raw_pitch, 5)
-
-  -- 4. Calculate Modulation
+  -- 3. Calculate Modulation: clean, zero-phase vibrato waveform
   local mod = {}
   for i = 1, #raw_pitch do
     mod[i] = smooth_pitch[i] - trend[i]
   end
 
-  -- 5. Find Smart Spots via Zero-Crossing (1 peak per vibrato wave)
+  -- 4. Calculate robust pitch center (energy-weighted median/mean of sustained core)
+  --    Excludes initial onset scoop (first 12%) and release tail (last 12%)
+  local total_w = 0
+  local weighted_sum = 0
+  local start_f = math.max(1, math.floor(#note.frames * 0.12))
+  local end_f = math.min(#note.frames, math.ceil(#note.frames * 0.88))
+  for i = start_f, end_f do
+    local f = note.frames[i]
+    local w = math.max(0.0001, (f.rms or 0.05))
+    weighted_sum = weighted_sum + f.note * w
+    total_w = total_w + w
+  end
+  if total_w > 0 then
+    note.avg_note = weighted_sum / total_w
+    note.display_note = math.floor(note.avg_note + 0.5)
+  end
+
+  -- 5. Find Smart Spots via Zero-Crossing (for visual rendering / anchor points)
   local smart_spots = {}
   table.insert(smart_spots, { index = 1, time = note.frames[1].time, type = "anchor_start" })
 
@@ -634,10 +778,10 @@ local function extract_note_features(note, preserve_controls)
         extrema_val = val
       end
     else
-      -- Zero crossing! Save the previous extrema if it's prominent enough (ignore micro-wobbles under 5 cents)
+      -- Zero crossing! Save the previous extrema if it's prominent enough
       if math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
-         local s_type = current_sign == 1 and "peak" or "valley"
-         table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
+        local s_type = current_sign == 1 and "peak" or "valley"
+        table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
       end
       current_sign = sign
       extrema_idx = i
@@ -645,10 +789,9 @@ local function extract_note_features(note, preserve_controls)
     end
   end
 
-  -- Push the last one if prominent
   if extrema_idx and math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
-     local s_type = current_sign == 1 and "peak" or "valley"
-     table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
+    local s_type = current_sign == 1 and "peak" or "valley"
+    table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
   end
 
   table.insert(smart_spots, { index = #raw_pitch, time = note.frames[#raw_pitch].time, type = "anchor_end" })
@@ -657,74 +800,20 @@ local function extract_note_features(note, preserve_controls)
   note.modulation = mod
   note.smart_spots = smart_spots
 
-  -- 6. Vibrato detection — three-gate approach
-  --    Gate 1: Onset/offset exclusion (pitch settling is not vibrato)
-  --    Gate 2: Periodicity validation (must be 4-8 Hz, not a one-shot scoop)
-  --    Gate 3: Energy threshold (modulation must be large enough)
-  local VIB_FLOOR = 0.04    -- below = no vibrato (semitones RMS)
-  local VIB_CEILING = 0.12  -- above = full vibrato
-  local ONSET_SEC = 0.12    -- exclude first 120ms (attack phase)
-  local OFFSET_SEC = 0.08   -- exclude last 80ms (release tail)
-  local VIB_FREQ_MIN = 3.5  -- Hz (generous low bound for vibrato)
-  local VIB_FREQ_MAX = 9.0  -- Hz (generous high bound)
-
-  local vib_win = math.max(3, math.min(#mod, 26)) -- ~300ms window
-  local half_vw = math.floor(vib_win / 2)
-  local vibrato_weight = {}
-
-  -- Estimate frame duration from actual timing
+  -- 6. Vibrato detection with Schmitt trigger hysteresis & asymmetric envelope follower
+  local total_dur = note.end_time - note.start_time
   local frame_dur = #note.frames > 1
     and (note.frames[#note.frames].time - note.frames[1].time) / (#note.frames - 1)
     or 0.012
 
-  for i = 1, #mod do
-    local t = note.frames[i].time
-
-    -- Gate 1: Onset/offset exclusion
-    if (t - note.start_time) < ONSET_SEC or (note.end_time - t) < OFFSET_SEC then
-      vibrato_weight[i] = 0.0
-    else
-      -- Gate 2: Periodicity — zero-crossing rate must be in vibrato band
-      local zc_count = 0
-      local win_start = math.max(2, i - half_vw)
-      local win_end = math.min(#mod, i + half_vw)
-      for j = win_start, win_end do
-        if (mod[j] >= 0) ~= (mod[j - 1] >= 0) then
-          zc_count = zc_count + 1
-        end
-      end
-      local win_dur = (win_end - win_start + 1) * frame_dur
-      local zc_freq = win_dur > 0 and (zc_count / (2 * win_dur)) or 0
-      local is_periodic = zc_freq >= VIB_FREQ_MIN and zc_freq <= VIB_FREQ_MAX
-
-      -- Gate 3: Energy threshold (RMS of modulation in window)
-      local sum_sq = 0
-      local cnt = 0
-      for j = math.max(1, i - half_vw), math.min(#mod, i + half_vw) do
-        sum_sq = sum_sq + mod[j] * mod[j]
-        cnt = cnt + 1
-      end
-      local rms = math.sqrt(sum_sq / cnt)
-
-      -- All three gates must pass
-      if not is_periodic or rms < VIB_FLOOR then
-        vibrato_weight[i] = 0.0
-      elseif rms > VIB_CEILING then
-        vibrato_weight[i] = 1.0
-      else
-        vibrato_weight[i] = (rms - VIB_FLOOR) / (VIB_CEILING - VIB_FLOOR)
-      end
-    end
-  end
-
-  note.vibrato_weight = vibrato_weight
+  note.vibrato_weight = compute_vibrato_weights(mod, frame_dur, total_dur)
 
   -- Default controls: NO correction (green preview = raw pitch)
   note.controls = {
     center_pitch = note.avg_note,
     drift_scale = 1.0,
     vibrato_scale = 1.0,
-    transition_ms = 15
+    transition_ms = 35
   }
 
   -- Restore user tuning offsets when splitting/merging notes
@@ -962,147 +1051,182 @@ local function apply_envelope_to_take(undo_desc)
     return
   end
 
-  -- Clear existing points
-  reaper.DeleteEnvelopePointRange(env, 0, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+
+  -- Clear existing points across the entire item
+  reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
 
   local SHAPE = 5   -- Bezier
   local TENSION = 0 -- Neutral tension
 
-  for n_idx, note in ipairs(state.notes) do
-    -- SCALPEL RULE: Untouched notes receive zero envelope points
-    if not is_note_modified(note) then
+  if not state.notes or #state.notes == 0 then
+    reaper.Envelope_SortPointsEx(env, -1)
+    reaper.UpdateArrange()
+    reaper.Undo_EndBlock(undo_desc or "Apply Pitch Correction", -1)
+    return
+  end
+
+  -- Check if any note in the phrase is modified
+  local any_modified = false
+  for _, n in ipairs(state.notes) do
+    if is_note_modified(n) then
+      any_modified = true
+      break
+    end
+  end
+
+  if not any_modified then
+    -- Clean envelope: untouched takes have no points
+    reaper.Envelope_SortPointsEx(env, -1)
+    reaper.UpdateArrange()
+    reaper.Undo_EndBlock(undo_desc or "Apply Pitch Correction", -1)
+    if state.target_take_guid and state.session_takes[state.target_take_guid] then
+      state.session_takes[state.target_take_guid].notes = state.notes
+      save_take_data(take, state.session_takes[state.target_take_guid])
+    end
+    return
+  end
+
+  -- 1. Precalculate continuous frame shifts for every note
+  for _, n in ipairs(state.notes) do
+    n.frame_shifts = {}
+    local is_mod = is_note_modified(n)
+    local coarse = is_mod and (n.controls.center_pitch - n.avg_note) or 0.0
+    local d_scale = (n.controls and n.controls.drift_scale) or 1.0
+    local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
+    if n.frames then
+      for i = 1, #n.frames do
+        if not is_mod then
+          n.frame_shifts[i] = 0.0
+        else
+          local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
+          local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
+          local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
+          n.frame_shifts[i] = coarse + drift_corr + vib_corr
+        end
+      end
+    end
+  end
+
+  -- 2. Build continuous trajectory across notes and boundaries
+  local all_points = {}
+  local num_notes = #state.notes
+
+  for idx = 1, num_notes do
+    local n = state.notes[idx]
+    local prev_n = state.notes[idx - 1]
+    local next_n = state.notes[idx + 1]
+
+    local is_mod = is_note_modified(n)
+    local prev_mod = is_note_modified(prev_n)
+    local next_mod = is_note_modified(next_n)
+
+    -- If this note and both its neighbors are untouched, skip entirely
+    if not is_mod and not prev_mod and not next_mod then
       goto continue_note
     end
 
-    local ctrl = note.controls
-    local prev_note = state.notes[n_idx - 1]
-    local next_note = state.notes[n_idx + 1]
+    local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
+    local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
 
-    -- STRICT BOUNDARY CONTRACT:
-    -- Legato connection ONLY exists if the neighbor is ALSO MODIFIED and within 50ms!
-    local prev_is_mod = is_note_modified(prev_note)
-    local next_is_mod = is_note_modified(next_note)
+    local trans_dur = math.min(((n.controls and n.controls.transition_ms) or 35) * 0.001, 0.060)
+    trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
 
-    local is_legato_prev = prev_is_mod and ((note.start_time - prev_note.end_time) < 0.05)
-    local is_legato_next = next_is_mod and ((next_note.start_time - note.end_time) < 0.05)
+    local is_legato_prev = false
+    local is_legato_next = false
 
-    local note_dur = note.end_time - note.start_time
-    local half_dur = note_dur * 0.5
+    -- A. START TRANSITION
+    local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
+    if prev_gap < 0.12 and prev_n then
+      is_legato_prev = true
+      -- Legato transition with previous note: smoothstep blend centered at boundary
+      local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
+      local t_bnd = (prev_n.end_time + n.start_time) * 0.5
+      local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
+      local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
 
-    -- Onset ramp duration for fine adjustments (scales with scoop)
-    local scoop = note.scoop_magnitude or 0
-    local base_onset = 0.08 -- 80ms
-    local scoop_extra = math.min(0.07, scoop * 0.05)
-    local onset_ramp_sec = math.min(base_onset + scoop_extra, half_dur * 0.6)
+      local steps = 5
+      for s = 0, steps do
+        local u = s / steps
+        local t = t_start + u * (t_end - t_start)
+        local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
+        table.insert(all_points, { time = t, val = val })
+      end
+    else
+      -- Onset from silence / start of take: smooth ramp into pitch shift
+      if is_mod and math.abs(start_shift) > 0.001 then
+        local ramp_t = math.min(0.035, (n.end_time - n.start_time) * 0.25)
+        local t_pre = math.max(0.0, n.start_time - ramp_t)
+        table.insert(all_points, { time = t_pre, val = 0.0 })
+        local steps = 4
+        for s = 1, steps do
+          local u = s / steps
+          local t = t_pre + u * (n.start_time - t_pre)
+          local val = start_shift * smoothstep(u)
+          table.insert(all_points, { time = t, val = val })
+        end
+      end
+    end
 
-    -- Crossfade duration between two modified notes
-    local xfade_sec = math.min(0.04, half_dur * 0.4)
+    -- B. NOTE BODY
+    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0))
+    local body_t_start = n.start_time + trans_dur * 0.5
+    local body_t_end = n.end_time - trans_dur * 0.5
 
-    -- Coarse pitch shift (rigid DC offset)
-    local coarse_shift = ctrl.center_pitch - note.avg_note
-    local fine_changed = (ctrl.drift_scale ~= 1.0) or (ctrl.vibrato_scale ~= 1.0)
+    if not fine_changed then
+      -- Coarse shift or untouched: hold shift across body
+      if is_mod then
+        table.insert(all_points, { time = math.min(item_len, body_t_start), val = start_shift })
+        table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
+      end
+    else
+      -- Fine contour: sample frames across body to counteract drift / scale vibrato
+      if n.frames then
+        for i = 1, #n.frames do
+          local t = n.frames[i].time
+          if t >= body_t_start and t <= body_t_end then
+            table.insert(all_points, { time = math.min(item_len, t), val = n.frame_shifts[i] })
+          end
+        end
+      end
+    end
 
-    -- Store debug info
-    note.onset_debug = {
-      onset_ramp_ms = onset_ramp_sec * 1000,
-      scoop_st = scoop,
+    -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
+    local next_gap = next_n and (next_n.start_time - n.end_time) or 999
+    if next_gap >= 0.12 then
+      if is_mod and math.abs(end_shift) > 0.001 then
+        local ramp_t = math.min(0.035, (n.end_time - n.start_time) * 0.25)
+        local steps = 4
+        for s = 1, steps do
+          local u = s / steps
+          local t = math.min(item_len, n.end_time + u * ramp_t)
+          local val = end_shift * (1.0 - smoothstep(u))
+          table.insert(all_points, { time = t, val = val })
+        end
+        local t_post = math.min(item_len, n.end_time + ramp_t + 0.001)
+        table.insert(all_points, { time = t_post, val = 0.0 })
+      end
+    else
+      is_legato_next = true
+    end
+
+    -- Store onset debug info
+    n.onset_debug = {
+      onset_ramp_ms = trans_dur * 1000,
+      scoop_st = n.scoop_magnitude or 0,
       voicing_delay_ms = 0,
       is_legato_prev = is_legato_prev,
       is_legato_next = is_legato_next
     }
 
-    if not fine_changed then
-      -- =====================================================================
-      -- 1. COARSE-ONLY MODE (Uniform pitch shift across the note)
-      -- =====================================================================
-      -- START BOUNDARY
-      if not is_legato_prev then
-        -- Strict 0.0 isolation: pin envelope to 0 before note start
-        reaper.InsertEnvelopePointEx(env, -1, note.start_time - 0.001, 0, 0, 0, 0, false)
-        reaper.InsertEnvelopePointEx(env, -1, note.start_time, coarse_shift, SHAPE, TENSION, 0, false)
-      else
-        -- Both notes modified: blend at boundary
-        local prev_shift = prev_note.controls.center_pitch - prev_note.avg_note
-        local blend_val = (prev_shift + coarse_shift) * 0.5
-        reaper.InsertEnvelopePointEx(env, -1, note.start_time, blend_val, SHAPE, TENSION, 0, false)
-        reaper.InsertEnvelopePointEx(env, -1, note.start_time + xfade_sec, coarse_shift, SHAPE, TENSION, 0, false)
-      end
-
-      -- END BOUNDARY
-      if not is_legato_next then
-        -- Strict 0.0 isolation: hold coarse shift to note end, pin to 0 immediately after
-        reaper.InsertEnvelopePointEx(env, -1, note.end_time, coarse_shift, SHAPE, TENSION, 0, false)
-        reaper.InsertEnvelopePointEx(env, -1, note.end_time + 0.001, 0, 0, 0, 0, false)
-      else
-        -- Both notes modified: hold coarse shift up to crossfade start
-        reaper.InsertEnvelopePointEx(env, -1, note.end_time - xfade_sec, coarse_shift, SHAPE, TENSION, 0, false)
-      end
-
-    else
-      -- =====================================================================
-      -- 2. FINE CONTOUR MODE (Drift reduction / vibrato scaling)
-      -- =====================================================================
-      -- Decoupled formula: env_val = coarse_shift + drift_corr + vib_corr
-      -- Avoids injecting YIN (smooth - raw) noise into the take envelope.
-      local num_spots = #note.smart_spots
-      for s_idx, spot in ipairs(note.smart_spots) do
-        local i = spot.index
-        local t = spot.time
-        local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
-        local drift_corr = (note.trend[i] - note.avg_note) * (ctrl.drift_scale - 1.0)
-        local vib_corr = note.modulation[i] * (ctrl.vibrato_scale - 1.0) * vw
-        local env_val = coarse_shift + drift_corr + vib_corr
-
-        if s_idx == 1 or spot.type == "anchor_start" then
-          -- START BOUNDARY
-          if not is_legato_prev then
-            -- Strict 0.0 isolation: pin envelope to 0 before note start
-            reaper.InsertEnvelopePointEx(env, -1, note.start_time - 0.001, 0, 0, 0, 0, false)
-            -- Coarse shift engages immediately
-            reaper.InsertEnvelopePointEx(env, -1, note.start_time, coarse_shift, SHAPE, TENSION, 0, false)
-            -- Ease into fine contour
-            local fine_at_ramp = env_val - coarse_shift
-            if math.abs(fine_at_ramp) > 0.01 and onset_ramp_sec > 0.02 then
-              reaper.InsertEnvelopePointEx(env, -1, note.start_time + onset_ramp_sec * 0.5, coarse_shift + fine_at_ramp * 0.5, SHAPE, TENSION, 0, false)
-              t = note.start_time + onset_ramp_sec
-            else
-              t = nil
-            end
-          else
-            -- Both notes modified: blend at boundary
-            local prev_ctrl = prev_note.controls
-            local prev_shift = prev_ctrl.center_pitch - prev_note.avg_note
-            local prev_drift_corr = (prev_note.trend[#prev_note.trend] - prev_note.avg_note) * (prev_ctrl.drift_scale - 1.0)
-            local prev_vw = prev_note.vibrato_weight and prev_note.vibrato_weight[#prev_note.vibrato_weight] or 1.0
-            local prev_vib_corr = prev_note.modulation[#prev_note.modulation] * (prev_ctrl.vibrato_scale - 1.0) * prev_vw
-            local prev_env_val = prev_shift + prev_drift_corr + prev_vib_corr
-
-            local blend_val = (prev_env_val + env_val) * 0.5
-            reaper.InsertEnvelopePointEx(env, -1, note.start_time, blend_val, SHAPE, TENSION, 0, false)
-            t = note.start_time + xfade_sec
-          end
-
-        elseif s_idx == num_spots or spot.type == "anchor_end" then
-          -- END BOUNDARY
-          if not is_legato_next then
-            -- Strict 0.0 isolation: note finishes at env_val, then pin to 0.0 immediately
-            reaper.InsertEnvelopePointEx(env, -1, note.end_time, env_val, SHAPE, TENSION, 0, false)
-            reaper.InsertEnvelopePointEx(env, -1, note.end_time + 0.001, 0, 0, 0, 0, false)
-            t = nil
-          else
-            -- Both notes modified: end slightly before boundary so next note can blend
-            reaper.InsertEnvelopePointEx(env, -1, note.end_time - xfade_sec, env_val, SHAPE, TENSION, 0, false)
-            t = nil
-          end
-        end
-
-        if t then
-          reaper.InsertEnvelopePointEx(env, -1, t, env_val, SHAPE, TENSION, 0, false)
-        end
-      end
-    end
-
     ::continue_note::
+  end
+
+  -- 3. Adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
+  local simplified = rdp_simplify(all_points, 0.01)
+  for _, pt in ipairs(simplified) do
+    local t = math.max(0.0, math.min(item_len, pt.time))
+    reaper.InsertEnvelopePointEx(env, -1, t, pt.val, SHAPE, TENSION, 0, true)
   end
 
   reaper.Envelope_SortPointsEx(env, -1)
@@ -1286,7 +1410,7 @@ split_note_at = function(note_idx, split_time)
     center_pitch = avg_a + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or 15,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or 35,
   })
 
   -- Build note B (right half)
@@ -1306,7 +1430,7 @@ split_note_at = function(note_idx, split_time)
     center_pitch = avg_b + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or 15,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or 35,
   })
 
   -- Splice into notes array
@@ -1424,7 +1548,7 @@ merge_selected_notes = function()
     center_pitch = total_dur > 0 and (weighted_pitch / total_dur) or avg_note,
     drift_scale = total_dur > 0 and (weighted_drift / total_dur) or 1.0,
     vibrato_scale = total_dur > 0 and (weighted_vibrato / total_dur) or 1.0,
-    transition_ms = first_note.controls and first_note.controls.transition_ms or 15,
+    transition_ms = first_note.controls and first_note.controls.transition_ms or 35,
   })
 
   -- Replace in array: put merged note at first index, remove the rest
@@ -1520,7 +1644,7 @@ trim_note_edge = function(note_idx, edge, new_time)
     center_pitch = avg_note + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or 15,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or 35,
   })
 
   apply_envelope_to_take()
@@ -2612,7 +2736,7 @@ local function draw_graph(draw_ctx, w, h)
         local cp_poly = reaper.new_array(#note.frames * 2)
         local cp_idx = 1
         for i, frame in ipairs(note.frames) do
-          local vw = note.vibrato_weight and note.vibrato_weight[i] or 1.0
+          local vw = (note.vibrato_weight and note.vibrato_weight[i]) or 0.0
           local drift_corr = (note.trend[i] - note.avg_note) * (ctrl.drift_scale - 1.0)
           local vib_corr = note.modulation[i] * (ctrl.vibrato_scale - 1.0) * vw
           local target = frame.note + coarse_shift + drift_corr + vib_corr
@@ -3258,9 +3382,9 @@ local function loop()
         local is_chrom = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic")
         local scale_str = is_chrom and "" or (is_pitch_in_scale(nearest % 12) and "  |  [In Scale]" or "  |  [Out of Scale]")
         reaper.ImGui_Text(ctx, string.format(
-          "Selected: %s %s%d\xC2\xA2%s  |  Stability: %.0f%%  |  Vibrato: %.0f%%  |  %s",
+          "Selected: %s %s%d\xC2\xA2%s  |  Stability: %.0f%%  |  Vibrato: %.0f%%  |  Transition: %.0fms  |  %s",
           midi_to_name(nearest), sign, cents, scale_str, (1 - ctrl.drift_scale) * 100,
-          ctrl.vibrato_scale * 100, status_str))
+          ctrl.vibrato_scale * 100, ctrl.transition_ms or 35, status_str))
         -- Onset debug info
         if sel.onset_debug then
           local od = sel.onset_debug
