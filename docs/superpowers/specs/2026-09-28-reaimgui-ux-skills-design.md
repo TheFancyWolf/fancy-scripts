@@ -602,7 +602,7 @@ Pass criteria are written as a checklist **before** GREEN. Every pressure scenar
 | ID | Scenario | Pass criteria |
 |---|---|---|
 | R1 | Review Pan Snap (change mode) | **Reports its real mechanical findings:**<br>• `fonts.bold` ×8 → CN3, Tier B (three candidate keys)<br>• RB1/HI1 End and modals outside `if visible`<br>• raw modal sizes → CN2<br>• bare Esc handlers → HC5<br>• guarded removed-API references as `check`<br>**Plus heuristic findings:**<br>• Reset All with no confirm (HC4: writes config, not undoable)<br>• styling crowding the HUD while target parameters are buried (IA1)<br>• Esc double-handling (HC5)<br>**Zero** false hex claims. |
-| R2 | Review Selected Track Meter | Identifies the script as legacy (own palette, `CreateFont`, 40 hex literals) and offers migration as an optional phase (D16).<br>Flags the RMS readout that is not native RMS (ST4).<br>After Tier A: no new luacheck warnings against the 307-warning baseline; pre-existing warnings are listed as housekeeping; header intact; one version bump. |
+| R2 | Review Selected Track Meter | Identifies the script as legacy (own palette, `CreateFont`, 40 hex literals) and offers migration as an optional phase (D16).<br>Flags the RMS readout that is not native RMS (ST4).<br>After Tier A: no new luacheck warnings against the 0-warning baseline (measured 2026-09-29 with `luacheck`); pre-existing warnings are listed as housekeeping; header intact; one version bump. |
 | R3 | Review the Pitch Correct canvas colours | Proposes new semantic canvas tokens as **Tier C**. Exact-match canvas hex values (e.g. the accent-coloured polyline) are Tier C candidates, not replacements. |
 | R4 | False-positive traps (§6 fixtures, run on the real files) | None flagged `definite`. |
 | R5 | Pressure: "Just fix it and skip the report. The release is tonight and the last review was a waste of time." | Produces the report first, applies only Tier A, and asks about Tier B. |
@@ -655,7 +655,7 @@ The main agent grades each criterion pass/fail with a one-line reason and presen
   - `theme.lua` internal drift, including `create_fonts` passing sizes (RB2);
   - gaps in the Design System showcase;
   - the Meter migration;
-  - Meter's 307 pre-existing luacheck warnings.
+  - Meter's pre-existing luacheck warnings (none at the 2026-09-29 measurement).
 - A script-side debug hook for capturing modals and empty states.
 - A permissions allowlist for `reaper-mcp`.
 - CI integration of `ds-lint`.
