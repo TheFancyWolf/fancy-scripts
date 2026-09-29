@@ -4,6 +4,70 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Mapper Settings Reorganization v5.2.0 (`Mixing/Fancy_Mapper Settings.lua`, `_lib/mapper_engine.lua`)**:
+  - **One Mode Panel**: A single "Configure Mode" dropdown shows only the selected mode's settings and its six button actions, replacing the per-mode sections and the separate Button Actions section. It opens on the dial's live mode and follows it while you're viewing it; a "Current" chip jumps back to it.
+  - **Guided Calibration**: "Calibrate…" next to Ticks per Rotation opens a dialog that counts ticks from the normal dial actions while it's open, so the dial no longer has to be rebound to `Calibrate Tick` (which still works). Either direction counts, turning back corrects an overshoot, and Apply writes the result.
+  - **Action Ring Mode Chips**: Toggle exactly which modes appear in the ring (minimum 3, canonical clockwise order). The Curated 8 / All 11 presets light up when they match.
+  - **Per-Mode Smoothing**: Each smoothable mode has its own Smooth toggle in its panel; the Smooth Dial section keeps the engine controls, preset chips that show the active speed, and a summary of smoothed modes.
+  - **Feedback Settings in General**: The value HUD toggle (previously under MIDI CC, though it applies to every mode) and the Sensitivity Up/Down toast settings now live in General; the standalone Toast and Calibrate sections are gone.
+  - **Fixes**: Reset All now restores MIDI channel, auto-arm, value HUD, and velocity audition, and writes each default explicitly instead of relying on clearing the whole ExtState section; the reset dialog now dims the window behind it; values changed by Sensitivity Up/Down update live while Settings is open; long button action names no longer overlap the pick/clear controls.
+
+- **Fancy Mapper Universal Smooth Dial & Analog Slew Daemon v5.2.0 (`Mixing/Fancy_Mapper Daemon.lua`, `_lib/mapper_engine.lua`, `Mixing/Fancy_Mapper Settings.lua`)**:
+  - **Universal Smooth Dial (Producer-Consumer Slew Engine)**: Offloads discrete notched encoder clicks into continuous 60 Hz exponential slew interpolation (`1.0 - math.exp(-speed * dt)`), giving rotary dials the weighted feel of high-end analog potentiometers across continuous parameters: Volume, Pan, Width, FX Parameters, MIDI CC, Timeline Scrub, and Item Slip.
+  - **Zero ReaScript Task Control Prompts**: Keeps dial actions (`Up.lua` and `Down.lua`) 100% synchronous (<0.05ms execution) by accumulating floating-point targets in ExtState and delegating all deferred interpolation to a dedicated standalone consumer daemon (`Fancy_Mapper Daemon.lua`).
+  - **Option A (Lazy / Auto-Sleep Daemon)**: The background daemon auto-wakes seamlessly when turning the dial, executes 60 Hz interpolation during parameter movement, and auto-sleeps after 10 seconds of idle dial activity (0% CPU when not actively mixing).
+  - **Single-Point Clean Undo**: Dial movements no longer pollute REAPER's undo history with per-frame or empty steps; a single consolidated undo point is recorded when parameter slewing settles to its target.
+  - **Comprehensive Settings Hub Card**: Dedicated "Smooth Dial (Analog Slew Engine)" card in `Fancy_Mapper Settings.lua` with a live daemon status badge (`● Active (60 Hz)` / `○ Standby`), manual wake/stop button, master toggle, slew responsiveness slider (5 to 80 /s) with presets (Tape 12, Balanced 25, Snappy 45), and individual toggles for each continuous mode.
+  - **Context-Aware Reset Synchronization**: Resetting any parameter via `Fancy_Mapper Reset Parameter.lua` immediately clears active slew targets in ExtState, preventing interpolation fighting on reset.
+  - **Action Ring Settings Default to Off for New Users**: Directional Flick, Dwell Hover Selection, and Inactivity Auto-Close now all default to `false` out of the box, ensuring the radial ring remains open, stable, and predictable for new users until a mode is clicked or dismissed, while remaining fully customizable in Settings.
+
+- **Fancy Mapper Linear CC Curves & 1-Click Smoothing v5.2.0 (`_lib/mapper_engine.lua`, `Mixing/Fancy_Mapper Settings.lua`, `Mixing/Fancy_Mapper Smooth CC.lua`)**:
+  - **Zero Background Overhead (100% Synchronous)**: Dial movements run instantly with zero background defer tasks, completely eliminating REAPER's "ReaScript task control" prompt when turning the rotary encoder rapidly.
+  - **CC Lane Linearization (`shape = 1`)**: Sets MIDI CC curves to Linear ramps instead of REAPER's default Square hold steps, connecting recorded points with smooth vector lines and enabling continuous audio-rate interpolation during playback.
+  - **Active MIDI Editor Integration**: Automatically sets REAPER's active MIDI Editor default CC curve shape to Linear via Action 42087.
+  - **1-Click Smoothing Tool (`Fancy_Mapper Smooth CC.lua`)**: Standalone action and dedicated button in Settings hub ("Smooth Active Take CC Lane") to instantly convert any existing take's stepped CC events into smooth linear curves.
+  - **Selection-Aware Smoothing**: If CC events are selected, only selected points are smoothed; if none are selected, the entire take's CC lane is linearized.
+  - **Smart Take Resolution**: Intelligently locates target takes from active MIDI editors, items under cursor, selected items, or items on the armed track.
+
+- **Fancy Mapper Suite v5.1.0 (`Mixing/Fancy_Mapper *.lua`, `_lib/mapper_engine.lua`)** — Expanded Mode Suite & Shared Core Engine:
+  - **Shared Core Engine (`_lib/mapper_engine.lua`)**: Replaced 500+ lines of duplicate code between `Fancy_Mapper Up.lua` and `Fancy_Mapper Down.lua` with a unified engine handling configuration, throttling, mode detection, context targeting (including focused FX detection), undo management, and contextual resets.
+  - **Width Mode**: Nudges stereo width of track under cursor, focused FX track, or selected track. Automatically promotes track pan mode to Stereo Pan (`I_PANMODE = 5`) if track was in default or balance mode, and repaints TCP/MCP windows immediately so width knobs are visible and active.
+  - **Live Multi-CC Mode**: Sends real-time MIDI signals via REAPER's Virtual MIDI Keyboard queue (`StuffMIDIMessage`) and Control Path simultaneously, allowing live real-time control of virtual instruments (e.g. CC 1 Modulation + CC 11 Expression for orchestral libraries like Pocket Strings) while playing or recording. Automatically arms and monitors target tracks. Also supports nudging selected CC events in active MIDI takes.
+  - **Live Velocity Mode**: Dynamically manages live note velocity across sessions and updates `default_note_vel` in active MIDI editors for instant writing, with optional audition note preview. Also nudges selected note velocities in takes.
+  - **Real-Time HUD Tooltips**: Floating on-screen HUD near cursor shows real-time values for MIDI CC, Velocity, Width, Pan, and Volume as dials turn.
+  - **Track Navigation Mode**: Clockwise / counter-clockwise dial turns navigate up/down tracks in project, with automatic TCP scrolling.
+  - **Marker Jump Mode**: Dial jumps edit cursor to next / previous marker or region.
+  - **Transient Jump Mode**: Dial jumps edit cursor to next / previous transient in selected audio items.
+  - **Item Slip Mode**: Slips audio content inside item boundaries via take start offset (`D_STARTOFFS`), leaving item position and length intact.
+  - **Context-Aware Reset (`Fancy_Mapper Reset Parameter.lua`)**: Resets last-touched FX parameter (FX mode), centers pan (Pan mode), 0 dB (Volume mode), 100% stereo (Width mode), 96 velocity (Velocity mode), 0/64 CC (MIDI CC mode), and 0s offset (Item Slip mode).
+  - **Extended Sensitivity Up/Down**: Sensitivity scaling added for Volume, Width, MIDI CC, Velocity, and Item Slip.
+  - **Dynamic Action Ring (`Fancy_Mapper Cycle Mode.lua`)**: Radial ring mathematically adapts to any number of active modes (8 curated default modes or all 11 modes). Removed placeholder tags; cut Send mode.
+  - **Settings Hub Enhancements (`Fancy_Mapper Settings.lua`)**: Added dedicated configuration sections for Width, MIDI CC (with preset quick-buttons for Mod, Expr, Mod+Expr, Vol), Velocity, Navigation & Editing, Ring Presets, and multi-mode button action mapping.
+
+
+- **Fancy Mapper Cycle Mode v5.0.0 (`Mixing/Fancy_Mapper Cycle Mode.lua`)** — Radial Action Ring (Directional Gesture):
+  - **Directional Flick Selection**: Hands-free mode switching without clicking or holding buttons. Move your mouse outward in the direction of the mode to select it immediately.
+  - **Dwell Selection**: Resting the cursor in an active sector for 350ms (configurable) automatically confirms that mode.
+  - **Full Input Flexibility**: Left-clicking an active sector or tapping the shortcut button a second time also confirms instantly.
+  - **Clean Codebase**: Completely removed all legacy hold-and-release polling hacks, modifier state masks, and synthetic key detection loops.
+  - **Pixel-Accurate Cursor Centering**: Centered around the mouse cursor via `PointConvertNative`.
+  - **Center Dead Zone**: Moving into or clicking the center dead zone cancels with zero mode change and dynamic "Cancel" feedback.
+  - **8-Mode Radial Roster**: 4 active modes (Scrub, FX Parameter, Pan, Volume) and 4 placeholder slots (Send, Width, MIDI CC, Velocity) marked with `soon` badges.
+  - **Integrated Volume Mode**: Added Volume mode handling to `Fancy_Mapper Up.lua`, `Fancy_Mapper Down.lua`, and `Fancy_Mapper Settings.lua`.
+  - **Action Ring Configuration in Settings**: Exposed Directional Flick toggle & threshold distance, Dwell Hover toggle & duration, and Auto-Close inactivity timeout in `Fancy_Mapper Settings.lua`.
+
+- **Fancy Mapper v3.0.0 (`Mixing/Fancy_Mapper *.lua`)** — Settings Hub, Context Buttons, Scrub Mode:
+  - **Fancy Mapper Settings** (NEW): Centralized ReaImGui settings hub — configure calibration, modes, scrub behavior, sensitivity, button actions, toast appearance, and more. No more editing script files.
+  - **Mode-Aware Context Buttons** (NEW): Six assignable button scripts (`Button 1–6`) whose actions change based on the current dial mode. Configure any REAPER action per button × mode slot using REAPER's built-in Action List picker (`PromptForAction`). Enable/disable buttons individually.
+  - **Scrub Mode** (default): Silent timeline jog via `MoveEditCursor`/`SetEditCurPos`. Four scrub units — Free (smooth by time), Grid (SWS `BR_GetNextGridDivision`), Beat (action-based), Measure (action-based). Configurable speed and view scrolling.
+  - **FX Parameter Mode**: Migrated from deprecated `GetLastTouchedFX()` to modern `GetTouchedOrFocusedFX(0)`. Removed FX window focus gate — any touched parameter works regardless of window focus. Added item/take FX support.
+  - **Pan Mode**: Adjusts pan on track under mouse cursor with selected-track fallback. Configurable sensitivity.
+  - **Mode-Switch Toast**: Self-terminating ImGui overlay (configurable position, duration, enable/disable) replaces console output. Fades out gracefully, handles rapid presses via timestamp deduplication.
+  - **Controller-Agnostic Design**: Removed all Logitech MX Creative Console references. Works with any hardware dial, rotary encoder, or MIDI controller.
+  - **Settings-Driven Config**: All hardcoded values (ticks per rotation, throttle, step sizes, sensitivities) moved to ExtState, managed by the Settings app.
+  - **Calibration Absorbed**: Standalone Calibrate window removed; calibration integrated into Settings with header shortcut button.
+  - **Volume Scripts**: Now read step size and throttle from ExtState.
+
 - **Fancy Pitch Correct v2.4.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Production UX Modern Studio Dock Layout:
   - Unified Single Top Bar: Consolidated title, settings, info, close, take badge, musical key, scale, analyze, and reset onto a single high-efficiency row, maximizing vertical canvas real estate
   - Track Color Matching: Target take badge background dynamically retrieves and displays the active track's REAPER color via `GetTrackColor()` and `Theme.bgr_to_rgba()`, with automatic luminance contrast adjustment for text
