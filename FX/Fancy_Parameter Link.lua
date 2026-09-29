@@ -1,11 +1,8 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.4.0
+-- @version 5.4.1
 -- @changelog
---   + Added global Show Tooltips option in Settings
---   + Respect global tooltip visibility setting for Last Touched preview
---   + Bundled 1x and 2x Retina toolbar icons (toolbar_fancy_parameter_link.png)
---   + Active toolbar button state while script is running
+--   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
 --   Features: multi-track selector, auto group-scan for same plugin, full-mesh linking,
@@ -1821,7 +1818,7 @@ local function draw_main()
     _current_proj = cur_proj
   end
 
-  Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
+  Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_FirstUseEver())
 
   local vis, op = reaper.ImGui_Begin(ctx, "Fancy Parameter Link", true, reaper.ImGui_WindowFlags_NoCollapse())
   if vis then
@@ -2324,14 +2321,16 @@ local function draw_main()
       reaper.ImGui_EndTable(ctx)
     end
     reaper.ImGui_PopStyleColor(ctx, 2)
+
+    -- Modals rendering
+    draw_preset_modal()
+    draw_info_modal()
+    draw_settings_modal()
+
+    -- ReaImGui's Begin calls End itself when it returns false
+    reaper.ImGui_End(ctx)
   end
 
-  -- Modals rendering
-  draw_preset_modal()
-  draw_info_modal()
-  draw_settings_modal()
-
-  reaper.ImGui_End(ctx)
   Theme.pop_font(ctx, pushed_default)
   Theme.pop(ctx, nc, nv)
   return op

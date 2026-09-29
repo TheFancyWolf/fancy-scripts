@@ -291,6 +291,15 @@ All notable changes to Fancy Scripts will be documented here.
 - **Fancy Parameter Link v5.2.0** — Updated Track B name labels and Track B Live Values indicators to use the secondary accent color (`P.accent2` / `P.blue`), and transitioned all badges and toolbar buttons to first-class `P.*_l` high-contrast palette tokens
 
 ### Fixed
+- **Fancy Parameter Link v5.4.1 (`FX/Fancy_Parameter Link.lua`)** — ReaImGui window lifecycle correction:
+  - `reaper.ImGui_End(ctx)` and the preset, info, and settings modals now run only inside `if vis then`. Previously `ImGui_End` ran even when `ImGui_Begin` returned false (window in an inactive dock tab or fully clipped), causing a double End and a ReaImGui stack error.
+  - Corrects the v5.2.0 "guarantee `reaper.ImGui_End(ctx)` is called when `reaper.ImGui_Begin()` returns false" fix: that is the Dear ImGui C++ rule. ReaImGui's `Begin` and `BeginChild` already call `End`/`EndChild` themselves when they return false, so scripts must only call them when Begin returned true.
+- **Fancy Pitch Correct v2.4.1 (`Pitch/Fancy_Pitch Correct.lua`)** — ReaImGui window lifecycle correction:
+  - `reaper.ImGui_End(ctx)` and the settings and info modals now run only when `ImGui_Begin` returns true, fixing a double End and ReaImGui stack error when the window is in an inactive dock tab or fully clipped. The window padding and item spacing style vars are still popped every frame.
+- **Fancy Selected Track Meter v9.67.1 (`Metering/Fancy_Selected Track Meter.lua`)** — ReaImGui window lifecycle correction:
+  - The Track Meters, Recent Clips, and Meter Settings windows now call `reaper.ImGui_End(ctx)` only when their `ImGui_Begin` returns true, fixing a double End and ReaImGui stack error when a window is collapsed, fully clipped, or in an inactive dock tab.
+- **Fancy Pan Snap v1.7.1 (`Routing/Fancy_Pan Snap.lua`)** — ReaImGui window lifecycle correction:
+  - The HUD window and the floating cursor tooltip now call `reaper.ImGui_End(ctx)` (and, for the HUD, draw the info and settings modals) only when `ImGui_Begin` returns true, fixing a double End and ReaImGui stack error when the window is in an inactive dock tab or fully clipped.
 - **UI Legibility & WCAG Contrast Hardening**:
   - Added first-class `_l` palette tokens (70% lightened text) and updated `Theme.badge()` / `Theme.toggle_button()` defaults to eliminate low-contrast badge text (boosting contrast ratios from ~3.3:1 – 5.5:1 up to 6.5:1 – 8.1:1, passing WCAG AAA on toolbar action buttons and badges)
   - Fixed `OFFLINE` status badge in `Fancy_Parameter Link.lua` to automatically use `P.red_l` / high-contrast red instead of unlightened `P.red` (raising contrast from 3.3:1 to 7.5:1)

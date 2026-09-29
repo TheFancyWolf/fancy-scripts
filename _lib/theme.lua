@@ -1003,7 +1003,7 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local hs = icon_sz * 0.5
   local hover = reaper.ImGui_IsItemHovered(ctx)
   local base_col = opts.color or P.text_dim
-  local draw_col = hover and lighten(base_col, 0.25) or base_col
+  local draw_col = hover and (opts.hover_color or lighten(base_col, 0.25)) or base_col
   icon_fn(dl, cx, cy, hs, draw_col)
   if opts.tooltip and hover then
     Theme.tooltip(ctx, opts.tooltip)
@@ -1772,8 +1772,13 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
   return toggled_idx, is_now_selected, changed
 end
 
---- Centers the next ImGui window on the active window (or viewport if none is active).
---- Call immediately before ImGui_Begin or ImGui_BeginPopupModal.
+--- Centers the next ImGui window.
+---
+--- When `cond` is Cond_FirstUseEver (standard for main windows), it centers on the
+--- REAPER main viewport (screen workspace) on initial launch, and allows ReaImGui
+--- to remember window position, size, and docker state across script sessions.
+--- For modal popups (default: Cond_Appearing), it centers over the currently active
+--- parent window.
 ---
 --- When `h` is 0 or nil, the window width is locked to `w` via
 --- SetNextWindowSizeConstraints while height is left free to fit content.
@@ -1781,13 +1786,25 @@ end
 --- @param ctx  userdata      ImGui context
 --- @param w    number|nil    Window width in pixels (optional)
 --- @param h    number|nil    Window height in pixels (0 or nil = auto-fit height)
---- @param cond number|nil    ImGui condition flag (default: Cond_Appearing; use Cond_Once for main windows)
+--- @param cond number|nil    ImGui condition flag (default: Cond_Appearing; use Cond_FirstUseEver for main windows)
 function Theme.center_next_window(ctx, w, h, cond)
+  -- If Cond_Once was passed, map to Cond_FirstUseEver so Dear ImGui does not
+  -- override the user's saved position and docking state on every script launch.
+  if cond == reaper.ImGui_Cond_Once() then
+    cond = reaper.ImGui_Cond_FirstUseEver()
+  end
   cond = cond or reaper.ImGui_Cond_Appearing()
+
+  local is_first_use = (cond == reaper.ImGui_Cond_FirstUseEver())
   local cx, cy
   local ok_p, wx, wy = pcall(reaper.ImGui_GetWindowPos, ctx)
   local ok_s, ww, wh = pcall(reaper.ImGui_GetWindowSize, ctx)
-  if ok_p and ok_s and ww and wh and ww > 0 and wh > 0 then
+  -- In Dear ImGui, before any user window has begun, GetWindowPos/GetWindowSize query
+  -- the internal fallback window "Debug##Default" (pos 60,112, size 400x400).
+  -- A real parent window will never be this dummy fallback.
+  local is_dummy = (wx == 60 and wy == 112 and ww == 400 and wh == 400)
+
+  if not is_first_use and not is_dummy and ok_p and ok_s and ww and wh and ww > 0 and wh > 0 then
     cx = wx + ww * 0.5
     cy = wy + wh * 0.5
   else

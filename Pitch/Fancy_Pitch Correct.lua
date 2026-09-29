@@ -1,21 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.4.0
+-- @version 2.4.1
 -- @changelog
---   + Production UX: Streamlined Modern Studio Dock layout maximizing vertical and horizontal piano roll canvas
---   + Integrated Theme.header with custom title bar, branding, and responsive window controls
---   + Pitched Items Panel: Renamed from Session Takes with collapsible flyout drawer and live count indicator
---   + Bottom Contextual Inspector: Clean note pitch badges, scale indicator, drift/vibrato/transition status, and quick action bar
---   + Audio Engine & Settings Modal: Dedicated modal for vocal range, detection strictness, quality, REAPER pitch shift algorithm, and advanced DSP parameters
---   + Keyboard Shortcuts & Help Modal: Accessible via header info button
---   + Layers Popover: Consolidated display toggles into a clean dropdown
---   + High-Fidelity Note Blending: S-curve smoothstep transitions (35ms default) across all note boundaries, eliminating 1ms cliff artifacts and vocoder chirps
---   + True Stability Drift Correction: Continuous pitch drift tracking sampled with sub-cent RDP decimation into REAPER Take Pitch Envelope
---   + Natural Vibrato Modeling: Zero-phase Gaussian filter separates slow drift from vibrato; hysteresis gate and smooth envelope follower prevent chattering
---   + Robust Energy-Weighted Pitch Center: Excludes onset scoops and release sag to calculate true stable pitch center
---   + UI / Audio Parity: Green preview line and take envelope points generated from identical continuous trajectory
---   + Transition Readout: Displays transition duration in active note status readout
---   + Multi-Note Selection & Batch Operations (Milestone 4)
+--   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -163,6 +150,15 @@ local INITIAL_PITCHMODE_NAME = PITCHMODE_FLAT[DEFAULT_PITCH_MODE_IDX] and PITCHM
 -------------------------------------------------------------------------------
 -- 1. STATE & SETTINGS
 -------------------------------------------------------------------------------
+
+-- Global cascade defaults (project-wide, persisted in ExtState)
+local global_defaults = {
+  retune_speed = 1.0,        -- 0.0–1.0 (correction strength)
+  transition_ms = 35,        -- 5–60ms (smoothstep crossfade)
+  onset_ramp_ms = 35,        -- 5–60ms (silence → correction fade-in)
+  legato_threshold_ms = 120, -- 50–300ms (gap below = legato blend)
+}
+
 local state = {
   is_analyzing = false,
   progress = 0,
@@ -202,6 +198,8 @@ local state = {
   drag = nil,           -- { note_idx, anchor_idx, zone, start_mouse_y, original_value, orig_values, dirty }
   edge_drag = nil,      -- { note_idx, edge, start_mouse_x, original_time, dirty }
   marquee = nil,        -- { start_x, start_y, cur_x, cur_y, active, has_shift, init_sel }
+  shift_mode = false,   -- true when Shift held before click (zone remap)
+  context_menu_note = nil, -- index of note for right-click context menu
 
   -- Visualization toggles
   show_note_blocks = true,
@@ -229,6 +227,39 @@ local state = {
   scale_pc_set = {}  -- pitch class lookup set [0..11] = true/false
 }
 
+--- Resolve an effective value through the Global → Item → Note cascade.
+--- For per-note cascadable keys: retune_speed, transition_ms, onset_ramp_ms.
+--- For per-item only keys: legato_threshold_ms.
+local function get_effective(note, key)
+  -- 1. Per-note override (not applicable for legato_threshold_ms)
+  if key ~= "legato_threshold_ms" then
+    if note and note.controls and note.controls[key] ~= nil then
+      return note.controls[key]
+    end
+  end
+  -- 2. Per-item override
+  if state.target_take_guid then
+    local take_data = state.session_takes[state.target_take_guid]
+    if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
+      return take_data.overrides[key]
+    end
+  end
+  -- 3. Global default
+  return global_defaults[key]
+end
+
+--- Returns the override level for display: "note", "item", or "global"
+local function get_override_level(note, key)
+  if key ~= "legato_threshold_ms" then
+    if note and note.controls and note.controls[key] ~= nil then return "note" end
+  end
+  if state.target_take_guid then
+    local take_data = state.session_takes[state.target_take_guid]
+    if take_data and take_data.overrides and take_data.overrides[key] ~= nil then return "item" end
+  end
+  return "global"
+end
+
 local function update_scale_pitch_classes()
   local scale = SCALE_DEFINITIONS[state.scale_idx]
   local root_pc = (state.key_idx - 1) % 12
@@ -247,7 +278,14 @@ local function is_pitch_in_scale(pitch_class)
   return state.scale_pc_set[pc] == true
 end
 
--- Initialize key, scale, and sidebar preferences from ExtState
+local function save_global_defaults()
+  reaper.SetExtState("FancyScripts", "pitch_retune_speed", tostring(global_defaults.retune_speed), true)
+  reaper.SetExtState("FancyScripts", "pitch_transition_ms", tostring(global_defaults.transition_ms), true)
+  reaper.SetExtState("FancyScripts", "pitch_onset_ramp_ms", tostring(global_defaults.onset_ramp_ms), true)
+  reaper.SetExtState("FancyScripts", "pitch_legato_thresh_ms", tostring(global_defaults.legato_threshold_ms), true)
+end
+
+-- Initialize key, scale, sidebar, and global defaults from ExtState
 do
   local saved_key = tonumber(reaper.GetExtState("FancyScripts", "pitch_key_idx"))
   local saved_scale = tonumber(reaper.GetExtState("FancyScripts", "pitch_scale_idx"))
@@ -264,6 +302,24 @@ do
     state.sidebar_open = false
   else
     state.sidebar_open = true
+  end
+
+  -- Restore global cascade defaults
+  local saved_retune = tonumber(reaper.GetExtState("FancyScripts", "pitch_retune_speed"))
+  if saved_retune and saved_retune >= 0 and saved_retune <= 1 then
+    global_defaults.retune_speed = saved_retune
+  end
+  local saved_trans = tonumber(reaper.GetExtState("FancyScripts", "pitch_transition_ms"))
+  if saved_trans and saved_trans >= 5 and saved_trans <= 60 then
+    global_defaults.transition_ms = saved_trans
+  end
+  local saved_ramp = tonumber(reaper.GetExtState("FancyScripts", "pitch_onset_ramp_ms"))
+  if saved_ramp and saved_ramp >= 5 and saved_ramp <= 60 then
+    global_defaults.onset_ramp_ms = saved_ramp
+  end
+  local saved_legato = tonumber(reaper.GetExtState("FancyScripts", "pitch_legato_thresh_ms"))
+  if saved_legato and saved_legato >= 50 and saved_legato <= 300 then
+    global_defaults.legato_threshold_ms = saved_legato
   end
 end
 
@@ -862,11 +918,16 @@ local function extract_note_features(note, preserve_controls)
   note.vibrato_weight = compute_vibrato_weights(mod, frame_dur, total_dur)
 
   -- Default controls: NO correction (green preview = raw pitch)
+  -- Cascade fields default to nil (inherit from item → global)
   note.controls = {
     center_pitch = note.avg_note,
     drift_scale = 1.0,
     vibrato_scale = 1.0,
-    transition_ms = 35
+    transition_ms = nil,       -- per-note override (nil = inherit)
+    onset_ramp_ms = nil,       -- per-note override (nil = inherit)
+    retune_speed = nil,        -- per-note override (nil = inherit)
+    scoop_shape = nil,         -- 0.0 (natural) to 1.0 (corrected), nil = 0
+    bypassed = false,          -- per-note bypass toggle
   }
 
   -- Restore user tuning offsets when splitting/merging notes
@@ -899,9 +960,13 @@ end
 local function is_note_modified(note)
   if not note or not note.controls then return false end
   local ctrl = note.controls
+  if ctrl.bypassed then return true end
   local pitch_changed = math.abs(ctrl.center_pitch - note.avg_note) > 0.001
   local fine_changed = (ctrl.drift_scale ~= 1.0) or (ctrl.vibrato_scale ~= 1.0)
-  return pitch_changed or fine_changed
+  local has_overrides = (ctrl.retune_speed ~= nil) or (ctrl.onset_ramp_ms ~= nil)
+    or (ctrl.scoop_shape ~= nil and ctrl.scoop_shape > 0)
+    or (ctrl.transition_ms ~= nil)
+  return pitch_changed or fine_changed or has_overrides
 end
 
 -- Forward declaration; will be set after apply_envelope_to_take is defined
@@ -928,7 +993,8 @@ local function save_take_data(take, data)
     results = data.results,
     notes = {},
     key_idx = data.key_idx or state.key_idx,
-    scale_idx = data.scale_idx or state.scale_idx
+    scale_idx = data.scale_idx or state.scale_idx,
+    overrides = data.overrides or nil
   }
   if data.notes then
     for _, note in ipairs(data.notes) do
@@ -969,7 +1035,14 @@ local function load_take_data(take)
   if success and data and data.results and data.notes then
     for _, note in ipairs(data.notes) do
       note.count = #note.frames
+      -- Preserve all saved controls (including cascade override fields) across re-extraction
+      local saved_controls = note.controls
       extract_note_features(note)
+      if saved_controls then
+        for k, v in pairs(saved_controls) do
+          note.controls[k] = v
+        end
+      end
     end
     return data
   end
@@ -1143,19 +1216,43 @@ local function apply_envelope_to_take(undo_desc)
   -- 1. Precalculate continuous frame shifts for every note
   for _, n in ipairs(state.notes) do
     n.frame_shifts = {}
-    local is_mod = is_note_modified(n)
-    local coarse = is_mod and (n.controls.center_pitch - n.avg_note) or 0.0
-    local d_scale = (n.controls and n.controls.drift_scale) or 1.0
-    local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
-    if n.frames then
-      for i = 1, #n.frames do
-        if not is_mod then
+    -- Per-note bypass: zero out all shifts
+    if n.controls and n.controls.bypassed then
+      if n.frames then
+        for i = 1, #n.frames do
           n.frame_shifts[i] = 0.0
-        else
-          local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
-          local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
-          local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
-          n.frame_shifts[i] = coarse + drift_corr + vib_corr
+        end
+      end
+    else
+      local is_mod = is_note_modified(n)
+      local retune = get_effective(n, "retune_speed")
+      local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
+      local d_scale = (n.controls and n.controls.drift_scale) or 1.0
+      local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
+      if n.frames then
+        for i = 1, #n.frames do
+          if not is_mod then
+            n.frame_shifts[i] = 0.0
+          else
+            local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
+            local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
+            local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
+            n.frame_shifts[i] = coarse + drift_corr + vib_corr
+          end
+        end
+
+        -- Scoop/glide shaping: blend onset frames toward body target
+        local scoop = (n.controls and n.controls.scoop_shape) or 0
+        if scoop > 0 and is_mod and n.voiced_start_idx then
+          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
+          if onset_end > 1 and onset_end < #n.frames then
+            local body_shift = n.frame_shifts[math.min(onset_end + 1, #n.frames)]
+            for i = 1, onset_end do
+              local onset_u = i / onset_end  -- 0→1 across onset
+              local natural = n.frame_shifts[i]
+              n.frame_shifts[i] = natural + (body_shift - natural) * scoop * (1 - onset_u)
+            end
+          end
         end
       end
     end
@@ -1164,11 +1261,17 @@ local function apply_envelope_to_take(undo_desc)
   -- 2. Build continuous trajectory across notes and boundaries
   local all_points = {}
   local num_notes = #state.notes
+  local legato_thresh = get_effective(nil, "legato_threshold_ms") * 0.001
 
   for idx = 1, num_notes do
     local n = state.notes[idx]
     local prev_n = state.notes[idx - 1]
     local next_n = state.notes[idx + 1]
+
+    -- Bypassed notes produce zero shifts — skip trajectory generation
+    if n.controls and n.controls.bypassed then
+      goto continue_note
+    end
 
     local is_mod = is_note_modified(n)
     local prev_mod = is_note_modified(prev_n)
@@ -1182,7 +1285,7 @@ local function apply_envelope_to_take(undo_desc)
     local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
     local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
 
-    local trans_dur = math.min(((n.controls and n.controls.transition_ms) or 35) * 0.001, 0.060)
+    local trans_dur = math.min(get_effective(n, "transition_ms") * 0.001, 0.060)
     trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
 
     local is_legato_prev = false
@@ -1190,7 +1293,7 @@ local function apply_envelope_to_take(undo_desc)
 
     -- A. START TRANSITION
     local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
-    if prev_gap < 0.12 and prev_n then
+    if prev_gap < legato_thresh and prev_n then
       is_legato_prev = true
       -- Legato transition with previous note: smoothstep blend centered at boundary
       local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
@@ -1208,7 +1311,8 @@ local function apply_envelope_to_take(undo_desc)
     else
       -- Onset from silence / start of take: smooth ramp into pitch shift
       if is_mod and math.abs(start_shift) > 0.001 then
-        local ramp_t = math.min(0.035, (n.end_time - n.start_time) * 0.25)
+        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
+        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
         local t_pre = math.max(0.0, n.start_time - ramp_t)
         table.insert(all_points, { time = t_pre, val = 0.0 })
         local steps = 4
@@ -1246,9 +1350,10 @@ local function apply_envelope_to_take(undo_desc)
 
     -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
     local next_gap = next_n and (next_n.start_time - n.end_time) or 999
-    if next_gap >= 0.12 then
+    if next_gap >= legato_thresh then
       if is_mod and math.abs(end_shift) > 0.001 then
-        local ramp_t = math.min(0.035, (n.end_time - n.start_time) * 0.25)
+        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
+        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
         local steps = 4
         for s = 1, steps do
           local u = s / steps
@@ -1265,12 +1370,13 @@ local function apply_envelope_to_take(undo_desc)
 
     -- Store onset debug info
     n.onset_debug = {
-      onset_ramp_ms = trans_dur * 1000,
+      onset_ramp_ms = get_effective(n, "onset_ramp_ms"),
       scoop_st = n.scoop_magnitude or 0,
       voicing_delay_ms = 0,
       is_legato_prev = is_legato_prev,
       is_legato_next = is_legato_next
     }
+
 
     ::continue_note::
   end
@@ -1378,6 +1484,11 @@ reset_selected_note = function()
       sel.controls.center_pitch = sel.avg_note
       sel.controls.drift_scale = 1.0
       sel.controls.vibrato_scale = 1.0
+      sel.controls.transition_ms = nil
+      sel.controls.onset_ramp_ms = nil
+      sel.controls.retune_speed = nil
+      sel.controls.scoop_shape = nil
+      sel.controls.bypassed = false
       any_changed = true
     end
   end
@@ -1468,7 +1579,11 @@ split_note_at = function(note_idx, split_time)
     center_pitch = avg_a + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or 35,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
+    onset_ramp_ms = old_ctrl and old_ctrl.onset_ramp_ms or nil,
+    retune_speed = old_ctrl and old_ctrl.retune_speed or nil,
+    scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
+    bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
 
   -- Build note B (right half)
@@ -1488,7 +1603,11 @@ split_note_at = function(note_idx, split_time)
     center_pitch = avg_b + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or 35,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
+    onset_ramp_ms = old_ctrl and old_ctrl.onset_ramp_ms or nil,
+    retune_speed = old_ctrl and old_ctrl.retune_speed or nil,
+    scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
+    bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
 
   -- Splice into notes array
@@ -1606,7 +1725,11 @@ merge_selected_notes = function()
     center_pitch = total_dur > 0 and (weighted_pitch / total_dur) or avg_note,
     drift_scale = total_dur > 0 and (weighted_drift / total_dur) or 1.0,
     vibrato_scale = total_dur > 0 and (weighted_vibrato / total_dur) or 1.0,
-    transition_ms = first_note.controls and first_note.controls.transition_ms or 35,
+    transition_ms = first_note.controls and first_note.controls.transition_ms or nil,
+    onset_ramp_ms = first_note.controls and first_note.controls.onset_ramp_ms or nil,
+    retune_speed = first_note.controls and first_note.controls.retune_speed or nil,
+    scoop_shape = first_note.controls and first_note.controls.scoop_shape or nil,
+    bypassed = false,
   })
 
   -- Replace in array: put merged note at first index, remove the rest
@@ -1702,7 +1825,11 @@ trim_note_edge = function(note_idx, edge, new_time)
     center_pitch = avg_note + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or 35,
+    transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
+    onset_ramp_ms = old_ctrl and old_ctrl.onset_ramp_ms or nil,
+    retune_speed = old_ctrl and old_ctrl.retune_speed or nil,
+    scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
+    bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
 
   apply_envelope_to_take()
@@ -2098,6 +2225,7 @@ local function draw_graph(draw_ctx, w, h)
       }
     elseif state.hovered_note then
       -- Note click → update selection and prepare pitch / drift (stability) / vibrato drag
+      local pending_single_select = nil
       if has_shift and state.selected_note then
         -- Shift+Click: range select from primary anchor to clicked note
         local lo = math.min(state.selected_note, state.hovered_note)
@@ -2120,7 +2248,6 @@ local function draw_graph(draw_ctx, w, h)
         end
       else
         -- Normal click
-        local pending_single_select = nil
         if state.selected_notes[state.hovered_note] then
           local cur_count = 0
           for _ in pairs(state.selected_notes) do cur_count = cur_count + 1 end
@@ -2135,11 +2262,23 @@ local function draw_graph(draw_ctx, w, h)
           state.selected_note = state.hovered_note
           state.selected_notes = { [state.hovered_note] = true }
         end
+      end
 
-        local orig_values = {}
-        for idx in pairs(state.selected_notes) do
-          local n = state.notes[idx]
-          if n and n.controls then
+      state.shift_mode = has_shift and (state.hovered_note ~= nil)
+
+      local orig_values = {}
+      for idx in pairs(state.selected_notes) do
+        local n = state.notes[idx]
+        if n and n.controls then
+          if state.shift_mode then
+            if state.hovered_zone == "drift" then
+              orig_values[idx] = n.controls.onset_ramp_ms or get_effective(n, "onset_ramp_ms")
+            elseif state.hovered_zone == "pitch" then
+              orig_values[idx] = n.controls.transition_ms or get_effective(n, "transition_ms")
+            else
+              orig_values[idx] = n.controls.scoop_shape or 0
+            end
+          else
             if state.hovered_zone == "pitch" then
               orig_values[idx] = n.controls.center_pitch
             elseif state.hovered_zone == "drift" then
@@ -2149,18 +2288,18 @@ local function draw_graph(draw_ctx, w, h)
             end
           end
         end
-
-        state.drag = {
-          note_idx = state.hovered_note,
-          anchor_idx = state.hovered_note,
-          zone = state.hovered_zone,
-          start_mouse_y = my,
-          original_value = orig_values[state.hovered_note] or 0,
-          orig_values = orig_values,
-          pending_single_select = pending_single_select,
-          dirty = false
-        }
       end
+
+      state.drag = {
+        note_idx = state.hovered_note,
+        anchor_idx = state.hovered_note,
+        zone = state.hovered_zone,
+        start_mouse_y = my,
+        original_value = orig_values[state.hovered_note] or 0,
+        orig_values = orig_values,
+        pending_single_select = pending_single_select,
+        dirty = false
+      }
     else
       -- Click on empty canvas: initiate marquee drag tracking
       local init_sel = {}
@@ -2179,6 +2318,16 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- Right-click on note: open context menu
+  if is_canvas_hovered and reaper.ImGui_IsMouseClicked(draw_ctx, 1) then
+    if state.hovered_note and state.notes[state.hovered_note] then
+      state.selected_note = state.hovered_note
+      state.selected_notes = { [state.hovered_note] = true }
+      state.context_menu_note = state.hovered_note
+      reaper.ImGui_OpenPopup(draw_ctx, "##note_context_menu")
+    end
+  end
+
   -- Process active drag (Single-note or Multi-note batch drag: Pitch, Stability, Vibrato)
   if state.drag then
     local delta_y = state.drag.start_mouse_y - my -- up = positive
@@ -2187,47 +2336,76 @@ local function draw_graph(draw_ctx, w, h)
       state.drag.dirty = true
       state.drag.pending_single_select = nil -- drag occurred, cancel single-select collapse
 
-      if state.drag.zone == "pitch" then
-        local delta_st = delta_y / px_per_st
-        local effective_delta = delta_st
-
-        -- Shift modifier = snap anchor note to semitones, preserving phrase musical intervals
-        local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
-        if shift_mod > 0 then
-          local ok, mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-          if ok and mods and (mods & shift_mod) ~= 0 then
-            local anchor_orig = state.drag.orig_values[state.drag.anchor_idx]
-            if anchor_orig then
-              local target_pitch = math.floor(anchor_orig + delta_st + 0.5)
-              effective_delta = target_pitch - anchor_orig
-            else
-              effective_delta = math.floor(delta_st + 0.5)
+      if state.shift_mode then
+        if state.drag.zone == "pitch" then
+          local delta = delta_y * 0.5
+          for idx, orig_val in pairs(state.drag.orig_values) do
+            local n = state.notes[idx]
+            if n and n.controls then
+              n.controls.transition_ms = math.max(5, math.min(60, orig_val + delta))
+            end
+          end
+        elseif state.drag.zone == "drift" then
+          local delta = delta_y * 0.5
+          for idx, orig_val in pairs(state.drag.orig_values) do
+            local n = state.notes[idx]
+            if n and n.controls then
+              n.controls.onset_ramp_ms = math.max(5, math.min(60, orig_val + delta))
+            end
+          end
+        elseif state.drag.zone == "vibrato" then
+          local delta = delta_y / (px_per_st * 2)
+          for idx, orig_val in pairs(state.drag.orig_values) do
+            local n = state.notes[idx]
+            if n and n.controls then
+              n.controls.scoop_shape = math.max(0, math.min(1, orig_val + delta))
             end
           end
         end
+      else
+        if state.drag.zone == "pitch" then
+          local delta_st = delta_y / px_per_st
+          local effective_delta = delta_st
 
-        for idx, orig_val in pairs(state.drag.orig_values) do
-          local n = state.notes[idx]
-          if n and n.controls then
-            n.controls.center_pitch = orig_val + effective_delta
+          -- Cmd/Ctrl modifier = snap anchor note to semitones, preserving phrase musical intervals
+          local ctrl_mod = reaper.ImGui_Mod_Ctrl and reaper.ImGui_Mod_Ctrl() or 0
+          local super_mod = reaper.ImGui_Mod_Super and reaper.ImGui_Mod_Super() or 0
+          if ctrl_mod > 0 or super_mod > 0 then
+            local ok, mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+            if ok and mods and ((mods & ctrl_mod) ~= 0 or (mods & super_mod) ~= 0) then
+              local anchor_orig = state.drag.orig_values[state.drag.anchor_idx]
+              if anchor_orig then
+                local target_pitch = math.floor(anchor_orig + delta_st + 0.5)
+                effective_delta = target_pitch - anchor_orig
+              else
+                effective_delta = math.floor(delta_st + 0.5)
+              end
+            end
           end
-        end
-      elseif state.drag.zone == "drift" then
-        -- Stability drag: up = more stable = less drift = lower drift_scale
-        local delta = delta_y / (px_per_st * 2)
-        for idx, orig_val in pairs(state.drag.orig_values) do
-          local n = state.notes[idx]
-          if n and n.controls then
-            n.controls.drift_scale = math.max(0, math.min(1, orig_val - delta))
+
+          for idx, orig_val in pairs(state.drag.orig_values) do
+            local n = state.notes[idx]
+            if n and n.controls then
+              n.controls.center_pitch = orig_val + effective_delta
+            end
           end
-        end
-      elseif state.drag.zone == "vibrato" then
-        -- Vibrato scale drag
-        local delta = delta_y / px_per_st
-        for idx, orig_val in pairs(state.drag.orig_values) do
-          local n = state.notes[idx]
-          if n and n.controls then
-            n.controls.vibrato_scale = math.max(0, math.min(2, orig_val + delta))
+        elseif state.drag.zone == "drift" then
+          -- Stability drag: up = more stable = less drift = lower drift_scale
+          local delta = delta_y / (px_per_st * 2)
+          for idx, orig_val in pairs(state.drag.orig_values) do
+            local n = state.notes[idx]
+            if n and n.controls then
+              n.controls.drift_scale = math.max(0, math.min(1, orig_val - delta))
+            end
+          end
+        elseif state.drag.zone == "vibrato" then
+          -- Vibrato scale drag
+          local delta = delta_y / px_per_st
+          for idx, orig_val in pairs(state.drag.orig_values) do
+            local n = state.notes[idx]
+            if n and n.controls then
+              n.controls.vibrato_scale = math.max(0, math.min(2, orig_val + delta))
+            end
           end
         end
       end
@@ -2248,6 +2426,7 @@ local function draw_graph(draw_ctx, w, h)
         state.selected_notes = { [state.drag.pending_single_select] = true }
       end
       state.drag = nil
+      state.shift_mode = false
     end
   end
 
@@ -2654,9 +2833,13 @@ local function draw_graph(draw_ctx, w, h)
         local is_hov = (state.hovered_note == n_idx)
         local is_mod = is_note_modified(note)
 
+        local is_bypassed_note = note.controls.bypassed or false
         local fill
         local border
-        if is_selected then
+        if is_bypassed_note then
+          fill = 0x2A2A2A55
+          border = 0x555555AA
+        elseif is_selected then
           fill = is_mod and 0x3FA34D99 or 0x4477AA88
           border = P.accent
         elseif is_mod then
@@ -2669,9 +2852,13 @@ local function draw_graph(draw_ctx, w, h)
 
         -- Zone-colored hover highlights
         if is_hov and not state.drag then
+          local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
+          local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+          local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
+
           if state.hovered_zone == "drift" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, sx + zone_w, bot_y, 0x4DA6FF44)
+              sx, top_y, sx + zone_w, bot_y, has_shift and 0xFFAA4444 or 0x4DA6FF44)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
           elseif state.hovered_zone == "vibrato" then
@@ -2682,6 +2869,18 @@ local function draw_graph(draw_ctx, w, h)
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex, bot_y, fill)
+            if has_shift then
+              reaper.ImGui_DrawList_AddRectFilled(draw_list,
+                sx + zone_w, top_y, ex - zone_w, bot_y, 0xFFAA4444)
+            end
+          end
+
+          if has_shift and block_w > 40 then
+            local label_col = 0xFFAA44FF
+            local text_y = top_y + (bot_y - top_y) * 0.5 - 6
+            reaper.ImGui_DrawList_AddText(draw_list, sx + 2, text_y, label_col, "Ramp")
+            reaper.ImGui_DrawList_AddText(draw_list, sx + zone_w + 2, text_y, label_col, "Trans")
+            reaper.ImGui_DrawList_AddText(draw_list, ex - zone_w + 2, text_y, label_col, "Scoop")
           end
         else
           reaper.ImGui_DrawList_AddRectFilled(draw_list,
@@ -2691,6 +2890,11 @@ local function draw_graph(draw_ctx, w, h)
         -- Border (thicker for selected notes)
         reaper.ImGui_DrawList_AddRect(draw_list,
           sx, top_y, ex, bot_y, border, 0, 0, is_selected and 2.0 or 1.0)
+
+        if is_bypassed_note then
+          local mid_y = top_y + (bot_y - top_y) * 0.5
+          reaper.ImGui_DrawList_AddLine(draw_list, sx, mid_y, ex, mid_y, border, 1.5)
+        end
 
         -- Zone divider lines on hover/select
         if is_hov or is_selected then
@@ -2836,10 +3040,12 @@ local function draw_graph(draw_ctx, w, h)
         end
       end
 
-      -- Corrected pitch preview line (green) — rendered for modified notes
-      if state.show_preview and is_note_modified(note) and note.controls and note.trend and note.modulation then
+      -- Corrected pitch preview line (green) — rendered for modified notes (not bypassed)
+      if state.show_preview and is_note_modified(note) and not (note.controls.bypassed)
+          and note.controls and note.trend and note.modulation then
         local ctrl = note.controls
-        local coarse_shift = ctrl.center_pitch - note.avg_note
+        local retune = get_effective(note, "retune_speed")
+        local coarse_shift = (ctrl.center_pitch - note.avg_note) * retune
         local cp_poly = reaper.new_array(#note.frames * 2)
         local cp_idx = 1
         for i, frame in ipairs(note.frames) do
@@ -2916,14 +3122,29 @@ local function draw_graph(draw_ctx, w, h)
     local h_note = state.notes[state.hovered_note]
     if h_note and h_note.controls then
       local tip
-      if state.hovered_zone == "drift" then
-        tip = string.format("Stability: %.0f%%",
-          (1 - h_note.controls.drift_scale) * 100)
-      elseif state.hovered_zone == "vibrato" then
-        tip = string.format("Vibrato: %.0f%%",
-          h_note.controls.vibrato_scale * 100)
+      local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
+      local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+      local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
+
+      if has_shift then
+        if state.hovered_zone == "drift" then
+          local v = h_note.controls.onset_ramp_ms or get_effective(h_note, "onset_ramp_ms")
+          tip = string.format("Onset Ramp: %.0fms (Shift+Drag)", v)
+        elseif state.hovered_zone == "vibrato" then
+          local v = h_note.controls.scoop_shape or 0
+          tip = string.format("Scoop: %.0f%% corrected (Shift+Drag)", v * 100)
+        else
+          local v = h_note.controls.transition_ms or get_effective(h_note, "transition_ms")
+          tip = string.format("Transition: %.0fms (Shift+Drag)", v)
+        end
       else
-        tip = "Drag to retune (Shift=snap)"
+        if state.hovered_zone == "drift" then
+          tip = string.format("Stability: %.0f%%", (1 - h_note.controls.drift_scale) * 100)
+        elseif state.hovered_zone == "vibrato" then
+          tip = string.format("Vibrato: %.0f%%", h_note.controls.vibrato_scale * 100)
+        else
+          tip = "Drag to retune (Cmd/Ctrl=snap)"
+        end
       end
       reaper.ImGui_DrawList_AddText(draw_list, mx + 15, my - 10,
         0xFFFFFFBB, tip)
@@ -2976,6 +3197,87 @@ local function draw_graph(draw_ctx, w, h)
 
     reaper.ImGui_DrawList_AddText(draw_list, cx - tw * 0.5, by1 + 10, P.red_l, txt_main)
     reaper.ImGui_DrawList_AddText(draw_list, cx - stw * 0.5, by1 + 14 + th, P.text_dim, sub_txt)
+  end
+
+  -- Note Context Menu (Phase 4)
+  if reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu") then
+    local note_idx = state.context_menu_note
+    local note = state.notes[note_idx]
+    if note and note.controls then
+      local ctrl = note.controls
+      local cp = ctrl.center_pitch
+      local nearest = math.floor(cp + 0.5)
+      local cents = math.floor((cp - nearest) * 100 + 0.5)
+      local sign = cents >= 0 and "+" or ""
+      local note_name = midi_to_name(nearest)
+      local in_scale = is_pitch_in_scale(nearest)
+      local scale_str = in_scale and "(In Scale)" or "(Out of Scale)"
+      local header = string.format("%s %s%d\xC2\xA2 %s", note_name, sign, cents, scale_str)
+
+      local pushed = Theme.push_font(draw_ctx, fonts.medium_bold)
+      reaper.ImGui_Text(draw_ctx, header)
+      Theme.pop_font(draw_ctx, pushed)
+
+      reaper.ImGui_Separator(draw_ctx)
+
+      local bp = ctrl.bypassed or false
+      local changed, new_bp = reaper.ImGui_Checkbox(draw_ctx, "Bypass This Note", bp)
+      if changed then
+        ctrl.bypassed = new_bp
+        apply_envelope_to_take("Toggle Note Bypass")
+      end
+
+      reaper.ImGui_Separator(draw_ctx)
+
+      reaper.ImGui_PushItemWidth(draw_ctx, 120)
+
+      local function draw_cm_slider(label, key, min_v, max_v, fmt, scale, default)
+         local level = get_override_level(note, key)
+         local cur_val = ctrl[key] or get_effective(note, key) or default or 0
+         if scale then cur_val = cur_val * scale end
+
+         local s_changed, new_val = reaper.ImGui_SliderDouble(draw_ctx, label .. "##cm_"..key, cur_val, min_v, max_v, fmt)
+         reaper.ImGui_SameLine(draw_ctx)
+         reaper.ImGui_TextDisabled(draw_ctx, "[" .. level .. "]")
+         if s_changed then
+            if scale then new_val = new_val / scale end
+            ctrl[key] = new_val
+         end
+         if reaper.ImGui_IsItemDeactivatedAfterEdit(draw_ctx) then
+            apply_envelope_to_take("Adjust " .. label)
+         end
+      end
+
+      draw_cm_slider("Onset Ramp", "onset_ramp_ms", 5, 60, "%.0f ms", nil)
+      draw_cm_slider("Scoop Shape", "scoop_shape", 0, 100, "%.0f%%", 100)
+      draw_cm_slider("Transition", "transition_ms", 5, 60, "%.0f ms", nil)
+      draw_cm_slider("Retune Speed", "retune_speed", 0, 100, "%.0f%%", 100)
+
+      reaper.ImGui_PopItemWidth(draw_ctx)
+      reaper.ImGui_Separator(draw_ctx)
+
+      if reaper.ImGui_MenuItem(draw_ctx, "Snap to Semitone", "S") then
+        snap_selected_note()
+      end
+      if reaper.ImGui_MenuItem(draw_ctx, "Quantize to Scale", "Q") then
+        quantize_selected_notes_to_scale()
+      end
+      if reaper.ImGui_MenuItem(draw_ctx, "Split at Cursor", "X") then
+        local _, item = get_target_take(false)
+        if item then
+          local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+          local cursor = reaper.GetCursorPosition() - item_pos
+          if cursor > note.start_time and cursor < note.end_time then
+            get_target_take(true)
+            split_note_at(note_idx, cursor)
+          end
+        end
+      end
+      if reaper.ImGui_MenuItem(draw_ctx, "Reset to Original", "R") then
+        reset_selected_note()
+      end
+    end
+    reaper.ImGui_EndPopup(draw_ctx)
   end
 
   reaper.ImGui_DrawList_PopClipRect(draw_list)
@@ -3178,6 +3480,13 @@ local function render_pitched_items_sidebar(sidebar_ctx)
 
   local to_remove = nil
   local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
+  local card_margin_x = 3
+  local card_pad_x = 8
+  local row_h = 28
+  local card_h = 24
+  local card_pad_y = math.floor((row_h - card_h) * 0.5)
+  local cb_sz = 14
+  local del_btn_sz = 16
 
   for _, guid in ipairs(state.session_order) do
     local data = state.session_takes[guid]
@@ -3191,20 +3500,44 @@ local function render_pitched_items_sidebar(sidebar_ctx)
       reaper.ImGui_PushID(sidebar_ctx, guid)
 
       local rx, ry = reaper.ImGui_GetCursorScreenPos(sidebar_ctx)
-      local row_h = reaper.ImGui_GetFrameHeight(sidebar_ctx) + 2
+      local start_x = reaper.ImGui_GetCursorPosX(sidebar_ctx)
+      local start_y = reaper.ImGui_GetCursorPosY(sidebar_ctx)
 
-      -- Full-width highlight bar encompassing all row buttons
+      -- 1. Full-width highlight bar (inset with card_margin_x so left/right border is never cut off)
+      local card_x1 = rx + card_margin_x
+      local card_y1 = ry + card_pad_y
+      local card_x2 = rx + avail_w - card_margin_x
+      local card_y2 = card_y1 + card_h
+
+      local dl = reaper.ImGui_GetWindowDrawList(sidebar_ctx)
+      local is_row_hovered = reaper.ImGui_IsMouseHoveringRect(sidebar_ctx, card_x1, card_y1, card_x2, card_y2)
       if is_active then
-        local dl = reaper.ImGui_GetWindowDrawList(sidebar_ctx)
-        reaper.ImGui_DrawList_AddRectFilled(dl, rx - 2, ry, rx + avail_w + 2, ry + row_h, Theme.with_alpha(P.accent, 0.22), 4.0)
-        reaper.ImGui_DrawList_AddRect(dl, rx - 2, ry, rx + avail_w + 2, ry + row_h, Theme.with_alpha(P.accent, 0.55), 4.0)
+        reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.accent, 0.22), 4.0)
+        reaper.ImGui_DrawList_AddRect(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.accent, 0.65), 4.0, 0, 1.0)
+      elseif is_row_hovered then
+        reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.card, 0.5), 4.0)
+        reaper.ImGui_DrawList_AddRect(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.border, 0.3), 4.0, 0, 1.0)
       end
 
-      -- Checkbox on the left: mirrors REAPER FX chain
-      Theme.align(sidebar_ctx)
+      -- Local window coordinates for internal widget placement
+      local card_local_x1 = start_x + card_margin_x
+      local card_local_x2 = start_x + avail_w - card_margin_x
+      local card_local_y1 = start_y + card_pad_y
+
+      -- 2. Checkbox on left: 14px, padded from card border so highlight is seen all around
+      local cb_pos_x = card_local_x1 + card_pad_x
+      local cb_pos_y = card_local_y1 + 4
+      reaper.ImGui_SetCursorPos(sidebar_ctx, cb_pos_x, cb_pos_y)
+
       local is_bp = is_take_pitch_bypassed(take_obj)
       local is_enabled = not is_bp
+
+      reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_FramePadding(), 1, 1)
+      local pfont = Theme.push_font(sidebar_ctx, fonts.small)
       local cb_changed, new_en = reaper.ImGui_Checkbox(sidebar_ctx, "##bp", is_enabled)
+      Theme.pop_font(sidebar_ctx, pfont)
+      reaper.ImGui_PopStyleVar(sidebar_ctx, 1)
+
       if cb_changed then
         toggle_take_pitch_bypass(take_obj)
       end
@@ -3212,16 +3545,29 @@ local function render_pitched_items_sidebar(sidebar_ctx)
         Theme.tooltip(sidebar_ctx, new_en and "Envelope Active — click to bypass take envelope" or "Envelope Bypassed — click to enable take envelope")
       end
 
-      reaper.ImGui_SameLine(sidebar_ctx, 0, L.xs)
+      -- 3. Delete button on right: horizontally and vertically centered in right slot
+      local del_pos_x = card_local_x2 - card_pad_x - del_btn_sz
+      local del_pos_y = card_local_y1 + 4
+      reaper.ImGui_SetCursorPos(sidebar_ctx, del_pos_x, del_pos_y)
+      if Theme.icon_btn(sidebar_ctx, "##del", Theme.icons.close, {
+        icon_size = 10,
+        w = del_btn_sz,
+        h = del_btn_sz,
+        color = P.text_dim,
+        hover_color = P.red,
+        tooltip = "Remove from session, clear envelope, and reset take"
+      }) then
+        to_remove = guid
+      end
 
-      -- Selectable take name in center
-      local del_btn_w = 20
-      local cur_x = reaper.ImGui_GetCursorPosX(sidebar_ctx)
-      local name_w = math.max(30, avail_w - cur_x - del_btn_w - L.xs)
+      -- 4. Selectable take name in center: spans between checkbox and delete button
+      local name_pos_x = cb_pos_x + cb_sz + 8
+      local name_pos_y = card_local_y1 + 2
+      local name_w = math.max(20, del_pos_x - 6 - name_pos_x)
+      reaper.ImGui_SetCursorPos(sidebar_ctx, name_pos_x, name_pos_y)
 
       local sel_flags = reaper.ImGui_SelectableFlags_AllowOverlap and reaper.ImGui_SelectableFlags_AllowOverlap() or 0
       local sel_text = data.name or "Item"
-      Theme.align(sidebar_ctx)
       local text_col = is_active and 0xFFFFFFFF or P.text
       reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Text(), text_col)
       if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "##sel", false, sel_flags, name_w, 0) then
@@ -3234,18 +3580,9 @@ local function render_pitched_items_sidebar(sidebar_ctx)
           data.name or "Item", data.notes and #data.notes or 0))
       end
 
-      -- Delete button on right
-      reaper.ImGui_SameLine(sidebar_ctx, 0, L.xs)
-      Theme.align(sidebar_ctx)
-      if Theme.icon_btn(sidebar_ctx, "##del", Theme.icons.close, {
-        size = 12,
-        pad = 3,
-        color = P.text_dim,
-        hover_color = P.red,
-        tooltip = "Remove from session, clear envelope, and reset take"
-      }) then
-        to_remove = guid
-      end
+      -- End row and advance cursor for next card
+      reaper.ImGui_SetCursorPos(sidebar_ctx, start_x, start_y + row_h)
+      reaper.ImGui_Dummy(sidebar_ctx, 0, 1)
 
       reaper.ImGui_PopID(sidebar_ctx)
     end
@@ -3512,219 +3849,159 @@ local function render_bottom_dock(dock_ctx)
     return
   end
 
+  local take_data = nil
+  if state.target_take_guid then
+    take_data = state.session_takes[state.target_take_guid]
+  end
+
+  local retune_eff = take_data and take_data.overrides and take_data.overrides["retune_speed"] or global_defaults["retune_speed"]
+  local trans_eff = take_data and take_data.overrides and take_data.overrides["transition_ms"] or global_defaults["transition_ms"]
+  local ramp_eff = take_data and take_data.overrides and take_data.overrides["onset_ramp_ms"] or global_defaults["onset_ramp_ms"]
+  local legato_eff = take_data and take_data.overrides and take_data.overrides["legato_threshold_ms"] or global_defaults["legato_threshold_ms"]
+
+  local function calc_badge_w(txt)
+    local w, _ = reaper.ImGui_CalcTextSize(dock_ctx, txt)
+    return w + L.sm * 2
+  end
+
   local sel_count = 0
   for _ in pairs(state.selected_notes) do sel_count = sel_count + 1 end
   if sel_count == 0 and state.selected_note and state.notes[state.selected_note] then
     sel_count = 1
   end
 
-  -- Left: Selection Status & Note Properties
-  if sel_count > 1 then
-    local mod_count = 0
-    local total_dur = 0
-    for idx in pairs(state.selected_notes) do
-      local n = state.notes[idx]
-      if n then
-        if is_note_modified(n) then mod_count = mod_count + 1 end
-        total_dur = total_dur + (n.end_time - n.start_time)
+  local status_str = sel_count > 0 and string.format("%d Selected", sel_count) or ""
+  local scale_str = string.format("%s %s", SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name)
+  local status_full_str = status_str ~= "" and (status_str .. "  •  " .. scale_str) or scale_str
+
+  local status_w = 0
+  if status_full_str ~= "" then
+    local _
+    status_w, _ = reaper.ImGui_CalcTextSize(dock_ctx, status_full_str)
+  end
+
+  local rs_label_w, _ = reaper.ImGui_CalcTextSize(dock_ctx, "Retune")
+  local retune_slider_w = 70
+
+  local trans_str = string.format("Trans: %.0fms", trans_eff)
+  local ramp_str = string.format("Ramp: %.0fms", ramp_eff)
+  local legato_str = string.format("Legato: %.0fms", legato_eff)
+
+  local total_w = rs_label_w + L.sm + retune_slider_w + L.sm + calc_badge_w(trans_str) + L.sm + calc_badge_w(ramp_str) + L.sm + calc_badge_w(legato_str)
+  if status_w > 0 then
+    total_w = total_w + L.xl + status_w
+  end
+
+  local avail_w = reaper.ImGui_GetContentRegionAvail(dock_ctx)
+  local cur_x = reaper.ImGui_GetCursorPosX(dock_ctx)
+  local center_x = cur_x + (avail_w - total_w) * 0.5
+  if center_x > cur_x then
+    reaper.ImGui_SetCursorPosX(dock_ctx, center_x)
+  end
+
+  local function get_override_color(key)
+    if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
+      return P.accent_l, P.accent_d
+    end
+    return P.text_dim, P.card
+  end
+
+  local function badge_editor(label_fmt, key, val, min_v, max_v, fmt, scale)
+    local fg, bg = get_override_color(key)
+    local txt = string.format(label_fmt, val)
+    Theme.align(dock_ctx)
+    local pressed = Theme.badge(dock_ctx, txt, {
+      color = fg, bg = bg, interactive = true,
+      tooltip = "Left-click to edit.\nRight-click to toggle item override."
+    })
+
+    if reaper.ImGui_IsItemHovered(dock_ctx) and reaper.ImGui_IsMouseClicked(dock_ctx, 1) then
+      if take_data then
+        take_data.overrides = take_data.overrides or {}
+        if take_data.overrides[key] ~= nil then
+          take_data.overrides[key] = nil
+        else
+          take_data.overrides[key] = global_defaults[key]
+        end
+        apply_envelope_to_take("Toggle Override")
       end
     end
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, string.format("%d Notes (%.2fs)", sel_count, total_dur), {
-      color = P.accent_l,
-      bg = P.accent_d,
-      tooltip = "Selected notes count and cumulative duration"
-    })
-    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-    if state.selected_note and state.notes[state.selected_note] then
-      local pn = state.notes[state.selected_note]
-      local p_nearest = math.floor(pn.controls.center_pitch + 0.5)
-      local p_cents = math.floor((pn.controls.center_pitch - p_nearest) * 100 + 0.5)
-      local p_sign = p_cents >= 0 and "+" or ""
-      Theme.align(dock_ctx)
-      Theme.badge(dock_ctx, string.format("Anchor: %s %s%d¢", midi_to_name(p_nearest), p_sign, p_cents), {
-        tooltip = "Anchor note for relative transposition and interval snapping"
-      })
-      reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-    end
-    local status_str = mod_count > 0 and string.format("%d/%d Tuned", mod_count, sel_count) or "Untouched"
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, status_str, {
-      color = mod_count > 0 and P.green_l or P.text_dim,
-      bg = mod_count > 0 and P.green_d or P.card,
-      tooltip = "Number of modified notes in selection"
-    })
-  elseif sel_count == 1 and state.selected_note and state.notes[state.selected_note] then
-    local sel = state.notes[state.selected_note]
-    local ctrl = sel.controls
-    local nearest = math.floor(ctrl.center_pitch + 0.5)
-    local cents = math.floor((ctrl.center_pitch - nearest) * 100 + 0.5)
-    local sign = cents >= 0 and "+" or ""
-    local is_mod = is_note_modified(sel)
-    local is_chrom = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic")
-    local in_scale = is_pitch_in_scale(nearest % 12)
 
-    local note_label = string.format("%s %s%d¢", midi_to_name(nearest), sign, cents)
-    local note_col = (is_chrom or in_scale) and P.green_l or P.yellow_l
-    local note_bg  = (is_chrom or in_scale) and P.green_d or Theme.with_alpha(P.yellow, 0.22)
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, note_label, {
-      color = note_col,
-      bg = note_bg,
-      tooltip = string.format("Note Pitch: %s\nDeviation: %s%d cents\nScale: %s",
-        midi_to_name(nearest), sign, cents, is_chrom and "Chromatic" or (in_scale and "In Scale" or "Out of Scale"))
-    })
-
-    if not is_chrom then
-      reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-      Theme.align(dock_ctx)
-      Theme.badge(dock_ctx, in_scale and "In Scale" or "Out of Scale", {
-        color = in_scale and P.green_l or P.yellow_l,
-        bg = in_scale and P.green_d or Theme.with_alpha(P.yellow, 0.22)
-      })
+    if pressed then
+      reaper.ImGui_OpenPopup(dock_ctx, "##edit_"..key)
     end
 
-    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, string.format("Stability: %.0f%%", (1 - ctrl.drift_scale) * 100), {
-      tooltip = "Pitch stability / drift correction (Drag left zone of note block)"
-    })
+    if reaper.ImGui_BeginPopup(dock_ctx, "##edit_"..key) then
+      local edit_val = val
+      if scale then edit_val = edit_val * scale end
 
-    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, string.format("Vibrato: %.0f%%", ctrl.vibrato_scale * 100), {
-      tooltip = "Vibrato depth scale (Drag right zone of note block)"
-    })
-
-    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, string.format("Trans: %.0fms", ctrl.transition_ms or 35), {
-      tooltip = "S-curve smoothstep transition duration into next note"
-    })
-
-    reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-    Theme.align(dock_ctx)
-    Theme.badge(dock_ctx, is_mod and "Tuned" or "Original", {
-      color = is_mod and P.green_l or P.text_dim,
-      bg = is_mod and P.green_d or P.card
-    })
-
-    -- Optional onset debug info
-    if state.show_onset_debug and sel.onset_debug then
-      local od = sel.onset_debug
-      reaper.ImGui_SameLine(dock_ctx, 0, L.md)
-      Theme.align(dock_ctx)
-      reaper.ImGui_TextDisabled(dock_ctx, string.format("[ramp=%.0fms scoop=%.2fst delay=%.0fms]",
-        od.onset_ramp_ms, od.scoop_st, od.voicing_delay_ms))
-    end
-  else
-    Theme.align(dock_ctx)
-    reaper.ImGui_TextDisabled(dock_ctx, "Click note to select  •  Marquee drag to box select  •  Cmd+A to select all")
-  end
-
-  -- Right: Action Buttons
-  local btn_q_w = 98
-  local btn_split_w = 74
-  local btn_merge_w = 78
-  local btn_reset_w = 80
-  local btn_all_w = 86
-  local act_w = btn_q_w + btn_split_w + btn_merge_w + btn_reset_w + btn_all_w + (L.sm * 4)
-
-  reaper.ImGui_SameLine(dock_ctx)
-  local cur_x = reaper.ImGui_GetCursorPosX(dock_ctx)
-  local avail_dock_w = reaper.ImGui_GetContentRegionAvail(dock_ctx)
-  local target_x = cur_x + avail_dock_w - act_w
-  if target_x > cur_x + L.md then
-    reaper.ImGui_SetCursorPosX(dock_ctx, target_x)
-  end
-
-  -- Quantize (Q)
-  local has_sel = (sel_count > 0)
-  if not has_sel then reaper.ImGui_BeginDisabled(dock_ctx) end
-  local q_label = sel_count > 1 and string.format("Quantize (%d)", sel_count) or "Quantize (Q)"
-  if reaper.ImGui_Button(dock_ctx, q_label .. "##dock_q", btn_q_w, 0) then
-    get_target_take(true)
-    quantize_selected_notes_to_scale()
-  end
-  if reaper.ImGui_IsItemHovered(dock_ctx) then
-    Theme.tooltip(dock_ctx, string.format("Quantize %s to nearest %s %s pitch (Q)",
-      sel_count > 1 and string.format("%d selected notes", sel_count) or "selected note",
-      SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name))
-  end
-  if not has_sel then reaper.ImGui_EndDisabled(dock_ctx) end
-
-  -- Split (X)
-  local can_split = false
-  if state.selected_note and state.notes[state.selected_note] then
-    local sn = state.notes[state.selected_note]
-    local _, si = get_target_take(false)
-    if si then
-      local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
-      local ec = reaper.GetCursorPosition() - ip
-      can_split = ec > sn.start_time and ec < sn.end_time
-    end
-  end
-  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-  if not can_split then reaper.ImGui_BeginDisabled(dock_ctx) end
-  if reaper.ImGui_Button(dock_ctx, "Split (X)##dock_x", btn_split_w, 0) then
-    if state.selected_note and state.notes[state.selected_note] then
-      local sn = state.notes[state.selected_note]
-      local _, si = get_target_take(false)
-      if si then
-        local ip = reaper.GetMediaItemInfo_Value(si, "D_POSITION")
-        local ec = reaper.GetCursorPosition() - ip
-        if ec > sn.start_time and ec < sn.end_time then
-          get_target_take(true)
-          split_note_at(state.selected_note, ec)
+      reaper.ImGui_PushItemWidth(dock_ctx, 120)
+      local c, v = reaper.ImGui_SliderDouble(dock_ctx, "##s_"..key, edit_val, min_v, max_v, fmt)
+      if c then
+        if scale then v = v / scale end
+        if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
+          take_data.overrides[key] = v
+        else
+          global_defaults[key] = v
+          save_global_defaults()
         end
       end
+      if reaper.ImGui_IsItemDeactivatedAfterEdit(dock_ctx) then
+        if take_data then apply_envelope_to_take("Adjust " .. key) end
+      end
+      reaper.ImGui_PopItemWidth(dock_ctx)
+      reaper.ImGui_EndPopup(dock_ctx)
     end
   end
-  if reaper.ImGui_IsItemHovered(dock_ctx) then
-    Theme.tooltip(dock_ctx, "Split selected note at REAPER edit cursor (X)")
-  end
-  if not can_split then reaper.ImGui_EndDisabled(dock_ctx) end
 
-  -- Merge (M)
-  local can_merge = (sel_count >= 2)
+  Theme.align(dock_ctx)
+  reaper.ImGui_TextDisabled(dock_ctx, "Retune")
   reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-  if not can_merge then reaper.ImGui_BeginDisabled(dock_ctx) end
-  if reaper.ImGui_Button(dock_ctx, "Merge (M)##dock_m", btn_merge_w, 0) then
-    get_target_take(true)
-    merge_selected_notes()
-  end
-  if reaper.ImGui_IsItemHovered(dock_ctx) then
-    Theme.tooltip(dock_ctx, "Merge 2 or more contiguous selected notes into one (M)")
-  end
-  if not can_merge then reaper.ImGui_EndDisabled(dock_ctx) end
 
-  -- Reset (R)
-  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-  if not has_sel then reaper.ImGui_BeginDisabled(dock_ctx) end
-  local r_label = sel_count > 1 and string.format("Reset (%d)", sel_count) or "Reset (R)"
-  if reaper.ImGui_Button(dock_ctx, r_label .. "##dock_r", btn_reset_w, 0) then
-    reset_selected_note()
-  end
-  if reaper.ImGui_IsItemHovered(dock_ctx) then
-    Theme.tooltip(dock_ctx, "Reset selected note(s) to original pitch/drift/vibrato (R)")
-  end
-  if not has_sel then reaper.ImGui_EndDisabled(dock_ctx) end
+  reaper.ImGui_PushItemWidth(dock_ctx, retune_slider_w)
+  local rs_c, rs_v = reaper.ImGui_SliderDouble(dock_ctx, "##rt_speed", retune_eff * 100, 0, 100, "%.0f%%")
+  reaper.ImGui_PopItemWidth(dock_ctx)
 
-  -- Select All
-  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-  if reaper.ImGui_Button(dock_ctx, "Select All##dock_all", btn_all_w, 0) then
-    state.selected_notes = {}
-    for i = 1, #state.notes do
-      state.selected_notes[i] = true
-    end
-    if not state.selected_note or not state.selected_notes[state.selected_note] then
-      state.selected_note = 1
-    end
+  if reaper.ImGui_IsItemHovered(dock_ctx) and reaper.ImGui_IsMouseClicked(dock_ctx, 1) then
+      if take_data then
+        take_data.overrides = take_data.overrides or {}
+        if take_data.overrides["retune_speed"] ~= nil then
+          take_data.overrides["retune_speed"] = nil
+        else
+          take_data.overrides["retune_speed"] = global_defaults["retune_speed"]
+        end
+        apply_envelope_to_take("Toggle Override")
+      end
   end
-  if reaper.ImGui_IsItemHovered(dock_ctx) then
-    Theme.tooltip(dock_ctx, "Select all notes in phrase (Cmd/Ctrl + A)")
+
+  if rs_c then
+      if take_data and take_data.overrides and take_data.overrides["retune_speed"] ~= nil then
+          take_data.overrides["retune_speed"] = rs_v / 100
+      else
+          global_defaults.retune_speed = rs_v / 100
+          save_global_defaults()
+      end
+  end
+  if reaper.ImGui_IsItemDeactivatedAfterEdit(dock_ctx) then
+      if take_data then apply_envelope_to_take("Adjust Retune Speed") end
+  end
+
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  badge_editor("Trans: %.0fms", "transition_ms", trans_eff, 5, 60, "%.0f ms", nil)
+
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  badge_editor("Ramp: %.0fms", "onset_ramp_ms", ramp_eff, 5, 60, "%.0f ms", nil)
+
+  reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
+  badge_editor("Legato: %.0fms", "legato_threshold_ms", legato_eff, 50, 300, "%.0f ms", nil)
+
+  if status_full_str ~= "" then
+    reaper.ImGui_SameLine(dock_ctx, 0, L.xl)
+    Theme.align(dock_ctx)
+    reaper.ImGui_TextDisabled(dock_ctx, status_full_str)
   end
 end
+
 
 local function loop_body()
   local _
@@ -3735,7 +4012,13 @@ local function loop_body()
   local nc, nv = Theme.push(ctx, P)
   local pushed_font = Theme.push_font(ctx, fonts.default)
 
-  Theme.center_next_window(ctx, 920, 620, reaper.ImGui_Cond_Once())
+  local pad_x = 10
+  local pad_v = 6
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), pad_x, pad_v)
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(), L.md, pad_v)
+  nv = nv + 2
+
+  Theme.center_next_window(ctx, 920, 620, reaper.ImGui_Cond_FirstUseEver())
   local win_flags = reaper.ImGui_WindowFlags_NoCollapse()
     | reaper.ImGui_WindowFlags_NoScrollbar()
     | reaper.ImGui_WindowFlags_NoNavInputs()
@@ -3959,11 +4242,9 @@ local function loop_body()
       open = false
     end
 
-    reaper.ImGui_Separator(ctx)
-
     -- 2. Main Body: Canvas + (optional) Pitched Items Sidebar
     local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-    local footer_h = reaper.ImGui_GetFrameHeight(ctx) + L.sm * 2 + 2
+    local footer_h = reaper.ImGui_GetFrameHeight(ctx) + pad_v
     local total_h = math.max(60, avail_h - footer_h)
 
     local min_graph_w = 200
@@ -3981,7 +4262,7 @@ local function loop_body()
 
         reaper.ImGui_SameLine(ctx, 0, 0)
 
-        -- Center: Resizable Splitter
+        -- Center: Resizable Splitter (borderless, invisible interactive zone)
         reaper.ImGui_InvisibleButton(ctx, "##v_splitter", splitter_w, total_h)
         local is_split_hov = reaper.ImGui_IsItemHovered(ctx)
         local is_split_act = reaper.ImGui_IsItemActive(ctx)
@@ -3992,19 +4273,11 @@ local function loop_body()
           local delta_x = select(1, reaper.ImGui_GetMouseDelta(ctx))
           state.sidebar_w = math.max(min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w - delta_x))
         end
-        -- Draw splitter visual bar
-        local split_dl = reaper.ImGui_GetWindowDrawList(ctx)
-        local sp_min_x, sp_min_y = reaper.ImGui_GetItemRectMin(ctx)
-        local sp_max_x, sp_max_y = reaper.ImGui_GetItemRectMax(ctx)
-        local sp_mid_x = (sp_min_x + sp_max_x) * 0.5
-        local sp_col = is_split_act and P.accent or (is_split_hov and P.accent_h or P.sep)
-        reaper.ImGui_DrawList_AddLine(split_dl, sp_mid_x, sp_min_y, sp_mid_x, sp_max_y, sp_col, is_split_act and 2.0 or 1.0)
 
         reaper.ImGui_SameLine(ctx, 0, 0)
 
-        -- Right: Pitched Items Sidebar
-        local child_border = reaper.ImGui_ChildFlags_Border and reaper.ImGui_ChildFlags_Border() or (reaper.ImGui_ChildFlags_Borders and reaper.ImGui_ChildFlags_Borders() or 0)
-        if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", state.sidebar_w, total_h, child_border) then
+        -- Right: Pitched Items Sidebar (borderless)
+        if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", state.sidebar_w, total_h, 0) then
           render_pitched_items_sidebar(ctx)
           reaper.ImGui_EndChild(ctx)
         end
@@ -4020,9 +4293,8 @@ local function loop_body()
         local tag_dl = reaper.ImGui_GetWindowDrawList(ctx)
         local tx, ty = reaper.ImGui_GetCursorScreenPos(ctx)
 
-        -- Background strip & border
+        -- Background strip
         reaper.ImGui_DrawList_AddRectFilled(tag_dl, tx, ty, tx + tag_w, ty + total_h, P.card)
-        reaper.ImGui_DrawList_AddLine(tag_dl, tx, ty, tx, ty + total_h, P.sep)
 
         -- Centered tag button
         local tag_btn_sz = 16
@@ -4039,17 +4311,21 @@ local function loop_body()
       end
     end
 
-    reaper.ImGui_Separator(ctx)
-
     -- 4. Bottom Row: Inspector & Action Bar
     render_bottom_dock(ctx)
   end
 
-  -- 5. Render Modals
-  draw_settings_modal()
-  draw_info_modal()
+  -- Pop custom window padding & item spacing before rendering modals
+  reaper.ImGui_PopStyleVar(ctx, 2)
+  nv = nv - 2
 
-  reaper.ImGui_End(ctx)
+  -- 5. Render Modals (ReaImGui's Begin calls End itself when it returns false)
+  if visible then
+    draw_settings_modal()
+    draw_info_modal()
+
+    reaper.ImGui_End(ctx)
+  end
 
   Theme.pop_font(ctx, pushed_font)
   Theme.pop(ctx, nc, nv)

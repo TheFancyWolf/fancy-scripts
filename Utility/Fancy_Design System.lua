@@ -953,7 +953,7 @@ local function loop()
   local nc, nv = Theme.push(ctx, P)
   local pushed_default = Theme.push_font(ctx, fonts.default)
 
-  Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_Once())
+  Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_FirstUseEver())
   local flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_NoTitleBar()
   local visible = reaper.ImGui_Begin(ctx, "Fancy Design System", nil, flags)
 
