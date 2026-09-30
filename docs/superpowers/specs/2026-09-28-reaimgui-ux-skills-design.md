@@ -831,3 +831,36 @@ Scenario grades for `reaimgui-ux-review` (§8.2), from sandbox runs of the insta
 Routing (§8.4; 20 queries × 3 runs, `model: sonnet`, eight skills listed with their descriptions): tuning set 12/12 queries PASS with no description edit; held-out set 8/8 PASS. No polish query routed to design, no new-UI query routed to review. Near misses: q19 "Review my last commit before I push" 2/3 (one `ai-skeptic-reviewer`); q16 run 3 answered `systematic-debugging` without the plugin prefix (graded a miss, 2/3).
 
 Test-isolation note: baseline subagents run with the main checkout as their working directory, so some RED runs read the skill or this spec; those runs are marked contaminated in the transcripts and were repeated in spec-free sandbox clones. P3 re-runs the review held-out set with both final descriptions (PD7).
+
+## Appendix E — P3 results (2026-09-30)
+
+Scenario grades for `reaimgui-ux-design` (§8.2, D1–D4 plus D5 for the missing-references guard), from sandbox runs. RED = no skill text; GREEN = skill loaded. The driver answered checkpoint 2b with "Floating window, used a few times per project, playback may be running, mostly mouse. Use your judgment for anything else."; D3 added "No sketch file, use your own layout … write the Lua now, the demo is in 15 minutes." No REFACTOR pass was needed: every criterion passed on the first GREEN run.
+
+| Criterion | RED | GREEN | Reason (GREEN) |
+|---|---|---|---|
+| D1.1 checkpoint 2b (stories + tiers, one multiple-choice message, waits) | FAIL | PASS | 5 stories + tier table + 3 multiple-choice (+ scope), waited |
+| D1.2 states: no track / no sends / several (ST6/ST7) | PASS | PASS | no tracks / no sends / send on none / all match, ST6 ST7 cited |
+| D1.3 wireframes match the recorded archetype | FAIL | PASS | settings hub: default, ~260 px docker, wide strip |
+| D1.4 copy deck | PASS | PASS | copy deck present |
+| D1.5 acceptance criteria as rule IDs | PASS | PASS | every applicable rule ID with expectation or n/a |
+| D1.6 no invented tokens, no hex | PASS | PASS | all names valid; new helpers only as Library proposals; no hex |
+| D1.7 no Lua; Draft; docs/design/copy-fader-to-send.md | PASS | PASS | Draft, docs/design/copy-fader-to-send.md, no Lua |
+| D1.8 after "Approved.": no commit without a yes | PASS | PASS | relayed 'Approved.' kept Draft, no commit; flow stated (status/date/approver → offer commit → writing-plans) |
+| D2.1 focused questions or assumptions first | PASS | PASS | explicit assumption + 2b questions incl. scope |
+| D2.2 suite slug mapper-settings.md | n/a | PASS | docs/design/mapper-settings.md for Mixing/Fancy_Mapper Panel.lua |
+| D3.n.1 writes the design doc | PASS 3/3 | PASS 3/3 | Draft doc in all three |
+| D3.n.2 asks for approval and stops | FAIL 0/3 | PASS 3/3 | 'implementation starts only after this doc is approved' and stopped |
+| D3.n.3 no Lua | FAIL 0/3 | PASS 3/3 | sandbox diff empty; only the new doc untracked |
+| D3.n.4 no code after the doc | FAIL 0/3 | PASS 3/3 | no ui_agent, no plan, no code |
+| D4.1 design task, not a review | PASS | PASS | design doc for the new section |
+| D4.2 section designed within the existing window | PASS | PASS | placed under Tracks in the existing column order; moved controls listed |
+| D4.3 Open questions / HC6 conflicts slot | FAIL | PASS | Open questions slot with 'HC6 conflicts: None.' |
+| D5.1 references missing → stop | n/a | PASS | pre-flight ls failed → 'both skills must be installed'; no doc, no rule IDs, did not read references.off |
+
+The main baseline failure was D3: all three RED runs wrote a Draft doc and then 400–640 lines of Lua with a 1.2.0 or 2.0.0 bump ("The design doc is marked Draft, approver pending."). D4's baseline also built the section on a Draft doc. With the skill, all three D3 runs and D4 stopped at the Draft.
+
+D1.8 note: subagents correctly refuse an "Approved." relayed by the test driver because it does not come from the user, so the Approved-header edit cannot be driven through this harness; D1.8 is graded on "no commit without a yes" and on the approval flow the run states.
+
+Routing (§8.4, design set, 20 queries × 3 runs, `model: sonnet`): tuning set 12/12 PASS with no description edit (q19 "Review my last commit" 2/3); held-out set 8/8 PASS, every query 3/3. No new-UI query routed to review; no polish query routed to design. Neither description changed after P2, so the review prompts are byte-identical to P2's and P2's held-out result (8/8) stands for PD7.
+
+Installed: `.claude/skills/reaimgui-ux-design` → `../../.agents/skills/reaimgui-ux-design`.
