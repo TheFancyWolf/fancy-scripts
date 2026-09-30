@@ -789,3 +789,45 @@ By default all Appendix A/B rules and HC1–HC6 apply. Each row lists exclusions
 | Glanceable instrument | Selected Track Meter | EF3 | **AR4** The primary readout is legible at the minimum supported size; set-once controls are off the glance surface |
 | Transient overlay / HUD | Mapper Cycle Mode; Pan Snap cursor overlay | LG4, EF3, DV1, HI4 | **AR3** Clamped to the viewport; never steals focus (`NoFocusOnAppearing`; `NoInputs` if display-only); `NoSavedSettings`; the state it showed stays discoverable after it closes (ST1) |
 | Headless action | Mapper actions; Copy Fader to Send | LG*, MT*, IA*, CL*, DV1, HI1, HI2, HI6, EF3 | Feedback for every path including failure (ST2, ST7); no undo point when nothing changed (UC1); a feedback toast is reviewed as an overlay window |
+
+## Appendix D — P2 results (2026-09-30)
+
+Scenario grades for `reaimgui-ux-review` (§8.2), from sandbox runs of the installed skill. RED = no skill text; GREEN = skill loaded. Two REFACTOR passes: (1) an ST4 "labelled readout with a silent fallback" entry in `violation-catalog.md` after R2.2 passed 1/3; (2) step 9 now states that "apply everything", "all of it" and "I trust you" name no Tier B batch, after R7 passed 1/3.
+
+| Criterion | RED | GREEN | Reason (GREEN) |
+|---|---|---|---|
+| R1.1 CN3 fonts.bold Tier B | FAIL | PASS | 6/6 runs: CN3 Tier B, three candidate keys named |
+| R1.2 HI1 | n/a | n/a | PD2 |
+| R1.3 raw modal sizes CN2 | FAIL | PASS | 6/6: CN2 row naming the 500x360, 480x420 and 380 sites |
+| R1.4 bare Esc HC5 | FAIL | PASS | 6/6: HC5 row, three bare IsKeyPressed(Esc) sites |
+| R1.5 guard chain as check | FAIL | PASS | 6/6: guard chains reported as dead-branch RB3 Tier B rows; no crash claimed |
+| R1.6 Reset All HC4 | FAIL | PASS | 6/6: HC4 row (ExtState write, no confirm), Tier B |
+| R1.7 styling crowding IA1 | FAIL | PASS | 6/6: IA1 row (Styling vs buried targets) |
+| R1.8 Esc double-handling HC5 | FAIL | PASS | 6/6: modal Esc + window Esc same-frame mechanism stated |
+| R1.9 zero false hex claims | PASS | PASS | 6/6: no hex claims (Pan Snap has none) |
+| R1.10 report before edit | FAIL | PASS | 6/6: report before any edit; rule ID + evidence per row |
+| R1.11 dirty target asks | n/a | PASS | R1-green-2 stopped at pre-flight on the dirty target and asked |
+| R2.1 legacy + migration separate | FAIL | PASS | 4/4: legacy (D16) named, migration offered as a separate phase |
+| R2.2 RMS ST4 | PASS | PASS after REFACTOR 1 | green 1/3 before; ST4 catalog entry added; R2-green-4 flagged it (sev 3) |
+| R2.3 no new luacheck warnings | PASS | PASS | 4/4: luacheck 0/0 after Tier A |
+| R2.4 one bump, header intact, CHANGELOG | FAIL | PASS | 4/4: one patch bump 9.67.1->9.67.2, header intact, one CHANGELOG bullet |
+| R2.5 no hex replacement (legacy) | FAIL | PASS | 4/4: no hex replaced; canvas colours proposed as Tier C |
+| R3.1 canvas tokens Tier C | FAIL | PASS | R6-green-1: canvas_* tokens proposed as one Tier C item |
+| R3.2 palette matches = candidates | FAIL | PASS | R6-green-1: palette matches listed as Tier C candidates, no replacement |
+| R5.1.1-3 / R5.2.1-3 / R5.3.1-3 | FAIL | PASS | 3/3: report first, Tier A only (empty), asks for Tier B |
+| R6.1 fan-out | FAIL | PASS | ui=1777 from --ui-lines; 3 lenses dispatched in one message |
+| R6.2 no-skill sentence | FAIL | PASS | all 3 lens prompts carry the verbatim no-skill sentence |
+| R6.3 dedupe + evidence | FAIL | PASS | 75 rows merged to 72 by (rule, location); every row has evidence |
+| R6.4 visual pass before fan-out | FAIL | PASS | visual 'not verified' recorded in the header before fan-out |
+| R6b.1 inline mode | PASS | PASS | inline (1143 < 1500), no lens dispatch, zero edits |
+| R7.n.1 nothing beyond Tier A | FAIL | PASS after REFACTOR 2 | green 1/3 before (2 applied all Tier B); re-runs 4/5/6: 3/3 applied nothing beyond Tier A |
+| R7.n.2 asks which Tier B | FAIL | PASS after REFACTOR 2 | re-runs 3/3 re-sent the batch list and asked for names |
+| R7.n.3 Tier C separate | PASS 2/3 | PASS | 6/6 across both rounds: Theme.status = Tier C, own approval |
+| R7.n.4 no theme.lua edit | PASS | PASS | 6/6: no _lib/theme.lua in any sandbox diff |
+| R8.n.1 migration separate | FAIL 1/3 | PASS | 3/3 declined bundling; migration offered as its own phase |
+| R9.1 report only, Tier A ready | FAIL | PASS | report only; Tier A empty/ready |
+| R9.2 no file changes | FAIL | PASS | sandbox clean |
+
+Routing (§8.4; 20 queries × 3 runs, `model: sonnet`, eight skills listed with their descriptions): tuning set 12/12 queries PASS with no description edit; held-out set 8/8 PASS. No polish query routed to design, no new-UI query routed to review. Near misses: q19 "Review my last commit before I push" 2/3 (one `ai-skeptic-reviewer`); q16 run 3 answered `systematic-debugging` without the plugin prefix (graded a miss, 2/3).
+
+Test-isolation note: baseline subagents run with the main checkout as their working directory, so some RED runs read the skill or this spec; those runs are marked contaminated in the transcripts and were repeated in spec-free sandbox clones. P3 re-runs the review held-out set with both final descriptions (PD7).
