@@ -1,5 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="57b4aef26d9f5e9d693f6e54acd861f5f90f3156">
+<index version="1" name="Fancy Scripts" commit="55b6fad40bd68edbb5250317a4d8955d243f5cd5">
+  <category name="_lib">
+    <reapack name="mapper_engine.lua" type="script" desc="Fancy Mapper Core Engine">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Shared engine for Fancy Mapper scripts. Provides unified configuration, throttling, context targeting, parameter math, and undo management for hardware dials and encoders. Modes supported: Scrub, FX Parameter, Pan, Volume, Width, MIDI CC, Velocity, Track Nav, Marker, Transient, Item Slip.\par}
+}
+]]></description>
+      </metadata>
+      <version name="5.1.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/_lib/mapper_engine.lua</source>
+      </version>
+    </reapack>
+  </category>
   <category name="FX">
     <reapack name="Fancy_Parameter Link.lua" type="script" desc="Fancy Parameter Link">
       <metadata>
@@ -92,6 +108,163 @@
       <version name="9.66.0" author="Fancy Scripts" time="2026-08-27T10:26:43Z">
         <changelog><![CDATA[+ Added ReaPack distribution support]]></changelog>
         <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8810c9c72fcbb378a1c60628096a9537ee6cbd52/Metering/Fancy_Selected%20Track%20Meter.lua</source>
+      </version>
+    </reapack>
+  </category>
+  <category name="Mixing">
+    <reapack name="Fancy_Mapper Button 1.lua" type="script" desc="Fancy Mapper Button 1">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-sensitive button whose action changes based on the current Fancy Mapper mode (Scrub / FX / Pan). Configure actions in the Fancy Mapper Settings window. Assign this script to any button on your hardware controller. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Initial release — mode-aware context button]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Button%201.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Button 2.lua" type="script" desc="Fancy Mapper Button 2">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-sensitive button whose action changes based on the current Fancy Mapper mode (Scrub / FX / Pan). Configure actions in the Fancy Mapper Settings window. Assign this script to any button on your hardware controller. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Initial release — mode-aware context button]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Button%202.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Button 3.lua" type="script" desc="Fancy Mapper Button 3">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-sensitive button whose action changes based on the current Fancy Mapper mode (Scrub / FX / Pan). Configure actions in the Fancy Mapper Settings window. Assign this script to any button on your hardware controller. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Initial release — mode-aware context button]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Button%203.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Button 4.lua" type="script" desc="Fancy Mapper Button 4">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-sensitive button whose action changes based on the current Fancy Mapper mode (Scrub / FX / Pan). Configure actions in the Fancy Mapper Settings window. Assign this script to any button on your hardware controller. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Initial release — mode-aware context button]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Button%204.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Button 5.lua" type="script" desc="Fancy Mapper Button 5">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-sensitive button whose action changes based on the current Fancy Mapper mode (Scrub / FX / Pan). Configure actions in the Fancy Mapper Settings window. Assign this script to any button on your hardware controller. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Initial release — mode-aware context button]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Button%205.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Button 6.lua" type="script" desc="Fancy Mapper Button 6">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Context-sensitive button whose action changes based on the current Fancy Mapper mode (Scrub / FX / Pan). Configure actions in the Fancy Mapper Settings window. Assign this script to any button on your hardware controller. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Initial release — mode-aware context button]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Button%206.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Calibrate Tick.lua" type="script" desc="Fancy Mapper Calibrate Tick">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Companion to the Fancy Mapper Settings calibration section. Assign THIS script to your dial's clockwise shortcut. Each invocation increments the tick counter displayed in Settings. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Controller-agnostic language]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Calibrate%20Tick.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Volume Down.lua" type="script" desc="Fancy Mapper Volume Down">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Nudges selected track(s) volume down by a configurable dB increment. Designed for hardware dials and rotary encoders that send rapid keyboard events. Includes timestamp-based throttling to prevent event queue buildup from causing runaway fader movement. Configure step size and throttle in Fancy Mapper Settings. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Settings-driven config (reads from Fancy Mapper Settings)
++ v3: Controller-agnostic design]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Volume%20Down.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Mapper Volume Up.lua" type="script" desc="Fancy Mapper Volume Up">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Nudges selected track(s) volume up by a configurable dB increment. Designed for hardware dials and rotary encoders that send rapid keyboard events. Includes timestamp-based throttling to prevent event queue buildup from causing runaway fader movement. Configure step size and throttle in Fancy Mapper Settings. Requirements: REAPER 7.0+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="3.0.0" author="Fancy Scripts" time="2026-09-29T13:34:42Z">
+        <changelog><![CDATA[+ v3: Settings-driven config (reads from Fancy Mapper Settings)
++ v3: Controller-agnostic design]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8e1ed7baf81feba57c6adca2b643c7d6b5c5cf63/Mixing/Fancy_Mapper%20Volume%20Up.lua</source>
       </version>
     </reapack>
   </category>
