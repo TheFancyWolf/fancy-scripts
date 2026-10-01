@@ -27,7 +27,8 @@
 --   Controls:   slider_grab_active            (slider grab while dragging)
 --   Canvas:     canvas = { row*, grid*, key_*, key_text_*, note_*, zone_*, handle*, trace, preview, trend, ... }
 --               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy Dark,
---               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
+--               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme; curves, markers and
+--               note_bypassed_mark are contrast-fitted in both modes. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
 --
 -- THEME MODES & PREFS -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
@@ -320,15 +321,19 @@ end
 --- zone highlights, trim handles, curves and markers, marquee, playhead, pills, ruler, scrim). Built by
 --- Theme.build_palette() into P.canvas for both modes:
 ---   Fancy Dark   fixed values (the colours the Pitch Correct canvas drew with hex literals), plus a few that are
----                exactly a palette colour or an alpha of it (noted per token).
+---                exactly a palette colour or an alpha of it (noted per token). The curves and markers then go
+---                through the same fit step as Match Theme (below), so they too read at >= 3:1 (marker label 4.5:1).
 ---   Match Theme  derived from P.bg / P.panel / P.text / P.accent / P.green / P.blue / P.yellow so the canvas
 ---                follows a dark or a light REAPER theme. Every text token is fitted to >= 4.5:1 and every object
 ---                boundary to >= 3:1 (WCAG 2.x, alpha composited first) against the surfaces it is drawn on.
----                The curves and markers (trace, playhead, trend, anchor, spot, preview, marker_split) are fitted
----                against the persistent surfaces they are drawn on: the rows, every note fill over the rows, the vibrato
----                wash (and the ruler strip for the playhead), moved toward white or black only as far as that takes so
----                each keeps its hue; the transient zone highlights (Shift-hover, drag) are not part of the fit. The
----                BYPASSED badge (bypass_title, bypass_border) is fitted against the card and the dimmed canvas.
+---                The BYPASSED badge (bypass_title, bypass_border) is fitted against the card and the dimmed canvas.
+---   Both modes   one shared fit step (fit_canvas_marks): the curves and markers (trace, playhead, trend, anchor,
+---                spot, preview, marker_split >= 3:1, marker_split_text >= 4.5:1) are fitted against the persistent
+---                surfaces they are drawn on: the rows, every note fill over the rows, the vibrato wash (and the ruler
+---                strip for the playhead), moved toward white or black only as far as that takes so each keeps its
+---                hue; the transient zone highlights (Shift-hover, drag) are not part of the fit. note_bypassed_mark
+---                (the strike / outline of a bypassed note) is fitted to >= 3:1 on the rows and on the bypassed fill
+---                over them, while the fill itself stays dim; note_bypassed_border keeps its dimmed value.
 ---                The piano keys keep the same fixed colours in both modes (white / black key metaphor).
 
 -- WCAG 2.x maths (private to the library).
@@ -520,6 +525,49 @@ local function fit_fill(fill, rows, ink, min_ratio)
   return fill, false
 end
 
+--- The canvas rows as they show (the accent tint included over the in-scale and root rows): the opaque surfaces
+--- every fitted canvas token is checked against.
+--- @param C table  Canvas palette holding the row* tokens
+--- @return table  Array of opaque 0xRRGGBBAA surfaces
+local function canvas_rows(C)
+  return {
+    composite_over(C.row_tint, C.row), composite_over(C.row_tint, C.row_black),
+    composite_over(C.row_tonic_tint, C.row_tonic), C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black,
+  }
+end
+
+--- The fit step both modes share: the curves, the markers and the bypassed-note mark, each starting from the colour
+--- already in C, are fitted against the persistent surfaces they are drawn on, the rows, every note fill over the
+--- rows and the vibrato wash over all of that (the playhead also over the ruler strip). Each is moved toward white
+--- or black only as far as that takes, so it keeps its hue and the layers stay apart by colour. The zone
+--- highlights (zone_drift, zone_shift) are NOT part of the fit: they show only while the pointer is over a block,
+--- and making every curve clear the brightest of them would turn the curves into near-white. A surface set this
+--- wide can still leave no colour that reaches 3:1 (a mid-grey theme): then the best worst case wins, with the rows
+--- held at 3:1 first; the vibrato band itself is decoration.
+--- @param C table  Canvas palette (changed in place): trace, preview, trend, spot, marker_split, marker_split_text,
+---                 note_bypassed_border, the note fills, vibrato and ruler_bg hold their starting colours
+--- @param rows table  canvas_rows(C)
+--- @return table  Every persistent surface a curve is drawn on (rows, note blocks, and the wash over those)
+local function fit_canvas_marks(C, rows)
+  local blocks   = over_each({ C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited, C.note_bypassed }, rows)
+  local shown    = concat_lists(rows, blocks)                           -- rows and note blocks (no wash): split markers and their label
+  local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
+  local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
+  C.trace    = fit_contrast(C.trace, line_on, 3.0, rows, true)          -- raw pitch trace (accent)
+  C.playhead = C.trace                                                  -- the playhead line: same as the trace
+  C.preview  = fit_contrast(C.preview, curve_on, 3.0, rows, true)       -- corrected-pitch preview (green, 80 % alpha)
+  C.trend    = fit_contrast(C.trend, curve_on, 3.0, rows, true)         -- trend line (cyan, apart from marker_split's blue)
+  C.anchor   = C.trend                                                  -- trend anchor diamond: same as the trend
+  C.spot     = fit_contrast(C.spot, curve_on, 3.0, rows, true)          -- smart-spot circle (yellow)
+  -- Split markers are drawn before the wash: the line on rows and blocks, its label on rows and blocks
+  C.marker_split      = fit_contrast(C.marker_split, shown, 3.0, rows, true)   -- split-point line (blue, 67 % alpha), >= 3:1
+  C.marker_split_text = fit_contrast(C.marker_split_text, shown, 4.5, rows)    -- split-point label (blue_l), >= 4.5:1
+  -- Bypassed note: the fill stays dim (a disabled state); its strike / outline mark reads at >= 3:1 on every row and
+  -- on the bypassed fill over every row. note_bypassed_border stays as it is, for scripts that still draw with it
+  C.note_bypassed_mark = fit_contrast(C.note_bypassed_border, concat_lists(rows, over_each({ C.note_bypassed }, rows)), 3.0)
+  return curve_on
+end
+
 --- Fancy Dark canvas values. Literal tokens are the colours Pitch Correct drew with hex literals; the ones
 --- built from P are exactly the palette colour (or an alpha of it) the script used next to them.
 local function build_canvas_fancy(P)
@@ -637,10 +685,7 @@ local function build_canvas_match(P)
   C.grid_plain_black = toward(bg, 0.07)
 
   -- The rows as they show (accent tint included): every other token is fitted against these
-  local rows = {
-    composite_over(C.row_tint, C.row), composite_over(C.row_tint, C.row_black),
-    composite_over(C.row_tonic_tint, C.row_tonic), C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black,
-  }
+  local rows = canvas_rows(C)
   local row_ends = add_ends({}, rows)
 
   -- Keys: the fixed colours of build_canvas_fancy, plus the tokens that follow the palette
@@ -702,27 +747,13 @@ local function build_canvas_match(P)
   C.handle_hover = fit_contrast((C.handle & 0xFFFFFF00) | 0xFF, edge_on, 3.0)   -- the resting handle made opaque
   C.handle_drag  = fit_contrast(P.accent, edge_on, 3.0)                          -- accent while the edge is dragged
 
-  -- Curves and markers are drawn straight on a row or on a note block, and the vibrato wash goes over all of that: each
-  -- palette hue is fitted to >= 3:1 on every one of those persistent surfaces (and the playhead also on the ruler strip),
-  -- moved toward white or black as little as that takes, so it keeps its hue and the layers stay apart by colour. The
-  -- zone highlights (zone_drift, zone_shift) are NOT part of the fit: they show only while the pointer is over a block,
-  -- and making every curve clear the brightest of them would turn the curves into near-white. A surface set this wide can
-  -- still leave no colour that reaches 3:1 (a mid-grey theme): then the best worst case wins, with the rows held at 3:1
-  -- first; the vibrato band itself is decoration.
+  -- Curves and markers (and the bypassed-note mark): the shared fit step (fit_canvas_marks), starting from the palette
+  -- hues. trace (P.accent), preview (P.green, 80 % alpha), trend (the Fancy Dark cyan), marker_split (P.blue, 67 %
+  -- alpha) and marker_split_text (P.blue_l) start from their build_canvas_fancy value; the spot and the wash follow
+  -- the theme's yellow
   C.vibrato = with_alpha(P.yellow, 0.094)                               -- vibrato band: a faint yellow wash
-  local blocks   = over_each({ C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited, C.note_bypassed }, rows)
-  local shown    = concat_lists(rows, blocks)                           -- rows and note blocks (no wash): split markers and their label
-  local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
-  local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
-  C.trace      = fit_contrast(P.accent, line_on, 3.0, rows, true)                -- raw pitch trace: accent
-  C.playhead   = C.trace                                                         -- the playhead line: same as the trace
-  C.preview    = fit_contrast(with_alpha(P.green, 0.80), curve_on, 3.0, rows, true)   -- corrected-pitch preview: green (80 % alpha)
-  C.trend      = fit_contrast(C.trend, curve_on, 3.0, rows, true)                -- trend line: the Fancy Dark cyan (apart from marker_split's blue)
-  C.anchor     = C.trend                                                         -- trend anchor diamond: same as the trend
-  C.spot       = fit_contrast(P.yellow, curve_on, 3.0, rows, true)               -- smart-spot circle: yellow
-  -- Split markers are drawn before the wash: the line on rows and blocks, its label on rows and blocks
-  C.marker_split      = fit_contrast(with_alpha(P.blue, 0.67), shown, 3.0, rows, true)   -- split-point line: blue (67 % alpha)
-  C.marker_split_text = fit_contrast(P.blue_l, shown, 4.5, rows)                    -- split-point label: blue_l, >= 4.5:1
+  C.spot    = P.yellow                                                  -- smart-spot circle: yellow
+  local curve_on = fit_canvas_marks(C, rows)
 
   -- BYPASSED badge: the card, inside a border drawn over the dimmed canvas (the scrim over rows, blocks and the wash)
   local card   = { P.card }
@@ -757,7 +788,10 @@ local function attach_canvas(P, mode, overrides)
     C = {}
     for k, v in pairs(_match_canvas) do C[k] = v end
   else
+    -- Fancy Dark: the fixed values, then the same curve / marker fit as Match Theme (most start out passing and
+    -- are returned unchanged; the ones that do not, e.g. the accent trace over the selected fill, are lightened)
     C = build_canvas_fancy(P)
+    fit_canvas_marks(C, canvas_rows(C))
   end
   if overrides and type(overrides.canvas) == "table" then
     for k, v in pairs(overrides.canvas) do C[k] = v end
@@ -1016,7 +1050,7 @@ end
 --- and Theme.create_fonts() instead of calling ImGui_CreateFont directly.
 
 Theme.font_family      = "sans-serif"
-Theme.font_bold_family = "sans-serif Bold"
+Theme.font_bold_family = "sans-serif"   -- bold is the Bold font flag on this family (CreateFont takes flags, not a size)
 
 Theme.font_sizes = {
   small   = 12,    -- labels, secondary text, table metadata
@@ -1053,15 +1087,15 @@ function Theme.create_fonts(_ctx, overrides)
 
   local fonts = {}
   -- Regular weights
-  fonts.default = reaper.ImGui_CreateFont(family, sizes.default)
-  fonts.small   = reaper.ImGui_CreateFont(family, sizes.small)
-  fonts.medium  = reaper.ImGui_CreateFont(family, sizes.medium)
-  fonts.large   = reaper.ImGui_CreateFont(family, sizes.large)
-  fonts.header  = reaper.ImGui_CreateFont(family, sizes.header)
+  fonts.default = reaper.ImGui_CreateFont(family)
+  fonts.small   = reaper.ImGui_CreateFont(family)
+  fonts.medium  = reaper.ImGui_CreateFont(family)
+  fonts.large   = reaper.ImGui_CreateFont(family)
+  fonts.header  = reaper.ImGui_CreateFont(family)
   -- Bold weights
-  fonts.default_bold = reaper.ImGui_CreateFont(bold_family, sizes.default)
-  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, sizes.medium)
-  fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, sizes.large)
+  fonts.default_bold = reaper.ImGui_CreateFont(bold_family, reaper.ImGui_FontFlags_Bold())
+  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, reaper.ImGui_FontFlags_Bold())
+  fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, reaper.ImGui_FontFlags_Bold())
   -- Backward compat alias
   fonts.tooltip = fonts.default
 
@@ -1307,49 +1341,215 @@ local function _hovered_for_tooltip(ctx)
   return reaper.ImGui_IsItemHovered(ctx, flags)
 end
 
---- Draws a manual fullscreen dim overlay (scrim) behind a modal popup.
+--- Draws a manual dim overlay (scrim) behind a modal popup.
 ---
 --- Call BEFORE `ImGui_BeginPopupModal` while inside the parent window's
---- `Begin`/`End` block.  The scrim is drawn on the parent window's draw
---- list with a fullscreen clip rect, so it renders behind the modal but
---- over the parent — exactly replicating Dear ImGui's built-in behaviour
---- without the first-frame colour lag that occurs in ReaImGui.
+--- `Begin`/`End` block, right after `Theme.center_next_window` (the standard
+--- pattern below). It replicates Dear ImGui's built-in dim without the
+--- first-frame colour lag that occurs in ReaImGui: Theme.push() sets
+--- ImGuiCol_ModalWindowDimBg to transparent, so the built-in mechanism never
+--- fires. Use this function everywhere instead.
 ---
---- Theme.push() sets ImGuiCol_ModalWindowDimBg to transparent, so the
---- built-in mechanism never fires. Use this function everywhere instead.
+--- The parent's child windows (BeginChild panes) draw over the parent's own
+--- draw list, so a scrim there would leave them bright. The scrim therefore goes
+--- on the foreground draw list of the parent's viewport, over the child windows,
+--- with a hole the shape of the modal so the modal itself is never dimmed. The
+--- modal's rect comes from the placement Theme.center_next_window gave it and,
+--- from then on, from a size-constraint callback run inside the modal's own
+--- Begin, so the hole follows the modal when it is moved, resized or auto-fitted
+--- (one frame behind while it is being dragged). Holes are also cut for every
+--- modal of the same context opened after this one (a confirm opened from a
+--- settings modal), which sits above it.
+--- On the first visible frame the modal's final size is not known yet (an
+--- auto-resizing modal can differ from the size it was given): then the scrim
+--- covers the parent's own draw list (behind the modal) for that one frame,
+--- or the whole foreground when the modal cannot fit the parent's viewport
+--- (it is then an OS window of its own, above the scrim). Without
+--- Theme.center_next_window the rect is never known and the parent's draw list
+--- is used throughout.
 ---
 --- **Standard pattern:**
 --- ```
+--- Theme.center_next_window(ctx, w, h)
 --- Theme.modal_scrim(ctx, "My Modal##id")
 --- local visible = reaper.ImGui_BeginPopupModal(ctx, "My Modal##id", ...)
 --- ```
 ---
----
 --- @param ctx  userdata  ImGui context
 --- @param popup_name string  Exact popup ID (same string passed to OpenPopup / BeginPopupModal)
-local _scrim_was_open = {}
+
+-- Per open popup (keyed by name): { ctx, order, frames, own_viewport, cx, cy, rect = { x1, y1, x2, y2 } | nil }
+local _scrim_state = {}
+local _scrim_order = 0   -- opening order: a modal opened later is drawn above the ones opened before it
+-- Placement of the window Theme.center_next_window set up last: { ctx, frame, cx, cy, w, h } (see modal_scrim)
+local _next_window_rect = nil
+-- Size-constraint callbacks that report a modal's position and size, per context and popup name. Kept for the
+-- context's lifetime (attached to it) and reused every time the popup opens again.
+local _scrim_fns = setmetatable({}, { __mode = "k" })
+local SCRIM_FN_EEL = "fs_x = Pos.x; fs_y = Pos.y; fs_w = DesiredSize.x; fs_h = DesiredSize.y; fs_n += 1;"
+
+--- True when the popup placed by the last Theme.center_next_window call (this frame) cannot fit the viewport
+--- (vp_x, vp_y, vp_w, vp_h), so Dear ImGui gives it a viewport of its own. An auto-fit height (h = 0) is checked
+--- with zero height: a taller modal only sticks out further. 1 px of slack so rounding never claims a miss.
+local function _popup_leaves_viewport(r, vp_x, vp_y, vp_w, vp_h)
+  if not r then return false end
+  local x1, x2 = r.cx - r.w * 0.5, r.cx + r.w * 0.5
+  local y1, y2 = r.cy - r.h * 0.5, r.cy + r.h * 0.5
+  return x1 < vp_x - 1 or y1 < vp_y - 1 or x2 > vp_x + vp_w + 1 or y2 > vp_y + vp_h + 1
+end
+
+--- The size callback of `popup_name` in `ctx` (created and attached on first use), or nil when this ReaImGui
+--- has no EEL functions.
+local function _scrim_size_fn(ctx, popup_name)
+  if not reaper.ImGui_CreateFunctionFromEEL then return nil end
+  local fns = _scrim_fns[ctx]
+  if not fns then
+    fns = {}
+    _scrim_fns[ctx] = fns
+  end
+  local fn = fns[popup_name]
+  if not fn or not reaper.ImGui_ValidatePtr(fn, "ImGui_Function*") then
+    fn = reaper.ImGui_CreateFunctionFromEEL(SCRIM_FN_EEL)
+    if not fn then return nil end
+    reaper.ImGui_Attach(ctx, fn)
+    fns[popup_name] = fn
+  end
+  return fn
+end
+
+--- Fills the rect (x1, y1)-(x2, y2) with `col` on `dl`, leaving out every rect of `holes` (each with corners
+--- rounded by `rounding`, like a window). Axis-aligned cells, so neighbouring fills meet without seams.
+local function _fill_around_holes(dl, x1, y1, x2, y2, holes, col, rounding)
+  local xs, ys = { x1, x2 }, { y1, y2 }
+  for _, h in ipairs(holes) do
+    for _, x in ipairs({ h[1], h[3] }) do
+      if x > x1 and x < x2 then xs[#xs + 1] = x end
+    end
+    for _, y in ipairs({ h[2], h[4] }) do
+      if y > y1 and y < y2 then ys[#ys + 1] = y end
+    end
+  end
+  table.sort(xs)
+  table.sort(ys)
+  for i = 1, #xs - 1 do
+    for j = 1, #ys - 1 do
+      local ax, bx, ay, by = xs[i], xs[i + 1], ys[j], ys[j + 1]
+      if bx > ax and by > ay then
+        local mx, my = (ax + bx) * 0.5, (ay + by) * 0.5
+        local in_hole = false
+        for _, h in ipairs(holes) do
+          if mx > h[1] and mx < h[3] and my > h[2] and my < h[4] then in_hole = true break end
+        end
+        if not in_hole then reaper.ImGui_DrawList_AddRectFilled(dl, ax, ay, bx, by, col) end
+      end
+    end
+  end
+  -- The hole is the modal's rect; its corners are rounded, so dim the bits of each corner outside the curve
+  if rounding > 0 then
+    local hp = math.pi * 0.5
+    for _, h in ipairs(holes) do
+      local r = math.min(rounding, (h[3] - h[1]) * 0.5, (h[4] - h[2]) * 0.5)
+      if r > 0 then
+        local corners = {
+          { h[1], h[2], h[1] + r, h[2] + r, 2 * hp }, { h[3], h[2], h[3] - r, h[2] + r, 3 * hp },
+          { h[3], h[4], h[3] - r, h[4] - r, 0 },      { h[1], h[4], h[1] + r, h[4] - r, hp },
+        }
+        for _, c in ipairs(corners) do
+          reaper.ImGui_DrawList_PathLineTo(dl, c[1], c[2])
+          reaper.ImGui_DrawList_PathArcTo(dl, c[3], c[4], r, c[5], c[5] + hp)
+          reaper.ImGui_DrawList_PathFillConcave(dl, col)
+        end
+      end
+    end
+  end
+end
+
 function Theme.modal_scrim(ctx, popup_name)
   local is_open = reaper.ImGui_IsPopupOpen(ctx, popup_name)
   if not is_open then
-    _scrim_was_open[popup_name] = nil
+    _scrim_state[popup_name] = nil
     return
   end
-  -- Skip the very first frame the popup appears — Dear ImGui hides the
-  -- modal window for one frame on creation (HiddenFramesCannotSkipItems).
-  -- Drawing the scrim on that frame produces a dark flash with no modal.
-  if not _scrim_was_open[popup_name] then
-    _scrim_was_open[popup_name] = true
-    return
-  end
-  local P = _get_palette()
-  local dl = reaper.ImGui_GetWindowDrawList(ctx)
-  -- Expand clip rect to cover the entire screen (not just the parent window)
-  reaper.ImGui_DrawList_PushClipRectFullScreen(dl)
-  -- Get the parent window's viewport bounds for the fill rect
   local vp = reaper.ImGui_GetWindowViewport(ctx)
   local vp_x, vp_y = reaper.ImGui_Viewport_GetPos(vp)
   local vp_w, vp_h = reaper.ImGui_Viewport_GetSize(vp)
-  reaper.ImGui_DrawList_AddRectFilled(dl, vp_x, vp_y, vp_x + vp_w, vp_y + vp_h, P.dim_bg)
+  local frame = reaper.ImGui_GetFrameCount(ctx)
+  local rec = _next_window_rect
+  if rec and (rec.ctx ~= ctx or rec.frame ~= frame) then rec = nil end
+
+  local st = _scrim_state[popup_name]
+  if not st or st.ctx ~= ctx then
+    -- The frame the popup appears: center_next_window placed it this frame
+    _scrim_order = _scrim_order + 1
+    st = { ctx = ctx, order = _scrim_order, frames = 0, own_viewport = _popup_leaves_viewport(rec, vp_x, vp_y, vp_w, vp_h),
+           cx = rec and rec.cx, cy = rec and rec.cy }
+    _scrim_state[popup_name] = st
+  end
+  st.frames = st.frames + 1
+
+  -- What the modal's Begin reported last frame (its final size, and its position), then arm the callback for this
+  -- frame's Begin. It repeats the size constraint center_next_window set (none with a fixed height), so it is only
+  -- installed when that call placed the modal this frame.
+  local fn = _scrim_size_fn(ctx, popup_name)
+  local got, fx, fy, fw, fh = false, 0, 0, 0, 0
+  if fn then
+    if reaper.ImGui_Function_GetValue(fn, "fs_n") > 0 then
+      got = true
+      fx, fy = reaper.ImGui_Function_GetValue(fn, "fs_x"), reaper.ImGui_Function_GetValue(fn, "fs_y")
+      fw, fh = reaper.ImGui_Function_GetValue(fn, "fs_w"), reaper.ImGui_Function_GetValue(fn, "fs_h")
+    end
+    reaper.ImGui_Function_SetValue(fn, "fs_n", 0)
+    if rec then
+      local _, flt_max = reaper.ImGui_NumericLimits_Float()
+      if rec.h > 0 then
+        reaper.ImGui_SetNextWindowSizeConstraints(ctx, 0, 0, flt_max, flt_max, fn)
+      else
+        reaper.ImGui_SetNextWindowSizeConstraints(ctx, rec.w, 0, rec.w, 1e6, fn)
+      end
+    end
+  end
+
+  -- Skip the very first frame the popup appears — Dear ImGui hides the
+  -- modal window for one frame on creation (HiddenFramesCannotSkipItems).
+  -- Drawing the scrim on that frame produces a dark flash with no modal.
+  if st.frames == 1 then return end
+
+  -- The modal's rect this frame. Frame 2: not known yet (its size may still change). Frame 3: the size from
+  -- frame 2, where Dear ImGui centred it on the placement point (the callback ran before that move). Later: the
+  -- position and size the callback reported (one frame behind while the modal is dragged)
+  if got and st.frames >= 3 and fw > 0 and fh > 0 then
+    fw, fh = math.floor(fw), math.floor(fh)
+    if st.frames == 3 then
+      if st.cx then
+        st.rect = { math.floor(st.cx - fw * 0.5), math.floor(st.cy - fh * 0.5) }
+      end
+    else
+      st.rect = { math.floor(fx), math.floor(fy) }
+    end
+    if st.rect then st.rect[3], st.rect[4] = st.rect[1] + fw, st.rect[2] + fh end
+  end
+
+  local P = _get_palette()
+  local x1, y1, x2, y2 = vp_x, vp_y, vp_x + vp_w, vp_y + vp_h
+  if st.rect then
+    -- Over the child windows, around this modal and every modal of this context opened after it (above it)
+    local holes = {}
+    for _, other in pairs(_scrim_state) do
+      if other.ctx == ctx and other.rect and other.order >= st.order then holes[#holes + 1] = other.rect end
+    end
+    local dl = reaper.ImGui_GetForegroundDrawList(ctx)
+    reaper.ImGui_DrawList_PushClipRect(dl, x1, y1, x2, y2, false)
+    -- The modal's Begin follows right after this call, under the same style: it rounds with this WindowRounding
+    local rounding = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding()) or 0
+    _fill_around_holes(dl, x1, y1, x2, y2, holes, P.dim_bg, rounding)
+    reaper.ImGui_DrawList_PopClipRect(dl)
+    return
+  end
+  -- Rect not known yet: the whole foreground when the modal is an OS window of its own, else the parent's draw
+  -- list (behind the modal; the child windows stay bright for this frame)
+  local dl = st.own_viewport and reaper.ImGui_GetForegroundDrawList(ctx) or reaper.ImGui_GetWindowDrawList(ctx)
+  reaper.ImGui_DrawList_PushClipRect(dl, x1, y1, x2, y2, false)
+  reaper.ImGui_DrawList_AddRectFilled(dl, x1, y1, x2, y2, P.dim_bg)
   reaper.ImGui_DrawList_PopClipRect(dl)
 end
 
@@ -2338,6 +2538,13 @@ function Theme.center_next_window(ctx, w, h, cond)
   end
 
   reaper.ImGui_SetNextWindowPos(ctx, cx, cy, cond, 0.5, 0.5)
+  -- Remember where a popup that appears this frame will be placed: Theme.modal_scrim() uses it to tell whether the
+  -- modal gets a viewport of its own (see there). Only Cond_Appearing / Cond_Always place it there for sure.
+  _next_window_rect = nil
+  if w and w > 0 and (cond == reaper.ImGui_Cond_Appearing() or cond == reaper.ImGui_Cond_Always()) then
+    _next_window_rect = { ctx = ctx, frame = reaper.ImGui_GetFrameCount(ctx), cx = cx, cy = cy, w = w,
+                          h = (h and h > 0) and h or 0 }
+  end
   if w and w > 0 then
     if h and h > 0 then
       -- Fixed width and height
