@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pan Snap v1.7.2 (`Routing/Fancy_Pan Snap.lua`)** — UX review fixes: one Esc closes an open Info or Settings dialog and a second Esc closes the HUD (a docked HUD is never closed by Esc); the cursor overlay value, the live preview and the Info dialog headings now request the shared bold font (they referenced an undefined font); tooltips wait for the hover delay; the window tip says the utility stops on close when "Keep running in background" is off; the Settings checkbox reads "Track Pan"; the About tab shows the current version; removed checks for ReaImGui functions that no longer exist.
+
 - **Fancy Pitch Correct v2.5.0 (`Pitch/Fancy_Pitch Correct.lua`)** — UX review: safer edits, clearer interface:
   - **Undo and data safety**: the editor follows Cmd/Ctrl+Z and Redo (the note model is saved inside the same undo point as the pitch envelope); Re-Analyze, Reset all, Clear, Remove and Wipe ask before discarding edits; Wipe and Remove no longer reset a take's own pitch and Wipe is one undo step; re-analysis no longer leaves a stale envelope; holding an arrow key to nudge is one undo step; the note-menu sliders now apply their changes.
   - **Keyboard and input**: Esc closes the innermost popup or dialog, then deselects, then closes a floating window (never a docked one); Space and its Shift/Ctrl/Alt chords run the action bound in REAPER; shortcuts need exact modifiers and ignore open menus; Cmd/Ctrl-drag is fine adjust; value controls are drag widgets with fine adjust, double-click reset, Cmd/Ctrl-click typing and clamping; Block and Hop size are lists.

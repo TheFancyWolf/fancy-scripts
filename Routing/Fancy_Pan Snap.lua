@@ -1,8 +1,11 @@
 -- @description Fancy Pan Snap
 -- @author Fancy Scripts
--- @version 1.7.1
+-- @version 1.7.2
 -- @changelog
---   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
+--   + Esc now closes an open Info or Settings dialog first; a second Esc closes the HUD (never when docked)
+--   + Overlay value, live preview and Info headings use the shared bold font slot (was an undefined font)
+--   + Tooltips wait for the hover delay; window tip follows the keep-in-background setting
+--   + Settings label "Track Pan"; About tab shows the current version
 -- @about
 --   Background auto-snap utility that snaps Track Pan, Track Width / Dual Pan,
 --   and Send Pans to configurable percentage increments (default 10%) on release.
@@ -527,9 +530,6 @@ local function snap_engine_tick(imgui_ctx)
     active_tip_data = nil
     cached_track_list = {}
     if not hud_open then
-      if ctx and reaper.ImGui_DestroyContext then
-        pcall(reaper.ImGui_DestroyContext, ctx)
-      end
       ctx = nil
       fonts = nil
     end
@@ -745,9 +745,6 @@ local function draw_floating_cursor_tooltip()
                   | reaper.ImGui_WindowFlags_NoInputs()
                   | reaper.ImGui_WindowFlags_NoFocusOnAppearing()
 
-  if reaper.ImGui_WindowFlags_Tooltip then
-    tip_flags = tip_flags | reaper.ImGui_WindowFlags_Tooltip()
-  end
   if reaper.ImGui_WindowFlags_TopMost then
     tip_flags = tip_flags | reaper.ImGui_WindowFlags_TopMost()
   end
@@ -774,7 +771,7 @@ local function draw_floating_cursor_tooltip()
     reaper.ImGui_Text(ctx, active_tip_data.track .. " • " .. active_tip_data.param)
     reaper.ImGui_PopStyleColor(ctx, 1)
 
-    local pushed_bold = Theme.push_font(ctx, fonts.bold)
+    local pushed_bold = Theme.push_font(ctx, fonts.default_bold)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), style.val)
     reaper.ImGui_Text(ctx, active_tip_data.val_str)
     reaper.ImGui_PopStyleColor(ctx, 1)
@@ -860,12 +857,14 @@ local function draw_master_row(P, bypass_active)
 
   if bypass_active then
     Theme.badge(ctx, "BYPASS (Shift/Alt)", {
+      id = "pan_snap_state",
       color = P.yellow,
       bg = Theme.with_alpha(P.yellow, 0.22),
       tooltip = "Auto-snapping is bypassed while holding Shift or Alt",
     })
   elseif not config.enabled then
     Theme.badge(ctx, "ENGINE PAUSED", {
+      id = "pan_snap_state",
       color = P.red,
       bg = Theme.with_alpha(P.red, 0.2),
       tooltip = "Auto-snapping is currently paused",
@@ -875,6 +874,7 @@ local function draw_master_row(P, bypass_active)
       and "LCR"
       or string.format("Snap: %g%%", config.step_pct)
     Theme.badge(ctx, step_label, {
+      id = "pan_snap_state",
       color = P.accent_l,
       bg = P.accent_d,
       tooltip = "Current active detent increment",
@@ -898,7 +898,7 @@ local function draw_master_row(P, bypass_active)
     hud_open = false
     reaper.DeleteExtState(EXTSTATE_SECTION, "pan_snap_hud_open", false)
   end
-  if reaper.ImGui_IsItemHovered(ctx) then
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
     Theme.tooltip(ctx, "Completely stops the background snapping engine and exits the script")
   end
 
@@ -907,7 +907,9 @@ local function draw_master_row(P, bypass_active)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
   local pushed_sm = Theme.push_font(ctx, fonts.small)
   reaper.ImGui_Text(ctx, "Tip: Hold Shift or Alt while adjusting to bypass snap.")
-  reaper.ImGui_Text(ctx, "Close window to keep running in background.")
+  reaper.ImGui_Text(ctx, config.keep_in_background
+    and "Close window to keep running in background."
+    or "Closing the window stops snapping.")
   Theme.pop_font(ctx, pushed_sm)
   reaper.ImGui_PopStyleColor(ctx, 1)
 end
@@ -954,7 +956,7 @@ local function draw_increment_section()
     config.step_pct = math.floor(new_pct * 10 + 0.5) / 10
     save_config()
   end
-  if reaper.ImGui_IsItemHovered(ctx) then
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
     Theme.tooltip(ctx, "Drag to dial any custom snap increment between 1.0% and 50.0%")
   end
 end
@@ -1074,7 +1076,7 @@ local function draw_styling_section(P)
     config.overlay_opacity = new_op_pct / 100.0
     save_config()
   end
-  if reaper.ImGui_IsItemHovered(ctx) then
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
     Theme.tooltip(ctx, "Adjust background opacity of the floating cursor overlay")
   end
 
@@ -1095,12 +1097,7 @@ local function draw_styling_section(P)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), L.md, L.sm)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ChildRounding(), style.rounding)
 
-  local prev_child_border = (style.border_size > 0)
-  if reaper.ImGui_ChildFlags_Border then
-    prev_child_border = prev_child_border and reaper.ImGui_ChildFlags_Border() or 0
-  elseif reaper.ImGui_ChildFlags_Borders then
-    prev_child_border = prev_child_border and reaper.ImGui_ChildFlags_Borders() or 0
-  end
+  local prev_child_border = (style.border_size > 0) and reaper.ImGui_ChildFlags_Borders() or 0
 
   local preview_h = L.row_h * 2 + L.sm
   if reaper.ImGui_BeginChild(ctx, "overlay_style_preview", 0, preview_h, prev_child_border) then
@@ -1108,7 +1105,7 @@ local function draw_styling_section(P)
     reaper.ImGui_Text(ctx, "Lead Vocal • Pan")
     reaper.ImGui_PopStyleColor(ctx, 1)
 
-    local pushed_bold = Theme.push_font(ctx, fonts.bold)
+    local pushed_bold = Theme.push_font(ctx, fonts.default_bold)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), style.val)
     reaper.ImGui_Text(ctx, "20% L")
     reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1142,7 +1139,7 @@ local function draw_styling_section(P)
     save_config()
     set_status("Overlay style reset to defaults")
   end
-  if reaper.ImGui_IsItemHovered(ctx) then
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
     Theme.tooltip(ctx, "Revert overlay styling to default theme elements")
   end
 
@@ -1168,7 +1165,7 @@ local function draw_info_modal()
   Theme.modal_scrim(ctx, "Fancy Pan Snap -- Info & Guide##pan_snap_info_modal")
   local visible = reaper.ImGui_BeginPopupModal(ctx, "Fancy Pan Snap -- Info & Guide##pan_snap_info_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
-    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
+    if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
@@ -1176,7 +1173,7 @@ local function draw_info_modal()
       if reaper.ImGui_BeginTabItem(ctx, "Quick Guide") then
         reaper.ImGui_Spacing(ctx)
 
-        local pf = Theme.push_font(ctx, fonts.bold)
+        local pf = Theme.push_font(ctx, fonts.default_bold)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "1. Background Auto-Snapping")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1184,7 +1181,7 @@ local function draw_info_modal()
         reaper.ImGui_TextWrapped(ctx, "Fancy Pan Snap monitors your pan adjustments in the TCP, MCP, Envelope lanes, and sends. When you release a knob, it automatically snaps to the nearest configured grid increment.")
         reaper.ImGui_Dummy(ctx, 0, L.sm)
 
-        pf = Theme.push_font(ctx, fonts.bold)
+        pf = Theme.push_font(ctx, fonts.default_bold)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "2. Live Snapped Overlay Tooltip")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1192,7 +1189,7 @@ local function draw_info_modal()
         reaper.ImGui_TextWrapped(ctx, "While adjusting any pan or width knob, a smooth floating badge follows your mouse cursor displaying the exact target value in real time.")
         reaper.ImGui_Dummy(ctx, 0, L.sm)
 
-        pf = Theme.push_font(ctx, fonts.bold)
+        pf = Theme.push_font(ctx, fonts.default_bold)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.yellow)
         reaper.ImGui_Text(ctx, "3. Free Pan Bypass Modifier")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1205,7 +1202,7 @@ local function draw_info_modal()
       if reaper.ImGui_BeginTabItem(ctx, "Keyboard & Controls") then
         reaper.ImGui_Spacing(ctx)
 
-        local pf = Theme.push_font(ctx, fonts.bold)
+        local pf = Theme.push_font(ctx, fonts.default_bold)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent_l)
         reaper.ImGui_Text(ctx, "Shift / Alt")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1215,7 +1212,7 @@ local function draw_info_modal()
 
         reaper.ImGui_Dummy(ctx, 0, L.xs)
 
-        pf = Theme.push_font(ctx, fonts.bold)
+        pf = Theme.push_font(ctx, fonts.default_bold)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent_l)
         reaper.ImGui_Text(ctx, "Esc")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1225,7 +1222,7 @@ local function draw_info_modal()
 
         reaper.ImGui_Dummy(ctx, 0, L.xs)
 
-        pf = Theme.push_font(ctx, fonts.bold)
+        pf = Theme.push_font(ctx, fonts.default_bold)
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent_l)
         reaper.ImGui_Text(ctx, "Toolbar Button")
         reaper.ImGui_PopStyleColor(ctx, 1)
@@ -1240,7 +1237,7 @@ local function draw_info_modal()
         reaper.ImGui_Spacing(ctx)
         reaper.ImGui_Text(ctx, "Fancy Pan Snap")
         reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-        reaper.ImGui_Text(ctx, "Version 1.7.0 -- Fancy Scripts")
+        reaper.ImGui_Text(ctx, "Version 1.7.2 -- Fancy Scripts")
         reaper.ImGui_Text(ctx, "Designed for REAPER 7.0+ with ReaImGui")
         reaper.ImGui_Dummy(ctx, 0, L.md)
         reaper.ImGui_TextWrapped(ctx, "Part of the Fancy Scripts workflow collection. Released under GNU GPL v3.")
@@ -1275,7 +1272,7 @@ local function draw_settings_modal()
   Theme.modal_scrim(ctx, "Pan Snap Settings##pan_snap_settings_modal")
   local visible = reaper.ImGui_BeginPopupModal(ctx, "Pan Snap Settings##pan_snap_settings_modal", true, reaper.ImGui_WindowFlags_None())
   if visible then
-    if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
+    if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
@@ -1283,14 +1280,14 @@ local function draw_settings_modal()
 
     Theme.section_divider(ctx, "TARGET PARAMETERS", { tooltip = "Choose which parameters are automatically snapped" })
 
-    local changed_pan, new_pan = reaper.ImGui_Checkbox(ctx, "Track Pan (D_PAN)##set_pan", config.target_pan)
+    local changed_pan, new_pan = reaper.ImGui_Checkbox(ctx, "Track Pan##set_pan", config.target_pan)
     if changed_pan then
       config.target_pan = new_pan
       save_config()
       last_track_count = -1
       tracked_params = {}
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Snaps main track pan positions (-100% L to +100% R)")
     end
 
@@ -1301,7 +1298,7 @@ local function draw_settings_modal()
       last_track_count = -1
       tracked_params = {}
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Snaps stereo track width (0% to 100%) or Dual Pan L/R positions")
     end
 
@@ -1312,7 +1309,7 @@ local function draw_settings_modal()
       last_track_count = -1
       tracked_params = {}
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Snaps send pan positions for all track sends")
     end
 
@@ -1323,7 +1320,7 @@ local function draw_settings_modal()
       last_track_count = -1
       tracked_params = {}
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Also monitor and snap pan/width adjustments on the REAPER Master Track")
     end
 
@@ -1336,7 +1333,7 @@ local function draw_settings_modal()
       config.keep_in_background = new_bg
       save_config()
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "When enabled (default), closing the HUD window keeps the snapping engine active in the background.")
     end
 
@@ -1348,7 +1345,7 @@ local function draw_settings_modal()
         active_tip_data = nil
       end
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Displays a smooth ReaImGui floating badge at your mouse cursor showing the snapped target while turning any knob")
     end
 
@@ -1368,7 +1365,7 @@ local function draw_settings_modal()
       tracked_params = {}
       set_status("All settings reset to defaults")
     end
-    if reaper.ImGui_IsItemHovered(ctx) then
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Restore all default Pan Snap settings and overlay styling")
     end
 
@@ -1436,14 +1433,16 @@ local function loop()
         draw_info_modal()
         draw_settings_modal()
 
+        -- HC5: a modal owns Esc while open; the window closes only when floating
+        if not reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
+           and not reaper.ImGui_IsAnyItemActive(ctx)
+           and not reaper.ImGui_IsWindowDocked(ctx)
+           and reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then
+          open = false
+        end
+
         -- ReaImGui's Begin calls End itself when it returns false
         reaper.ImGui_End(ctx)
-      end
-
-      local modal_open = reaper.ImGui_IsPopupOpen(ctx, "Fancy Pan Snap -- Info & Guide##pan_snap_info_modal")
-        or reaper.ImGui_IsPopupOpen(ctx, "Pan Snap Settings##pan_snap_settings_modal")
-      if not modal_open and reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Escape()) then
-        open = false
       end
 
       Theme.pop_font(ctx, pushed_default)
