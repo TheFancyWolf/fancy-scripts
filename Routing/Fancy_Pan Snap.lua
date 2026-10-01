@@ -1,25 +1,8 @@
 -- @description Fancy Pan Snap
 -- @author Fancy Scripts
--- @version 1.7.0
+-- @version 1.7.1
 -- @changelog
---   + Multi-project tab switching support: automatic session switch detection via EnumProjects(-1)
---   + Prevents cross-session pointer leaks, stale track pointers, and ReaImGui context desync
---   + High-performance zero-allocation fast-path engine eliminates GC churn during idle
---   + Pre-cached track descriptors, GUIDs, and parameter keys eliminate string allocations in defer loops
---   + Fixed mousewheel and MIDI controller snapping: tracks mouse_down_seen to allow smooth scrolling without premature snap
---   + Hardened ReaImGui context lifecycle and bypass modifier query to prevent context pointer errors
---   + Periodic stale track cleanup without per-tick table diffing
---   + Fixed intermittent ImGui_GetKeyMods context error during background idle execution
---   + Added context validation and dynamic recreation for seamless background running
---   + Added 50% preset button and replaced 12.5% step
---   + Removed "Auto Detent" subtitle from header
---   + Added Info and Settings modal dialogs matching Parameter Link layout
---   + Moved target parameters into Settings modal
---   + Added STOP button to top master control row with tips placed directly beneath
---   + Refactored Styling section to permanent section using standard section divider
---   + Added comprehensive Overlay Styling with REAPER theme element pickers
---   + Seamless background execution when closing HUD window with toolbar re-open
---   + Initial release
+--   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
 -- @about
 --   Background auto-snap utility that snaps Track Pan, Track Width / Dual Pan,
 --   and Send Pans to configurable percentage increments (default 10%) on release.
@@ -811,8 +794,10 @@ local function draw_floating_cursor_tooltip()
       reaper.ImGui_Text(ctx, "[Bypass]")
       reaper.ImGui_PopStyleColor(ctx, 1)
     end
+
+    -- ReaImGui's Begin calls End itself when it returns false
+    reaper.ImGui_End(ctx)
   end
-  reaper.ImGui_End(ctx)
 
   reaper.ImGui_PopStyleVar(ctx, 3)
   reaper.ImGui_PopStyleColor(ctx, 2)
@@ -1426,7 +1411,7 @@ local function loop()
       local nc, nv = Theme.push(ctx, P)
       local pushed_default = Theme.push_font(ctx, fonts.default)
 
-      Theme.center_next_window(ctx, 380, 0, reaper.ImGui_Cond_Once())
+      Theme.center_next_window(ctx, 380, 0, reaper.ImGui_Cond_FirstUseEver())
       local win_flags = reaper.ImGui_WindowFlags_NoCollapse() | reaper.ImGui_WindowFlags_NoTitleBar()
 
       local visible, open = reaper.ImGui_Begin(ctx, "Fancy Pan Snap", true, win_flags)
@@ -1446,13 +1431,14 @@ local function loop()
         reaper.ImGui_Dummy(ctx, 0, L.md)
 
         draw_styling_section(P)
+
+        -- Modals rendering
+        draw_info_modal()
+        draw_settings_modal()
+
+        -- ReaImGui's Begin calls End itself when it returns false
+        reaper.ImGui_End(ctx)
       end
-
-      -- Modals rendering
-      draw_info_modal()
-      draw_settings_modal()
-
-      reaper.ImGui_End(ctx)
 
       local modal_open = reaper.ImGui_IsPopupOpen(ctx, "Fancy Pan Snap -- Info & Guide##pan_snap_info_modal")
         or reaper.ImGui_IsPopupOpen(ctx, "Pan Snap Settings##pan_snap_settings_modal")
