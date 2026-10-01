@@ -1016,7 +1016,7 @@ end
 --- and Theme.create_fonts() instead of calling ImGui_CreateFont directly.
 
 Theme.font_family      = "sans-serif"
-Theme.font_bold_family = "sans-serif Bold"
+Theme.font_bold_family = "sans-serif"   -- bold is the Bold font flag on this family (CreateFont takes flags, not a size)
 
 Theme.font_sizes = {
   small   = 12,    -- labels, secondary text, table metadata
@@ -1053,15 +1053,15 @@ function Theme.create_fonts(_ctx, overrides)
 
   local fonts = {}
   -- Regular weights
-  fonts.default = reaper.ImGui_CreateFont(family, sizes.default)
-  fonts.small   = reaper.ImGui_CreateFont(family, sizes.small)
-  fonts.medium  = reaper.ImGui_CreateFont(family, sizes.medium)
-  fonts.large   = reaper.ImGui_CreateFont(family, sizes.large)
-  fonts.header  = reaper.ImGui_CreateFont(family, sizes.header)
+  fonts.default = reaper.ImGui_CreateFont(family)
+  fonts.small   = reaper.ImGui_CreateFont(family)
+  fonts.medium  = reaper.ImGui_CreateFont(family)
+  fonts.large   = reaper.ImGui_CreateFont(family)
+  fonts.header  = reaper.ImGui_CreateFont(family)
   -- Bold weights
-  fonts.default_bold = reaper.ImGui_CreateFont(bold_family, sizes.default)
-  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, sizes.medium)
-  fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, sizes.large)
+  fonts.default_bold = reaper.ImGui_CreateFont(bold_family, reaper.ImGui_FontFlags_Bold())
+  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, reaper.ImGui_FontFlags_Bold())
+  fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, reaper.ImGui_FontFlags_Bold())
   -- Backward compat alias
   fonts.tooltip = fonts.default
 
