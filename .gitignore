@@ -20,6 +20,10 @@ _fancy_*.json
 .agents/
 agents.md
 AGENTS.md
+.claude/agents/qa_agent.md
+.claude/skills/ai-skeptic-reviewer
+.claude/skills/reaper-screenshot
+.mcp.json
 
 # Claude Code skill/agent symlinks into .agents/ (local-only, see docs/superpowers/specs)
 .claude/skills/
