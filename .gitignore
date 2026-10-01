@@ -18,5 +18,7 @@ _fancy_*.json
 
 # Antigravity / Agent files (managed externally)
 .agents/
+.claude/
 agents.md
 AGENTS.md
+.mcp.json
