@@ -1,8 +1,8 @@
 -- @description Fancy Selected Track Meter
 -- @author Fancy Scripts
--- @version 9.67.1
+-- @version 9.67.2
 -- @changelog
---   + Fixed ReaImGui double-End error when a window is collapsed, fully clipped, or in an inactive dock tab
+--   # Holding B, L or M no longer flips the setting repeatedly; Recent Clips buttons use the standard button height
 -- @about
 --   Real-time visual metering display for selected tracks.
 --   Features customizable colors, peak hold, and docking support.
@@ -810,13 +810,13 @@ local function loop()
             State.clip_log = {}
             State.last_clip_time = -100
         end
-        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_B()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_B(), false) then
             State.show_balance_meter = not State.show_balance_meter
         end
-        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_M()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_M(), false) then
             State.meter_scale_mode = State.meter_scale_mode == 1 and 2 or 1
         end
-        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_L()) then
+        if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_L(), false) then
             State.is_locked = not State.is_locked
             if State.is_locked then
                 State.locked_track = reaper.GetSelectedTrack(0, 0)
@@ -1222,14 +1222,14 @@ local function loop()
                 for i, clip in ipairs(State.clip_log) do
                     local time_str = reaper.format_timestr_pos(clip.time, "", -1)
                     local val_str = string.format("+%.1f dB", clip.val)
-                    if reaper.ImGui_Button(ctx, time_str .. "  |  " .. val_str .. "##" .. i, -1, 30) then
+                    if reaper.ImGui_Button(ctx, time_str .. "  |  " .. val_str .. "###clip_" .. i, -1, 0) then
                         reaper.SetEditCurPos(clip.time, true, false)
                     end
                 end
                 reaper.ImGui_Dummy(ctx, 0, 10)
                 reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), VisualSettings.Color_Clip)
                 reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x000000FF)
-                if reaper.ImGui_Button(ctx, "Clear Log", -1, 30) then
+                if reaper.ImGui_Button(ctx, "Clear Log", -1, 0) then
                     State.clip_log = {}
                     State.last_clip_time = -100
                 end
