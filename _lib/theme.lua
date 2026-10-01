@@ -22,9 +22,12 @@
 --               red/red_h/red_d/red_l         (error, delete, destructive)
 --               yellow/yellow_l               (warning, caution)
 --               blue/blue_h/blue_d/blue_e/blue_l (info, secondary accent)
---   Structure:  border, sep, dim_bg           (borders, separators, modal overlay)
+--   Structure:  border, sep, dim_bg           (borders, separators, modal overlay; border >= 3:1 on bg/panel/card)
 --   Table:      table_row, table_row_alt      (alternating row backgrounds)
 --   Controls:   slider_grab_active            (slider grab while dragging)
+--   Canvas:     canvas = { row*, grid*, key_*, key_text_*, note_*, zone_*, handle*, trace, preview, trend, ... }
+--               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy Dark,
+--               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
 --
 -- THEME MODES & PREFS -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
@@ -51,6 +54,7 @@
 --
 -- ICON PRESETS -- button dim = size + pad*2
 --   icon_sm={size=md,pad=xs}->12px  icon_md={size=lg,pad=sm}->20px  icon_lg={size=xl,pad=md}->32px
+--   icon_target={size=xl,pad=sm}->24px (WCAG 2.5.8 minimum target for frequent / destructive icon buttons)
 --   Pass via opts.preset: Theme.icon_btn(ctx, id, fn, {preset = L.icon_sm})
 --
 -- FONTS -- Theme.font_sizes: small=12 default=14 medium=16 large=18 header=20
@@ -60,20 +64,22 @@
 --   pop_font(ctx, pushed)      -> conditional pop
 --   fonts.tooltip = fonts.default (backward-compat alias)
 --
--- STYLE -- Theme.push(ctx, [palette]) -> nc=32, nv=9 / Theme.pop(ctx, nc, nv)
+-- STYLE -- Theme.push(ctx, [palette]) -> nc=32, nv=10 / Theme.pop(ctx, nc, nv)
 --   Colors: WindowBg, TitleBg*2, Header*3, Button*3, FrameBg*3, Slider*2, CheckMark,
 --           Popup, ModalDim, Separator*3, Table*5, Scrollbar*3, ScrollbarGrabActive,
 --           Text, TextDisabled, Border
 --   Vars:   WindowRounding, FrameRounding, GrabRounding, ItemSpacing, FramePadding,
---           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing
+--           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize
 --
 -- ICONS -- function(dl, cx, cy, half_size, color)
 --   Theme.icons: play, pause, close, plus, info, tri_down, tri_up, tri_left, tri_right, slider, gear
 --
 -- WIDGETS
---   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip
+--   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip (hand cursor on hover)
 --   icon_btn_colored(ctx, id, icon_fn, [opts]) -> bool  opts: +bg,bg_hover,bg_active,icon_color
---   tooltip(ctx, text, [max_w])
+--   selectable(ctx, label, [sel], [flags], [w], [h], [opts])  Rounded Selectable; a label wider than the item is
+--                                              shortened with "..." and shown in full in a tooltip
+--   tooltip(ctx, text, [max_w])                The widgets' opts.tooltip show on HoveredFlags_ForTooltip (also when disabled)
 --   section_divider(ctx, label, [opts])        opts: tooltip,color,preset,icon_size,w,h,icon_color
 --   collapsing_header(ctx, label, [opts])      Safe collapsing header (opts: default_open, flags)
 --   progress_bar(ctx, fraction, [opts])        Meter/progress bar (opts: preset,fonts,fill_color,bg_color,overlay)
@@ -274,7 +280,7 @@ local FANCY_PALETTE = {
 
   -- Text
   text     = 0xFFFFFFFF,
-  text_dim = 0x7A7A9FFF,
+  text_dim = 0x8E8EADFF,
 
   -- Accent (primary purple)
   accent   = 0x8B70FAFF,
@@ -289,7 +295,7 @@ local FANCY_PALETTE = {
   blue     = 0x4DA6FFFF,
 
   -- Structural base
-  border   = 0x444444FF,
+  border   = 0x737373FF,
 }
 
 -------------------------------------------------------------------------------
@@ -305,6 +311,459 @@ local function read_theme_color(key, fallback)
   local bgr = reaper.GetThemeColor(key, 0)
   if not bgr or bgr < 0 then return fallback end
   return bgr_to_rgba(bgr)
+end
+
+-------------------------------------------------------------------------------
+-- 4A. CANVAS PALETTE (P.canvas)
+-------------------------------------------------------------------------------
+--- Colours for custom-drawn editor canvases (piano-roll rows and grid, piano keys and their labels, note blocks,
+--- zone highlights, trim handles, curves and markers, marquee, playhead, pills, ruler, scrim). Built by
+--- Theme.build_palette() into P.canvas for both modes:
+---   Fancy Dark   fixed values (the colours the Pitch Correct canvas drew with hex literals), plus a few that are
+---                exactly a palette colour or an alpha of it (noted per token).
+---   Match Theme  derived from P.bg / P.panel / P.text / P.accent / P.green / P.blue / P.yellow so the canvas
+---                follows a dark or a light REAPER theme. Every text token is fitted to >= 4.5:1 and every object
+---                boundary to >= 3:1 (WCAG 2.x, alpha composited first) against the surfaces it is drawn on.
+---                The curves and markers (trace, playhead, trend, anchor, spot, preview, marker_split) are fitted
+---                against the persistent surfaces they are drawn on: the rows, every note fill over the rows, the vibrato
+---                wash (and the ruler strip for the playhead), moved toward white or black only as far as that takes so
+---                each keeps its hue; the transient zone highlights (Shift-hover, drag) are not part of the fit. The
+---                BYPASSED badge (bypass_title, bypass_border) is fitted against the card and the dimmed canvas.
+---                The piano keys keep the same fixed colours in both modes (white / black key metaphor).
+
+-- WCAG 2.x maths (private to the library).
+local function srgb_to_linear(c8)
+  local c = c8 / 255
+  if c <= 0.03928 then return c / 12.92 end
+  return ((c + 0.055) / 1.055) ^ 2.4
+end
+
+--- Relative luminance (0 = black, 1 = white) of an 0xRRGGBBAA colour (alpha ignored).
+local function luminance(rgba)
+  return 0.2126 * srgb_to_linear((rgba >> 24) & 0xFF)
+       + 0.7152 * srgb_to_linear((rgba >> 16) & 0xFF)
+       + 0.0722 * srgb_to_linear((rgba >> 8) & 0xFF)
+end
+
+--- Alpha-composites `fg` (0xRRGGBBAA) over the opaque colour `under`; the result is opaque.
+local function composite_over(fg, under)
+  local a = (fg & 0xFF) / 255
+  local out = 0
+  for shift = 24, 8, -8 do
+    local f = (fg >> shift) & 0xFF
+    local u = (under >> shift) & 0xFF
+    out = out | (math.floor(f * a + u * (1 - a) + 0.5) << shift)
+  end
+  return out | 0xFF
+end
+
+--- WCAG contrast ratio of `fg` (its alpha composited first) over the opaque surface `under`.
+local function contrast_over(fg, under)
+  local l1 = luminance(composite_over(fg, under))
+  local l2 = luminance(under)
+  if l1 < l2 then l1, l2 = l2, l1 end
+  return (l1 + 0.05) / (l2 + 0.05)
+end
+
+-- Margin added to every fitted threshold so rounding never leaves a colour a hair under the WCAG limit.
+local FIT_MARGIN = 0.05
+
+--- Luminance of every opaque colour of `surfaces`, worked out once and kept on the list (again if the list grew).
+local function surface_lums(surfaces)
+  local lums = surfaces.lums
+  if not lums or #lums ~= #surfaces then
+    lums = {}
+    for i = 1, #surfaces do lums[i] = luminance(surfaces[i]) end
+    surfaces.lums = lums
+  end
+  return lums
+end
+
+--- WCAG contrast ratio of `col` (alpha composited first) over the opaque colour `under`, whose luminance is `l2`.
+local function ratio_over(col, under, l2)
+  local l1 = luminance(composite_over(col, under))
+  if l1 < l2 then l1, l2 = l2, l1 end
+  return (l1 + 0.05) / (l2 + 0.05)
+end
+
+--- Lowest contrast of `col` (alpha composited first) over the opaque colours in `surfaces`.
+local function min_contrast(col, surfaces)
+  local lums = surface_lums(surfaces)
+  local w = math.huge
+  for i = 1, #surfaces do
+    local r = ratio_over(col, surfaces[i], lums[i])
+    if r < w then w = r end
+  end
+  return w
+end
+
+--- True when the contrast of `col` over every opaque colour in `surfaces` is at least `need` (stops at the first
+--- surface that falls short, so a search that mostly fails stays cheap).
+local function reaches(col, surfaces, need)
+  local lums = surface_lums(surfaces)
+  for i = 1, #surfaces do
+    if ratio_over(col, surfaces[i], lums[i]) < need then return false end
+  end
+  return true
+end
+
+--- Moves `col` toward white or black, as little as possible, until its contrast against every opaque colour in
+--- `surfaces` reaches `min_ratio`. Returns `col` unchanged when it already does. A translucent colour that
+--- cannot get there keeps its alpha first, then becomes opaque. When nothing reaches it (the surfaces span too
+--- wide a range for any one colour) the result is the candidate with the best worst case over `surfaces`; with
+--- `keep` (the surfaces that matter most, a subset) a candidate that still reaches `min_ratio` on `keep` wins
+--- over one that does not.
+--- With `keep_hue` (the curve and marker colours, which tell the layers apart by hue) a translucent colour does not
+--- take the first shade that reaches `min_ratio` with its alpha: the variant that moves least toward white or black
+--- wins, whether that keeps the alpha or becomes opaque (a see-through line needs to be whitened far more than an
+--- opaque one, and that turns it into a near-neutral tint); on a tie the translucent one wins.
+--- @param col integer  Colour 0xRRGGBBAA
+--- @param surfaces table  Array of opaque 0xRRGGBBAA surfaces the colour is drawn on
+--- @param min_ratio number  Required WCAG contrast ratio (4.5 text, 3 object boundaries)
+--- @param keep table|nil  Optional subset of `surfaces` to hold at `min_ratio` when `surfaces` as a whole is out of reach
+--- @param keep_hue boolean|nil  Prefer the variant that shifts the colour least (see above)
+--- @return integer
+local function fit_contrast(col, surfaces, min_ratio, keep, keep_hue)
+  local need = min_ratio + FIT_MARGIN
+  if reaches(col, surfaces, need) then return col end
+  local lums = surface_lums(surfaces)
+  local mean = 0
+  for i = 1, #surfaces do mean = mean + lums[i] end
+  mean = mean / #surfaces
+  -- Light surfaces: darken first (a dark mark reads on them); dark surfaces: lighten first.
+  local first, second = lighten, darken
+  if mean > 0.179 then first, second = darken, lighten end
+  local bases = { col, (col & 0xFFFFFF00) | 0xFF }
+  if keep_hue then
+    -- Per direction, the smallest step over both bases (the translucent one first, so it wins a tie)
+    for _, shade in ipairs({ first, second }) do
+      local found, found_step
+      for _, base in ipairs(bases) do
+        for step = 0, found_step and found_step - 1 or 20 do
+          local c = step == 0 and base or shade(base, step / 20)
+          if reaches(c, surfaces, need) then found, found_step = c, step; break end
+        end
+      end
+      if found then return found end
+    end
+  end
+  local tried = {}
+  for _, base in ipairs(bases) do
+    for _, shade in ipairs({ first, second }) do
+      for step = 0, 20 do
+        local c = step == 0 and base or shade(base, step / 20)
+        if reaches(c, surfaces, need) then return c end
+        tried[#tried + 1] = c
+      end
+    end
+  end
+  -- Out of reach: the best worst case (a candidate that holds `keep` first)
+  local best, best_w = col, min_contrast(col, surfaces)
+  local best_keeps = keep ~= nil and reaches(col, keep, need)
+  for _, c in ipairs(tried) do
+    local keeps = keep ~= nil and reaches(c, keep, need)
+    local w = min_contrast(c, surfaces)
+    if (keeps and not best_keeps) or (keeps == best_keeps and w > best_w) then
+      best, best_w, best_keeps = c, w, keeps
+    end
+  end
+  return best
+end
+
+--- Appends the lightest and darkest of `list` (opaque colours) to `into`: a colour that clears both ends of
+--- a narrow band of surfaces clears the ones between them.
+local function add_ends(into, list)
+  local lo, hi = list[1], list[1]
+  local lo_l, hi_l = luminance(lo), luminance(hi)
+  for i = 2, #list do
+    local l = luminance(list[i])
+    if l < lo_l then lo, lo_l = list[i], l end
+    if l > hi_l then hi, hi_l = list[i], l end
+  end
+  into[#into + 1] = lo
+  into[#into + 1] = hi
+  return into
+end
+
+--- Every colour of `fills` (translucent, e.g. note fills) as it shows over every surface of `rows`.
+local function over_each(fills, rows)
+  local out = {}
+  for _, fill in ipairs(fills) do
+    for _, row in ipairs(rows) do out[#out + 1] = composite_over(fill, row) end
+  end
+  return out
+end
+
+--- A new list holding the entries of every list given.
+local function concat_lists(...)
+  local out = {}
+  for _, list in ipairs({ ... }) do
+    for _, v in ipairs(list) do out[#out + 1] = v end
+  end
+  return out
+end
+
+--- Moves the translucent `fill` away from `ink` (toward the opposite extreme) until `ink` reads at `min_ratio`
+--- on the fill as it shows over every surface of `rows`. Keeps the hue when the fill already works.
+--- @param fill integer  Fill colour 0xRRGGBBAA (translucent)
+--- @param rows table  Array of opaque surfaces the fill is drawn over
+--- @param ink integer  Extreme colour a label will be drawn in: 0xFFFFFFFF or 0x000000FF
+--- @param min_ratio number  Required contrast
+--- @return integer fill, boolean ok
+local function fit_fill(fill, rows, ink, min_ratio)
+  local need = min_ratio + FIT_MARGIN
+  local away = ink == 0xFFFFFFFF and darken or lighten
+  for step = 0, 20 do
+    local f = step == 0 and fill or away(fill, step / 20)
+    if min_contrast(ink, over_each({ f }, rows)) >= need then return f, true end
+  end
+  return fill, false
+end
+
+--- Fancy Dark canvas values. Literal tokens are the colours Pitch Correct drew with hex literals; the ones
+--- built from P are exactly the palette colour (or an alpha of it) the script used next to them.
+local function build_canvas_fancy(P)
+  local C = {}
+  -- Rows (what a note sits on). row* = in the scale, row_tonic = the key's root, row_dim* = out of the scale,
+  -- row_plain* = no scale chosen (Chromatic). *_black = the row of a black piano key.
+  C.row             = 0x212230FF
+  C.row_black       = 0x1B1B26FF
+  C.row_tonic       = 0x222032FF
+  C.row_dim         = 0x131317FF
+  C.row_dim_black   = 0x111114FF
+  C.row_plain       = 0x202020FF
+  C.row_plain_black = 0x161616FF
+  -- Accent tints drawn over the in-scale / root rows (follow P.accent)
+  C.row_tint        = with_alpha(P.accent, 0.05)
+  C.row_tonic_tint  = with_alpha(P.accent, 0.12)
+  -- Grid lines between rows
+  C.grid            = with_alpha(P.accent, 0.16)
+  C.grid_tonic      = with_alpha(P.accent, 0.35)
+  C.grid_dim        = 0x1A1A20FF
+  C.grid_plain      = 0x333333FF
+  C.grid_plain_black = 0x222222FF
+  -- Piano keys (fixed in both modes: a piano does not change colour with the REAPER theme)
+  C.key_white       = 0xDDDDDDFF
+  C.key_black       = 0x1E1E24FF
+  C.key_plain_black = 0x1A1A1AFF
+  C.key_tonic_white = 0xFFFFFFFF
+  C.key_tonic_black = 0x252338FF
+  C.key_dim_white   = 0x585962FF
+  C.key_dim_black   = 0x101013FF
+  C.key_outline     = 0x000000FF
+  C.key_tonic_strip = P.accent
+  -- Key labels (>= 4.5:1 on their key)
+  C.key_text_white       = 0x2B2B2BFF
+  C.key_text_black       = 0x999999FF
+  C.key_text_plain_white = 0x333333FF
+  C.key_text_plain_black = 0x888888FF
+  C.key_text_tonic_white = 0x181824FF
+  C.key_text_tonic_black = P.accent_l
+  C.key_text_dim_white   = P.text
+  C.key_text_dim_black   = P.text
+  -- Note blocks: fills are translucent over the row
+  C.note_fill            = 0x2A364499
+  C.note_border          = 0x6F829CFF
+  C.note_edited          = 0x3FA34D77
+  C.note_edited_border   = P.green
+  C.note_selected        = 0x4477AA88
+  C.note_selected_edited = 0x3FA34D99
+  C.note_selected_border = P.accent
+  C.note_bypassed        = 0x2A2A2A55
+  C.note_bypassed_border = 0x555555AA
+  C.note_label           = 0xDDDDDDDD
+  C.note_label_selected  = P.text
+  C.note_label_edited    = 0xFFFFFFFF
+  C.note_edit_mark       = P.text
+  -- Zone highlights and trim handles (over a note block)
+  C.zone_drift      = with_alpha(P.blue, 0.267)
+  C.zone_shift      = 0xFFAA4444
+  C.zone_divider    = with_alpha(P.text, 0.20)
+  C.handle          = with_alpha(P.text, 0.80)
+  C.handle_hover    = P.text
+  C.handle_drag     = P.accent
+  -- Curves, markers, selection, playhead
+  C.trace           = P.accent
+  C.preview         = with_alpha(P.green, 0.80)
+  C.vibrato         = 0xFFAA4418
+  C.trend           = 0x00FFFFFF
+  C.spot            = 0xFFFF00FF
+  C.anchor          = 0x00FFFFFF
+  C.marker_split      = with_alpha(P.blue, 0.67)
+  C.marker_split_text = P.blue_l
+  C.marquee_fill    = with_alpha(P.accent, 0.18)
+  C.marquee_border  = with_alpha(P.accent, 0.85)
+  C.marquee_text    = P.accent_l
+  C.playhead        = P.accent
+  -- Overlays: pills (readouts, zone names), ruler strip, scrim
+  C.pill_bg         = with_alpha(P.panel, 0.90)
+  C.pill_text       = P.text
+  C.ruler_bg        = with_alpha(P.panel, 0.90)
+  C.scrim           = with_alpha(P.bg, 0.75)
+  -- BYPASSED badge on the card, over the scrim: title and border are exactly P.yellow
+  C.bypass_title    = P.yellow
+  C.bypass_border   = P.yellow
+  return C
+end
+
+--- Match Theme canvas values, derived from the REAPER-theme palette P. "toward" = toward the text colour
+--- (lighter on a dark theme, darker on a light one), "away" = the other way. Fitted tokens start from the
+--- palette colour named in the comment and move only as far as the contrast rule needs.
+--- Tokens not assigned below keep their build_canvas_fancy value, by design: the piano keys and their
+--- black/white labels and outline (key_white ... key_text_tonic_white), and the accent / text / blue / panel /
+--- bg alphas that already follow the palette (row_tint, row_tonic_tint, grid, grid_tonic, zone_drift,
+--- zone_divider, marquee_fill, marquee_border, pill_bg, ruler_bg, scrim).
+local function build_canvas_match(P)
+  local C = build_canvas_fancy(P)
+  local bg = P.bg
+  local dark = contrast_over(0xFFFFFFFF, bg) >= contrast_over(0x000000FF, bg)
+  local toward = dark and lighten or darken
+  local away = dark and darken or lighten
+
+  -- Rows: out-of-scale rows are the window background, in-scale rows step toward the text colour. On a mid-grey
+  -- background neither white nor black text can reach 4.5:1 on surfaces that differ much (the best possible
+  -- is 4.58:1 at mid-grey), so the steps shrink as the background approaches mid-grey (k = 1 on clearly dark
+  -- or light themes).
+  local k = math.min(1, math.max(0.3, math.abs(luminance(bg) - 0.179) / 0.09))
+  C.row             = toward(bg, 0.065 * k)   -- in scale, white key
+  C.row_black       = toward(bg, 0.035 * k)   -- in scale, black key
+  C.row_tonic       = toward(bg, 0.07 * k)    -- the key's root (plus the accent tint)
+  C.row_dim         = bg                      -- out of scale: the window background
+  C.row_dim_black   = away(bg, 0.10 * k)      -- out of scale, black key
+  C.row_plain       = toward(bg, 0.06 * k)    -- no scale chosen, white key
+  C.row_plain_black = toward(bg, 0.02 * k)    -- no scale chosen, black key
+  C.grid_dim        = toward(bg, 0.05)        -- grid lines: fixed steps toward the text colour
+  C.grid_plain      = toward(bg, 0.14)
+  C.grid_plain_black = toward(bg, 0.07)
+
+  -- The rows as they show (accent tint included): every other token is fitted against these
+  local rows = {
+    composite_over(C.row_tint, C.row), composite_over(C.row_tint, C.row_black),
+    composite_over(C.row_tonic_tint, C.row_tonic), C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black,
+  }
+  local row_ends = add_ends({}, rows)
+
+  -- Keys: the fixed colours of build_canvas_fancy, plus the tokens that follow the palette
+  local key_tonics = { C.key_tonic_white, C.key_tonic_black }
+  C.key_tonic_strip      = fit_contrast(P.accent, key_tonics, 3.0)                   -- accent, >= 3:1 on both root keys
+  C.key_text_tonic_black = fit_contrast(P.accent_l, { C.key_tonic_black }, 4.5)      -- accent_l, >= 4.5:1 on the root black key
+  C.key_text_dim_white   = fit_contrast(P.text, { C.key_dim_white }, 4.5)            -- text, >= 4.5:1 on the dimmed white key
+  C.key_text_dim_black   = fit_contrast(P.text, { C.key_dim_black }, 4.5)            -- text, >= 4.5:1 on the dimmed black key
+
+  -- Note blocks: translucent blue (untouched, selected) and green (edited) tints moved "away" from the text
+  -- colour (darker on a dark theme, lighter on a light one), so a label can always read on them; borders are
+  -- the palette hue fitted to >= 3:1 on every row
+  C.note_fill            = with_alpha(away(P.blue, 0.35), 0.45)    -- untouched note: muted blue
+  C.note_edited          = with_alpha(away(P.green, 0.45), 0.50)   -- edited note: muted green
+  C.note_selected        = with_alpha(away(P.blue, 0.15), 0.60)    -- selected note: brighter blue
+  C.note_selected_edited = with_alpha(away(P.green, 0.35), 0.65)   -- selected edited note
+  C.note_bypassed        = with_alpha(toward(bg, 0.10), 0.33)      -- bypassed note: a faint grey
+  -- A fill that would leave the label no room (a mid-grey theme) is pushed further away until white (dark
+  -- theme) or black (light theme) reads on it, so the label fit below can always succeed
+  local ink, other_ink = 0xFFFFFFFF, 0x000000FF
+  if not dark then ink, other_ink = other_ink, ink end
+  for _, key in ipairs({ "note_fill", "note_edited", "note_selected", "note_selected_edited", "note_bypassed" }) do
+    local fitted, ok = fit_fill(C[key], rows, ink, 4.5)
+    if not ok then
+      local alt, alt_ok = fit_fill(C[key], rows, other_ink, 4.5)
+      if alt_ok then fitted = alt end
+    end
+    C[key] = fitted
+  end
+  C.note_bypassed_border = with_alpha(toward(bg, 0.30), 0.67)   -- dimmed on purpose (a disabled state)
+  C.note_border          = fit_contrast(P.blue, rows, 3.0)        -- blue, >= 3:1 on every row
+  C.note_edited_border   = fit_contrast(P.green, rows, 3.0)       -- green, >= 3:1 on every row
+  C.note_selected_border = fit_contrast(P.accent, rows, 3.0)      -- accent, >= 3:1 on every row
+
+  -- Labels on the block fills as they show over the rows (>= 4.5:1)
+  local plain_fills    = over_each({ C.note_fill, C.note_bypassed }, row_ends)
+  local selected_fills = over_each({ C.note_selected }, row_ends)
+  local edited_fills   = over_each({ C.note_edited, C.note_selected_edited }, row_ends)
+  C.note_label          = fit_contrast(with_alpha(P.text, 0.867), plain_fills, 4.5)   -- text (87 % alpha), untouched / bypassed fills
+  C.note_label_selected = fit_contrast(P.text, selected_fills, 4.5)                   -- text on the selected fill
+  C.note_label_edited   = fit_contrast(P.text, edited_fills, 4.5)                     -- text on both edited fills
+  C.note_edit_mark      = fit_contrast(P.text, edited_fills, 3.0)                     -- the corner square: >= 3:1 on both edited fills
+
+  -- Zone highlights: blue for the drift zone (as in Fancy Dark), yellow for the vibrato zone and while Shift is held
+  C.zone_shift = with_alpha(P.yellow, 0.267)
+
+  -- Trim handles, fitted to >= 3:1. At rest a handle can sit on any row, fill or zone highlight; the hovered and
+  -- the dragged edge never have a zone highlight under them (an edge hit hides the zone)
+  local fills = { C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited }
+  local edge_on = add_ends({}, rows)
+  local fills_seen = over_each(fills, row_ends)
+  for _, s in ipairs(fills_seen) do edge_on[#edge_on + 1] = s end
+  local rest_on = {}
+  for _, s in ipairs(edge_on) do rest_on[#rest_on + 1] = s end
+  for _, s in ipairs(over_each({ C.zone_drift, C.zone_shift }, add_ends({}, fills_seen))) do
+    rest_on[#rest_on + 1] = s
+  end
+  C.handle       = fit_contrast(with_alpha(P.text, 0.80), rest_on, 3.0)          -- text (80 % alpha) at rest
+  C.handle_hover = fit_contrast((C.handle & 0xFFFFFF00) | 0xFF, edge_on, 3.0)   -- the resting handle made opaque
+  C.handle_drag  = fit_contrast(P.accent, edge_on, 3.0)                          -- accent while the edge is dragged
+
+  -- Curves and markers are drawn straight on a row or on a note block, and the vibrato wash goes over all of that: each
+  -- palette hue is fitted to >= 3:1 on every one of those persistent surfaces (and the playhead also on the ruler strip),
+  -- moved toward white or black as little as that takes, so it keeps its hue and the layers stay apart by colour. The
+  -- zone highlights (zone_drift, zone_shift) are NOT part of the fit: they show only while the pointer is over a block,
+  -- and making every curve clear the brightest of them would turn the curves into near-white. A surface set this wide can
+  -- still leave no colour that reaches 3:1 (a mid-grey theme): then the best worst case wins, with the rows held at 3:1
+  -- first; the vibrato band itself is decoration.
+  C.vibrato = with_alpha(P.yellow, 0.094)                               -- vibrato band: a faint yellow wash
+  local blocks   = over_each({ C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited, C.note_bypassed }, rows)
+  local shown    = concat_lists(rows, blocks)                           -- rows and note blocks (no wash): split markers and their label
+  local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
+  local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
+  C.trace      = fit_contrast(P.accent, line_on, 3.0, rows, true)                -- raw pitch trace: accent
+  C.playhead   = C.trace                                                         -- the playhead line: same as the trace
+  C.preview    = fit_contrast(with_alpha(P.green, 0.80), curve_on, 3.0, rows, true)   -- corrected-pitch preview: green (80 % alpha)
+  C.trend      = fit_contrast(C.trend, curve_on, 3.0, rows, true)                -- trend line: the Fancy Dark cyan (apart from marker_split's blue)
+  C.anchor     = C.trend                                                         -- trend anchor diamond: same as the trend
+  C.spot       = fit_contrast(P.yellow, curve_on, 3.0, rows, true)               -- smart-spot circle: yellow
+  -- Split markers are drawn before the wash: the line on rows and blocks, its label on rows and blocks
+  C.marker_split      = fit_contrast(with_alpha(P.blue, 0.67), shown, 3.0, rows, true)   -- split-point line: blue (67 % alpha)
+  C.marker_split_text = fit_contrast(P.blue_l, shown, 4.5, rows)                    -- split-point label: blue_l, >= 4.5:1
+
+  -- BYPASSED badge: the card, inside a border drawn over the dimmed canvas (the scrim over rows, blocks and the wash)
+  local card   = { P.card }
+  local dimmed = over_each({ C.scrim }, curve_on)
+  C.bypass_title  = fit_contrast(P.yellow, card, 4.5)                              -- yellow, >= 4.5:1 on the card
+  C.bypass_border = fit_contrast(P.yellow, concat_lists(card, dimmed), 3.0, card)  -- yellow, >= 3:1 on the card and the dimmed canvas
+
+  -- Pills sit over rows and note fills: P.text / P.accent_l fitted on the pill as it shows
+  local pill_on = over_each({ C.pill_bg }, add_ends({ C.key_tonic_white }, rows))
+  C.pill_text    = fit_contrast(P.text, pill_on, 4.5)        -- readouts and zone names on the pill
+  C.marquee_text = fit_contrast(P.accent_l, pill_on, 4.5)    -- the "N selected" count on the pill
+  return C
+end
+
+--- Adds the canvas palette to a built palette: P.canvas (see the section comment above).
+--- Kept out of Theme.build_palette so that function reads the same as before.
+--- @param P table  Palette from build_palette (complete)
+--- @param mode string  Theme mode the palette was built for
+--- @param overrides table|nil  The build_palette overrides; overrides.canvas = { token = 0xRRGGBBAA } replaces tokens
+--- @return table  P
+local _match_canvas_key, _match_canvas = nil, nil
+local function attach_canvas(P, mode, overrides)
+  local C
+  if mode == Theme.MODE_MATCH then
+    -- The Match Theme derivation searches for contrast (about 0.5 ms): keep the last result, keyed by every colour
+    -- it reads, and hand out a copy so callers may change their table
+    local key = string.format("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", P.bg, P.panel, P.card, P.text, P.accent, P.accent_l,
+      P.blue, P.blue_l, P.green, P.yellow)
+    if key ~= _match_canvas_key then
+      _match_canvas_key, _match_canvas = key, build_canvas_match(P)
+    end
+    C = {}
+    for k, v in pairs(_match_canvas) do C[k] = v end
+  else
+    C = build_canvas_fancy(P)
+  end
+  if overrides and type(overrides.canvas) == "table" then
+    for k, v in pairs(overrides.canvas) do C[k] = v end
+  end
+  P.canvas = C
+  return P
 end
 
 -------------------------------------------------------------------------------
@@ -336,9 +795,11 @@ function Theme.build_palette(overrides)
     P.panel    = overrides.panel    or read_theme_color("col_tr1_bg",    FANCY_PALETTE.panel)
     P.card     = overrides.card     or read_theme_color("col_tr2_bg",    FANCY_PALETTE.card)
     P.text     = overrides.text     or read_theme_color("col_main_text", FANCY_PALETTE.text)
-    P.text_dim = overrides.text_dim or read_theme_color("col_tcp_text",  FANCY_PALETTE.text_dim)
+    -- text_dim / border are fitted to WCAG on the three surfaces they are drawn on (text 4.5:1, border 3:1)
+    local surfaces = { P.bg, P.panel, P.card }
+    P.text_dim = overrides.text_dim or fit_contrast(read_theme_color("col_tcp_text", FANCY_PALETTE.text_dim), surfaces, 4.5)
     P.accent   = overrides.accent   or read_theme_color("col_cursor", FANCY_PALETTE.accent)
-    P.border   = overrides.border   or read_theme_color("col_main_3dhl", FANCY_PALETTE.border)
+    P.border   = overrides.border   or fit_contrast(read_theme_color("col_main_3dhl", FANCY_PALETTE.border), surfaces, 3.0)
   end
 
   -- Semantic base colors & secondary accent
@@ -362,6 +823,9 @@ function Theme.build_palette(overrides)
   P.accent2_h = P.blue_h
   P.accent2_d = P.blue_d
   P.accent2_e = P.blue_e
+
+  -- accent_press = ButtonActive: the accent moved toward white/black only as far as P.text needs to read on it (4.5:1)
+  P.accent_press = overrides.accent_press or fit_contrast(P.accent, { P.text }, 4.5)
 
   -- Derive accent states from the resolved primary accent color
   -- accent_h = Hover state (40% alpha): ButtonHovered, HeaderHovered, FrameBgActive, SeparatorHovered, ScrollbarGrabHovered
@@ -394,7 +858,8 @@ function Theme.build_palette(overrides)
   -- slider_grab_active = Lighter accent for active slider grab: SliderGrabActive
   P.slider_grab_active = overrides.slider_grab_active or lighten(P.accent, 0.15)
 
-  return P
+  -- Canvas colours for custom-drawn editors (piano roll, keys, notes, curves): see section 4A
+  return attach_canvas(P, mode, overrides)
 end
 
 --- Returns the active cached palette, rebuilding only when mode changes.
@@ -435,6 +900,7 @@ Theme.layout = {
 
   -- ── Rounding ───────────────────────────────────────────────────────────
   rounding     = S.sm,  -- universal corner radius (windows, frames, grabs, drawlist)
+  border       = 1,     -- hairline border width (FrameBorderSize); colour is P.border (>= 3:1)
 
   -- ── Button size presets ─────────────────────────────────────────────────
   -- Height flows from font + padding. Default uses global FramePadding (md, sm).
@@ -448,6 +914,7 @@ Theme.layout = {
   icon_sm      = { size = S.md, pad = S.xs },   -- 8 + 2*2  -> 12px btn
   icon_md      = { size = S.lg, pad = S.sm },   -- 12 + 4*2 -> 20px btn
   icon_lg      = { size = S.xl, pad = S.md },   -- 16 + 8*2 -> 32px btn
+  icon_target  = { size = S.xl, pad = S.sm },   -- 16 + 4*2 -> 24px btn (WCAG 2.5.8 minimum target)
 
   -- ── Table dimensions ───────────────────────────────────────────────────
   row_h        = S.xxl,             -- standard table row height (24)
@@ -478,7 +945,7 @@ Theme.layout = {
 --- @param ctx userdata  ImGui context
 --- @param palette table|nil  Palette from build_palette() / get_palette() (builds default if nil)
 --- @return integer color_count  Number of style colors pushed (32)
---- @return integer var_count  Number of style vars pushed (9)
+--- @return integer var_count  Number of style vars pushed (10)
 function Theme.push(ctx, palette)
   local P = palette or Theme.get_palette()
   local L = Theme.layout
@@ -492,7 +959,7 @@ function Theme.push(ctx, palette)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),         P.accent)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),               P.accent_d)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),         P.accent)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),         P.accent_press)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),              P.card)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(),       P.accent_d)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),        P.accent_h)
@@ -517,7 +984,7 @@ function Theme.push(ctx, palette)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TextDisabled(),         P.text_dim)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(),               P.border)
 
-  -- Style vars (9 total — all values from layout tokens)
+  -- Style vars (10 total — all values from layout tokens)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding(),  L.rounding)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(),   L.rounding)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_GrabRounding(),    L.rounding)
@@ -527,8 +994,9 @@ function Theme.push(ctx, palette)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding(),     L.sm, L.xs)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemInnerSpacing(),L.sm, L.sm)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_IndentSpacing(),   L.indent)
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameBorderSize(), L.border)
 
-  return 32, 9
+  return 32, 10
 end
 
 --- Pops all Fancy Scripts ImGui styles from the stack.
@@ -538,7 +1006,7 @@ end
 --- @param nv integer|nil  Number of vars to pop (default 9)
 function Theme.pop(ctx, nc, nv)
   reaper.ImGui_PopStyleColor(ctx, nc or 32)
-  reaper.ImGui_PopStyleVar(ctx, nv or 9)
+  reaper.ImGui_PopStyleVar(ctx, nv or 10)
 end
 
 -------------------------------------------------------------------------------
@@ -827,6 +1295,18 @@ local function _get_palette()
   return Theme.get_palette()
 end
 
+--- True when the last item is hovered long enough to show its tooltip: ReaImGui's own tooltip delay
+--- (HoveredFlags_ForTooltip) and also while the item is disabled, so `opts.tooltip` can explain why.
+--- @param ctx userdata  ImGui context
+--- @return boolean
+local function _hovered_for_tooltip(ctx)
+  local flags = reaper.ImGui_HoveredFlags_AllowWhenDisabled()
+  if reaper.ImGui_HoveredFlags_ForTooltip then
+    flags = flags | reaper.ImGui_HoveredFlags_ForTooltip()
+  end
+  return reaper.ImGui_IsItemHovered(ctx, flags)
+end
+
 --- Draws a manual fullscreen dim overlay (scrim) behind a modal popup.
 ---
 --- Call BEFORE `ImGui_BeginPopupModal` while inside the parent window's
@@ -1005,7 +1485,10 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local base_col = opts.color or P.text_dim
   local draw_col = hover and (opts.hover_color or lighten(base_col, 0.25)) or base_col
   icon_fn(dl, cx, cy, hs, draw_col)
-  if opts.tooltip and hover then
+  if hover then
+    reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_Hand())   -- hovered and enabled
+  end
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
   return pressed
@@ -1048,7 +1531,10 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   local cy = (ry + ry2) * 0.5
   local hs = icon_sz * 0.5
   icon_fn(dl, cx, cy, hs, opts.icon_color or P.text)
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if reaper.ImGui_IsItemHovered(ctx) then
+    reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_Hand())   -- hovered and enabled
+  end
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
   return pressed
@@ -1316,7 +1802,7 @@ function Theme.progress_bar(ctx, fraction, opts)
   -- Advance layout cursor
   reaper.ImGui_Dummy(ctx, w, h)
 
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
 end
@@ -1398,7 +1884,7 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
 
   local btn_id = id or label or "toggle_btn"
-  local btn_label = string.format("%s##%s", label or "", btn_id)
+  local btn_label = string.format("%s###%s", label or "", btn_id)   -- ### hashes only the id: a changing label keeps the widget
   local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
 
   reaper.ImGui_PopStyleColor(ctx, 4)
@@ -1409,7 +1895,7 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
     reaper.ImGui_PopStyleVar(ctx, pushed_vars)
   end
 
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
 
@@ -1480,8 +1966,7 @@ function Theme.badge(ctx, label, opts)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.interactive and bg_a or bg)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
 
-  local badge_id = opts.id and ("##badge_" .. opts.id) or ("##badge_" .. label)
-  local btn_label = label .. badge_id
+  local btn_label = label .. "###badge_" .. (opts.id or label)   -- ### hashes only the id: a changing label keeps the widget
 
   local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
 
@@ -1493,11 +1978,36 @@ function Theme.badge(ctx, label, opts)
     reaper.ImGui_PopStyleVar(ctx, pushed_vars)
   end
 
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
 
   return opts.interactive and pressed or false
+end
+
+--- Shortens `text` with a trailing "..." until it fits `max_w` pixels (measured with the current font).
+--- Cuts on UTF-8 character boundaries. Returns `text` itself when it already fits.
+--- @param ctx userdata  ImGui context
+--- @param text string  Text to fit
+--- @param max_w number  Available width in pixels
+--- @return string fitted, boolean clipped
+local function _fit_text(ctx, text, max_w)
+  if (reaper.ImGui_CalcTextSize(ctx, text)) <= max_w then return text, false end
+  local ellipsis = "..."
+  local lo, hi = 0, #text   -- longest prefix (in bytes) that fits with the ellipsis: binary search
+  while lo < hi do
+    local mid = (lo + hi + 1) // 2
+    local cut = mid
+    while cut > 0 and (text:byte(cut + 1) or 0) & 0xC0 == 0x80 do cut = cut - 1 end   -- never split a character
+    if (reaper.ImGui_CalcTextSize(ctx, text:sub(1, cut) .. ellipsis)) <= max_w then
+      lo = mid
+    else
+      hi = mid - 1
+    end
+  end
+  local cut = lo
+  while cut > 0 and (text:byte(cut + 1) or 0) & 0xC0 == 0x80 do cut = cut - 1 end
+  return text:sub(1, cut) .. ellipsis, true
 end
 
 -- File-level helper for Theme.combo to eliminate per-frame closure allocations
@@ -1513,6 +2023,8 @@ end
 
 --- Renders a selectable item with rounded highlight corners matching the design system.
 --- Replaces native square-cornered Selectables.
+--- A label wider than the item is shortened with "..." inside the item and shown in full in a tooltip;
+--- a label that fits is drawn exactly as before.
 ---
 --- @param ctx userdata  ImGui context
 --- @param label string  Selectable label (can include ##ID)
@@ -1560,12 +2072,22 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
   end
 
   -- 2. Draw text on top if visible label is non-empty
+  local clipped = false
   if visible_label ~= "" then
     local text_col = opts.text_col or (sel_state and P.accent_l or P.text)
     local pad_x = opts.pad_x or L.sm
-    local _, th = reaper.ImGui_CalcTextSize(ctx, visible_label)
+    local tw, th = reaper.ImGui_CalcTextSize(ctx, visible_label)
     local ty = ry1 + math.floor(((ry2 - ry1) - th) * 0.5)
-    reaper.ImGui_DrawList_AddText(dl, rx1 + pad_x, ty, text_col, visible_label)
+    local shown = visible_label
+    -- Text that would run past the item's right edge is cut to the item minus a padding on each side
+    if tw > (rx2 - rx1) - pad_x then
+      shown, clipped = _fit_text(ctx, visible_label, math.max(0, (rx2 - rx1) - pad_x * 2))
+    end
+    reaper.ImGui_DrawList_AddText(dl, rx1 + pad_x, ty, text_col, shown)
+  end
+
+  if clipped and _hovered_for_tooltip(ctx) then
+    Theme.tooltip(ctx, visible_label)
   end
 
   return clicked
@@ -1625,7 +2147,7 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
     reaper.ImGui_EndDisabled(ctx)
   end
 
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
 
@@ -1765,7 +2287,7 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
     reaper.ImGui_EndDisabled(ctx)
   end
 
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
 
@@ -1945,7 +2467,7 @@ function Theme.tooltip_setting_widget(ctx, opts)
   if changed then
     Theme.set_show_tooltips(new_val)
   end
-  if opts.tooltip and reaper.ImGui_IsItemHovered(ctx) then
+  if opts.tooltip and _hovered_for_tooltip(ctx) then
     Theme.tooltip(ctx, opts.tooltip)
   end
   return changed, new_val

@@ -1,14 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.3.0
+-- @version 1.3.1
 -- @changelog
---   + Added live interactive demonstration for Theme.tooltip_setting_widget()
---   + Add live interactive demonstrations for Theme.progress_bar(), Theme.badge_button(), and Theme.combo()
---   + Rebuild header using shared Theme.header() composite widget
---   + Fix vertical alignment across header icon, title, subtitle, and controls
---   + Add Theme.header() component preview in Widget Components section
---   + Add SameLine vcenter ref_y pattern demonstration
---   + Eliminate raw hex color literals in color swatch alpha checkerboard
+--   + Show the new canvas palette (P.canvas) and the icon_target preset (24 px target)
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -220,6 +214,78 @@ end
 -------------------------------------------------------------------------------
 -- 6. SECTION: COLOR PALETTE
 -------------------------------------------------------------------------------
+
+-- The P.canvas tokens in display order. A token that is not listed here still shows, under "Other".
+local CANVAS_GROUPS = {
+  { "Rows", "in scale / root / out of scale (dim) / no scale chosen (plain); *_black = a black piano key's row", {
+    "row", "row_black", "row_tonic", "row_dim", "row_dim_black", "row_plain", "row_plain_black" } },
+  { "Row tints & grid", "accent tints over the in-scale and root rows, and the lines between rows", {
+    "row_tint", "row_tonic_tint", "grid", "grid_tonic", "grid_dim", "grid_plain", "grid_plain_black" } },
+  { "Piano keys", "fixed in both theme modes (a piano does not follow the REAPER theme); the root strip follows the accent", {
+    "key_white", "key_black", "key_plain_black", "key_tonic_white", "key_tonic_black",
+    "key_dim_white", "key_dim_black", "key_outline", "key_tonic_strip" } },
+  { "Key labels", "text on the keys (>= 4.5:1)", {
+    "key_text_white", "key_text_black", "key_text_plain_white", "key_text_plain_black",
+    "key_text_tonic_white", "key_text_tonic_black", "key_text_dim_white", "key_text_dim_black" } },
+  { "Note blocks", "fills are translucent over the row; borders are >= 3:1 on every row", {
+    "note_fill", "note_border", "note_edited", "note_edited_border", "note_selected", "note_selected_edited",
+    "note_selected_border", "note_bypassed", "note_bypassed_border" } },
+  { "Note labels", "text on the note fills (>= 4.5:1) and the edited-note corner mark", {
+    "note_label", "note_label_selected", "note_label_edited", "note_edit_mark" } },
+  { "Zones & handles", "hover highlights over a note and its trim handles (resting handle >= 3:1)", {
+    "zone_drift", "zone_shift", "zone_divider", "handle", "handle_hover", "handle_drag" } },
+  { "Curves & markers", "pitch trace, preview, trend, smart spots, split markers and the playhead (>= 3:1 on the rows)", {
+    "trace", "preview", "vibrato", "trend", "spot", "anchor", "marker_split", "marker_split_text", "playhead" } },
+  { "Selection & overlays", "marquee, pills behind canvas text, time-ruler strip, bypass scrim", {
+    "marquee_fill", "marquee_border", "marquee_text", "pill_bg", "pill_text", "ruler_bg", "scrim" } },
+}
+
+--- Draws the P.canvas tokens as labelled swatches: one titled group per CANVAS_GROUPS entry, at most
+--- five swatches per line so the longest token names still fit the window.
+local function draw_canvas_palette()
+  local canvas = P.canvas
+  if not canvas then return end
+  local groups, listed = {}, {}
+  for _, g in ipairs(CANVAS_GROUPS) do
+    groups[#groups + 1] = g
+    for _, key in ipairs(g[3]) do listed[key] = true end
+  end
+  local other = {}
+  for key in pairs(canvas) do
+    if not listed[key] then other[#other + 1] = key end
+  end
+  if #other > 0 then
+    table.sort(other)
+    groups[#groups + 1] = { "Other", "canvas tokens not yet grouped in this window", other }
+  end
+
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+  reaper.ImGui_Text(ctx, "P.canvas: colours for custom-drawn editors. Fixed in Fancy Dark; derived and contrast-fitted in Match Theme.")
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.md)
+
+  local per_line = 5
+  for _, g in ipairs(groups) do
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
+    reaper.ImGui_Text(ctx, g[1])
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    reaper.ImGui_SameLine(ctx, 0, L.md)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+    reaper.ImGui_Text(ctx, g[2])
+    reaper.ImGui_PopStyleColor(ctx, 1)
+    vspace(L.sm)
+    for i, key in ipairs(g[3]) do
+      color_swatch(key, canvas[key] or 0)
+      if i % per_line ~= 0 and i < #g[3] then
+        reaper.ImGui_SameLine(ctx, 0, L.xl)
+      elseif i < #g[3] then
+        vspace(L.md)
+      end
+    end
+    vspace(L.xxxl)
+  end
+end
+
 local function draw_colors_section()
   if not Theme.collapsing_header(ctx, "Color Palette") then return end
   reaper.ImGui_Indent(ctx, L.md)
@@ -293,6 +359,14 @@ local function draw_colors_section()
   swatch_row("Controls", {
     { "slider_grab_active", P.slider_grab_active },
   }, "Slider grab while dragging")
+
+  -- Canvas palette (collapsed by default: 60+ tokens)
+  if Theme.collapsing_header(ctx, "Canvas palette##ds_canvas_palette") then
+    reaper.ImGui_Indent(ctx, L.md)
+    vspace(L.md)
+    draw_canvas_palette()
+    reaper.ImGui_Unindent(ctx, L.md)
+  end
 
   vspace(L.md)
   reaper.ImGui_Unindent(ctx, L.md)
@@ -399,6 +473,8 @@ local function draw_layout_section()
     L.icon_md.size, L.icon_md.pad, L.icon_md.size + L.icon_md.pad * 2))
   reaper.ImGui_Text(ctx, string.format("icon_lg = size %d + pad %d  → btn %dpx",
     L.icon_lg.size, L.icon_lg.pad, L.icon_lg.size + L.icon_lg.pad * 2))
+  reaper.ImGui_Text(ctx, string.format("icon_target = size %d + pad %d  → btn %dpx  (WCAG 2.5.8 minimum target for frequent / destructive icons)",
+    L.icon_target.size, L.icon_target.pad, L.icon_target.size + L.icon_target.pad * 2))
   reaper.ImGui_PopStyleColor(ctx, 1)
   vspace(L.xxxl)
 
@@ -540,6 +616,13 @@ local function draw_widgets_section()
   reaper.ImGui_Text(ctx, "lg:")
   reaper.ImGui_SameLine(ctx, 0, L.sm)
   Theme.icon_btn(ctx, "demo_close_lg", Theme.icons.close, { preset = L.icon_lg })
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  reaper.ImGui_Text(ctx, "target:")
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
+  Theme.icon_btn(ctx, "demo_close_target", Theme.icons.close, {
+    preset = L.icon_target,
+    tooltip = "icon_target: 24 px, the WCAG 2.5.8 minimum target",
+  })
   vspace(L.xxxl)
 
   -- icon_btn_colored
