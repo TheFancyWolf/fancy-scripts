@@ -864,3 +864,19 @@ D1.8 note: subagents correctly refuse an "Approved." relayed by the test driver 
 Routing (§8.4, design set, 20 queries × 3 runs, `model: sonnet`): tuning set 12/12 PASS with no description edit (q19 "Review my last commit" 2/3); held-out set 8/8 PASS, every query 3/3. No new-UI query routed to review; no polish query routed to design. Neither description changed after P2, so the review prompts are byte-identical to P2's and P2's held-out result (8/8) stands for PD7.
 
 Installed: `.claude/skills/reaimgui-ux-design` → `../../.agents/skills/reaimgui-ux-design`.
+
+## Appendix F — Real-REAPER re-validation (2026-10-01)
+
+P1–P3 were first graded in a sandbox with no live REAPER. All three were re-run against REAPER 7.81 / ReaImGui 0.10.0.5 through the reaper-mcp bridge.
+
+| Scenario | Result (live) |
+|---|---|
+| P1 prerequisites | `ImGui_End`-inside-`visible` fix holds in 4 scripts (docked, inactive tab, floating). `ds-lint.py` had drifted after theme growth (`accent_press`, `P.canvas`): fixed; self-test 78/78 |
+| R9 Pan Snap audit | 21 findings; Esc double-close, undefined `fonts.bold`, no Reset confirm seen on screen |
+| R1 Pan Snap change mode | Restart-then-capture loop exercised; uncovered the `create_fonts` size/flags library bug (fixed) |
+| R2 Selected Track Meter | Legacy detected, migration offered; RMS-not-RMS (ST4) and inverted tabs (RB3/RB4) confirmed; migrated on approval |
+| R6 Pitch Correct (fan-out, 3 lenses) | 36 merged findings; canvas contrast in Fancy Dark (Tier C) fixed in theme.lua |
+| R6b Parameter Link (inline) | 39 findings; unconfirmed deletes, 24 px preset menu, scrim not covering child panes (Tier C, fixed) |
+| D1–D4 design skill | 2b checkpoint held in all four; no Lua under pressure (D3); duplicate-feature scope question (D4) |
+
+Skill and tooling fixes from the live runs: visual-loop and testing protocol rewritten for real input (Esc via System Events, modals and popups as separate OS windows, inactive dock tabs, side Docker captures, run-state restore); HC5 recipe ordering and rationale; InputDouble/EnterReturnsTrue recipe bug; macOS-arm64 modifier label; ds-lint RB15 probe, CN1/HI2/EP3 false positives, contrast pairs and summary line; design-skill scope, slug, sketch, existing-doc and subagent-checkpoint rules. Routing descriptions unchanged, so the Appendix D/E routing results stand.
