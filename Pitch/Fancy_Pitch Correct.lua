@@ -1,10 +1,10 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.5.0
+-- @version 2.6.0
 -- @changelog
---   + Undo/redo keeps the editor in sync; destructive actions ask first; Esc, Space and shortcuts follow REAPER conventions
---   + Timeline zoom, scroll and ruler; responsive header, dock and Pitched Items panel; Cancel for analysis; settings persist
---   + Higher-contrast canvas, larger destructive targets, and canvas colours from the shared theme
+--   + Diagnostics spots off by default; note labels drawn above the curves and fitted to their block; clearer bypassed notes
+--   + Esc cancels a canvas drag; wheel adjusts values (Cmd/Ctrl + wheel: fine); right-click Reset on Settings values
+--   + Status messages for note resets, Settings resets and global defaults (not undoable); Split / Merge reasons inline
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -207,7 +207,7 @@ local PARAM_LABELS = {
   transition_ms = "Transition",
   onset_ramp_ms = "Onset Ramp",
   legato_threshold_ms = "Legato Gap",
-  scoop_shape = "Scoop Shape", -- per-note only (note context menu)
+  scoop_shape = "Scoop", -- per-note only (note context menu); the same name as the Shift + vibrato-zone drag
 }
 
 -- Named constants, in one table so they take a single one of the chunk's 200 locals
@@ -227,6 +227,19 @@ local K = {
 
   -- Ctrl/Cmd held during a note pitch drag scales the pixel-to-semitone movement by this factor (fine adjust)
   FINE_ADJUST_SCALE = 0.1,
+
+  -- Wheel over a value control (param_drag): one notch moves it by 1 / WHEEL_NOTCHES of its range (Ctrl/Cmd + wheel:
+  -- FINE_ADJUST_SCALE of that); a run of notches is one edit, committed this long (seconds) after the last notch
+  WHEEL_NOTCHES = 50,
+  WHEEL_IDLE_S = 0.25,
+
+  -- Where a value comes from, in words (a badge colour is only a second cue): the dock's strength slider and the note
+  -- menu's values show it after themselves
+  SCOPE_TAGS = { note = "· note", item = "· item", global = "· global" },
+
+  -- Window size on first use (a saved size wins); wider when the full header needs it (see loop_body)
+  FIRST_USE_W = 920,
+  FIRST_USE_H = 620,
 
   -- Hard limits start_analysis enforces on the engine sizes, whatever the UI or older state holds
   BLOCK_SIZE_MIN = 64,
@@ -287,6 +300,11 @@ local K = {
   EDGE_GRAB = Theme.layout.sm * 2,                   -- note edge grab zone, per side
   EDGE_GRAB_HOVER = Theme.layout.sm * 3,             -- ... while the pointer rests on that edge
   EDGE_GRAB_MAX_FRAC = 0.25,                         -- a zone never takes more than this fraction of the block width (both edges stay usable)
+  PIANO_W = Theme.layout.xxxl + Theme.layout.md,     -- the piano-key column left of the note area (40)
+  ZONE_MIN_W = Theme.layout.lg,                      -- a note's stability / vibrato zone is at least this wide (12)
+  HANDLE_W = 3,                                      -- visible width of a note's edge trim handle
+  TONIC_STRIP_W = 3,                                 -- the accent strip on the tonic key
+  ZONE_PILLS_MIN_W = 40,                             -- a block narrower than this shows no Shift zone names on pills
 }
 
 local state = {
@@ -339,7 +357,7 @@ local state = {
   show_note_blocks = true,
   show_raw_pitch = true,
   show_trend = false,
-  show_smart_spots = true,
+  show_smart_spots = false,  -- Diagnostics layer: off unless enabled in Settings > Diagnostics (a stored choice still wins)
   show_split_points = false,
   show_preview = true,
   show_vibrato_regions = false,
@@ -390,6 +408,7 @@ local state = {
   sidebar_w = 200,     -- Pitched Items width: the body table's fixed column, mirrored from ImGui's live width each frame
   sidebar_open = true, -- Pitched Items drawer preference (defaults open); a window too narrow for it shows the tag instead
   sidebar_gen = 0,     -- body table id generation: a new id makes ImGui take TableSetupColumn's width again (see draw_body_split)
+  sidebar_scroll_y = 0, -- the Pitched Items list's scroll position, carried over when the body table gets a new id
   sidebar_tabled = false, -- the resizable body table was drawn last frame
   grip_hover_since = nil, -- time the mouse began resting on the divider between canvas and panel (its tooltip waits)
   grip_pressed = false,   -- a press began on that divider: the width is saved when the button is released
@@ -1423,6 +1442,33 @@ local function is_note_modified(note)
   return pitch_changed or fine_changed or has_overrides
 end
 
+--- True when the envelope of a take (its model `data`) depends on the global default of `key`: the take has no item
+--- value for it and an edited note inherits it (an untouched take has no envelope to go stale).
+K.inherits_global = function(data, key)
+  if not data or (data.overrides and data.overrides[key] ~= nil) then return false end
+  for _, note in ipairs(data.notes or {}) do
+    local own = key ~= "legato_threshold_ms" and note.controls and note.controls[key] ~= nil
+    if is_note_modified(note) and not own then return true end
+  end
+  return false
+end
+
+--- After a take's model was reloaded (undo / redo): its envelope is stale when it was written with a global default
+--- that differs from the current one, for a key the take inherits. data.globals is the snapshot persist_take_model
+--- stores with every envelope write; a model saved before that snapshot existed leaves the flag as it is.
+K.refresh_stale_flag = function(guid, data)
+  if not guid or not data or type(data.globals) ~= "table" then return end
+  local stale = false
+  for key, value in pairs(global_defaults) do
+    local was = tonumber(data.globals[key])
+    if was and math.abs(was - value) > 1e-6 and K.inherits_global(data, key) then
+      stale = true
+      break
+    end
+  end
+  state.stale_takes[guid] = stale or nil
+end
+
 -- Forward declaration; will be set after apply_envelope_to_take is defined
 local reset_selected_note
 local snap_selected_note
@@ -1449,7 +1495,8 @@ local function save_take_data(take, data)
     notes = {},
     key_idx = data.key_idx or state.key_idx,
     scale_idx = data.scale_idx or state.scale_idx,
-    overrides = data.overrides or nil
+    overrides = data.overrides or nil,
+    globals = data.globals or nil,   -- the global defaults the stored envelope was written with (see persist_take_model)
   }
   if data.notes then
     for _, note in ipairs(data.notes) do
@@ -1556,15 +1603,18 @@ local function is_take_pitch_bypassed(take)
   return bypassed
 end
 
+--- One undo point (UC1): a missing envelope is created inside the same block as the toggle, and nothing opens a block
+--- when there is neither an envelope nor an item to make one on.
 local function toggle_take_pitch_bypass(take)
   if not take then return end
   local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
   local item = reaper.GetMediaItemTake_Item(take)
-  if not env and item then
+  if not env and not item then return end
+  reaper.Undo_BeginBlock()
+  if not env then
     env = ensure_take_pitch_envelope(take, item, true)
   end
   if env then
-    reaper.Undo_BeginBlock()
     local ok, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
     if ok and chunk then
       if chunk:match("ACT%s+0") then
@@ -1579,8 +1629,8 @@ local function toggle_take_pitch_bypass(take)
       if item then reaper.UpdateItemInProject(item) end
       reaper.UpdateArrange()
     end
-    reaper.Undo_EndBlock("Toggle Pitch Envelope Bypass", -1)
   end
+  reaper.Undo_EndBlock("Toggle Pitch Envelope Bypass", -1)
   note_own_write()
 end
 
@@ -1722,6 +1772,8 @@ local function sync_with_project()
         if data then
           state.session_takes[guid] = data
           if is_active then adopt_take_data(guid, data) end
+          -- Undo of a global-default edit brings back an envelope written with the old default: flag it
+          K.refresh_stale_flag(guid, data)
           i = i + 1
         elseif raw == "" then
           -- The analysis was undone away: the take has no pitch data any more
@@ -1785,6 +1837,11 @@ local function persist_take_model(take)
   local data = guid and state.session_takes[guid]
   if not data or not take then return end
   if state.notes then data.notes = state.notes end
+  -- The envelope written in this block uses the current global defaults: remember them, so an undo / redo that brings
+  -- back an older model can tell whether its envelope is stale (K.refresh_stale_flag)
+  local globals = {}
+  for key, value in pairs(global_defaults) do globals[key] = value end
+  data.globals = globals
   save_take_data(take, data)
 end
 
@@ -2051,10 +2108,11 @@ local function nudge_selected_notes(delta, key_name)
   end
   if #indices == 0 then return end
 
+  -- EP3: a nudge never leaves the MIDI range (0..127), like a pitch drag
   for _, idx in ipairs(indices) do
     local n = state.notes[idx]
     if n and n.controls then
-      n.controls.center_pitch = n.controls.center_pitch + delta
+      n.controls.center_pitch = math.max(0, math.min(127, n.controls.center_pitch + delta))
     end
   end
 
@@ -2787,9 +2845,13 @@ end
 ---   label  visible text right of the control (nil / "" = none)
 ---   speed  value units per pixel (default: (hi - lo) / the item width in pixels, so a drag across the whole
 ---          control sweeps the whole range whatever its width; Ctrl/Cmd fine adjust is FINE_ADJUST_SCALE x that)
+--- The wheel adjusts the hovered value too (Ctrl/Cmd + wheel: fine, FINE_ADJUST_SCALE x a notch), but only where the
+--- window cannot scroll (there the wheel belongs to the window): a run of notches is ONE edit, committed WHEEL_IDLE_S
+--- after the last notch or as soon as the pointer leaves the control, so the caller makes one undo point per burst.
 --- Returns changed, value, committed, reset:
----   changed    the value moved (a drag frame, or a typed entry confirmed); value is clamped to [lo, hi]
----   committed  the edit is done: the drag was released after an edit, the typed entry was confirmed, or reset
+---   changed    the value moved (a drag frame, a wheel notch, or a typed entry confirmed); value is clamped to [lo, hi]
+---   committed  the edit is done: the drag was released after an edit, a wheel burst ended, the typed entry was
+---              confirmed, or reset
 ---   reset      double-click: the caller restores its own default (the value returned is the input, untouched)
 --- Test the gestures right here: no other item may be submitted between this call and the caller's
 --- BeginPopupContextItem / IsItemHovered.
@@ -2809,7 +2871,24 @@ local function param_drag(pctx, id, label, value, lo, hi, fmt, speed)
   if reaper.ImGui_IsItemActive(pctx) and reaper.ImGui_IsMouseDragging(pctx, 0) then st.dragged = true end
   local released = reaper.ImGui_IsItemDeactivated(pctx)
   local committed = reaper.ImGui_IsItemDeactivatedAfterEdit(pctx) == true
-  local reset = reaper.ImGui_IsItemHovered(pctx) and reaper.ImGui_IsMouseDoubleClicked(pctx, 0) or false
+  local hovered = reaper.ImGui_IsItemHovered(pctx)
+  local reset = hovered and reaper.ImGui_IsMouseDoubleClicked(pctx, 0) or false
+
+  -- HC2 / EF1: wheel adjust where the window cannot scroll; the burst commits once (see above)
+  local now = reaper.time_precise()
+  if hovered and not reset and not reaper.ImGui_IsItemActive(pctx) and (reaper.ImGui_GetScrollMaxY(pctx) or 0) <= 0 then
+    local wheel = reaper.ImGui_GetMouseWheel(pctx) or 0
+    if wheel ~= 0 then
+      local notch = (hi - lo) / K.WHEEL_NOTCHES * (ctrl_down and K.FINE_ADJUST_SCALE or 1)
+      local wheeled = math.max(lo, math.min(hi, value + wheel * notch))
+      if wheeled ~= value then rv, v = true, wheeled end
+      st.wheel_pending, st.wheel_last = true, now
+    end
+  end
+  if st.wheel_pending and (not hovered or now - st.wheel_last > K.WHEEL_IDLE_S) then
+    st.wheel_pending = false
+    committed = true
+  end
 
   -- HC3: Ctrl/Cmd-click released without dragging opens the typed entry
   local popup = "###type_" .. id
@@ -2997,6 +3076,38 @@ K.note_preview = function(note, f0, f1, t_to_x)
   return e.p_arr
 end
 
+--- The note control a canvas drag writes: by zone, and Shift remaps the zones (Transition / Onset Ramp / Scoop).
+K.drag_field = function(zone, shift)
+  if shift then
+    return (zone == "pitch" and "transition_ms") or (zone == "drift" and "onset_ramp_ms") or "scoop_shape"
+  end
+  return (zone == "pitch" and "center_pitch") or (zone == "drift" and "drift_scale") or "vibrato_scale"
+end
+
+--- Esc during a canvas gesture (HC5): put back what the drag, edge drag or box selection changed and end it. Nothing
+--- was written while it moved (the envelope and the undo point come on release), so nothing is written now either.
+K.cancel_gesture = function()
+  local d, e, m = state.drag, state.edge_drag, state.marquee
+  if d and d.field and d.orig_raw and state.notes then
+    for idx in pairs(d.orig_values or {}) do
+      local n = state.notes[idx]
+      if n and n.controls then n.controls[d.field] = d.orig_raw[idx] end
+    end
+  end
+  if e and state.notes then
+    local n = state.notes[e.note_idx]
+    if n then
+      if e.edge == "left" then n.start_time = e.original_time else n.end_time = e.original_time end
+    end
+  end
+  if m and m.prev_sel then
+    state.selected_notes = m.prev_sel
+    state.selected_note = m.prev_primary
+  end
+  state.drag, state.edge_drag, state.marquee, state.shift_mode = nil, nil, nil, false
+  if (d and d.dirty) or (e and e.dirty) then set_status("Drag cancelled. Nothing was changed.") end
+end
+
 local function draw_graph(draw_ctx, w, h)
   local draw_list = reaper.ImGui_GetWindowDrawList(draw_ctx)
   local px, py = reaper.ImGui_GetCursorScreenPos(draw_ctx)
@@ -3015,7 +3126,7 @@ local function draw_graph(draw_ctx, w, h)
   reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + h, P.bg)
   reaper.ImGui_DrawList_AddRect(draw_list, px, py, px + w, py + h, P.border)
 
-  local piano_w = 40
+  local piano_w = K.PIANO_W
   local full_px = px
   local full_w = w
   px = px + piano_w
@@ -3066,7 +3177,10 @@ local function draw_graph(draw_ctx, w, h)
     local gap = L.lg
 
     if #state.results == 0 then
-      local msg = "No data. Select an item and click Analyze."
+      -- While the analysis runs (and has no frame yet) the canvas says so, as the dock does
+      local msg = state.is_analyzing
+        and string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor((state.progress or 0) * 100))
+        or "No data. Select an item and click Analyze."
       local text_w, text_h = reaper.ImGui_CalcTextSize(draw_ctx, msg)
       local start_y = cy - (L.btn_lg.h + gap + text_h) * 0.5
 
@@ -3119,6 +3233,13 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   if not has_notes then
+    -- Frames exist but none is voiced yet: a silent lead-in while analysing, or an item without pitched audio
+    local msg = state.is_analyzing
+      and string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor((state.progress or 0) * 100))
+      or "No pitched audio found in this item."
+    local msg_w, msg_h = reaper.ImGui_CalcTextSize(draw_ctx, msg)
+    reaper.ImGui_DrawList_AddText(draw_list, full_px + (full_w - (msg_w or 0)) * 0.5, py + (h - (msg_h or 0)) * 0.5,
+      P.text_dim, msg)
     reaper.ImGui_DrawList_PopClipRect(draw_list)
     return
   end
@@ -3282,7 +3403,7 @@ local function draw_graph(draw_ctx, w, h)
         if mx >= px and mx >= sx and mx <= ex and my >= top_y and my <= bot_y then
           state.hovered_note = n_idx
           local block_w = ex - sx
-          local zone_w = math.max(12, block_w * 0.25)
+          local zone_w = math.max(K.ZONE_MIN_W, block_w * 0.25)
           if mx < sx + zone_w then
             state.hovered_zone = "drift"
           elseif mx > ex - zone_w then
@@ -3382,9 +3503,13 @@ local function draw_graph(draw_ctx, w, h)
       state.shift_mode = has_shift and (state.hovered_note ~= nil)
 
       local orig_values = {}
+      -- What the drag writes and each note's own value of it before (nil = inherited), so Esc can put it back (HC5)
+      local field = K.drag_field(state.hovered_zone, state.shift_mode)
+      local orig_raw = {}
       for idx in pairs(state.selected_notes) do
         local n = state.notes[idx]
         if n and n.controls then
+          orig_raw[idx] = n.controls[field]
           if state.shift_mode then
             if state.hovered_zone == "drift" then
               orig_values[idx] = n.controls.onset_ramp_ms or get_effective(n, "onset_ramp_ms")
@@ -3415,6 +3540,8 @@ local function draw_graph(draw_ctx, w, h)
         pitch_st = 0,     -- semitones moved so far by a pitch drag (fine adjust scales each frame's share)
         original_value = orig_values[state.hovered_note] or 0,
         orig_values = orig_values,
+        field = field,
+        orig_raw = orig_raw,
         pending_single_select = pending_single_select,
         dirty = false,
         view_min = min_note,   -- the pitch range stays as it is for the whole gesture
@@ -3426,7 +3553,11 @@ local function draw_graph(draw_ctx, w, h)
       if has_shift and state.selected_notes then
         for k, v in pairs(state.selected_notes) do init_sel[k] = v end
       end
+      local prev_sel = {}
+      for k, v in pairs(state.selected_notes) do prev_sel[k] = v end
       state.marquee = {
+        prev_sel = prev_sel,                    -- the selection before the box, restored by Esc (HC5)
+        prev_primary = state.selected_note,
         start_x = mx,
         start_y = my,
         cur_x = mx,
@@ -3538,7 +3669,7 @@ local function draw_graph(draw_ctx, w, h)
           action_name = (state.drag.zone == "pitch" and "Adjust Transition" or
                         (state.drag.zone == "drift" and "Adjust Onset Ramp" or "Adjust Scoop"))
         else
-          action_name = (state.drag.zone == "pitch" and "Pitch Shift" or
+          action_name = (state.drag.zone == "pitch" and "Adjust Pitch" or
                         (state.drag.zone == "drift" and "Adjust Stability" or "Adjust Vibrato"))
         end
         local undo_title = count > 1 and string.format("%s (%d notes)", action_name, count) or action_name
@@ -3691,6 +3822,14 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- HC5: Esc during a drag, edge drag or box selection cancels it: every value goes back to what it was when the
+  -- gesture began and nothing is written (no envelope, no undo point). The canvas button stays active until the
+  -- mouse is released, so the window-level Esc handler in loop_body (which skips active items) never sees this press.
+  if (state.drag or state.edge_drag or state.marquee) and reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Escape()) then
+    K.cancel_gesture()
+    gesture = nil
+  end
+
   ---------------------------------------------------------------------------
   -- KEYBOARD CONTROLS (Scalpel Workflow)
   ---------------------------------------------------------------------------
@@ -3758,7 +3897,7 @@ local function draw_graph(draw_ctx, w, h)
       if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_R())
         or reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Backspace())
         or reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Delete()) then
-        reset_selected_note()
+        K.request_reset(K.count_selected_notes(), #state.notes)   -- same status (and confirm) as the header Reset
       end
 
       -- X: Split note at edit cursor position (outside the note it says so)
@@ -3896,7 +4035,7 @@ local function draw_graph(draw_ctx, w, h)
 
     -- Accent indicator strip for root key
     if not is_chromatic and is_root then
-      reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px + piano_w - 3, key_top, full_px + piano_w, key_bot, C.key_tonic_strip)
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px + piano_w - K.TONIC_STRIP_W, key_top, full_px + piano_w, key_bot, C.key_tonic_strip)
     end
 
     -- Every in-scale key is labelled while a row is at least a text line tall; below that only the C keys are, so
@@ -3904,13 +4043,15 @@ local function draw_graph(draw_ctx, w, h)
     if (px_per_st >= line_h or n % 12 == 0) and (in_scale or pc == 0) then
       local label = midi_to_name(n)
       local text_y = (key_top + key_bot) * 0.5 - line_h * 0.5
-      reaper.ImGui_DrawList_AddText(draw_list, full_px + 2, text_y, text_col, label)
+      reaper.ImGui_DrawList_AddText(draw_list, full_px + L.xs, text_y, text_col, label)
     end
   end
 
   ---------------------------------------------------------------------------
   -- DRAW NOTE BLOCKS (interactive, positioned by center_pitch)
   ---------------------------------------------------------------------------
+  -- Note labels are collected here and drawn after the curves (HC1: a curve never crosses the text)
+  local note_labels = {}
   if state.show_note_blocks and state.notes then
     for n_idx, note in ipairs(state.notes) do
       -- Only blocks that reach the visible window are drawn
@@ -3921,7 +4062,7 @@ local function draw_graph(draw_ctx, w, h)
         local top_y = py + h - ((cp + 0.5 - min_note) / note_range) * h
         local bot_y = py + h - ((cp - 0.5 - min_note) / note_range) * h
         local block_w = ex - sx
-        local zone_w = math.max(12, block_w * 0.25)
+        local zone_w = math.max(K.ZONE_MIN_W, block_w * 0.25)
 
         local is_selected = state.selected_notes[n_idx] or false
         local is_hov = (state.hovered_note == n_idx)
@@ -3932,7 +4073,7 @@ local function draw_graph(draw_ctx, w, h)
         local border
         if is_bypassed_note then
           fill = C.note_bypassed
-          border = C.note_bypassed_border
+          border = C.note_bypassed_mark   -- outline and strike: >= 3:1 on the rows while the fill stays dim
         elseif is_selected then
           fill = is_mod and C.note_selected_edited or C.note_selected
           border = C.note_selected_border
@@ -3969,22 +4110,24 @@ local function draw_graph(draw_ctx, w, h)
             end
           end
 
-          if has_shift and block_w > 40 then
+          if has_shift and block_w > K.ZONE_PILLS_MIN_W then
             -- The zone names sit on a pill: the text over the amber zone highlight alone is not enough. All three are
             -- drawn when each fits its zone (the pills never overlap); on a narrower block only the name of the zone
             -- under the pointer is (the hover hint names it at any width)
-            local text_y = top_y + (bot_y - top_y) * 0.5 - 6
-            if pill_fits("Onset Ramp", zone_w) and pill_fits("Transition", block_w - zone_w * 2)
-                and pill_fits("Scoop", zone_w) then
-              pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
-              pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
-              pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
+            -- The pill (a text line + L.xs above and below) centred on the block
+            local text_y = (top_y + bot_y) * 0.5 - line_h * 0.5 - L.xs
+            local onset, transition, scoop = PARAM_LABELS.onset_ramp_ms, PARAM_LABELS.transition_ms, PARAM_LABELS.scoop_shape
+            if pill_fits(onset, zone_w) and pill_fits(transition, block_w - zone_w * 2)
+                and pill_fits(scoop, zone_w) then
+              pill_text(sx + L.xs, text_y, onset, C.pill_text)
+              pill_text(sx + zone_w + L.xs, text_y, transition, C.pill_text)
+              pill_text(ex - zone_w + L.xs, text_y, scoop, C.pill_text)
             elseif state.hovered_zone == "drift" then
-              pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
+              pill_text(sx + L.xs, text_y, onset, C.pill_text)
             elseif state.hovered_zone == "vibrato" then
-              pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
+              pill_text(ex - zone_w + L.xs, text_y, scoop, C.pill_text)
             else
-              pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
+              pill_text(sx + zone_w + L.xs, text_y, transition, C.pill_text)
             end
           end
         else
@@ -4010,7 +4153,7 @@ local function draw_graph(draw_ctx, w, h)
 
           -- Edge trim handles (visible grab zones). C.handle is >= 3:1 against every note fill, row and zone highlight at
           -- rest; the hovered edge goes opaque (C.handle_hover)
-          local handle_w = 3
+          local handle_w = K.HANDLE_W
           local left_handle_col = C.handle
           local right_handle_col = C.handle
 
@@ -4048,14 +4191,23 @@ local function draw_graph(draw_ctx, w, h)
           end
         end
 
-        -- Note label: name + cents deviation (always visible). Each label token is fitted to >= 4.5:1 over its note fill
+        -- Note label: name + cents deviation. Each label token is fitted to >= 4.5:1 over its note fill. It must fit
+        -- the block (LG4): the cents go first, then the name; a block too short for the name shows no label
         local nearest = math.floor(cp + 0.5)
         local cents = math.floor((cp - nearest) * 100 + 0.5)
         local sign = cents >= 0 and "+" or ""
-        local label = string.format("%s %s%d\xC2\xA2", midi_to_name(nearest), sign, cents)
-        local text_y = (top_y + bot_y) * 0.5 - 7
-        local text_color = is_mod and C.note_label_edited or (is_selected and C.note_label_selected or C.note_label)
-        reaper.ImGui_DrawList_AddText(draw_list, label_x, text_y, text_color, label)
+        local name = midi_to_name(nearest)
+        local room = math.min(ex, px + w) - L.xs - label_x
+        local label = string.format("%s %s%d\xC2\xA2", name, sign, cents)
+        if (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) > room then label = name end
+        if (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) <= room then
+          note_labels[#note_labels + 1] = {
+            x = label_x,
+            y = (top_y + bot_y) * 0.5 - line_h * 0.5,
+            color = is_mod and C.note_label_edited or (is_selected and C.note_label_selected or C.note_label),
+            text = label,
+          }
+        end
       end
     end
   end
@@ -4069,7 +4221,7 @@ local function draw_graph(draw_ctx, w, h)
         local x = t_to_x(sp.time)
         reaper.ImGui_DrawList_AddLine(draw_list, x, py, x, py + h, C.marker_split, 1.0)   -- blue: red is for clip / destructive only
         -- The label sits below the time ruler, which covers the top of the note area
-        reaper.ImGui_DrawList_AddText(draw_list, x + 2, py + ruler_h + L.xs, C.marker_split_text, sp.reason)
+        reaper.ImGui_DrawList_AddText(draw_list, x + L.xs, py + ruler_h + L.xs, C.marker_split_text, sp.reason)
       end
     end
   end
@@ -4154,6 +4306,11 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- The note labels, above every curve and marker (HC1)
+  for _, lb in ipairs(note_labels) do
+    reaper.ImGui_DrawList_AddText(draw_list, lb.x, lb.y, lb.color, lb.text)
+  end
+
   ---------------------------------------------------------------------------
   -- DRAW MARQUEE SELECTION BOX (Milestone 4)
   ---------------------------------------------------------------------------
@@ -4236,7 +4393,7 @@ local function draw_graph(draw_ctx, w, h)
       end
     end
 
-    if on_ruler and state.view_t0 and not gesture then
+    if on_ruler and canvas_tip_ready and state.view_t0 and not gesture then   -- waits for the hover delay (RB15)
       Theme.tooltip(draw_ctx, "Double-click to show the whole item")
     end
   end
@@ -4279,13 +4436,13 @@ local function draw_graph(draw_ctx, w, h)
       if has_shift then
         if state.hovered_zone == "drift" then
           local v = h_note.controls.onset_ramp_ms or get_effective(h_note, "onset_ramp_ms")
-          tip = string.format("Onset Ramp: %.0fms (Shift+Drag)", v)
+          tip = string.format("%s: %.0f ms (Shift + drag)", PARAM_LABELS.onset_ramp_ms, v)
         elseif state.hovered_zone == "vibrato" then
           local v = h_note.controls.scoop_shape or 0
-          tip = string.format("Scoop: %.0f%% corrected (Shift+Drag)", v * 100)
+          tip = string.format("%s: %.0f%% corrected (Shift + drag)", PARAM_LABELS.scoop_shape, v * 100)
         else
           local v = h_note.controls.transition_ms or get_effective(h_note, "transition_ms")
-          tip = string.format("Transition: %.0fms (Shift+Drag)", v)
+          tip = string.format("%s: %.0f ms (Shift + drag)", PARAM_LABELS.transition_ms, v)
         end
       else
         if state.hovered_zone == "drift" then
@@ -4293,7 +4450,7 @@ local function draw_graph(draw_ctx, w, h)
         elseif state.hovered_zone == "vibrato" then
           tip = string.format("Vibrato: %.0f%%", h_note.controls.vibrato_scale * 100)
         else
-          tip = string.format("Drag to change pitch (%s = fine)", K.MOD_LABEL)
+          tip = string.format("Pitch: drag to move the note (%s-drag: fine adjust)", K.MOD_LABEL)
         end
       end
       Theme.tooltip(draw_ctx, tip)   -- the Show Tooltips preference applies
@@ -4342,8 +4499,8 @@ local function draw_graph(draw_ctx, w, h)
     local bx2 = cx + badge_w * 0.5
     local by2 = cy + badge_h * 0.5
 
-    reaper.ImGui_DrawList_AddRectFilled(draw_list, bx1, by1, bx2, by2, P.card, 6.0)
-    reaper.ImGui_DrawList_AddRect(draw_list, bx1, by1, bx2, by2, C.bypass_border, 6.0, 0, 1.5)   -- yellow, >= 3:1 on the card and the dimmed canvas
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, bx1, by1, bx2, by2, P.card, L.rounding)
+    reaper.ImGui_DrawList_AddRect(draw_list, bx1, by1, bx2, by2, C.bypass_border, L.rounding, 0, 1.5)   -- yellow, >= 3:1 on the card and the dimmed canvas
 
     local line_y = by1 + L.lg
     pushed_bp_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)
@@ -4395,7 +4552,8 @@ local function draw_graph(draw_ctx, w, h)
 
       reaper.ImGui_Separator(draw_ctx)
 
-      reaper.ImGui_PushItemWidth(draw_ctx, 120)
+      -- As wide as the longest value name, so the drags follow the font size
+      reaper.ImGui_PushItemWidth(draw_ctx, (reaper.ImGui_CalcTextSize(draw_ctx, PARAM_LABELS.retune_speed)) or L.xxxl)
 
       local function draw_cm_slider(label, key, min_v, max_v, fmt, scale, default)
          local level = get_override_level(note, key)
@@ -4420,13 +4578,13 @@ local function draw_graph(draw_ctx, w, h)
                apply_envelope_to_take("Adjust " .. name)
             end
          end
-         reaper.ImGui_SameLine(draw_ctx)
-         reaper.ImGui_TextDisabled(draw_ctx, "[" .. level .. "]")
+         reaper.ImGui_SameLine(draw_ctx, 0, L.sm)
+         reaper.ImGui_TextDisabled(draw_ctx, K.SCOPE_TAGS[level] or K.SCOPE_TAGS.global)   -- one scope style, as in the dock (CN4)
       end
 
-      draw_cm_slider("Onset Ramp", "onset_ramp_ms", 5, 60, "%.0f ms", nil)
-      draw_cm_slider("Scoop Shape", "scoop_shape", 0, 100, "%.0f%%", 100)
-      draw_cm_slider("Transition", "transition_ms", 5, 60, "%.0f ms", nil)
+      draw_cm_slider(PARAM_LABELS.onset_ramp_ms, "onset_ramp_ms", 5, 60, "%.0f ms", nil)
+      draw_cm_slider(PARAM_LABELS.scoop_shape, "scoop_shape", 0, 100, "%.0f%%", 100)
+      draw_cm_slider(PARAM_LABELS.transition_ms, "transition_ms", 5, 60, "%.0f ms", nil)
       draw_cm_slider(PARAM_LABELS.retune_speed, "retune_speed", 0, 100, "%.0f%%", 100)
 
       reaper.ImGui_PopItemWidth(draw_ctx)
@@ -4442,7 +4600,7 @@ local function draw_graph(draw_ctx, w, h)
         K.note_action("split", note_idx)
       end
       if reaper.ImGui_MenuItem(draw_ctx, "Reset to Original", "R") then
-        reset_selected_note()
+        K.request_reset(K.count_selected_notes(), #state.notes)   -- same status as the header Reset and the R key
       end
     end
     reaper.ImGui_EndPopup(draw_ctx)
@@ -5200,9 +5358,14 @@ local function draw_body_split(P, avail_w, total_h)
   local max_sidebar_w = math.max(BODY.min_sidebar_w, avail_w - BODY.min_graph_w - BODY.splitter_w)
   local wanted_w = math.max(BODY.min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w))
   -- A drag may run past the limits while the button is down; the width snaps back on release
+  -- ReaImGui 0.10 has no TableSetColumnWidth: the table takes TableSetupColumn's width again only under a new id. The id
+  -- changes only when the width must be clamped (window resized, panel reopened), never while the user works, and the
+  -- list's scroll position is carried over to the new id (RB17)
+  local new_id = false
   if not state.sidebar_tabled or (math.abs(wanted_w - state.sidebar_w) > BODY.width_eps and not mouse_down) then
     state.sidebar_w = wanted_w
     state.sidebar_gen = state.sidebar_gen + 1
+    new_id = true
   end
 
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding(), 0, 0)
@@ -5229,8 +5392,10 @@ local function draw_body_split(P, avail_w, total_h)
     state.sidebar_w = column_w
     reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.sm)
     local panel_w = math.max(column_w, BODY.min_sidebar_w) - L.sm
+    if new_id then reaper.ImGui_SetNextWindowScroll(ctx, 0, state.sidebar_scroll_y or 0) end
     if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", panel_w, total_h, 0) then
       render_pitched_items_sidebar(ctx)
+      state.sidebar_scroll_y = reaper.ImGui_GetScrollY(ctx) or 0
       reaper.ImGui_EndChild(ctx)
     end
 
@@ -5314,17 +5479,38 @@ local function hop_choices(block_size)
   return hops
 end
 
+--- Status line of a Settings reset: engine settings are saved outside the undo history, so it says so (EP1 / HC4).
+K.settings_reset_status = function(name, shown)
+  set_status(string.format("%s reset to %s (not undoable)", name, shown))
+end
+
 --- Settings value control: a param_drag on state[key] within K.LIMITS[key], `width` wide and without a label (the form's
---- label column names it); double-click restores DEFAULTS[key] (engine settings are not project state: no undo point).
---- The value is saved once the edit is done (the drag released, a typed entry confirmed, a reset), not while it moves.
-local function settings_drag(id, key, fmt, width)
+--- label column names it, `name` is the setting's name in the status line); double-click or the right-click menu's
+--- "Reset to default" restores DEFAULTS[key] (engine settings are not project state: no undo point, the status line
+--- says so). The value is saved once the edit is done (the drag released, a wheel burst over, a typed entry confirmed,
+--- a reset), not while it moves.
+local function settings_drag(id, key, fmt, width, name)
   reaper.ImGui_SetNextItemWidth(ctx, width)
   local changed, v, committed, reset = param_drag(ctx, id, nil, state[key], K.LIMITS[key][1], K.LIMITS[key][2], fmt)
-  if reset then
-    state[key] = DEFAULTS[key]
-  elseif changed then
-    state[key] = v
+  -- HC3: right-click menu. A Ctrl/Cmd-click opens the typed entry instead (on macOS ReaImGui may report it as a
+  -- right-click too), so the menu never opens while Ctrl/Cmd is held
+  local menu_id = "##reset_menu_" .. id
+  local ctrl_held = ((reaper.ImGui_GetKeyMods(ctx) or 0) & reaper.ImGui_Mod_Ctrl()) ~= 0
+  if (not ctrl_held or reaper.ImGui_IsPopupOpen(ctx, menu_id))
+     and reaper.ImGui_BeginPopupContextItem(ctx, menu_id, reaper.ImGui_PopupFlags_MouseButtonRight()) then
+    if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end   -- HC5
+    if reaper.ImGui_MenuItem(ctx, "Reset to default", nil, nil, state[key] ~= DEFAULTS[key]) then reset = true end
+    reaper.ImGui_EndPopup(ctx)
   end
+  if reset then
+    if state[key] ~= DEFAULTS[key] then
+      state[key] = DEFAULTS[key]
+      K.save_settings("engine")
+      K.settings_reset_status(name or key, string.format(fmt, DEFAULTS[key]))
+    end
+    return
+  end
+  if changed then state[key] = v end
   if committed then K.save_settings("engine") end
 end
 
@@ -5370,6 +5556,7 @@ K.SETTINGS_SECTIONS = {
   { id = "engine", title = "Pitch Shift Engine", rows = {
     { id = "pitchmode", label = "Pitch Shift Algorithm", labels = COMBO_LABELS.pitchmodes,
       is_default = function() return state.preset_pitchmode_idx == DEFAULTS.preset_pitchmode_idx end,
+      shown = function() return state.pitchmode_name end,
       reset = function() K.set_pitch_algorithm(DEFAULTS.preset_pitchmode_idx) end,
       draw = function(w)
         local idx, changed = Theme.combo(ctx, "##settings_pitchmode", PITCHMODE_FLAT, state.preset_pitchmode_idx, {
@@ -5386,6 +5573,7 @@ K.SETTINGS_SECTIONS = {
         return (reaper.ImGui_CalcTextSize(ctx, K.KEEP_PITCH_LABEL)) + reaper.ImGui_GetFrameHeight(ctx) + Theme.layout.sm
       end,
       is_default = function() return state.keep_pitch_mode == DEFAULTS.keep_pitch_mode end,
+      shown = function() return state.keep_pitch_mode and "on" or "off" end,
       reset = function() state.keep_pitch_mode = DEFAULTS.keep_pitch_mode end,
       draw = function()
         local changed, on = reaper.ImGui_Checkbox(ctx, K.KEEP_PITCH_LABEL .. "###keep_pitch_mode", state.keep_pitch_mode)
@@ -5401,6 +5589,10 @@ K.SETTINGS_SECTIONS = {
   { id = "detection", title = "Analysis & Detection Presets", rows = {
     { id = "range", label = "Vocal Range", labels = COMBO_LABELS.ranges,
       is_default = function() return state.min_freq == DEFAULTS.min_freq and state.max_freq == DEFAULTS.max_freq end,
+      shown = function()
+        local i = K.match_preset(VOCAL_RANGES, function(r) return r.min == state.min_freq and r.max == state.max_freq end)
+        return VOCAL_RANGES[i] and VOCAL_RANGES[i].name or string.format("%.0f-%.0f Hz", state.min_freq, state.max_freq)
+      end,
       reset = function() state.min_freq, state.max_freq = DEFAULTS.min_freq, DEFAULTS.max_freq end,
       draw = function(w)
         local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == state.min_freq and r.max == state.max_freq end)
@@ -5415,6 +5607,10 @@ K.SETTINGS_SECTIONS = {
       end },
     { id = "mode", label = "Detection Mode", labels = COMBO_LABELS.detection,
       is_default = function() return state.threshold == DEFAULTS.threshold end,
+      shown = function()
+        local i = K.match_preset(DETECTION_MODES, function(m) return m.threshold == state.threshold end)
+        return DETECTION_MODES[i] and DETECTION_MODES[i].name or string.format("%.2f", state.threshold)
+      end,
       reset = function() state.threshold = DEFAULTS.threshold end,
       draw = function(w)
         local current = K.match_preset(DETECTION_MODES, function(m) return m.threshold == state.threshold end)
@@ -5429,6 +5625,10 @@ K.SETTINGS_SECTIONS = {
       end },
     { id = "quality", label = "Quality / CPU", labels = COMBO_LABELS.quality,
       is_default = function() return state.block_size == DEFAULTS.block_size and state.hop_size == DEFAULTS.hop_size end,
+      shown = function()
+        local i = K.match_preset(QUALITY_MODES, function(q) return q.block == state.block_size and q.hop == state.hop_size end)
+        return QUALITY_MODES[i] and QUALITY_MODES[i].name or string.format("%d / %d samples", state.block_size, state.hop_size)
+      end,
       reset = function() state.block_size, state.hop_size = DEFAULTS.block_size, DEFAULTS.hop_size end,
       draw = function(w)
         local current = K.match_preset(QUALITY_MODES, function(q) return q.block == state.block_size and q.hop == state.hop_size end)
@@ -5447,6 +5647,7 @@ K.SETTINGS_SECTIONS = {
     -- Discrete choices; a value outside the lists (older state) shows the nearest item. The hop never exceeds the block.
     { id = "block", label = "Block size (samples)", name = "Block size",
       is_default = function() return state.block_size == DEFAULTS.block_size end,
+      shown = function() return string.format("%d samples", state.block_size) end,
       reset = function()
         state.block_size = DEFAULTS.block_size
         if state.hop_size > state.block_size then state.hop_size = state.block_size end
@@ -5464,6 +5665,7 @@ K.SETTINGS_SECTIONS = {
     -- The factory hop never exceeds the block either: a smaller block limits what Reset can restore
     { id = "hop", label = "Hop size (samples)", name = "Hop size",
       is_default = function() return state.hop_size == math.min(DEFAULTS.hop_size, state.block_size) end,
+      shown = function() return string.format("%d samples", state.hop_size) end,
       reset = function() state.hop_size = math.min(DEFAULTS.hop_size, state.block_size) end,
       draw = function(w)
         local size, changed = K.size_combo("##dsp_hop", hop_choices(state.block_size), state.hop_size, w,
@@ -5475,21 +5677,24 @@ K.SETTINGS_SECTIONS = {
       end },
     { id = "threshold", label = "Detection Threshold",
       is_default = function() return state.threshold == DEFAULTS.threshold end,
+      shown = function() return string.format("%.2f", state.threshold) end,
       reset = function() state.threshold = DEFAULTS.threshold end,
       draw = function(w)
-        settings_drag("dsp_threshold", "threshold", "%.2f", w)
+        settings_drag("dsp_threshold", "threshold", "%.2f", w, "Detection Threshold")
         if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           Theme.tooltip(ctx, "Confidence threshold for pitch detection (lower = stricter).")
         end
       end },
-    { id = "min_freq", label = "Min Freq (Hz)",
+    { id = "min_freq", label = "Min Freq (Hz)", name = "Min Freq",
       is_default = function() return state.min_freq == DEFAULTS.min_freq end,
+      shown = function() return string.format("%.0f Hz", state.min_freq) end,
       reset = function() state.min_freq = DEFAULTS.min_freq end,
-      draw = function(w) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w) end },
-    { id = "max_freq", label = "Max Freq (Hz)",
+      draw = function(w) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w, "Min Freq") end },
+    { id = "max_freq", label = "Max Freq (Hz)", name = "Max Freq",
       is_default = function() return state.max_freq == DEFAULTS.max_freq end,
+      shown = function() return string.format("%.0f Hz", state.max_freq) end,
       reset = function() state.max_freq = DEFAULTS.max_freq end,
-      draw = function(w) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w) end },
+      draw = function(w) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w, "Max Freq") end },
   } },
 }
 
@@ -5645,6 +5850,7 @@ local function draw_settings_modal()
             "Restore the default value") then
           row.reset()
           K.save_settings("engine")
+          K.settings_reset_status(row.name or row.label, row.shown())   -- EP1: outside the undo history, so say so
         end
       end
       reaper.ImGui_TableNextRow(ctx)
@@ -5767,7 +5973,7 @@ end
 K.INFO_SECTIONS = {
   { title = "Selection & Navigation", rows = {
     { K.MOD_LABEL .. " + A", "Select all notes in phrase" },
-    { "Escape", "Close dialog, deselect, close if floating" },
+    { "Escape", "Cancel a drag, close a dialog, deselect, close if floating" },
     { "Marquee Drag", "Box select notes (Shift=Add)" },
     { "Shift + Click", "Range select notes" },
     { K.MOD_LABEL .. " + Click", "Toggle note in/out of selection" },
@@ -5778,17 +5984,18 @@ K.INFO_SECTIONS = {
     { "Drag the divider", "Resize Pitched Items" },
   } },
   { title = "Pitch & Note Editing", rows = {
-    { "Drag Center Zone", string.format("Move note pitch (%s = fine adjust)", K.MOD_LABEL) },
-    { "Drag Left Zone", "Adjust drift stability tracking" },
-    { "Drag Right Zone", "Scale natural vibrato depth" },
-    { "Shift + Drag Left Zone", "Adjust Onset Ramp" },
-    { "Shift + Drag Center Zone", "Adjust Transition" },
-    { "Shift + Drag Right Zone", "Adjust Scoop shape" },
-    { "Drag Note Edge", "Trim note start / end boundary" },
-    { K.MOD_LABEL .. " + Wheel", "Zoom the timeline" },
-    { "Wheel", "Scroll the timeline (when zoomed)" },
+    { "Drag the Pitch zone (middle)", string.format("Move the note's pitch (%s-drag: fine adjust)", K.MOD_LABEL) },
+    { "Drag the Stability zone (left)", "Stability: hold the pitch steadier (less drift)" },
+    { "Drag the Vibrato zone (right)", "Vibrato: scale its depth" },
+    { "Shift + drag a zone", string.format("%s (left) / %s (middle) / %s (right)", PARAM_LABELS.onset_ramp_ms,
+      PARAM_LABELS.transition_ms, PARAM_LABELS.scoop_shape) },
+    { "Shift on the canvas", "Remaps the three zones (as above); the zones turn amber and are named" },
+    { "Drag a note edge", "Trim the note's start / end" },
+    { K.MOD_LABEL .. " + wheel", "Zoom the timeline" },
+    { "Wheel / horizontal wheel", "Scroll the timeline (when zoomed)" },
+    { "Double-click the ruler", "Show the whole item again" },
     { "↑ / ↓", "Nudge pitch ±1 semitone" },
-    { "Shift + ↑ / ↓", "Fine-tune pitch ±10 cents" },
+    { "Shift + ↑ / ↓", "Nudge pitch ±10 cents (fine)" },
     { "S / Double-Click", "Snap note to nearest semitone" },
     { "Q", "Quantize selected note(s) to scale" },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch" },
@@ -5796,6 +6003,8 @@ K.INFO_SECTIONS = {
     { "Right-click a dock value", "Item override and reset" },
     { "Double-click a value", "Reset to its default" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
+    { "Wheel over a value", string.format("Adjust it (%s + wheel: fine), where the window does not scroll", K.MOD_LABEL) },
+    { "Right-click a Settings value", "Reset to default" },
     { "Snap / Quantize / Split / Merge buttons", "Same as S / Q / X / M" },
   } },
   { title = "Note Topology & REAPER Transport", rows = {
@@ -5976,6 +6185,8 @@ local function count_selected_notes()
   return n
 end
 
+K.count_selected_notes = count_selected_notes   -- for draw_graph (defined above this function)
+
 local function count_modified_notes()
   local n = 0
   for _, note in ipairs(state.notes or {}) do
@@ -6120,6 +6331,8 @@ local function request_reset(sel_n, note_n)
     end,
   })
 end
+
+K.request_reset = request_reset   -- for draw_graph: R / Backspace / Delete and the note menu's Reset (ST2 / HC4)
 
 -- Space forwarding (HC6). While the window is focused it has the keyboard, so Space (and its Shift,
 -- Ctrl/Cmd and Alt chords) is forwarded to the command the user bound to it in REAPER's Main section.
@@ -6406,8 +6619,8 @@ do
         text_color = get_contrasting_text_color(badge_bg),
         w = hs.badge_w,
       })
-      -- The tooltip is built on hover only: it reads the item's pitch algorithm from REAPER
-      if reaper.ImGui_IsItemHovered(ctx) then
+      -- The tooltip is built on hover only (after the hover delay, RB15): it reads the item's pitch algorithm from REAPER
+      if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
         Theme.tooltip(ctx, string.format("Active item: %s\nStatus: %s\n%s\nSelect any audio item in REAPER to switch to it.",
           state.target_take_name, hs.has_notes and "Analyzed & Active" or "Ready to Analyze",
           hdr_pitch_algorithm_line(hs.target_take)))
@@ -6723,7 +6936,7 @@ do
   local DOCK_STRENGTH_LABEL = PARAM_LABELS.retune_speed
   local DOCK_STRENGTH_SHORT = "Correction"
   -- Where a value comes from, in words (the badge colour is only a second cue): the strength slider shows it after itself
-  local DOCK_SCOPE_TAGS = { note = "· note", item = "· item", global = "· global" }
+  local DOCK_SCOPE_TAGS = K.SCOPE_TAGS
   -- Appended to a badge label when its value is overridden for the item (or the selected note)
   local DOCK_OVERRIDE_MARK = "*"
   -- Why the controls are disabled (the state hint below is the inline reason; the tooltips repeat these)
@@ -6790,7 +7003,8 @@ do
   --- Lay the dock out for a content width: `rows` is a list of rows of { id, x, w } (x from the row start), and
   --- `row_count` includes the status row when the status text needs a row of its own. Inspector and Actions
   --- share a row when both fit (a group gap apart), else Actions starts a new row; a group wider than a row
-  --- wraps unit by unit.
+  --- wraps unit by unit. Gaps grow with the distance (LG1): L.sm inside a unit (the strength label, slider and
+  --- scope tag) and between the action buttons, L.md between the Inspector's units, L.lg between the groups.
   plan_dock = function(dock_ctx, avail_w)
     local L = Theme.layout
     local s = measure_dock(dock_ctx)
@@ -6807,8 +7021,9 @@ do
       local rows, row, row_w = {}, {}, 0
       rows[1] = row
       for _, group in ipairs({ inspector, actions }) do
+        local unit_gap = (group == inspector) and L.md or L.sm
         local group_w = 0
-        for i, unit in ipairs(group) do group_w = group_w + unit.w + ((i > 1) and L.sm or 0) end
+        for i, unit in ipairs(group) do group_w = group_w + unit.w + ((i > 1) and unit_gap or 0) end
         local lead_gap = 0
         if #row > 0 then
           if row_w + L.lg + group_w <= avail_w then
@@ -6819,7 +7034,7 @@ do
           end
         end
         for i, unit in ipairs(group) do
-          local gap = (i == 1) and lead_gap or L.sm
+          local gap = (i == 1) and lead_gap or unit_gap
           if #row > 0 and row_w + gap + unit.w > avail_w then
             row, row_w, gap = {}, 0, 0
             rows[#rows + 1] = row
@@ -6875,17 +7090,9 @@ do
   mark_stale_takes = function(key)
     local n = 0
     for _, guid in ipairs(state.session_order) do
-      local data = state.session_takes[guid]
-      if guid ~= state.target_take_guid and data
-         and not (data.overrides and data.overrides[key] ~= nil) then
-        for _, note in ipairs(data.notes or {}) do
-          local own = key ~= "legato_threshold_ms" and note.controls and note.controls[key] ~= nil
-          if is_note_modified(note) and not own then
-            state.stale_takes[guid] = true
-            n = n + 1
-            break
-          end
-        end
+      if guid ~= state.target_take_guid and K.inherits_global(state.session_takes[guid], key) then
+        state.stale_takes[guid] = true
+        n = n + 1
       end
     end
     return n
@@ -6982,12 +7189,26 @@ do
       end
     end
 
-    --- An edit was committed: when it went to the global default, the other items still hold an envelope
-    --- written with the old value; say so (a global default is not part of the undo history).
-    local function note_global_edit(key)
-      if take_data and take_data.overrides and take_data.overrides[key] ~= nil then return end
-      local n = mark_stale_takes(key)
-      if n > 0 then set_status(global_change_status("Global default changed (not undoable)", n)) end
+    --- Undo point of re-writing the target's envelope after a global default changed: Cmd+Z reverts that envelope
+    --- (and the stored model), never the global default itself, so the name says what it reverts.
+    local function global_undo_label(key)
+      return string.format("Apply Global %s to Item Envelope", PARAM_LABELS[key] or key)
+    end
+
+    --- A drag / typed / wheel edit of a cascade value was committed (the value is already written by
+    --- write_cascade_value). An item override is project state: one undo point. A global default is saved
+    --- outside the undo history: it is saved, the target's envelope is re-written with it (an undo point that
+    --- reverts only that envelope; after such an undo the item is flagged stale, see K.refresh_stale_flag), and
+    --- the status line always says it is not undoable (and how many other items keep their old envelope).
+    local function commit_cascade_edit(key)
+      local name = PARAM_LABELS[key] or key
+      if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
+        apply_envelope_to_take("Adjust Item " .. name)
+        return
+      end
+      K.save_settings("cascade")
+      if take_data then apply_envelope_to_take(global_undo_label(key)) end
+      set_status(global_change_status("Global default changed (not undoable)", mark_stale_takes(key)))
     end
 
     --- Item override on / off (right-click menu): a new override starts at the current global default.
@@ -7013,8 +7234,8 @@ do
       elseif DEFAULTS[key] ~= nil and global_defaults[key] ~= DEFAULTS[key] then
         global_defaults[key] = DEFAULTS[key]
         K.save_settings("cascade")
-        if take_data then apply_envelope_to_take("Reset Default: " .. name) end
-        set_status(global_change_status("Global default reset (not undoable)", mark_stale_takes(key)))
+        if take_data then apply_envelope_to_take(global_undo_label(key)) end
+        set_status(global_change_status("Global default changed (not undoable)", mark_stale_takes(key)))
       end
     end
 
@@ -7069,11 +7290,7 @@ do
           reset_cascade_param("retune_speed")
         else
           if rs_c then write_cascade_value("retune_speed", rs_v / 100) end
-          if rs_committed then K.save_settings("cascade") end   -- the drag is over: one write, only the key that changed
-          if rs_committed and take_data then
-            apply_envelope_to_take("Adjust " .. PARAM_LABELS.retune_speed)
-            note_global_edit("retune_speed")
-          end
+          if rs_committed then commit_cascade_edit("retune_speed") end   -- the edit is over: one write, one undo point
         end
       end
 
@@ -7127,11 +7344,7 @@ do
           reset_cascade_param(key)
         else
           if c then write_cascade_value(key, v) end
-          if committed then K.save_settings("cascade") end
-          if committed and take_data then
-            apply_envelope_to_take("Adjust " .. (PARAM_LABELS[key] or key))
-            note_global_edit(key)
-          end
+          if committed then commit_cascade_edit(key) end
         end
         reaper.ImGui_PopItemWidth(dock_ctx)
         reaper.ImGui_EndPopup(dock_ctx)
@@ -7205,6 +7418,18 @@ do
     -- Status / hint text (left) and selection count + key / scale (right-aligned): the message replaces the hint
     local scale_str = string.format("%s %s", SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name)
     local right_text = (sel_count > 0) and string.format("%d Selected  •  %s", sel_count, scale_str) or scale_str
+    -- EP2: with notes selected, why Split / Merge are disabled stays readable inline (not in a tooltip only): it fills
+    -- the hint line while no status message is showing
+    if hint == "" and has_data and sel_count > 0 and not inspector_reason then
+      local reasons = {}
+      for _, id in ipairs({ "split", "merge" }) do
+        local why = action_reason(id)
+        if why then
+          reasons[#reasons + 1] = string.format("%s: %s%s", DOCK_ACTION_BY_ID[id].label, why:sub(1, 1):lower(), why:sub(2))
+        end
+      end
+      hint = table.concat(reasons, "  ·  ")
+    end
     local wanted = status_text or hint
     local left_text, right_shown, right_x = layout_dock_texts(dock_ctx, plan.status_x, plan.avail_w, wanted, right_text)
     -- Inline, the text continues the last control row; otherwise it opens the row the plan reserved
@@ -7245,11 +7470,11 @@ local function loop_body()
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(), L.md, pad_v)
   nv = nv + 2
 
-  -- First use: 920 x 620, wider when the full header (title, Key: / Scale: labels, one row) needs it, so
-  -- it opens unabbreviated. A saved size wins over this (Cond_FirstUseEver)
+  -- First use: K.FIRST_USE_W x K.FIRST_USE_H, wider when the full header (title, Key: / Scale: labels, one row) needs
+  -- it, so it opens unabbreviated. A saved size wins over this (Cond_FirstUseEver)
   hdr_static = hdr_static or measure_header_static()
-  Theme.center_next_window(ctx, math.max(920, math.ceil(hdr_min_content_w(hdr_static, true) + pad_x * 2)), 620,
-    reaper.ImGui_Cond_FirstUseEver())
+  Theme.center_next_window(ctx, math.max(K.FIRST_USE_W, math.ceil(hdr_min_content_w(hdr_static, true) + pad_x * 2)),
+    K.FIRST_USE_H, reaper.ImGui_Cond_FirstUseEver())
   -- A floating window never gets narrower than the header needs (two rows); a docked one takes its
   -- dock's size, and the header wraps further to fit (see HEADER BAR)
   if hdr_was_docked == false then
