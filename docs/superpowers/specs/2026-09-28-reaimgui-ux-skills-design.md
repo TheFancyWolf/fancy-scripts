@@ -48,7 +48,7 @@ Success means:
 | D15 | Match Theme | Verified against the user's current REAPER theme only. The skills never switch the REAPER theme. Hardcoded colours are flagged statically. |
 | D16 | Legacy scripts | A script that defines its own palette or font table (today: Selected Track Meter) is marked **legacy**. No hex or token replacement is applied to it in any tier outside a separately approved **migration phase**. The review offers that phase and never bundles it. |
 | D17 | Housekeeping | Doc/help drift, CHANGELOG claims not in code, `theme.lua` internal drift and pre-existing luacheck warnings are reported, not fixed. |
-| D18 | Version control | The skills stay local-only, like the existing ones (`.agents/` is gitignored). `.claude/skills/` and `.claude/agents/` are added to `.gitignore` so their symlinks into the ignored tree are never committed (§7). `docs/design/` and this spec **are** tracked. |
+| D18 | Version control | **Superseded 2026-10-01:** `.agents/`, `.claude/skills/`, `.claude/agents/` and `AGENTS.md` are now **tracked** so they are shared across machines; `.reapack-index.conf` ignores `.agents` and `.claude` (enforced by the `reaper-gates` H6 gate). See `.agents/README.md`. *(Was: skills local-only, `.agents/` gitignored.)* `docs/design/` and this spec are tracked. |
 
 ### 2.3 House conventions (HC1–HC6)
 

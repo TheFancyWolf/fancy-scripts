@@ -1,5 +1,8 @@
 std = "lua54"
 
+-- Agent tooling is never shipped or linted as REAPER code.
+exclude_files = { ".agents/**", ".claude/**" }
+
 globals = {
   "reaper",
   "gfx",

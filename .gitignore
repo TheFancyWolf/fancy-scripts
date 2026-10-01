@@ -16,9 +16,8 @@ _fancy_*.json
 *.tmp
 *.bak
 
-# Antigravity / Agent files (managed externally)
-.agents/
-.claude/
-agents.md
-AGENTS.md
+# Agent tooling: skills, agents and AGENTS.md are tracked so every machine shares them
+# (.reapack-index.conf keeps them out of ReaPack). Only per-machine files stay local.
+.claude/settings.local.json
+.claude/worktrees/
 .mcp.json
