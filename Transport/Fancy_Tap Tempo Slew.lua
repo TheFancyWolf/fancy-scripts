@@ -7,8 +7,8 @@
 --   Tap tempo for following a live player. After the 4th tap the tempo
 --   changes at once, or glides at a configurable slew rate.
 --   Bind the action to a key and press it on each beat. The target BPM is
---   the average of the last few tap intervals. Edit CONFIG at the top of
---   the script to change the slew rate and tap behaviour.
+--   the average of the last few tap intervals. Use the "Fancy Tap Tempo
+--   Slew Settings" action to change the mode, taps per change and limits.
 --   An instant change inserts a tempo marker at the play position, so the
 --   play position does not jump and sounding notes are not retriggered.
 --   Requirements: REAPER 7.03+
@@ -16,20 +16,19 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
+--   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
--- 1. CONFIG
+-- 1. SETTINGS
 -------------------------------------------------------------------------------
 
-local CONFIG = {
-  slew_bpm_per_sec = 0,   -- maximum tempo change per second; 0 = instant
-  tap_count        = 4,   -- taps needed before the tempo changes, then averaged
-  reset_gap        = 2.0, -- seconds between taps that start a new sequence
-  min_bpm          = 30,
-  max_bpm          = 300,
-}
+local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
+package.path = script_dir .. "../_lib/?.lua;" .. package.path
 
-local EXT = "FancyTapTempoSlew"
+local Settings = require("tap_tempo_settings")
+local CONFIG = Settings.load() -- re-read on every press (each press relaunches)
+
+local EXT = Settings.EXT
 local EPSILON = 0.001
 
 -------------------------------------------------------------------------------
@@ -54,15 +53,19 @@ end
 -- Records a tap and returns the new target BPM, or nil until tap_count taps.
 local function register_tap(now)
   local taps = load_taps()
-  if #taps > 0 and now - taps[#taps] > CONFIG.reset_gap then
+  if #taps > 0 and now - taps[#taps] > CONFIG.restart_gap then
     taps = {}
   end
   taps[#taps + 1] = now
-  while #taps > CONFIG.tap_count do table.remove(taps, 1) end
-  save_taps(taps)
+  while #taps > CONFIG.taps_per_change do table.remove(taps, 1) end
 
-  if #taps < CONFIG.tap_count then return nil end
+  if #taps < CONFIG.taps_per_change then
+    save_taps(taps)
+    return nil
+  end
   local avg = (taps[#taps] - taps[1]) / (#taps - 1)
+  -- Group mode: the next change needs a fresh group of taps.
+  save_taps(CONFIG.update == "group" and {} or taps)
   if avg <= 0 then return nil end
   local bpm = 60.0 / avg
   return math.max(CONFIG.min_bpm, math.min(CONFIG.max_bpm, bpm))
@@ -154,7 +157,7 @@ local function start_glide(target)
       return
     end
 
-    local max_step = CONFIG.slew_bpm_per_sec * dt
+    local max_step = CONFIG.glide_rate * dt
     local new_bpm
     if math.abs(diff) <= max_step then
       new_bpm = target
@@ -180,7 +183,7 @@ local function main()
 
   local target = register_tap(reaper.time_precise())
 
-  if CONFIG.slew_bpm_per_sec <= 0 then
+  if CONFIG.mode ~= "glide" then
     if target then apply_instant(target) end
     return
   end
