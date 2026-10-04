@@ -4,6 +4,11 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Tap Tempo Slew v1.0.0 (`Transport/Fancy_Tap Tempo Slew.lua`, `Transport/Fancy_Tap Tempo Slew Stop.lua`, `Transport/Fancy_Tap Tempo Slew Settings.lua`, `_lib/tap_tempo_settings.lua`)** — New scripts for following a live player:
+  - **Tap action**: after a set number of taps (default 4) the tempo changes to their average. Instant mode (default) inserts a tempo marker at the play position, so what has already played keeps its timing and sounding notes are not cut and retriggered. Glide mode moves the tempo in effect toward the tapped value at a set rate. After the first change, the tempo updates once per group of taps (default) or on every tap (rolling average). A pause longer than the restart gap (default 2 s) starts a new count. Each press replaces a running glide without a prompt; one undo point per change.
+  - **Stop action**: stops a glide where it is and clears the tap count.
+  - **Settings window**: change mode, glide rate, taps per change, group or rolling updates, restart gap and tempo range. Changes save at once and apply on the next tap; a summary line describes what tapping will do; Reset all asks first. Settings are shared through `_lib/tap_tempo_settings.lua`.
+
 - **Fancy Pitch Correct v2.5.0 (`Pitch/Fancy_Pitch Correct.lua`)** — UX review: safer edits, clearer interface:
   - **Undo and data safety**: the editor follows Cmd/Ctrl+Z and Redo (the note model is saved inside the same undo point as the pitch envelope); Re-Analyze, Reset all, Clear, Remove and Wipe ask before discarding edits; Wipe and Remove no longer reset a take's own pitch and Wipe is one undo step; re-analysis no longer leaves a stale envelope; holding an arrow key to nudge is one undo step; the note-menu sliders now apply their changes.
   - **Keyboard and input**: Esc closes the innermost popup or dialog, then deselects, then closes a floating window (never a docked one); Space and its Shift/Ctrl/Alt chords run the action bound in REAPER; shortcuts need exact modifiers and ignore open menus; Cmd/Ctrl-drag is fine adjust; value controls are drag widgets with fine adjust, double-click reset, Cmd/Ctrl-click typing and clamping; Block and Hop size are lists.
