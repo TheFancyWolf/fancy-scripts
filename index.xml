@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<index version="1" name="Fancy Scripts" commit="55b6fad40bd68edbb5250317a4d8955d243f5cd5">
+<index version="1" name="Fancy Scripts" commit="c41091106a540b031367ea5649e0d2ad5007b304">
   <category name="_lib">
     <reapack name="mapper_engine.lua" type="script" desc="Fancy Mapper Core Engine">
       <metadata>
@@ -284,6 +284,42 @@
       <version name="1.0.0" author="Fancy Scripts" time="2026-08-27T10:26:43Z">
         <changelog><![CDATA[+ Initial ReaPack release]]></changelog>
         <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/8810c9c72fcbb378a1c60628096a9537ee6cbd52/Routing/Fancy_Copy%20Fader%20to%20Send.lua</source>
+      </version>
+    </reapack>
+  </category>
+  <category name="Transport">
+    <reapack name="Fancy_Tap Tempo Slew Stop.lua" type="script" desc="Fancy Tap Tempo Slew Stop">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Stops a running Fancy Tap Tempo Slew glide. The tempo stays where it is and the tap history is cleared, so the next tap starts fresh. Requirements: REAPER 7.03+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="1.0.0" author="Fancy Scripts" time="2026-10-04T01:08:58Z">
+        <changelog><![CDATA[+ Initial release]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/619acd0793ae4b93bcdbc65d7bf41d167063854d/Transport/Fancy_Tap%20Tempo%20Slew%20Stop.lua</source>
+      </version>
+    </reapack>
+    <reapack name="Fancy_Tap Tempo Slew.lua" type="script" desc="Fancy Tap Tempo Slew">
+      <metadata>
+        <description><![CDATA[{\rtf1\ansi\deff0{\fonttbl{\f0 \fswiss Helvetica;}{\f1 \fmodern Courier;}}
+{\colortbl;\red255\green0\blue0;\red0\green0\blue255;}
+\widowctrl\hyphauto
+
+{\pard \ql \f0 \sa180 \li0 \fi0 Tap tempo for following a live player. After the 4th tap the tempo changes at once, or glides at a configurable slew rate. Bind the action to a key and press it on each beat. The target BPM is the average of the last few tap intervals. Use the "Fancy Tap Tempo Slew Settings" action to change the mode, taps per change and limits. An instant change inserts a tempo marker at the play position, so the play position does not jump and sounding notes are not retriggered. Requirements: REAPER 7.03+\par}
+}
+]]></description>
+        <link rel="website" href="https://github.com/TheFancyWolf/fancy-scripts">Website</link>
+        <link rel="donation">https://github.com/sponsors/TheFancyWolf</link>
+      </metadata>
+      <version name="1.0.0" author="Fancy Scripts" time="2026-10-04T01:08:58Z">
+        <changelog><![CDATA[+ Initial release]]></changelog>
+        <source main="main">https://github.com/TheFancyWolf/fancy-scripts/raw/619acd0793ae4b93bcdbc65d7bf41d167063854d/Transport/Fancy_Tap%20Tempo%20Slew.lua</source>
       </version>
     </reapack>
   </category>
