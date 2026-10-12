@@ -41,10 +41,12 @@ Platform: Apple Silicon only for now (mlx-whisper). Stated in `@about`.
 
 - Clock: 0:00 = earliest start of the MIDI or audio item. Times print m:ss.
 - Keyswitch = any pitch with a note name on the MIDI track. Label = that name.
-- New row only when there is something new to play: (1) articulation switch;
-  (2) phrase whose figure differs from the previous phrase (phrases split at
-  gaps > `phrase_gap`, default 0.75 s). Lyrics sung while resting stay in the
-  row before (no REST rows).
+- One row per articulation switch (plus a leading row for notes before the
+  first switch). Inside a row, each change of figure is a new part (gray
+  band): phrases split at gaps > `phrase_gap` (default 0.75 s), and
+  consecutive phrases with the same figure merge. Parts and lyric lines are
+  interleaved in time order (a line sung more than 0.3 s before a part's first
+  note comes before it). Lyrics sung while resting stay in the row.
 - Lyrics: each Whisper segment goes in the row where it starts (0.4 s lead
   allowed). A row without lyrics shows only its part note.
 - Reference lyrics (optional): `Cheat Sheets/<Song>.lyrics.txt`, supplied by
@@ -57,17 +59,29 @@ Platform: Apple Silicon only for now (mlx-whisper). Stated in `@about`.
   Encodings: UTF-8, UTF-16 with BOM, Mac Roman.
 - Lyrics print in full, one line per line (`cue_words` > 0 shortens each line
   to its first N words; default 0).
-- Part note per row, LH first (split at `hand_split`, default C4), pitch names
-  without octave numbers: the main note or shape ("D", "G octave", "D chord"),
-  walk-up/down, a repeating pattern ("G D A D pattern"), octave lines
-  ("Octaves: F# G F# A"), otherwise notes in order (max 6, then "…"). Rhythm
-  is not described yet (the project grid does not follow the performance).
+- Part wording follows how the player marks parts (learned from the edited
+  Hard Knock Life sheet):
+  - register words instead of octave numbers: High (C6+), Mid (C5–B5), none
+    (C4–B4), Low (below C4); left-hand parts get no register word;
+  - "F# octave", "Quad octave D" (one pitch class stacked; both hands doubling
+    the same notes read as one shape), "D chord" / "D chord: D F# A D" for
+    arpeggios;
+  - short single notes as lines with speed: "Slow line G D A D", "Fast line …",
+    "Run up C# D E" (fast, stepwise), "Walk-up slow F G A";
+  - held notes and octave changes with arrows: "High D → Mid D → High G",
+    "Octaves B → C"; repeats as "2x" (or "(repeat)" when the last pass is cut
+    off); a long last note as ", then hold D";
+  - LH/RH labels only when the hands do different things.
+  Rhythm and judgment ("odd rhythm", "slam", "double time") stay the
+  player's.
 
 ## Markdown format and merge
 
 Front matter holds per-song values that print at the top (`key`, `run_key`,
 `run_direction`, `gliss_direction`, `trill_interval`; blank = a line to write
-on) and settings (`hand_split`, `phrase_gap`, `cue_words`).
+on) and settings (`hand_split`, `phrase_gap`, `cue_words`, `auto_keys` —
+first-pass keyboards, default `no`). `short` prints as a "Short ____" field
+(detaché / spiccato) and `scale` pre-fills the title-bar keyboard.
 Free text between the title and the first row is preserved verbatim.
 Row = `## m:ss · ART <!-- at=SECONDS auto=HASH -->`, then a `>` lyric line, then
 the part note (any Markdown).
@@ -82,19 +96,43 @@ within 0.5 s:
 | Old edited row, no match | kept, marked `⚠ no longer in MIDI — check` |
 | Old unedited row, no match | dropped |
 | New auto row | inserted in time order |
-| User row (no anchor comment) | kept at its time |
+| Row whose anchor comment was lost (some editors strip comments) | matched by heading time (±1.1 s) and articulation, kept as edited, anchor restored |
+| User row (no anchor comment, no match) | kept at its time |
 | `(hide)` in heading | kept in file, not printed |
 
 ## Printed page
 
-Title, a settings strip (Key · Run key/dir · Gliss dir · Trill interval),
+Title with a one-octave keyboard (C–B, full title-bar height) on the right
+for writing in a scale (`scale:` in the front matter pre-fills dots), a
+settings strip (Key · Run key/dir · Gliss dir · Trill interval),
 then rows: articulation name (left, only on rows where it changes) · lyrics
-(large) with the part note (bold) placed where the playing starts: lines
+(large) with each part note (bold, in a gray band with a black left bar,
+forced to print) placed where the playing starts: lines
 sung more than 0.3 s before the row's first note come before it, the rest
 after. No time column on the printout (times stay in the .md headings).
 Filled-in lyric lines have estimated times, so their side of the part note
 can be wrong. Print CSS for letter
 portrait.
+
+## Keyboard diagrams
+
+A line `keys [LH|RH] <low>-<high>: <notes>` (dots) or `line …` (dots numbered
+in the order given) under an instruction draws a small keyboard inline in that
+gray band; several sit side by side. Notes take an optional octave (`G2`);
+the range reads upward and is widened to white keys at both ends; without an
+octave a mark is the first matching key in the range. Spans over 4 octaves or
+unknown notes leave the line as plain text. Full runs add a first-pass `keys`
+line per hand under each generated part note (range = notes played ±1 key;
+a `line` for walk-ups/downs of 3–8 notes). Drawn at render time, so the
+double-click render picks up edits.
+
+## Show toggles (screen only)
+
+The HTML has a control bar (Lyrics · Part notes · Keyboards checkboxes) that
+hides those parts via body classes; print shows what is on screen and the bar
+itself never prints. Rows left with nothing visible and no switch name are
+hidden. The choice is stored per song in the browser's localStorage. The .md
+and the REAPER action are unaffected; articulation switches always show.
 
 ## Render from the Markdown only
 
@@ -103,8 +141,8 @@ needs only the .md: `fancy_cheatsheet.py --render <file.md | folder> [--open]`
 parses the .md and writes the HTML in file order, without reading project
 data or rewriting the .md. Each full run writes `Cheat Sheets/Render Cheat
 Sheets.command` (absolute Python and helper paths, chmod 755), which runs
-`--render . --open` when double-clicked. The header shows the switch count
-only (no song length), so both paths produce identical HTML.
+`--render . --open` when double-clicked. The header carries no counts or song length, so both paths produce
+identical HTML.
 
 ## Errors
 

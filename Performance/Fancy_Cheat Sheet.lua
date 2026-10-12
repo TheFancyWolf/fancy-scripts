@@ -28,6 +28,13 @@
 --   marked for you to check. Add "(hide)" to a row's heading to leave it off
 --   the printout.
 --
+--   Under an instruction, "keys B-E: D C# C" draws a small keyboard with
+--   dots on those keys ("line" numbers them in playing order). Set
+--   "auto_keys: yes" at the top of the .md to generate a first pass.
+--
+--   In the browser, the Show bar at the top hides lyrics, part notes or
+--   keyboards before you print (the bar itself does not print).
+--
 --   After hand edits you don't need REAPER: double-click "Render Cheat
 --   Sheets.command" in the Cheat Sheets folder. It turns every .md there into
 --   HTML (without changing the .md) and opens the sheets.

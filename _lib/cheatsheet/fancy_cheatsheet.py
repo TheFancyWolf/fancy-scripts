@@ -29,13 +29,17 @@ VERSION = "1.0.0"
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULTS = {  # front matter of each .md; the first five print at the top of the sheet
     "key": "", "run_key": "", "run_direction": "", "gliss_direction": "", "trill_interval": "",
-    "hand_split": "C4", "phrase_gap": 0.75, "cue_words": 0,
+    "short": "", "scale": "",
+    "hand_split": "C4", "phrase_gap": 0.75, "cue_words": 0, "auto_keys": "no",
 }
 MATCH_TOLERANCE = 0.5      # seconds: a moved switch within this is the same row
 LYRIC_LEAD = 0.4           # seconds: a line starting this early still belongs to the next row
 PART_LEAD = 0.3            # seconds: a line starting this close to the first note counts as with it
 MIN_LOGPROB = -1.0         # Whisper segments less confident than this are dropped
 DOMINANT = 0.5             # share of onsets that makes one shape "the" figure
+FAST_GAP = 0.18            # seconds between notes: faster than this is a "run"
+SLOW_GAP = 0.5             # seconds between notes: slower than this is "slow"
+HOLD_MIN = 0.6             # seconds: a last note this long (and 3x the others) is "held"
 MATCH_MIN = 0.6            # similarity needed to replace a heard line with the reference
 MATCH_AHEAD = 10           # reference lines searched past the last match
 UNSURE = " (?)"            # marks a heard line that matched no reference line
@@ -337,70 +341,123 @@ def _pc(p):
     return NAMES[p % 12]
 
 
-def shape_name(shape):
+def _reg(p):
+    """Register word as players say it: High from C6, Mid from C5, Low below C4."""
+    if p >= 84:
+        return "High "
+    if p >= 72:
+        return "Mid "
+    if p < 60:
+        return "Low "
+    return ""
+
+
+OCTAVE_STACK = {2: "Octave", 3: "Triple octave", 4: "Quad octave", 5: "5-octave"}
+
+
+def shape_label(shape, reg=True):
+    """One onset: 'Mid D', 'F# octave', 'Quad octave D', 'D chord'."""
     pcs = {p % 12 for p in shape}
     if len(shape) == 1:
-        return _pc(shape[0])
+        return (_reg(shape[0]) if reg else "") + _pc(shape[0])
     if len(pcs) == 1:
-        return f"{_pc(shape[0])} octave"
+        if len(shape) == 2:
+            return f"{_pc(shape[0])} octave"
+        return f"{OCTAVE_STACK.get(len(shape), 'Octave')} {_pc(shape[0])}"
     name = chord_name(shape)
     return f"{name} chord" if name else "/".join(_pc(p) for p in shape)
 
 
-def _pattern(seq):
-    """Smallest repeating cycle (2-4 notes) covering most of seq, or None."""
-    for period in (2, 3, 4):
-        if len(seq) < 2 * period + 1:
+def _cycle(items):
+    """(cycle, times, exact) if items repeats one short cycle 2+ times, else None.
+
+    A cut-off last pass still counts (exact=False)."""
+    for period in range(1, 5):
+        if len(items) < 2 * period:
             continue
-        same = sum(seq[i] == seq[i + period] for i in range(len(seq) - period))
-        if same / (len(seq) - period) >= 0.8:
-            return seq[:period]
+        cyc = items[:period]
+        if len(set(cyc)) > 1 or period == 1:
+            if all(items[i] == cyc[i % period] for i in range(len(items))):
+                return cyc, len(items) // period, len(items) % period == 0
     return None
 
 
-def describe_hand(notes):
-    """Return (text, signature) for one hand's notes, in pitch names without octaves."""
+def _speed(groups):
+    """'fast' / 'slow' / '' from the time between onsets."""
+    gaps = sorted(b[0]["s"] - a[0]["s"] for a, b in zip(groups, groups[1:]))
+    if not gaps:
+        return ""
+    med = gaps[len(gaps) // 2]
+    return "fast" if med < FAST_GAP else ("slow" if med > SLOW_GAP else "")
+
+
+def describe_hand(notes, reg=True):
+    """Return (text, signature) for one hand, worded the way a player marks a part."""
     groups = onsets(notes)
     shapes = [tuple(sorted({n["p"] for n in g})) for g in groups]
     count = len(groups)
     length = length_word(notes)
     shape_set = sorted(set(shapes))
+    octaves = all(len(s) > 1 and len({p % 12 for p in s}) == 1 for s in shapes)
 
     if len(shape_set) == 1:
-        shape = shape_set[0]
-        sig = ("single", length) if len(shape) == 1 else \
-            ("same", tuple(sorted({p % 12 for p in shape})), length)
-        return shape_name(shape), sig
+        sig = ("single", length) if len(shape_set[0]) == 1 else \
+            ("same", tuple(sorted({p % 12 for p in shape_set[0]})), length)
+        return shape_label(shape_set[0], reg), sig
 
     top, top_n = max(((s, shapes.count(s)) for s in shape_set), key=lambda x: x[1])
     if top_n / count >= DOMINANT and top_n > 2:
-        return shape_name(top), ("same", tuple(sorted({p % 12 for p in top})), length)
+        return shape_label(top, reg), ("same", tuple(sorted({p % 12 for p in top})), length)
 
-    if all(len(s) == 1 for s in shapes):
-        seq = [s[0] for s in shapes]
+    # A held last note reads "then hold X".
+    hold = ""
+    durs = [max(n["e"] - n["s"] for n in g) for g in groups]
+    if count >= 3:
+        rest = sorted(durs[:-1])
+        if durs[-1] >= HOLD_MIN and durs[-1] >= 3 * rest[len(rest) // 2]:
+            hold = ", then hold " + (_pc(shapes[-1][0]) if octaves else shape_label(shapes[-1], reg))
+            shapes, groups = shapes[:-1], groups[:-1]
+
+    if all(len(sh) == 1 for sh in shapes):
+        seq = [sh[0] for sh in shapes]
         steps = [b - a for a, b in zip(seq, seq[1:])]
-        cycle = _pattern(seq)
-        name = chord_name(seq)
-        if len(seq) >= 3 and all(0 < d <= 2 for d in steps):
-            text = f"Walk-up {_pc(seq[0])} → {_pc(seq[-1])}"
-        elif len(seq) >= 3 and all(-2 <= d < 0 for d in steps):
-            text = f"Walk-down {_pc(seq[0])} → {_pc(seq[-1])}"
-        elif cycle:
-            text = " ".join(_pc(p) for p in cycle) + " pattern"
-        elif name and len(set(seq)) >= 3:
-            text = f"{name} chord: " + _listed(seq)
-        else:
-            text = _listed(seq)
-        return text, ("line", length)
+        speed = _speed(groups)
+        up = len(seq) >= 3 and all(0 < d <= 4 for d in steps)
+        down = len(seq) >= 3 and all(-4 <= d < 0 for d in steps)
+        if up or down:
+            kind = ("Run " + ("up" if up else "down")) if speed == "fast" else ("Walk-up" if up else "Walk-down")
+            if speed == "slow":
+                kind += " slow"
+            names = " ".join(_pc(p) for p in seq[:LIST_MAX + 2])
+            lead = _reg(seq[0]).strip() if reg else ""
+            text = f"{lead + ' ' if lead else ''}{kind.lower() if lead else kind} {names}"
+            return text + hold, ("line", length)
 
-    uniq = _dedupe(shapes)
-    if all(len({p % 12 for p in s}) == 1 for s in shapes):
-        text = "Octaves: " + " ".join(_pc(s[0]) for s in uniq[:LIST_MAX])
+        # Short single notes read as a line ("Slow line G D A D"); a chord's
+        # notes one at a time read "D chord: D F# A D".
+        name = chord_name(seq)
+        arpeggio = all(d > 0 for d in steps) or all(d < 0 for d in steps)
+        if name and arpeggio and len(set(p % 12 for p in seq)) >= 3 and len(seq) <= LIST_MAX:
+            return f"{name} chord: " + " ".join(_pc(p) for p in _dedupe(seq)) + hold, ("line", length)
+        if length != "held":
+            names = _dedupe([_pc(p) for p in seq])
+            cyc = _cycle(names)
+            if cyc:
+                listed = " ".join(cyc[0]) + (f" {cyc[1]}x" if cyc[2] else " (repeat)")
+            else:
+                listed = " ".join(names[:LIST_MAX]) + (" …" if len(names) > LIST_MAX else "")
+            lead = (speed.capitalize() + " line") if speed else "Line"
+            return f"{lead} {listed}" + hold, ("line", length)
+
+    labels = _dedupe([_pc(sh[0]) if octaves else shape_label(sh, reg) for sh in shapes])
+    cyc = _cycle(labels)
+    if cyc:
+        body = " → ".join(cyc[0]) + (f" {cyc[1]}x" if cyc[2] else " (repeat)")
     else:
-        text = ", ".join(shape_name(s) for s in uniq[:4])
-    if len(uniq) > (LIST_MAX if text.startswith("Octaves") else 4):
-        text += " …"
-    return text, ("mixed", length)
+        body = " → ".join(labels[:LIST_MAX]) + (" …" if len(labels) > LIST_MAX else "")
+    if octaves:
+        body = "Octaves " + body
+    return body + hold, ("mixed", length)
 
 
 def _dedupe(seq):
@@ -418,18 +475,174 @@ def _listed(pitches):
 
 
 def describe(notes, split):
-    """Return (text, signature) for a group of notes, labelled per hand."""
+    """Return (text, signature) for a group of notes.
+
+    Hands are labelled only when they do different things; when both hands
+    double the same notes in octaves it reads as one shape ("Quad octave D")."""
     if not notes:
         return "No notes", ("none",)
     rh = [n for n in notes if n["p"] >= split]
     lh = [n for n in notes if n["p"] < split]
     if rh and lh:
+        same_pcs = {n["p"] % 12 for n in rh} == {n["p"] % 12 for n in lh}
+        if same_pcs and all(len({n["p"] % 12 for n in g}) == 1 for g in onsets(notes)):
+            return describe_hand(notes)
         rt, rs = describe_hand(rh)
-        lt, ls = describe_hand(lh)
+        lt, ls = describe_hand(lh, reg=False)
         return f"LH: {lt} · RH: {rt}", (ls, rs)
-    hand = rh or lh
-    text, sig = describe_hand(hand)
+    text, sig = describe_hand(rh or lh)
     return text, (("rh", sig) if rh else ("lh", sig))
+
+
+# -----------------------------------------------------------------------------
+# 3b. KEYBOARD DIAGRAMS
+#
+#   keys [LH|RH] <low>-<high>: <notes>   dots on the notes (chords, shapes)
+#   line [LH|RH] <low>-<high>: <notes>   dots numbered in the order given
+#
+# Notes are names with an optional octave (D, C#, Bb, G2). The range reads
+# upward: "B-E" is B up to the next E. Without octaves, a mark is the first
+# matching key in the range.
+# -----------------------------------------------------------------------------
+
+BLACK_PCS = {1, 3, 6, 8, 10}
+KEY_TOKEN = r"[A-Ga-g](?:#|b|♯|♭)?\d?"
+KEY_LINE_RE = re.compile(rf"^\s*(keys|line)(?:\s+(LH|RH))?\s+({KEY_TOKEN})\s*-\s*({KEY_TOKEN})\s*:\s*(.+?)\s*$",
+                         re.I)
+KB_MAX_SPAN = 48           # semitones; wider ranges are refused
+KB_WHITE_W, KB_H = 16, 48  # key size in px for print
+
+
+def _key_token(tok):
+    """'C#4' -> (pitch class, octave or None); None if not a note."""
+    m = re.fullmatch(r"([A-Ga-g])(#|b|♯|♭)?(\d)?", tok.strip())
+    if not m:
+        return None
+    pc = NAMES.index(m.group(1).upper()) + {"#": 1, "♯": 1, "b": -1, "♭": -1}.get(m.group(2) or "", 0)
+    return pc % 12, (int(m.group(3)) if m.group(3) else None)
+
+
+def parse_key_line(line):
+    """Return (kind, hand, lo, hi, marks) for a keys/line row, or None if it isn't one."""
+    m = KEY_LINE_RE.match(line)
+    if not m:
+        return None
+    kind, hand, lo_t, hi_t, marks_t = m.groups()
+    lo_k, hi_k = _key_token(lo_t), _key_token(hi_t)
+    if lo_k is None or hi_k is None:
+        return None
+    lo = (lo_k[1] if lo_k[1] is not None else 4) * 12 + 12 + lo_k[0]
+    if hi_k[1] is not None:
+        hi = hi_k[1] * 12 + 12 + hi_k[0]
+    else:
+        hi = lo + 1 + (hi_k[0] - lo - 1) % 12
+    if hi <= lo or hi - lo > KB_MAX_SPAN:
+        return None
+    marks = []
+    for tok in re.split(r"[\s,]+", marks_t.strip()):
+        if not tok:
+            continue
+        k = _key_token(tok)
+        if k is None:
+            return None
+        if k[1] is not None:
+            p = k[1] * 12 + 12 + k[0]
+        else:
+            p = next((q for q in range(lo, hi + 1) if q % 12 == k[0]), None)
+            if p is None:
+                return None
+        lo, hi = min(lo, p), max(hi, p)
+        marks.append(p)
+    if lo % 12 in BLACK_PCS:
+        lo -= 1
+    if hi % 12 in BLACK_PCS:
+        hi += 1
+    return kind.lower(), (hand or "").upper(), lo, hi, marks
+
+
+def keyboard_svg(lo, hi, marks, numbered, key_w=None, key_h=None):
+    """A small keyboard from lo to hi (white keys at both ends) with dots."""
+    whites = [p for p in range(lo, hi + 1) if p % 12 not in BLACK_PCS]
+    w = key_w or (KB_WHITE_W if len(whites) <= 15 else max(11, KB_WHITE_W * 15 // len(whites)))
+    h = key_h or KB_H
+    bw, bh = w * 0.6, h * 0.6
+    r = max(4.0, w * 0.32)
+    x_of = {p: i * w for i, p in enumerate(whites)}
+    width = len(whites) * w
+    out = [f'<svg class="kb" xmlns="http://www.w3.org/2000/svg" width="{width + 2}" height="{h + 2}" '
+           f'viewBox="-1 -1 {width + 2} {h + 2}">']
+    for p in whites:
+        out.append(f'<rect x="{x_of[p]}" y="0" width="{w}" height="{h}" rx="2" fill="#fff" '
+                   f'stroke="#000" stroke-width="1.2"/>')
+    bx = {}
+    for p in range(lo, hi + 1):
+        if p % 12 in BLACK_PCS:
+            bx[p] = x_of[p - 1] + w - bw / 2
+            out.append(f'<rect x="{bx[p]:.1f}" y="0" width="{bw:.1f}" height="{bh:.1f}" rx="1.5" fill="#000"/>')
+    seen = set()
+    for n, p in enumerate(marks, 1):
+        if p in seen and not numbered:
+            continue
+        seen.add(p)
+        if p in bx:
+            cx, cy, fill, ink = bx[p] + bw / 2, bh - r - 3, "#fff", "#000"
+        else:
+            cx, cy, fill, ink = x_of[p] + w / 2, h - r - 4, "#000", "#fff"
+        out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{r:.1f}" fill="{fill}" stroke="#000" stroke-width="1.2"/>')
+        if numbered:
+            out.append(f'<text x="{cx:.1f}" y="{cy + 3.6:.1f}" font-size="{min(11, r * 1.6):.0f}" '
+                       f'font-weight="bold" text-anchor="middle" fill="{ink}" '
+                       f'font-family="Helvetica, Arial, sans-serif">{n}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+def keyboards_in(body):
+    """Turn keys/line rows into inline keyboards attached to the line above."""
+    out = []
+    for line in body.splitlines():
+        parsed = parse_key_line(line)
+        if not parsed:
+            out.append(line)
+            continue
+        kind, hand, lo, hi, marks = parsed
+        label = f'<span class="kbh">{hand}</span>' if hand else ""
+        kb = f'<span class="kbw">{label}{keyboard_svg(lo, hi, marks, kind == "line")}</span>'
+        if out and out[-1].strip() and not out[-1].lstrip().startswith(">"):
+            out[-1] += " " + kb
+        else:
+            out.append(kb)
+    return "\n".join(out)
+
+
+def _pitch_text(p):
+    return f"{NAMES[p % 12]}{p // 12 - 1}"
+
+
+def auto_keys(notes, split):
+    """keys/line rows for one row of notes, per hand (a first pass to edit)."""
+    lines = []
+    rh = [n for n in notes if n["p"] >= split]
+    lh = [n for n in notes if n["p"] < split]
+    for hand, group in (("LH", lh), ("RH", rh)):
+        if not group:
+            continue
+        label = f" {hand}" if lh and rh else ""
+        pitches = sorted({n["p"] for n in group})
+        lo, hi = pitches[0] - 1, pitches[-1] + 1
+        if hi - lo > KB_MAX_SPAN:
+            continue
+        lo -= 1 if lo % 12 in BLACK_PCS else 0
+        hi += 1 if hi % 12 in BLACK_PCS else 0
+        groups = onsets(sorted(group, key=lambda n: n["s"]))
+        seq = _dedupe([g[0]["p"] for g in groups]) if all(len(g) == 1 for g in groups) else []
+        steps = [b - a for a, b in zip(seq, seq[1:])]
+        is_line = 3 <= len(seq) <= 8 and (all(0 < d <= 2 for d in steps) or all(-2 <= d < 0 for d in steps))
+        marks = seq if is_line else pitches
+        kind = "line" if is_line else "keys"
+        lines.append(f"{kind}{label} {_pitch_text(lo)}-{_pitch_text(hi)}: "
+                     + " ".join(_pitch_text(p) for p in marks))
+    return lines
 
 
 # -----------------------------------------------------------------------------
@@ -480,44 +693,51 @@ def build_rows(data, lyrics, settings):
         ph["s"] = ph["notes"][0]["s"]
         ph["e"] = max(n["e"] for n in ph["notes"])
 
-    # Rows: a row per switch, then a new row whenever the phrase shape changes.
+    # Rows: one per articulation switch. Inside a row, each change of figure
+    # is a new part, placed among the lyrics where its playing starts.
     rows = []
-    sw_iter = iter(switches)
-    next_sw = next(sw_iter, None)
-    cur_art = None
 
     def open_row(at, art, kind):
-        rows.append({"at": at, "art": art, "kind": kind, "notes": [], "sig": None, "end": at})
+        rows.append({"at": at, "art": art, "kind": kind, "parts": []})
 
+    sw_iter = iter(switches)
+    next_sw = next(sw_iter, None)
     for ph in phrases:
         while next_sw and next_sw[0] <= ph["s"] + 0.05:
             open_row(next_sw[0], next_sw[1], "switch")
-            cur_art = next_sw[1]
             next_sw = next(sw_iter, None)
+        if not rows:
+            open_row(ph["s"], ph["art"], "phrase")
         _, sig = describe(ph["notes"], split)
-        row = rows[-1] if rows else None
-        if row is None or row["art"] != (ph["art"] or cur_art) or (row["sig"] is not None and row["sig"] != sig):
-            open_row(ph["s"], ph["art"] or cur_art, "phrase")
-            row = rows[-1]
-        row["notes"].extend(ph["notes"])
-        row["sig"] = sig
-        row["end"] = max(row["end"], ph["e"])
+        parts = rows[-1]["parts"]
+        if parts and parts[-1]["sig"] == sig:
+            parts[-1]["notes"].extend(ph["notes"])
+        else:
+            parts.append({"s": ph["s"], "notes": list(ph["notes"]), "sig": sig})
     while next_sw:   # switches after the last note
         open_row(next_sw[0], next_sw[1], "switch")
         next_sw = next(sw_iter, None)
 
-    # Lyrics go to the row they start in.
+    words = int(float(settings["cue_words"] or 0))
+    want_keys = str(settings.get("auto_keys", "no")).strip().lower() in ("yes", "on", "true", "1")
     for i, row in enumerate(rows):
         nxt = rows[i + 1]["at"] - LYRIC_LEAD if i + 1 < len(rows) else float("inf")
         lo = row["at"] - LYRIC_LEAD if i else float("-inf")
-        words = int(float(settings["cue_words"] or 0))
-        first_note = min((n["s"] for n in row["notes"]), default=float("inf"))
-        mine = [ly for ly in lyrics if lo <= ly["s"] < nxt]
-        # The part goes where the playing starts: lines sung clearly before the
-        # first note come first, lines from the first note on come after it.
-        row["lyric_before"] = lyric_lines([ly["t"] for ly in mine if ly["s"] < first_note - PART_LEAD], words)
-        row["lyric_after"] = lyric_lines([ly["t"] for ly in mine if ly["s"] >= first_note - PART_LEAD], words)
-        row["part"] = describe(row["notes"], split)[0]
+        # Items in time order. A lyric line sung clearly before a part's first
+        # note comes before it; lines from the first note on come after it.
+        items = [(ly["s"], 1, "lyric", ly["t"]) for ly in lyrics if lo <= ly["s"] < nxt]
+        for part in row["parts"]:
+            text = describe(part["notes"], split)[0]
+            keys = auto_keys(part["notes"], split) if want_keys else []
+            items.append((part["s"] - PART_LEAD, 0, "part", (text, keys)))
+        items.sort(key=lambda it: (it[0], it[1]))
+        row["items"] = []
+        for _, _, kind, val in items:
+            if kind == "lyric":
+                for line in lyric_lines([val], words):
+                    row["items"].append(("lyric", line))
+            else:
+                row["items"].append(("part", val))
     return rows, ks_names
 
 
@@ -529,13 +749,20 @@ ANCHOR_RE = re.compile(r"<!--\s*at=([\d.]+)\s+auto=([0-9a-f]+)\s*-->")
 
 
 def auto_body(row):
-    blocks = []
-    if row["lyric_before"]:
-        blocks.append("\n".join("> " + line for line in row["lyric_before"]))
-    blocks.append(f"**{row['part']}**")
-    if row["lyric_after"]:
-        blocks.append("\n".join("> " + line for line in row["lyric_after"]))
-    return "\n\n".join(blocks)
+    """Lyric lines as quotes, each part as a bold line (plus keys rows), in order."""
+    blocks, quote = [], []
+    for kind, val in row.get("items", []):
+        if kind == "lyric":
+            quote.append("> " + val)
+            continue
+        if quote:
+            blocks.append("\n".join(quote))
+            quote = []
+        text, keys = val
+        blocks.append("\n".join([f"**{text}**"] + keys))
+    if quote:
+        blocks.append("\n".join(quote))
+    return "\n\n".join(blocks) or "*(no notes)*"
 
 
 def parse_markdown(text):
@@ -585,6 +812,11 @@ def row_label(at_text, art, _kind):
 def merge(new_rows, old_rows, origin):
     """Combine fresh rows with the user's file. Returns (rows, stats)."""
     stats = {"kept": 0, "flagged": 0, "added": 0}
+    # Rows whose anchor comment was lost (some editors strip comments) are
+    # matched by the time and articulation in their heading instead.
+    for r in old_rows:
+        if r["at"] is None and r.get("at_user") is not None:
+            r["at"], r["guessed"] = origin + r["at_user"], True
     unmatched_old = [r for r in old_rows if r["at"] is not None]
     out = []
     for nr in new_rows:
@@ -592,7 +824,8 @@ def merge(new_rows, old_rows, origin):
         best = None
         for orow in unmatched_old:
             okey = orow["label"].split("·", 1)[-1].replace("(hide)", "").replace(FLAG, "").strip()
-            if okey == key and abs(orow["at"] - nr["at"]) <= MATCH_TOLERANCE:
+            tol = MATCH_TOLERANCE + (0.6 if orow.get("guessed") else 0)   # headings round to 1 s
+            if okey == key and abs(orow["at"] - nr["at"]) <= tol:
                 if best is None or abs(orow["at"] - nr["at"]) < abs(best["at"] - nr["at"]):
                     best = orow
         body = auto_body(nr)
@@ -604,20 +837,25 @@ def merge(new_rows, old_rows, origin):
             entry["hide"] = best["hide"]
             if best["edited"]:
                 entry["body"] = best["body"]
-                entry["auto"] = best["auto"]
+                if best["auto"]:             # a lost anchor gets the fresh hash back
+                    entry["auto"] = best["auto"]
                 stats["kept"] += 1
         else:
             stats["added"] += 1
         out.append(entry)
     for orow in unmatched_old:
+        if orow.get("guessed"):          # kept below as the user's own row
+            continue
         if orow["edited"]:
             label = orow["label"] if orow["flagged"] else f"{orow['label']} {FLAG}"
             out.append({"at": orow["at"], "label": label, "auto": orow["auto"], "body": orow["body"],
                         "kind": "flagged", "art": None, "hide": orow["hide"]})
             stats["flagged"] += 1
     for orow in old_rows:
-        if orow["at"] is None:   # user rows: no anchor, timed by their heading
+        if (orow.get("guessed") and orow in unmatched_old) or orow["at"] is None:
+            # user rows: no anchor, timed by their heading
             t = orow.get("at_user")
+            orow["at"] = None
             out.append({"at": origin + t if t is not None else float("inf"), "label": orow["label"],
                         "auto": None, "body": orow["body"], "kind": "user", "art": None,
                         "hide": orow["hide"]})
@@ -647,7 +885,7 @@ CSS = """
 @page { size: letter portrait; margin: 0.45in 0.5in; }
 * { box-sizing: border-box; }
 body { font-family: -apple-system, "Helvetica Neue", Arial, sans-serif; color: #000; margin: 0; }
-header { display: flex; justify-content: space-between; align-items: baseline;
+header { display: flex; justify-content: space-between; align-items: center;
          border-bottom: 3px solid #000; padding-bottom: 4px; }
 h1 { font-size: 24pt; margin: 0; letter-spacing: -0.5px; text-transform: uppercase; }
 .sub { font-size: 10.5pt; }
@@ -664,13 +902,22 @@ table { width: 100%; border-collapse: collapse; }
 thead { display: table-header-group; }
 th { text-align: left; font-size: 8.5pt; text-transform: uppercase; letter-spacing: 1px;
      border-bottom: 1.5px solid #000; padding: 3px 6px; }
-tr { break-inside: avoid; page-break-inside: avoid; }
+tr { break-inside: auto; }
+td.body > p, td.body blockquote p { break-inside: avoid; page-break-inside: avoid; }
+td.art b { break-after: avoid; }
 td { padding: 5px 6px; border-bottom: 1px solid #aaa; vertical-align: top; }
 td.body { font-size: 11.5pt; line-height: 1.3; }
 td.body blockquote { margin: 0; font-size: 13.5pt; line-height: 1.22; }
-td.body > p { margin: 3px 0; }
 td.body blockquote p { margin: 0; }
 td.body p { margin: 0; }
+td.body > p { background: #e4e4e4; border-left: 5px solid #000; padding: 3px 8px 2px;
+              margin: 7px 0; font-size: 12pt; font-weight: bold;
+              -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+td.body > p:first-child { margin-top: 0; }
+.kbw { display: inline-flex; align-items: center; gap: 4px; margin: 3px 14px 1px 0; vertical-align: middle; }
+td.body > p > .kbw:first-of-type { margin-left: 14px; }
+.kbh { font-size: 8.5pt; font-weight: bold; }
+svg.kb { display: block; }
 td.body ul { margin: 0; padding-left: 18px; }
 td.art { width: 1.25in; white-space: nowrap; padding-top: 6px; }
 td.art b { font-size: 17pt; letter-spacing: 0.5px; }
@@ -678,6 +925,47 @@ tr.switch td { border-top: 2px solid #000; }
 tr.flagged td { background: #f3f3f3; }
 .flag { font-size: 9pt; font-weight: bold; }
 footer { margin-top: 8px; font-size: 8pt; color: #555; }
+.controls { display: flex; gap: 18px; align-items: center; margin: 0 0 10px; padding: 6px 10px;
+            border: 1px dashed #888; font-size: 10.5pt; }
+.controls b { font-size: 9pt; text-transform: uppercase; letter-spacing: 1px; color: #555; }
+.controls label { cursor: pointer; user-select: none; }
+body.hide-lyrics td.body blockquote { display: none; }
+body.hide-parts td.body > p { display: none; }
+body.hide-keys .kbw { display: none; }
+tr.empty { display: none; }
+@media print { .controls { display: none; } }
+"""
+
+# Screen-only toggles: hide lyrics / part notes / keyboards before printing.
+# The choice is remembered per song in the browser (localStorage).
+TOGGLE_JS = """
+(function () {
+  var key = "fancy-cheatsheet:" + document.body.dataset.song;
+  var saved = {};
+  try { saved = JSON.parse(localStorage.getItem(key) || "{}"); } catch (e) {}
+  var boxes = document.querySelectorAll(".controls input");
+  function apply() {
+    var state = {};
+    boxes.forEach(function (b) {
+      state[b.dataset.part] = b.checked;
+      document.body.classList.toggle("hide-" + b.dataset.part, !b.checked);
+    });
+    document.querySelectorAll("tbody tr").forEach(function (tr) {
+      tr.classList.remove("empty");
+      if (tr.querySelector("td.art").textContent.trim()) return;
+      var shown = Array.prototype.some.call(tr.querySelector("td.body").children, function (el) {
+        return getComputedStyle(el).display !== "none";
+      });
+      tr.classList.toggle("empty", !shown);
+    });
+    try { localStorage.setItem(key, JSON.stringify(state)); } catch (e) {}
+  }
+  boxes.forEach(function (b) {
+    if (b.dataset.part in saved) b.checked = saved[b.dataset.part];
+    b.addEventListener("change", apply);
+  });
+  apply();
+})();
 """
 
 
@@ -685,39 +973,49 @@ def render_html(path, title, preamble, rows, settings, md_name):
     import markdown as md
 
     def mdx(text):
-        return md.markdown(text or "", extensions=["nl2br", "sane_lists"])
+        return md.markdown(keyboards_in(text or ""), extensions=["nl2br", "sane_lists"])
 
     def field(label, value):
         return f"<i>{label}</i><b>{html.escape(str(value or ''))}</b>"
 
     boxes = (f'<div><span>Key</span>{field("", settings["key"])}</div>'
+             f'<div><span>Short</span>{field("", settings["short"])}</div>'
              f'<div><span>Run</span>{field("key", settings["run_key"])}'
              f'{field("dir", settings["run_direction"])}</div>'
              f'<div><span>Gliss</span>{field("dir", settings["gliss_direction"])}</div>'
              f'<div><span>Trill</span>{field("interval", settings["trill_interval"])}</div>')
+    # One empty octave in the title bar to fill in a scale by hand; the
+    # "scale" setting (e.g. "G A B C D E F#") pre-fills the dots.
+    scale = [_key_token(t) for t in re.split(r"[\s,]+", str(settings.get("scale") or "").strip()) if t]
+    scale_marks = [60 + k[0] for k in scale if k]
+    scale_kb = keyboard_svg(60, 71, scale_marks, False, key_w=18, key_h=40)
     shown = [r for r in rows if not r["hide"]]
     trs, cur, switches = [], None, 0
     for r in shown:
-        cls, art_html = r["kind"], ""
-        if r["kind"] in ("switch", "phrase") and r["art"]:
-            if r["art"] != cur:          # only show the name when it is time to switch
+        cls, art_html, art = r["kind"], "", r["art"]
+        if r["kind"] == "user" and not art:
+            label = r["label"].split("·", 1)[1] if "·" in r["label"] else ""
+            art = label.replace("(hide)", "").strip() or None
+        if r["kind"] in ("switch", "phrase", "user") and art:
+            if art != cur:               # only show the name when it is time to switch
                 cls = "switch"
                 switches += 1
-                art_html = f'<b>{html.escape(r["art"])}</b>'
-            cur = r["art"]
-        elif r["kind"] == "user":
-            label = r["label"].split("·", 1)[1] if "·" in r["label"] else ""
-            label = label.replace("(hide)", "").strip()
-            art_html = f'<b>{html.escape(label)}</b>' if label else ""
+                art_html = f'<b>{html.escape(art)}</b>'
+            cur = art
         flag = f'<div class="flag">{FLAG}</div>' if r["kind"] == "flagged" else ""
         trs.append(f'<tr class="{cls}"><td class="art">{art_html}</td>'
                    f'<td class="body">{flag}{mdx(r["body"])}</td></tr>')
 
     doc = f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>{html.escape(title)} — Cheat Sheet</title>
-<style>{CSS}</style></head><body>
+<style>{CSS}</style></head><body data-song="{html.escape(title)}">
+<div class="controls"><b>Show</b>
+<label><input type="checkbox" data-part="lyrics" checked> Lyrics</label>
+<label><input type="checkbox" data-part="parts" checked> Part notes</label>
+<label><input type="checkbox" data-part="keys" checked> Keyboards</label>
+<span style="color:#666">Print shows what you see; this bar doesn't print.</span></div>
 <header><h1>{html.escape(title)}</h1>
-<div class="sub">{switches} switches</div></header>
+{scale_kb}</header>
 {f'<div class="pre">{mdx(preamble)}</div>' if preamble else ''}
 <div class="settings">{boxes}</div>
 <table><thead><tr><th>Switch</th><th>Lyrics · part</th></tr></thead>
@@ -726,6 +1024,7 @@ def render_html(path, title, preamble, rows, settings, md_name):
 </tbody></table>
 <footer>Edit “{html.escape(md_name)}” and run Fancy Cheat Sheet again to update.
 Generated {datetime.date.today().isoformat()}.</footer>
+<script>{TOGGLE_JS}</script>
 </body></html>
 """
     with open(path, "w", encoding="utf-8") as f:
