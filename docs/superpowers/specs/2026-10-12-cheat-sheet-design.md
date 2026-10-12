@@ -47,6 +47,10 @@ Platform: Apple Silicon only for now (mlx-whisper). Stated in `@about`.
   consecutive phrases with the same figure merge. Parts and lyric lines are
   interleaved in time order (a line sung more than 0.3 s before a part's first
   note comes before it). Lyrics sung while resting stay in the row.
+- With `split_by_line: yes` (default), a part that runs across several lyric
+  lines is cut at each line start; each piece is placed just above the line it
+  is played under, and a piece whose wording equals the previous piece is left
+  out (a repeated figure stays one band). Up to 10 notes are listed per band.
 - Lyrics: each Whisper segment goes in the row where it starts (0.4 s lead
   allowed). A row without lyrics shows only its part note.
 - Reference lyrics (optional): `Cheat Sheets/<Song>.lyrics.txt`, supplied by
@@ -79,7 +83,7 @@ Platform: Apple Silicon only for now (mlx-whisper). Stated in `@about`.
 
 Front matter holds per-song values that print at the top (`key`, `run_key`,
 `run_direction`, `gliss_direction`, `trill_interval`; blank = a line to write
-on) and settings (`hand_split`, `phrase_gap`, `cue_words`, `auto_keys` —
+on) and settings (`hand_split`, `phrase_gap`, `cue_words`, `split_by_line`, `auto_keys` —
 first-pass keyboards, default `no`). `short` prints as a "Short ____" field
 (detaché / spiccato) and `scale` pre-fills the title-bar keyboard.
 Free text between the title and the first row is preserved verbatim.

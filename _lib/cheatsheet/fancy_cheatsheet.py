@@ -30,7 +30,7 @@ DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo"
 DEFAULTS = {  # front matter of each .md; the first five print at the top of the sheet
     "key": "", "run_key": "", "run_direction": "", "gliss_direction": "", "trill_interval": "",
     "short": "", "scale": "",
-    "hand_split": "C4", "phrase_gap": 0.75, "cue_words": 0, "auto_keys": "no",
+    "hand_split": "C4", "phrase_gap": 0.75, "cue_words": 0, "auto_keys": "no", "split_by_line": "yes",
 }
 MATCH_TOLERANCE = 0.5      # seconds: a moved switch within this is the same row
 LYRIC_LEAD = 0.4           # seconds: a line starting this early still belongs to the next row
@@ -48,7 +48,7 @@ JUNK_LINE = re.compile(r"^\[.*\]$|^\d*\s*Contributors|Embed$|^You might also lik
 CHORD_WINDOW = 0.04        # seconds: notes starting this close form one chord
 HIT_MAX = 0.25             # seconds: median length below this = hits
 HELD_MIN = 0.8             # seconds: median length above this = held
-LIST_MAX = 6               # notes listed before "…"
+LIST_MAX = 10              # notes listed before "…"
 FLAG = "⚠ no longer in MIDI — check"
 NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 CHORDS = [  # (intervals from root, suffix); first match wins
@@ -339,6 +339,10 @@ def length_word(notes):
 
 def _pc(p):
     return NAMES[p % 12]
+
+
+def _yes(value):
+    return str(value).strip().lower() in ("yes", "on", "true", "1")
 
 
 def _reg(p):
@@ -719,17 +723,34 @@ def build_rows(data, lyrics, settings):
         next_sw = next(sw_iter, None)
 
     words = int(float(settings["cue_words"] or 0))
-    want_keys = str(settings.get("auto_keys", "no")).strip().lower() in ("yes", "on", "true", "1")
+    want_keys = _yes(settings.get("auto_keys", "no"))
+    by_line = _yes(settings.get("split_by_line", "yes"))
     for i, row in enumerate(rows):
         nxt = rows[i + 1]["at"] - LYRIC_LEAD if i + 1 < len(rows) else float("inf")
         lo = row["at"] - LYRIC_LEAD if i else float("-inf")
         # Items in time order. A lyric line sung clearly before a part's first
         # note comes before it; lines from the first note on come after it.
-        items = [(ly["s"], 1, "lyric", ly["t"]) for ly in lyrics if lo <= ly["s"] < nxt]
+        mine = [ly for ly in lyrics if lo <= ly["s"] < nxt]
+        items = [(ly["s"], 1, "lyric", ly["t"]) for ly in mine]
+        prev_text = None
         for part in row["parts"]:
-            text = describe(part["notes"], split)[0]
-            keys = auto_keys(part["notes"], split) if want_keys else []
-            items.append((part["s"] - PART_LEAD, 0, "part", (text, keys)))
+            # A long part is cut at each lyric line so the sheet follows along:
+            # each piece sits just above the line it is played under, and a
+            # piece that says the same as the one before is left out.
+            cuts = sorted(ly["s"] for ly in mine if part["s"] + PART_LEAD < ly["s"]) if by_line else []
+            pieces = {}
+            for n in part["notes"]:
+                k = sum(1 for t in cuts if t <= n["s"] + PART_LEAD)
+                pieces.setdefault(k, []).append(n)
+            for k in sorted(pieces):
+                notes_k = pieces[k]
+                text = describe(notes_k, split)[0]
+                if text == prev_text:
+                    continue
+                prev_text = text
+                keys = auto_keys(notes_k, split) if want_keys else []
+                at = cuts[k - 1] if k else notes_k[0]["s"] - PART_LEAD
+                items.append((at, 0, "part", (text, keys)))
         items.sort(key=lambda it: (it[0], it[1]))
         row["items"] = []
         for _, _, kind, val in items:
