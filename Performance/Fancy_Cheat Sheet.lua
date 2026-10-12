@@ -36,8 +36,9 @@
 --   keyboards before you print (the bar itself does not print).
 --
 --   After hand edits you don't need REAPER: double-click "Render Cheat
---   Sheets.command" in the Cheat Sheets folder. It turns every .md there into
---   HTML (without changing the .md) and opens the sheets.
+--   Sheets.command" in the Cheat Sheets folder, pick the songs (edited ones
+--   are preselected), and they are turned into HTML (without changing the
+--   .md) and opened.
 --
 --   Requirements: REAPER 7.0+, macOS on Apple Silicon, Python 3.9+ with the
 --   packages mlx-whisper and markdown, and ffmpeg (brew install ffmpeg).

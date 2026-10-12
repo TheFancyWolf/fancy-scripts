@@ -145,7 +145,11 @@ needs only the .md: `fancy_cheatsheet.py --render <file.md | folder> [--open]`
 parses the .md and writes the HTML in file order, without reading project
 data or rewriting the .md. Each full run writes `Cheat Sheets/Render Cheat
 Sheets.command` (absolute Python and helper paths, chmod 755), which runs
-`--render . --open` when double-clicked. The header carries no counts or song length, so both paths produce
+`--render . --pick --open` when double-clicked: a plain `osascript` "choose
+from list" dialog (no `tell application`, so no automation permission)
+lists the folder's songs with those edited since their last render (.md newer
+than .html) preselected; Cancel renders nothing. Without osascript, the
+edited songs are rendered. The header carries no counts or song length, so both paths produce
 identical HTML.
 
 ## Errors

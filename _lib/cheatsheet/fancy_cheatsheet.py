@@ -4,7 +4,7 @@
 # "Performance/Fancy_Cheat Sheet.lua" exports from a REAPER project.
 #
 #   python3 fancy_cheatsheet.py <input.json> [log file]     full run (from REAPER)
-#   python3 fancy_cheatsheet.py --render <file.md | folder> [--open]
+#   python3 fancy_cheatsheet.py --render <file.md | folder> [--pick] [--open]
 #                                                         HTML from the .md only
 #
 # Steps: transcribe the audio (cached) -> build rows from the MIDI ->
@@ -1097,20 +1097,57 @@ RENDER_COMMAND = "Render Cheat Sheets.command"
 
 
 def write_render_command(out_dir):
-    """A double-clickable file that re-renders every .md in the folder."""
+    """A double-clickable file: pick songs in this folder, render them, open them."""
     path = os.path.join(out_dir, RENDER_COMMAND)
     script = ("#!/bin/sh\n"
-              "# Fancy Cheat Sheet: re-render every .md in this folder to HTML and open them.\n"
+              "# Fancy Cheat Sheet: choose which songs in this folder to render to HTML\n"
+              "# (edited ones are preselected), then open them.\n"
               "# Written by the Fancy Cheat Sheet action; it is replaced on each run.\n"
               'cd "$(dirname "$0")" || exit 1\n'
-              f'"{sys.executable}" "{os.path.abspath(__file__)}" --render . --open\n')
+              f'"{sys.executable}" "{os.path.abspath(__file__)}" --render . --pick --open\n')
     with open(path, "w", encoding="utf-8") as f:
         f.write(script)
     os.chmod(path, 0o755)
 
 
-def render_cli(target, open_after):
-    """--render <file.md | folder>: print what happened, open the sheets if asked."""
+def _edited_since_render(md_path):
+    html_path = os.path.splitext(md_path)[0] + ".html"
+    return not os.path.isfile(html_path) or os.path.getmtime(md_path) > os.path.getmtime(html_path)
+
+
+def _applescript_text(text):
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def pick_files(files):
+    """macOS list dialog: choose songs, edited ones preselected. None = cancelled.
+
+    Without osascript (not macOS) the edited files are used as-is."""
+    names = [os.path.splitext(os.path.basename(f))[0] for f in files]
+    edited = [n for n, f in zip(names, files) if _edited_since_render(f)]
+    if sys.platform != "darwin" or not shutil.which("osascript"):
+        return [f for f in files if _edited_since_render(f)]
+    prompt = ("Choose the cheat sheets to render (⌘-click for several)."
+              + (" Edited since the last render are selected." if edited else ""))
+    # Plain osascript dialog: no "tell application", so macOS asks for no
+    # automation permission.
+    script = (f"set picked to choose from list {{{', '.join(_applescript_text(n) for n in names)}}} "
+              f"with title \"Render Cheat Sheets\" with prompt {_applescript_text(prompt)} "
+              f"default items {{{', '.join(_applescript_text(n) for n in edited)}}} "
+              "OK button name \"Render\" with multiple selections allowed\n"
+              "if picked is false then return \"\"\n"
+              "set AppleScript's text item delimiters to linefeed\n"
+              "return picked as text")
+    import subprocess
+    res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    chosen = [ln for ln in res.stdout.splitlines() if ln.strip()]
+    if res.returncode != 0 or not chosen:
+        return None
+    return [f for n, f in zip(names, files) if n in chosen]
+
+
+def render_cli(target, open_after, pick=False):
+    """--render <file.md | folder> [--pick]: print what happened, open the sheets if asked."""
     if os.path.isdir(target):
         files = sorted(os.path.join(target, n) for n in os.listdir(target)
                        if n.lower().endswith(".md") and not n.startswith("."))
@@ -1119,6 +1156,11 @@ def render_cli(target, open_after):
     if not files:
         print("No .md files found.")
         return 1
+    if pick:
+        files = pick_files(files)
+        if not files:
+            print("Nothing rendered.")
+            return 0
     failed = 0
     for md_path in files:
         try:
@@ -1193,7 +1235,7 @@ def run(input_path):
 
 def main():
     if len(sys.argv) >= 3 and sys.argv[1] == "--render":
-        return render_cli(sys.argv[2], "--open" in sys.argv[3:])
+        return render_cli(sys.argv[2], "--open" in sys.argv[3:], "--pick" in sys.argv[3:])
     if len(sys.argv) not in (2, 3):
         print("usage: fancy_cheatsheet.py <input.json> [log file]\n"
               "       fancy_cheatsheet.py --render <file.md | folder> [--open]", file=sys.stderr)
