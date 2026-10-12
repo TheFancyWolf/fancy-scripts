@@ -28,6 +28,10 @@
 --   marked for you to check. Add "(hide)" to a row's heading to leave it off
 --   the printout.
 --
+--   After hand edits you don't need REAPER: double-click "Render Cheat
+--   Sheets.command" in the Cheat Sheets folder. It turns every .md there into
+--   HTML (without changing the .md) and opens the sheets.
+--
 --   Requirements: REAPER 7.0+, macOS on Apple Silicon, Python 3.9+ with the
 --   packages mlx-whisper and markdown, and ffmpeg (brew install ffmpeg).
 --   One-time setup in Terminal:

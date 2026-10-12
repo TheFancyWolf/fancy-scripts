@@ -3,7 +3,9 @@
 # Builds a printable cheat sheet (Markdown source + HTML) from the data that
 # "Performance/Fancy_Cheat Sheet.lua" exports from a REAPER project.
 #
-#   python3 fancy_cheatsheet.py <input.json> [log file]
+#   python3 fancy_cheatsheet.py <input.json> [log file]     full run (from REAPER)
+#   python3 fancy_cheatsheet.py --render <file.md | folder> [--open]
+#                                                         HTML from the .md only
 #
 # Steps: transcribe the audio (cached) -> build rows from the MIDI ->
 # merge with the existing Markdown (keeps hand edits) -> render HTML.
@@ -679,7 +681,7 @@ footer { margin-top: 8px; font-size: 8pt; color: #555; }
 """
 
 
-def render_html(path, title, preamble, rows, settings, origin, length, md_name):
+def render_html(path, title, preamble, rows, settings, md_name):
     import markdown as md
 
     def mdx(text):
@@ -694,14 +696,13 @@ def render_html(path, title, preamble, rows, settings, origin, length, md_name):
              f'<div><span>Gliss</span>{field("dir", settings["gliss_direction"])}</div>'
              f'<div><span>Trill</span>{field("interval", settings["trill_interval"])}</div>')
     shown = [r for r in rows if not r["hide"]]
-    switches = sum(1 for r in shown if r["kind"] == "switch")
-
-    trs, cur = [], None
+    trs, cur, switches = [], None, 0
     for r in shown:
         cls, art_html = r["kind"], ""
         if r["kind"] in ("switch", "phrase") and r["art"]:
             if r["art"] != cur:          # only show the name when it is time to switch
                 cls = "switch"
+                switches += 1
                 art_html = f'<b>{html.escape(r["art"])}</b>'
             cur = r["art"]
         elif r["kind"] == "user":
@@ -716,7 +717,7 @@ def render_html(path, title, preamble, rows, settings, origin, length, md_name):
 <html><head><meta charset="utf-8"><title>{html.escape(title)} — Cheat Sheet</title>
 <style>{CSS}</style></head><body>
 <header><h1>{html.escape(title)}</h1>
-<div class="sub">{switches} switches · {fmt_time(length)}</div></header>
+<div class="sub">{switches} switches</div></header>
 {f'<div class="pre">{mdx(preamble)}</div>' if preamble else ''}
 <div class="settings">{boxes}</div>
 <table><thead><tr><th>Switch</th><th>Lyrics · part</th></tr></thead>
@@ -742,6 +743,73 @@ def extend_path():
         if d not in parts and os.path.isdir(d):
             parts.append(d)
     os.environ["PATH"] = os.pathsep.join(p for p in parts if p)
+
+
+def rows_from_markdown(md_rows):
+    """Rows for rendering straight from a parsed .md, in file order."""
+    rows = []
+    for r in md_rows:
+        art = r["label"].split("·", 1)[1] if "·" in r["label"] else ""
+        art = art.replace("(hide)", "").replace(FLAG, "").strip()
+        if r["flagged"]:
+            kind = "flagged"
+        elif r["at"] is None:
+            kind = "user"
+        else:
+            kind = "phrase"
+        rows.append({"label": r["label"], "body": r["body"], "hide": r["hide"], "kind": kind,
+                     "art": None if art in ("", "—") else art})
+    return rows
+
+
+def render_only(md_path):
+    """Re-render one .md to HTML without touching the project data or the .md."""
+    with open(md_path, encoding="utf-8") as f:
+        settings, title, preamble, md_rows = parse_markdown(f.read())
+    title = title or os.path.splitext(os.path.basename(md_path))[0]
+    html_path = os.path.splitext(md_path)[0] + ".html"
+    render_html(html_path, title, preamble, rows_from_markdown(md_rows), settings,
+                os.path.basename(md_path))
+    return html_path
+
+
+RENDER_COMMAND = "Render Cheat Sheets.command"
+
+
+def write_render_command(out_dir):
+    """A double-clickable file that re-renders every .md in the folder."""
+    path = os.path.join(out_dir, RENDER_COMMAND)
+    script = ("#!/bin/sh\n"
+              "# Fancy Cheat Sheet: re-render every .md in this folder to HTML and open them.\n"
+              "# Written by the Fancy Cheat Sheet action; it is replaced on each run.\n"
+              'cd "$(dirname "$0")" || exit 1\n'
+              f'"{sys.executable}" "{os.path.abspath(__file__)}" --render . --open\n')
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(script)
+    os.chmod(path, 0o755)
+
+
+def render_cli(target, open_after):
+    """--render <file.md | folder>: print what happened, open the sheets if asked."""
+    if os.path.isdir(target):
+        files = sorted(os.path.join(target, n) for n in os.listdir(target)
+                       if n.lower().endswith(".md") and not n.startswith("."))
+    else:
+        files = [target]
+    if not files:
+        print("No .md files found.")
+        return 1
+    failed = 0
+    for md_path in files:
+        try:
+            html_path = render_only(md_path)
+            print(f"Rendered {os.path.basename(html_path)}")
+            if open_after and sys.platform == "darwin":
+                os.system(f'open "{html_path}"')
+        except Exception as e:  # keep going with the other files
+            failed += 1
+            print(f"Could not render {os.path.basename(md_path)}: {type(e).__name__}: {e}")
+    return 1 if failed else 0
 
 
 def run(input_path):
@@ -782,8 +850,8 @@ def run(input_path):
     rows, stats = merge(new_rows, old_rows, data["origin"])
     write_markdown(md_path, settings, title, preamble, rows)
 
-    render_html(html_path, title, preamble, rows, settings, data["origin"],
-                data.get("length", 0.0), os.path.basename(md_path))
+    render_html(html_path, title, preamble, rows, settings, os.path.basename(md_path))
+    write_render_command(out_dir)
 
     warnings = []
     if stats["flagged"]:
@@ -804,8 +872,11 @@ def run(input_path):
 
 
 def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--render":
+        return render_cli(sys.argv[2], "--open" in sys.argv[3:])
     if len(sys.argv) not in (2, 3):
-        print("usage: fancy_cheatsheet.py <input.json> [log file]", file=sys.stderr)
+        print("usage: fancy_cheatsheet.py <input.json> [log file]\n"
+              "       fancy_cheatsheet.py --render <file.md | folder> [--open]", file=sys.stderr)
         return 2
     input_path = sys.argv[1]
     if len(sys.argv) == 3:   # REAPER launches us without a console: log to a file

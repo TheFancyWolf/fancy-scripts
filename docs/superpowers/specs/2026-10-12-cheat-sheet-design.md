@@ -96,6 +96,16 @@ Filled-in lyric lines have estimated times, so their side of the part note
 can be wrong. Print CSS for letter
 portrait.
 
+## Render from the Markdown only
+
+Typical use: run the action once, edit the .md, then print. Re-rendering
+needs only the .md: `fancy_cheatsheet.py --render <file.md | folder> [--open]`
+parses the .md and writes the HTML in file order, without reading project
+data or rewriting the .md. Each full run writes `Cheat Sheets/Render Cheat
+Sheets.command` (absolute Python and helper paths, chmod 755), which runs
+`--render . --open` when double-clicked. The header shows the switch count
+only (no song length), so both paths produce identical HTML.
+
 ## Errors
 
 Plain message boxes for: no/ambiguous tracks, no keyswitch names, no audio
