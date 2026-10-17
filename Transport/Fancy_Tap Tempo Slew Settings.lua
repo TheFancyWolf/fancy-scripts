@@ -1,8 +1,9 @@
 -- @description Fancy Tap Tempo Slew Settings
 -- @author Fancy Scripts
--- @version 1.0.0
+-- @version 1.0.1
 -- @changelog
---   + Initial release
+--   # Typing a value for Taps per change shows the number instead of garbage
+--   # Works with ReaImGui versions that lack the tooltip and no-speed-tweaks flags
 -- @about
 --   Settings window for Fancy Tap Tempo Slew: instant or glide, taps per
 --   change, whether the tempo updates on every tap or once per group, the
@@ -95,8 +96,13 @@ end
 -------------------------------------------------------------------------------
 -- 5. WIDGET HELPERS
 -------------------------------------------------------------------------------
+--- Value of an ImGui flag function, or 0 when this ReaImGui version lacks it.
+local function flag(f)
+  return f and f() or 0
+end
+
 local function hover_tip(text)
-  if text and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()
+  if text and reaper.ImGui_IsItemHovered(ctx, flag(reaper.ImGui_HoveredFlags_ForTooltip)
       | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
     Theme.tooltip(ctx, text)
   end
@@ -140,7 +146,7 @@ local function param_drag(label, key, speed, fmt, is_int, tip)
   local lo, hi = range_of(key)
   local ctrl = (reaper.ImGui_GetKeyMods(ctx) & reaper.ImGui_Mod_Ctrl()) ~= 0
   local flags = reaper.ImGui_SliderFlags_AlwaysClamp() | reaper.ImGui_SliderFlags_NoInput()
-              | reaper.ImGui_SliderFlags_NoSpeedTweaks()
+              | flag(reaper.ImGui_SliderFlags_NoSpeedTweaks)
   local spd = ctrl and speed * 0.1 or speed
   local st = drag_state[key] or {}
   drag_state[key] = st
@@ -178,7 +184,9 @@ local function param_drag(label, key, speed, fmt, is_int, tip)
       st.typed = config[key]
       reaper.ImGui_SetKeyboardFocusHere(ctx)
     end
-    local _, typed = reaper.ImGui_InputDouble(ctx, "##typed_" .. key, st.typed or config[key], 0, 0, fmt)
+    -- InputDouble formats a double: an integer format must be a float one.
+    local typed_fmt = is_int and (fmt:gsub("%%d", "%%.0f")) or fmt
+    local _, typed = reaper.ImGui_InputDouble(ctx, "##typed_" .. key, st.typed or config[key], 0, 0, typed_fmt)
     st.typed = typed
     if reaper.ImGui_IsItemDeactivated(ctx)
        and (reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_Enter(), false)

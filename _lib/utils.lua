@@ -53,15 +53,18 @@ end
 
 --- Wraps a function call in an undo block.
 --- Calls Undo_BeginBlock, executes fn, then Undo_EndBlock + UpdateArrange.
+--- The block is always closed, even when fn raises; the error is re-raised
+--- afterwards so the caller still sees it.
 --- @param name string  Short description for the undo history
 --- @param fn function  The function to execute inside the undo block
 --- @return any  Whatever fn() returns
 function Utils.undo_block(name, fn)
   reaper.Undo_BeginBlock()
-  local result = fn()
+  local res = table.pack(pcall(fn))
   reaper.Undo_EndBlock(name, -1)
   reaper.UpdateArrange()
-  return result
+  if not res[1] then error(res[2], 0) end
+  return table.unpack(res, 2, res.n)
 end
 
 -------------------------------------------------------------------------------

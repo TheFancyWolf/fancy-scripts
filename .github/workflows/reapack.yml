@@ -21,13 +21,15 @@ jobs:
 
       - name: Run Luacheck
         run: luacheck .
-        continue-on-error: true
 
   index:
     name: Generate ReaPack Index
     needs: lint
     if: "github.ref == 'refs/heads/main' && github.event_name == 'push'"
     runs-on: ubuntu-latest
+    concurrency:
+      group: reapack-index
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -54,7 +56,14 @@ jobs:
 
       - name: Build ReaPack Index
         run: |
-          reapack-index --rebuild --commit -m "chore: update index.xml [skip ci]"
+          set -o pipefail
+          reapack-index --rebuild --commit -m "chore: update index.xml [skip ci]" 2>&1 | tee "$RUNNER_TEMP/reapack-index.log"
+          if grep -i "warning:" "$RUNNER_TEMP/reapack-index.log" | grep -i "conflict"; then
+            echo "::error::reapack-index reported conflicts"
+            exit 1
+          fi
 
       - name: Push updated index
-        run: git push
+        run: |
+          git pull --rebase origin main
+          git push origin HEAD:main
