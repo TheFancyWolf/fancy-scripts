@@ -1,10 +1,14 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.5.0
+-- @version 2.5.1
 -- @changelog
---   + Undo/redo keeps the editor in sync; destructive actions ask first; Esc, Space and shortcuts follow REAPER conventions
---   + Timeline zoom, scroll and ruler; responsive header, dock and Pitched Items panel; Cancel for analysis; settings persist
---   + Higher-contrast canvas, larger destructive targets, and canvas colours from the shared theme
+--   # Switching or removing items during an analysis cancels it instead of storing it on the wrong item
+--   # Split, merge and trim no longer shift untouched notes; edited notes keep their correction
+--   # Bypassed notes after a legato edit return to the original pitch; envelope points stay in time order
+--   # Envelope points follow the item playrate; Scoop Shape corrects the onset toward the note's target
+--   # Pitch detection reaches the configured lowest frequency, reads every channel and stamps frames at the window centre
+--   # Notes right after a short dropout are kept; the highest detection threshold can still reject unvoiced frames
+--   # Saved analyses are about half the size (older saved data still loads); re-analysis keeps the item's own settings
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -231,6 +235,8 @@ local K = {
   -- Hard limits start_analysis enforces on the engine sizes, whatever the UI or older state holds
   BLOCK_SIZE_MIN = 64,
   BLOCK_SIZE_MAX = 16384,
+  -- At most this many channels of the source are read and mixed down to mono for the analysis
+  MAX_ANALYSIS_CHANNELS = 8,
 
   -- The time one frame may spend reading and analysing audio before it yields to the window (seconds, measured with
   -- reaper.time_precise). Small on purpose: the window keeps answering (Cancel, Esc, scrolling) and the analysis
@@ -731,6 +737,13 @@ local function get_target_take()
     take = resolve_take_by_guid(state.target_take_guid)
   end
 
+  -- The analysed item vanished mid-analysis (deleted, undone): the analysis is cancelled, and the target is not
+  -- silently moved to another item while it runs (the selection tracker picks the next target once it has stopped)
+  if not take and state.is_analyzing then
+    K.cancel_analysis()
+    return nil, nil
+  end
+
   if not take then
     local sel_item = reaper.GetSelectedMediaItem(0, 0)
     if sel_item then
@@ -929,14 +942,40 @@ local function midi_to_name(midi)
   return NOTE_NAMES[note_idx] .. octave
 end
 
--- Process a single block of audio using the YIN algorithm
-local function yin_process_block(samples, sample_rate, params)
+--- The analysis window of one YIN frame for a block size, sample rate and lowest frequency: the integration window
+--- (half the block, as always) and the number of samples read per frame, which is the block or, when the block is
+--- too short for the longest period wanted (sample_rate / min_freq), the integration window plus that period, so the
+--- lag search is never capped below the configured lowest frequency.
+K.yin_window = function(block_size, sample_rate, min_freq)
+  local W = math.floor(block_size / 2)
+  local max_tau = math.ceil(sample_rate / math.max(1, min_freq))
+  return W, math.max(block_size, W + max_tau + 2)
+end
+
+-- YIN: a global CMNDF minimum above this level is unvoiced whatever the threshold (threshold * 2 reaches 1 at the
+-- highest Detection threshold, and a CMNDF minimum is never above 1, so that frame could never be called unvoiced)
+K.YIN_UNVOICED_MAX = 0.8
+
+-- Process a single block of audio using the YIN algorithm. samples holds num_channels interleaved channels per
+-- sample frame (default 1); they are mixed down to mono first.
+local function yin_process_block(samples, sample_rate, params, num_channels)
   local b_size = params.calc_block_size or params.block_size
+  local nch = num_channels or 1
 
   -- Cache to native Lua table. reaper.array metamethods are extremely slow inside nested loops!
   local s = {}
-  for i = 1, b_size do
-    s[i] = samples[i]
+  if nch <= 1 then
+    for i = 1, b_size do
+      s[i] = samples[i]
+    end
+  else
+    local inv = 1 / nch
+    for i = 1, b_size do
+      local base = (i - 1) * nch
+      local sum = 0
+      for c = 1, nch do sum = sum + samples[base + c] end
+      s[i] = sum * inv
+    end
   end
 
   local rms_sum = 0
@@ -945,11 +984,13 @@ local function yin_process_block(samples, sample_rate, params)
   end
   local rms = math.sqrt(rms_sum / b_size)
 
-  local W = math.floor(b_size / 2)
+  local W = params.yin_window or math.floor(b_size / 2)
+  if W > b_size - 1 then W = b_size - 1 end
   local max_tau = math.floor(sample_rate / params.min_freq)
   local min_tau = math.floor(sample_rate / params.max_freq)
 
-  if max_tau > W then max_tau = W end
+  -- The difference function reads s[j + tau] for j <= W: the lag never reaches past the samples read
+  if max_tau > b_size - W then max_tau = b_size - W end
   if min_tau < 1 then min_tau = 1 end
 
   local diff = {}
@@ -1000,8 +1041,8 @@ local function yin_process_block(samples, sample_rate, params)
         tau_estimate = tau
       end
     end
-    -- If even the global minimum is high, it's likely unvoiced
-    if min_val > params.threshold * 2 then
+    -- If even the global minimum is high, it's likely unvoiced (no lag searched at all: unvoiced too)
+    if tau_estimate == -1 or min_val > math.min(params.threshold * 2, K.YIN_UNVOICED_MAX) then
       return rms, nil
     end
   end
@@ -1089,7 +1130,12 @@ local function start_analysis()
   state.current_time = 0
 
   local source = reaper.GetMediaItemTake_Source(take)
-  state.sample_rate = reaper.GetMediaSourceSampleRate(source)
+  local sample_rate = source and tonumber(reaper.GetMediaSourceSampleRate(source)) or 0
+  if sample_rate ~= sample_rate or sample_rate <= 0 then sample_rate = K.DEFAULT_SAMPLE_RATE end   -- never divide by a rate of 0
+  state.sample_rate = sample_rate
+  -- Every channel of the source is read and mixed down to mono (not only the first)
+  local num_channels = source and math.floor(tonumber(reaper.GetMediaSourceNumChannels(source)) or 1) or 1
+  state.num_channels = math.max(1, math.min(K.MAX_ANALYSIS_CHANNELS, num_channels))
 
   -- A bad engine value must never crash (negative array size) or hang (a hop of 0 never advances the
   -- analysis time) an analysis: clamp to 64 <= block, 1 <= hop <= block before anything is allocated
@@ -1100,15 +1146,24 @@ local function start_analysis()
 
   -- The running analysis reads this snapshot, never the live settings: the Settings controls are locked meanwhile,
   -- and a value changed some other way cannot overrun the sample buffer or mix two parameter sets
+  -- It also freezes the item it analyses (GUID, name, length, rate, channels) and the frames table it fills: a target
+  -- change meanwhile cancels the analysis (see K.analysis_guid), and nothing of another item is ever written to
+  local yin_window, calc_block = K.yin_window(state.block_size, state.sample_rate, state.min_freq)
+  local results = {}
   state.analysis_params = {
     block_size = state.block_size, hop_size = state.hop_size, threshold = state.threshold,
     min_freq = state.min_freq, max_freq = state.max_freq,
+    yin_window = yin_window, calc_block_size = calc_block,
+    guid = state.target_take_guid, name = state.target_take_name,
+    item_len = state.item_len, end_time = state.end_time,
+    sample_rate = state.sample_rate, num_channels = state.num_channels,
+    results = results,
   }
 
   state.accessor = reaper.CreateTakeAudioAccessor(take)
-  state.buffer = reaper.new_array(state.analysis_params.block_size)
+  state.buffer = reaper.new_array(calc_block * state.num_channels)
 
-  state.results = {}
+  state.results = results
   state.is_analyzing = true
   state.analysis_empty = false
   state.progress = 0
@@ -1436,8 +1491,93 @@ local flush_nudge_burst -- commits a pending arrow-key nudge as one undo point (
 -- MULTI-ITEM SESSION & PROJECT PERSISTENCE
 -------------------------------------------------------------------------------
 
+-- Saved model format (P_EXT, JSON). The analysis frames are stored once, in `results`: each frame keeps only what
+-- the model reads (time, note, rms; rounded far below what can be heard or seen), and a note stores where its frames
+-- are in `results` as runs (`frame_runs` = { first index, count, first index, count, ... }) instead of a second copy
+-- of them. Notes saved by earlier versions hold their own `frames`; those still load, and a note whose frames are not
+-- all in `results` is saved that way too.
+K.round_to = function(v, step)
+  if type(v) ~= "number" or v ~= v or v == math.huge or v == -math.huge then return v end
+  return math.floor(v / step + 0.5) * step
+end
+
+--- The stored copy of one analysis frame.
+K.saved_frame = function(f)
+  local rms = f.rms
+  if type(rms) == "number" and rms == rms and rms ~= 0 and rms < math.huge then
+    rms = tonumber(string.format("%.6g", rms))
+  end
+  return { time = K.round_to(f.time, 1e-6), note = K.round_to(f.note, 1e-5), rms = rms }
+end
+
+-- Per analysis-frames table (weak keys; frames are only ever appended to it, never changed, see the drawing cache):
+-- its encoded JSON array and the index of each frame, valid for the number of frames they were made for
+K.results_cache = setmetatable({}, { __mode = "k" })
+
+--- The encoded `results` array and the frame -> index map of `results` (each made once per frames table).
+K.encoded_results = function(results)
+  local c = K.results_cache[results]
+  if not c or c.n ~= #results then
+    local copy, index = {}, {}
+    for i, f in ipairs(results) do
+      copy[i] = K.saved_frame(f)
+      index[f] = i
+    end
+    c = { n = #results, json = JSON.encode(copy), index = index }
+    K.results_cache[results] = c
+  end
+  return c.json, c.index
+end
+
+--- A note's frames as runs of indices into the analysis frames ({ first, count, ... }), or nil when one of them is not
+--- one of those frames.
+K.frame_runs = function(frames, index)
+  local runs = {}
+  local last = nil
+  for _, f in ipairs(frames) do
+    local i = index[f]
+    if not i then return nil end
+    if last and i == last + 1 then
+      runs[#runs] = runs[#runs] + 1
+    else
+      runs[#runs + 1] = i
+      runs[#runs + 1] = 1
+    end
+    last = i
+  end
+  return runs
+end
+
+--- The frames a saved note refers to (its own `frames` from an earlier version, or its `frame_runs` into results).
+--- Raises an error for runs that do not fit the frames (the take is then reported unreadable).
+K.note_frames_from_runs = function(runs, results)
+  local frames = {}
+  for k = 1, #runs, 2 do
+    local first, count = math.tointeger(runs[k]), math.tointeger(runs[k + 1])
+    if not first or not count or first < 1 or count < 1 or first + count - 1 > #results then
+      error("note frames out of range")
+    end
+    for i = first, first + count - 1 do frames[#frames + 1] = results[i] end
+  end
+  return frames
+end
+
+--- A note saved by an earlier version holds copies of its frames: they are replaced by the analysis frames with the
+--- same time and pitch, so the note shares them as a fresh analysis does (and is saved as runs from now on). Frames
+--- that do not match are kept as they are.
+K.share_note_frames = function(frames, by_time)
+  local shared = {}
+  for i, f in ipairs(frames) do
+    local r = by_time[f.time]
+    if not r or r.note ~= f.note then return frames end
+    shared[i] = r
+  end
+  return shared
+end
+
 local function save_take_data(take, data)
   if not take or not data then return end
+  local results_json, index = K.encoded_results(data.results or {})
   local save_data = {
     guid = data.guid,
     name = data.name,
@@ -1445,7 +1585,6 @@ local function save_take_data(take, data)
     end_time = data.end_time,
     item_len = data.item_len,
     sample_rate = data.sample_rate,
-    results = data.results,
     notes = {},
     key_idx = data.key_idx or state.key_idx,
     scale_idx = data.scale_idx or state.scale_idx,
@@ -1453,7 +1592,7 @@ local function save_take_data(take, data)
   }
   if data.notes then
     for _, note in ipairs(data.notes) do
-      table.insert(save_data.notes, {
+      local entry = {
         start_time = note.start_time,
         end_time = note.end_time,
         avg_note = note.avg_note,
@@ -1462,11 +1601,21 @@ local function save_take_data(take, data)
         scoop_magnitude = note.scoop_magnitude,
         voiced_start_idx = note.voiced_start_idx,
         voiced_start_time = note.voiced_start_time,
-        frames = note.frames
-      })
+      }
+      local runs = note.frames and K.frame_runs(note.frames, index)
+      if runs then
+        entry.frame_runs = runs
+      else
+        local copy = {}
+        for i, f in ipairs(note.frames or {}) do copy[i] = K.saved_frame(f) end
+        entry.frames = copy
+      end
+      table.insert(save_data.notes, entry)
     end
   end
-  local json_str = JSON.encode(save_data)
+  -- The frames array is spliced in as encoded once (the object's other members are encoded on every save)
+  local rest = JSON.encode(save_data)
+  local json_str = '{"results":' .. results_json .. (rest == "{}" and "}" or ("," .. rest:sub(2)))
   reaper.GetSetMediaItemTakeInfo_String(take, K.TAKE_DATA_KEY, json_str, true)
 
   -- Remember what is now stored (read back) so the resync never treats our own write as external; what was stored
@@ -1519,7 +1668,18 @@ local function load_take_data(take, raw)
   if readable then
     -- A note that does not hold what the model needs makes the whole take unreadable, not the window fail
     readable = pcall(function()
+      local by_time = nil   -- analysis frame by time, made only for notes saved with their own frames
       for _, note in ipairs(data.notes) do
+        if note.frames then
+          if not by_time then
+            by_time = {}
+            for _, f in ipairs(data.results) do by_time[f.time] = f end
+          end
+          note.frames = K.share_note_frames(note.frames, by_time)
+        else
+          note.frames = K.note_frames_from_runs(note.frame_runs, data.results)
+        end
+        note.frame_runs = nil
         note.count = #note.frames
         -- Preserve all saved controls (including cascade override fields) across re-extraction
         local saved_controls = note.controls
@@ -1604,6 +1764,9 @@ end
 --- Make a session take's data the editing model (canvas, notes, key/scale). Does not touch
 --- REAPER's item selection.
 local function adopt_take_data(guid, data)
+  -- A running analysis is bound to the model it replaces: anything else adopted meanwhile ends it first (Cancel
+  -- puts the analysed item's own model back, so the analysis can never be stored on, or overwrite, another item)
+  if state.is_analyzing then K.cancel_analysis() end
   local same_target = (state.target_take_guid == guid)
   local view_t0, view_t1 = state.view_t0, state.view_t1
   state.target_take_guid = guid
@@ -1646,6 +1809,12 @@ K.cancel_analysis = function()
 end
 
 local function switch_active_target(guid, take_obj)
+  -- While an analysis runs, its own item stays as it is (a click on it changes nothing); any other item cancels it
+  if state.is_analyzing then
+    if state.analysis_params and state.analysis_params.guid == guid then return true end
+    K.cancel_analysis()
+  end
+
   -- A pending arrow-key nudge belongs to the take being left: commit it first
   flush_nudge_burst()
 
@@ -1797,12 +1966,231 @@ local function end_apply(take, undo_desc)
   note_own_write()
 end
 
+--- The take's playrate (1 when REAPER reports none). Take envelope point times are in take time: item time (the
+--- time of the analysis frames, relative to the item start in project seconds) multiplied by the playrate.
+K.take_playrate = function(take)
+  local rate = take and tonumber(reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")) or 1
+  if not rate or rate ~= rate or rate <= 0 or rate == math.huge then return 1 end
+  return rate
+end
+
+--- Stable sort of trajectory points by time (equal times keep the order they were made in).
+K.sort_points = function(points)
+  for i, pt in ipairs(points) do pt.seq = i end
+  table.sort(points, function(a, b)
+    if a.time ~= b.time then return a.time < b.time end
+    return a.seq < b.seq
+  end)
+  for _, pt in ipairs(points) do pt.seq = nil end
+  return points
+end
+
+--- The pitch-shift trajectory of a phrase: { time, val } points in item time (seconds from the item start), sorted by
+--- time and simplified, with val the shift in semitones. Pure: it reads only its arguments (it also leaves
+--- n.frame_shifts on each note). eff(note, key) resolves a cascade value (Global -> Item -> Note), modified(note) tells
+--- an edited note (is_note_modified), legato_thresh is the legato gap in seconds. Returns an empty list when nothing
+--- shifts the pitch (an untouched take has no points).
+K.build_pitch_trajectory = function(notes, item_len, legato_thresh, eff, modified)
+  local scoop_end = {}   -- [note] = the last onset frame the Scoop Shape reshaped
+
+  -- 1. Precalculate continuous frame shifts for every note
+  for _, n in ipairs(notes) do
+    n.frame_shifts = {}
+    -- Per-note bypass: zero out all shifts
+    if n.controls and n.controls.bypassed then
+      if n.frames then
+        for i = 1, #n.frames do
+          n.frame_shifts[i] = 0.0
+        end
+      end
+    else
+      local is_mod = modified(n)
+      local retune = eff(n, "retune_speed")
+      local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
+      local d_scale = (n.controls and n.controls.drift_scale) or 1.0
+      local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
+      if n.frames then
+        for i = 1, #n.frames do
+          if not is_mod then
+            n.frame_shifts[i] = 0.0
+          else
+            local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
+            local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
+            local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
+            n.frame_shifts[i] = coarse + drift_corr + vib_corr
+          end
+        end
+
+        -- Scoop/glide shaping (0 = natural onset, 1 = corrected): the onset frames are pulled toward the note's
+        -- target pitch, i.e. their own deviation from it is corrected (target - raw frame pitch), fading back to the
+        -- body's shift by the end of the onset
+        local scoop = (n.controls and n.controls.scoop_shape) or 0
+        if scoop > 0 and is_mod and n.voiced_start_idx then
+          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
+          if onset_end > 1 and onset_end < #n.frames then
+            local target = n.avg_note + coarse
+            for i = 1, onset_end do
+              local onset_u = i / onset_end  -- 0→1 across onset
+              local natural = n.frame_shifts[i]
+              local raw = n.frames[i].note
+              if raw then
+                local full = target - raw
+                n.frame_shifts[i] = natural + (full - natural) * scoop * (1 - onset_u)
+              end
+            end
+            scoop_end[n] = onset_end
+          end
+        end
+      end
+    end
+  end
+
+  -- 2. Build continuous trajectory across notes and boundaries
+  local all_points = {}
+  local num_notes = #notes
+
+  local function add(t, val)
+    all_points[#all_points + 1] = { time = math.max(0.0, math.min(item_len, t)), val = val }
+  end
+  -- Points made for earlier notes at or after t give way to a transition that starts at t (they would come out of
+  -- order and make the curve zigzag)
+  local function trim_tail(t)
+    while #all_points > 0 and all_points[#all_points].time >= t do
+      all_points[#all_points] = nil
+    end
+  end
+
+  for idx = 1, num_notes do
+    local n = notes[idx]
+    local prev_n = notes[idx - 1]
+    local next_n = notes[idx + 1]
+
+    -- A bypassed note is a note with no shift: the curve goes back to 0 for it (from a legato neighbour too), so
+    -- it never holds the shift of the note before it
+    local bypassed = (n.controls and n.controls.bypassed) and true or false
+    local is_mod = bypassed or modified(n)
+    local prev_mod = modified(prev_n)
+    local next_mod = modified(next_n)
+
+    -- If this note and both its neighbors are untouched, skip entirely
+    if is_mod or prev_mod or next_mod then
+      local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
+      local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
+
+      local trans_dur = math.min(eff(n, "transition_ms") * 0.001, 0.060)
+      trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
+
+      -- A. START TRANSITION
+      local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
+      if prev_gap < legato_thresh and prev_n then
+        -- Legato transition with previous note: smoothstep blend centered at boundary
+        local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
+        local t_bnd = (prev_n.end_time + n.start_time) * 0.5
+        local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
+        local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
+        trim_tail(t_start)
+
+        local steps = 5
+        for s = 0, steps do
+          local u = s / steps
+          local t = t_start + u * (t_end - t_start)
+          local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
+          add(t, val)
+        end
+      else
+        -- Onset from silence / start of take: smooth ramp into pitch shift (within the first half of the gap, so
+        -- it never overlaps the previous note's ramp out)
+        if is_mod and math.abs(start_shift) > 0.001 then
+          local onset_ramp = eff(n, "onset_ramp_ms") * 0.001
+          local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
+          if prev_n then ramp_t = math.max(0.0, math.min(ramp_t, prev_gap * 0.5)) end
+          local t_pre = math.max(0.0, n.start_time - ramp_t)
+          trim_tail(t_pre)
+          add(t_pre, 0.0)
+          local steps = 4
+          for s = 1, steps do
+            local u = s / steps
+            local t = t_pre + u * (n.start_time - t_pre)
+            local val = start_shift * smoothstep(u)
+            add(t, val)
+          end
+        end
+      end
+
+      -- B. NOTE BODY
+      local fine_changed = is_mod and not bypassed
+        and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0))
+      local body_t_start = n.start_time + trans_dur * 0.5
+      local body_t_end = n.end_time - trans_dur * 0.5
+
+      if not fine_changed then
+        -- Coarse shift or untouched: hold shift across body (a reshaped onset is followed frame by frame first)
+        if is_mod then
+          local emitted = false
+          local se = scoop_end[n]
+          if se and n.frames then
+            for i = 1, math.min(#n.frames, se + 1) do
+              local t = n.frames[i].time
+              if t >= body_t_start and t <= body_t_end then
+                add(t, n.frame_shifts[i])
+                emitted = true
+              end
+            end
+          end
+          if not emitted then add(body_t_start, start_shift) end
+          add(body_t_end, end_shift)
+        end
+      else
+        -- Fine contour: sample frames across body to counteract drift / scale vibrato
+        if n.frames then
+          for i = 1, #n.frames do
+            local t = n.frames[i].time
+            if t >= body_t_start and t <= body_t_end then
+              add(t, n.frame_shifts[i])
+            end
+          end
+        end
+      end
+
+      -- C. END TRANSITION TO SILENCE (if next note is far or this is last note): within the first half of the gap
+      local next_gap = next_n and (next_n.start_time - n.end_time) or 999
+      if next_gap >= legato_thresh then
+        if is_mod and math.abs(end_shift) > 0.001 then
+          local onset_ramp = eff(n, "onset_ramp_ms") * 0.001
+          local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
+          if next_n then ramp_t = math.max(0.0, math.min(ramp_t, next_gap * 0.5 - 0.001)) end
+          local steps = 4
+          for s = 1, steps do
+            local u = s / steps
+            local t = n.end_time + u * ramp_t
+            local val = end_shift * (1.0 - smoothstep(u))
+            add(t, val)
+          end
+          add(n.end_time + ramp_t + 0.001, 0.0)
+        end
+      end
+    end
+  end
+
+  -- 3. Points in time order, then adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
+  K.sort_points(all_points)
+  local simplified = rdp_simplify(all_points, 0.01)
+  -- A trajectory that never leaves 0 (bypassed notes only, say) writes no points: the take stays clean
+  for _, pt in ipairs(simplified) do
+    if math.abs(pt.val) > 1e-6 then return simplified end
+  end
+  return {}
+end
+
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
 --- keep_pitch_mode leaves the item's I_PITCHMODE untouched (used by re-analysis, which applies no correction); so does
 --- the Settings option "Keep each item's own pitch algorithm" (state.keep_pitch_mode).
 --- Returns true when the envelope and the model were written (one undo point); false when they were not, after
 --- saying why in the status line (so a caller must not then claim an undo point).
 local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
+  -- The notes on screen are replaced when a running analysis completes: nothing is written meanwhile
+  if state.is_analyzing then return false end
+
   -- A pending arrow-key nudge is committed as its own undo point first
   if state.nudge_burst then flush_nudge_burst() end
 
@@ -1832,194 +2220,34 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   end
 
   local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+  -- Envelope points are placed in take time (item time x playrate)
+  local rate = K.take_playrate(take)
 
   -- Clear existing points across the entire item
-  reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
+  reaper.DeleteEnvelopePointRange(env, 0, (item_len + 1.0) * rate)
 
   local SHAPE = 5   -- Bezier
   local TENSION = 0 -- Neutral tension
 
-  if not state.notes or #state.notes == 0 then
-    reaper.Envelope_SortPointsEx(env, -1)
-    reaper.UpdateArrange()
-    end_apply(take, undo_desc)
-    return true
-  end
-
-  -- Check if any note in the phrase is modified
-  local any_modified = false
-  for _, n in ipairs(state.notes) do
-    if is_note_modified(n) then
-      any_modified = true
-      break
+  local points = {}
+  if state.notes and #state.notes > 0 then
+    -- Check if any note in the phrase is modified (untouched takes have no points)
+    local any_modified = false
+    for _, n in ipairs(state.notes) do
+      if is_note_modified(n) then
+        any_modified = true
+        break
+      end
+    end
+    if any_modified then
+      points = K.build_pitch_trajectory(state.notes, item_len, get_effective(nil, "legato_threshold_ms") * 0.001,
+        get_effective, is_note_modified)
     end
   end
 
-  if not any_modified then
-    -- Clean envelope: untouched takes have no points
-    reaper.Envelope_SortPointsEx(env, -1)
-    reaper.UpdateArrange()
-    end_apply(take, undo_desc)
-    return true
-  end
-
-  -- 1. Precalculate continuous frame shifts for every note
-  for _, n in ipairs(state.notes) do
-    n.frame_shifts = {}
-    -- Per-note bypass: zero out all shifts
-    if n.controls and n.controls.bypassed then
-      if n.frames then
-        for i = 1, #n.frames do
-          n.frame_shifts[i] = 0.0
-        end
-      end
-    else
-      local is_mod = is_note_modified(n)
-      local retune = get_effective(n, "retune_speed")
-      local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
-      local d_scale = (n.controls and n.controls.drift_scale) or 1.0
-      local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
-      if n.frames then
-        for i = 1, #n.frames do
-          if not is_mod then
-            n.frame_shifts[i] = 0.0
-          else
-            local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
-            local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
-            local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
-            n.frame_shifts[i] = coarse + drift_corr + vib_corr
-          end
-        end
-
-        -- Scoop/glide shaping: blend onset frames toward body target
-        local scoop = (n.controls and n.controls.scoop_shape) or 0
-        if scoop > 0 and is_mod and n.voiced_start_idx then
-          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
-          if onset_end > 1 and onset_end < #n.frames then
-            local body_shift = n.frame_shifts[math.min(onset_end + 1, #n.frames)]
-            for i = 1, onset_end do
-              local onset_u = i / onset_end  -- 0→1 across onset
-              local natural = n.frame_shifts[i]
-              n.frame_shifts[i] = natural + (body_shift - natural) * scoop * (1 - onset_u)
-            end
-          end
-        end
-      end
-    end
-  end
-
-  -- 2. Build continuous trajectory across notes and boundaries
-  local all_points = {}
-  local num_notes = #state.notes
-  local legato_thresh = get_effective(nil, "legato_threshold_ms") * 0.001
-
-  for idx = 1, num_notes do
-    local n = state.notes[idx]
-    local prev_n = state.notes[idx - 1]
-    local next_n = state.notes[idx + 1]
-
-    -- Bypassed notes produce zero shifts — skip trajectory generation
-    if n.controls and n.controls.bypassed then
-      goto continue_note
-    end
-
-    local is_mod = is_note_modified(n)
-    local prev_mod = is_note_modified(prev_n)
-    local next_mod = is_note_modified(next_n)
-
-    -- If this note and both its neighbors are untouched, skip entirely
-    if not is_mod and not prev_mod and not next_mod then
-      goto continue_note
-    end
-
-    local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
-    local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
-
-    local trans_dur = math.min(get_effective(n, "transition_ms") * 0.001, 0.060)
-    trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
-
-    -- A. START TRANSITION
-    local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
-    if prev_gap < legato_thresh and prev_n then
-      -- Legato transition with previous note: smoothstep blend centered at boundary
-      local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
-      local t_bnd = (prev_n.end_time + n.start_time) * 0.5
-      local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
-      local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
-
-      local steps = 5
-      for s = 0, steps do
-        local u = s / steps
-        local t = t_start + u * (t_end - t_start)
-        local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
-        table.insert(all_points, { time = t, val = val })
-      end
-    else
-      -- Onset from silence / start of take: smooth ramp into pitch shift
-      if is_mod and math.abs(start_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
-        local t_pre = math.max(0.0, n.start_time - ramp_t)
-        table.insert(all_points, { time = t_pre, val = 0.0 })
-        local steps = 4
-        for s = 1, steps do
-          local u = s / steps
-          local t = t_pre + u * (n.start_time - t_pre)
-          local val = start_shift * smoothstep(u)
-          table.insert(all_points, { time = t, val = val })
-        end
-      end
-    end
-
-    -- B. NOTE BODY
-    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0))
-    local body_t_start = n.start_time + trans_dur * 0.5
-    local body_t_end = n.end_time - trans_dur * 0.5
-
-    if not fine_changed then
-      -- Coarse shift or untouched: hold shift across body
-      if is_mod then
-        table.insert(all_points, { time = math.min(item_len, body_t_start), val = start_shift })
-        table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
-      end
-    else
-      -- Fine contour: sample frames across body to counteract drift / scale vibrato
-      if n.frames then
-        for i = 1, #n.frames do
-          local t = n.frames[i].time
-          if t >= body_t_start and t <= body_t_end then
-            table.insert(all_points, { time = math.min(item_len, t), val = n.frame_shifts[i] })
-          end
-        end
-      end
-    end
-
-    -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
-    local next_gap = next_n and (next_n.start_time - n.end_time) or 999
-    if next_gap >= legato_thresh then
-      if is_mod and math.abs(end_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
-        local steps = 4
-        for s = 1, steps do
-          local u = s / steps
-          local t = math.min(item_len, n.end_time + u * ramp_t)
-          local val = end_shift * (1.0 - smoothstep(u))
-          table.insert(all_points, { time = t, val = val })
-        end
-        local t_post = math.min(item_len, n.end_time + ramp_t + 0.001)
-        table.insert(all_points, { time = t_post, val = 0.0 })
-      end
-    end
-
-    ::continue_note::
-  end
-
-  -- 3. Adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
-  local simplified = rdp_simplify(all_points, 0.01)
-  for _, pt in ipairs(simplified) do
+  for _, pt in ipairs(points) do
     local t = math.max(0.0, math.min(item_len, pt.time))
-    reaper.InsertEnvelopePointEx(env, -1, t, pt.val, SHAPE, TENSION, 0, true)
+    reaper.InsertEnvelopePointEx(env, -1, t * rate, pt.val, SHAPE, TENSION, 0, true)
   end
 
   reaper.Envelope_SortPointsEx(env, -1)
@@ -2250,6 +2478,25 @@ end
 -- NOTE TOPOLOGY: SPLIT, MERGE & EDGE TRIMMING
 -------------------------------------------------------------------------------
 
+--- The user's pitch offset of a note: its target (center_pitch) relative to its own pitch centre (avg_note), 0 for
+--- an untouched pitch (within the 0.001 st is_note_modified allows).
+K.pitch_offset = function(note)
+  local ctrl = note and note.controls
+  if not ctrl or not ctrl.center_pitch or not note.avg_note then return 0 end
+  local off = ctrl.center_pitch - note.avg_note
+  if math.abs(off) <= 0.001 then return 0 end
+  return off
+end
+
+--- After a split, merge or trim re-extracted a note: its target is its new pitch centre (avg_note, the energy-weighted
+--- centre extract_note_features computes) plus the offset the user gave it, so an untouched note stays untouched
+--- and an edited one keeps its correction relative to its own pitch.
+K.apply_pitch_offset = function(note, offset)
+  if note.controls and note.avg_note then
+    note.controls.center_pitch = note.avg_note + (offset or 0)
+  end
+end
+
 -- Splits the note at note_idx into two independent notes at split_time.
 -- Preserves user tuning offsets on both halves and re-extracts features.
 -- Returns true and whether the change was written to the take (an undo point) when the note was split, else false and
@@ -2279,7 +2526,7 @@ split_note_at = function(note_idx, split_time)
 
   -- Preserve the user's pitch offset (semitones from original avg)
   local old_ctrl = note.controls
-  local pitch_offset = old_ctrl and (old_ctrl.center_pitch - note.avg_note) or 0
+  local pitch_offset = K.pitch_offset(note)
 
   -- Build note A (left half)
   local sum_a = 0
@@ -2295,7 +2542,6 @@ split_note_at = function(note_idx, split_time)
     frames = frames_a,
   }
   extract_note_features(note_a, {
-    center_pitch = avg_a + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
     transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
@@ -2319,7 +2565,6 @@ split_note_at = function(note_idx, split_time)
     frames = frames_b,
   }
   extract_note_features(note_b, {
-    center_pitch = avg_b + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
     transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
@@ -2328,6 +2573,9 @@ split_note_at = function(note_idx, split_time)
     scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
     bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
+
+  K.apply_pitch_offset(note_a, pitch_offset)
+  K.apply_pitch_offset(note_b, pitch_offset)
 
   -- Splice into notes array
   state.notes[note_idx] = note_a
@@ -2406,21 +2654,21 @@ merge_selected_notes = function()
 
   if #merged_frames < 3 then return false, "Can't merge: the merged note would have too few analysis frames" end
 
-  -- Duration-weighted pitch target from user tuning
+  -- Duration-weighted user tuning: the pitch offsets (target relative to each note's own centre, 0 when untouched),
+  -- the stability and the vibrato
   local total_dur = 0
-  local weighted_pitch = 0
+  local weighted_offset = 0
   local weighted_drift = 0
   local weighted_vibrato = 0
   for _, idx in ipairs(indices) do
     local n = state.notes[idx]
     local dur = n.end_time - n.start_time
     total_dur = total_dur + dur
+    weighted_offset = weighted_offset + K.pitch_offset(n) * dur
     if n.controls then
-      weighted_pitch = weighted_pitch + n.controls.center_pitch * dur
       weighted_drift = weighted_drift + n.controls.drift_scale * dur
       weighted_vibrato = weighted_vibrato + n.controls.vibrato_scale * dur
     else
-      weighted_pitch = weighted_pitch + n.avg_note * dur
       weighted_drift = weighted_drift + 1.0 * dur
       weighted_vibrato = weighted_vibrato + 1.0 * dur
     end
@@ -2441,7 +2689,6 @@ merge_selected_notes = function()
   }
 
   extract_note_features(merged, {
-    center_pitch = total_dur > 0 and (weighted_pitch / total_dur) or avg_note,
     drift_scale = total_dur > 0 and (weighted_drift / total_dur) or 1.0,
     vibrato_scale = total_dur > 0 and (weighted_vibrato / total_dur) or 1.0,
     transition_ms = first_note.controls and first_note.controls.transition_ms or nil,
@@ -2450,6 +2697,7 @@ merge_selected_notes = function()
     scoop_shape = first_note.controls and first_note.controls.scoop_shape or nil,
     bypassed = false,
   })
+  K.apply_pitch_offset(merged, total_dur > 0 and (weighted_offset / total_dur) or 0)
 
   -- Replace in array: put merged note at first index, remove the rest
   local first_idx = indices[1]
@@ -2493,7 +2741,7 @@ trim_note_edge = function(note_idx, edge, new_time)
 
   -- Preserve pitch offset
   local old_ctrl = note.controls
-  local pitch_offset = old_ctrl and (old_ctrl.center_pitch - note.avg_note) or 0
+  local pitch_offset = K.pitch_offset(note)
 
   -- Rebuild frames within the new boundary
   local new_start = (edge == "left") and new_time or note.start_time
@@ -2545,7 +2793,6 @@ trim_note_edge = function(note_idx, edge, new_time)
   note.display_note = math.floor(avg_note + 0.5)
 
   extract_note_features(note, {
-    center_pitch = avg_note + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
     transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
@@ -2554,6 +2801,7 @@ trim_note_edge = function(note_idx, edge, new_time)
     scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
     bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
+  K.apply_pitch_offset(note, pitch_offset)
 
   apply_envelope_to_take("Trim Note Edge")
 end
@@ -2570,26 +2818,23 @@ local function run_hybrid_segmentation()
   local pitch_jump_threshold = 0.75 -- Semitones
   local rms_noise_floor = 0.005 -- Absolute RMS threshold for silence
 
-  -- Calculate derivatives (applying a simple median filter logic by looking at 3 frames would be better, but we keep it simple for now)
-  for i, frame in ipairs(state.results) do
-    if i > 1 then
-      local prev = state.results[i-1]
-      if frame.note and prev.note then
-        frame.delta_note = frame.note - prev.note
-      else
-        frame.delta_note = 0
-      end
-      frame.delta_rms = frame.rms - prev.rms
+  -- Frame-to-frame changes of pitch and level (kept here: the frames themselves are not changed, nor saved with them)
+  local results = state.results
+  local delta_note, delta_rms = {}, {}
+  for i, frame in ipairs(results) do
+    local prev = results[i - 1]
+    if prev then
+      delta_note[i] = (frame.note and prev.note) and (frame.note - prev.note) or 0
+      delta_rms[i] = frame.rms - prev.rms
     else
-      frame.delta_note = 0
-      frame.delta_rms = 0
+      delta_note[i], delta_rms[i] = 0, 0
     end
   end
 
   local current_note = nil
   local last_split_time = -1
 
-  for _, frame in ipairs(state.results) do
+  for i, frame in ipairs(results) do
     local is_voiced = (frame.note ~= nil and frame.rms > rms_noise_floor)
 
     local should_split = false
@@ -2601,13 +2846,13 @@ local function run_hybrid_segmentation()
         split_reason = "Onset (from silence)"
       else
         -- Check for pitch jump (legato)
-        if math.abs(frame.delta_note) > pitch_jump_threshold then
+        if math.abs(delta_note[i]) > pitch_jump_threshold then
           should_split = true
           split_reason = "Pitch Jump"
         end
 
         -- Check for amplitude spike (articulation)
-        if frame.delta_rms > frame.rms * 0.5 and frame.delta_rms > 0.02 then
+        if delta_rms[i] > frame.rms * 0.5 and delta_rms[i] > 0.02 then
           should_split = true
           split_reason = "Amplitude Spike"
         end
@@ -2623,7 +2868,9 @@ local function run_hybrid_segmentation()
       end
     end
 
-    if should_split and (frame.time - last_split_time) >= debounce_dur then
+    -- The debounce only spaces splits inside a sounding note: an onset after silence always starts a note (else the
+    -- voiced frames after a short dropout would be dropped until the debounce had passed)
+    if should_split and (not current_note or (frame.time - last_split_time) >= debounce_dur) then
       if current_note then
         current_note.end_time = frame.time
         if (current_note.end_time - current_note.start_time) >= min_note_dur then
@@ -2669,101 +2916,120 @@ end
 local function process_analysis_step()
   if not state.is_analyzing then return end
 
-  -- The parameters frozen by start_analysis (an analysis always has them; the copy only guards a state set up by hand)
+  -- Everything comes from what start_analysis froze: the parameters, the item (GUID, length, rate, channels) and
+  -- the frames table. An analysis without them, or whose item is no longer the target or no longer in the project,
+  -- is cancelled: its frames are never stored on another item
   local params = state.analysis_params
-  if not params then
-    params = {
-      block_size = state.block_size, hop_size = state.hop_size, threshold = state.threshold,
-      min_freq = state.min_freq, max_freq = state.max_freq,
-    }
-    state.analysis_params = params
+  if not params or not params.results or not state.accessor
+      or state.target_take_guid ~= params.guid
+      or (params.guid and not resolve_take_by_guid(params.guid)) then
+    K.cancel_analysis()
+    return
   end
+  local results = params.results
+  local sample_rate = params.sample_rate
+  local nch = params.num_channels or 1
+  local calc_block = params.calc_block_size or params.block_size
+  -- Each frame is stamped with the centre of the window it was measured over (not its start)
+  local half_window_s = calc_block / (2 * sample_rate)
 
   -- Work for one short slice, then yield to the window (the progress and Cancel stay responsive)
   local slice_start = reaper.time_precise()
 
-  while state.current_time < state.end_time do
+  while state.current_time + half_window_s < params.end_time do
     if reaper.time_precise() - slice_start > K.ANALYSIS_SLICE_S then
       break
     end
 
-    -- Read samples
+    -- Read samples (every channel, interleaved; yin_process_block mixes them down)
     local num_read = reaper.GetAudioAccessorSamples(
       state.accessor,
-      state.sample_rate,
-      state.num_channels,
+      sample_rate,
+      nch,
       state.current_time,
-      params.block_size,
+      calc_block,
       state.buffer
     )
 
     if num_read > 0 then
-      local rms, freq = yin_process_block(state.buffer, state.sample_rate, params)
+      local rms, freq = yin_process_block(state.buffer, sample_rate, params, nch)
       local note = nil
       if freq and freq >= params.min_freq and freq <= params.max_freq then
         note = freq_to_note(freq)
       end
-      table.insert(state.results, {
-        time = state.current_time,
+      results[#results + 1] = {
+        time = state.current_time + half_window_s,
         freq = freq,
         note = note,
         rms = rms
-      })
+      }
     end
 
     -- Advance time by hop size
-    state.current_time = state.current_time + (params.hop_size / state.sample_rate)
+    state.current_time = state.current_time + (params.hop_size / sample_rate)
   end
 
-  if state.current_time >= state.end_time then
+  if state.current_time + half_window_s >= params.end_time then
     -- The resync is paused while analysing: remember whether the project changed meanwhile so the
     -- next frame still picks up external changes (undo etc.) after this script's own writes.
     local external_change = (state.last_change_count ~= reaper.GetProjectStateChangeCount(0))
 
+    local guid = params.guid
     reaper.DestroyAudioAccessor(state.accessor)
     state.accessor = nil
+    state.buffer = nil
     state.is_analyzing = false
     state.analysis_params = nil
     state.progress = 1.0
+    -- The model of the analysed item (the target, checked above)
+    state.results = results
+    state.start_time = 0
+    state.end_time = params.end_time
+    state.item_len = params.item_len
+    state.sample_rate = sample_rate
     run_hybrid_segmentation()
     state.analysis_empty = (not state.notes or #state.notes == 0)
     state.view_t0, state.view_t1 = nil, nil   -- the new model is shown whole
+    -- A nudge pending from before the analysis belongs to the replaced notes: it is not written now
+    state.nudge_burst = nil
 
     -- Store into multi-item session cache, then persist inside ONE named undo block
-    if state.target_take_guid then
-      state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
+    if guid then
+      state.stale_takes[guid] = nil   -- a fresh analysis has no stale envelope
+      local previous = state.session_takes[guid]
       local take_data = {
-        guid = state.target_take_guid,
-        name = state.target_take_name or "Item",
-        start_time = state.start_time,
-        end_time = state.end_time,
-        item_len = state.item_len,
-        sample_rate = state.sample_rate,
-        results = state.results,
+        guid = guid,
+        name = params.name or state.target_take_name or "Item",
+        start_time = 0,
+        end_time = params.end_time,
+        item_len = params.item_len,
+        sample_rate = sample_rate,
+        results = results,
         notes = state.notes,
         key_idx = state.key_idx,
-        scale_idx = state.scale_idx
+        scale_idx = state.scale_idx,
+        overrides = previous and previous.overrides or nil,   -- the item's own settings survive a re-analysis
       }
-      state.session_takes[state.target_take_guid] = take_data
+      state.session_takes[guid] = take_data
 
       local found = false
       for _, g in ipairs(state.session_order) do
-        if g == state.target_take_guid then found = true; break end
+        if g == guid then found = true; break end
       end
-      if not found then table.insert(state.session_order, state.target_take_guid) end
+      if not found then table.insert(state.session_order, guid) end
 
       -- Re-apply the envelope from the fresh (untouched) notes: this clears every stale point left by
       -- a previous analysis and writes the new model to the take inside the same "Analyze Pitch" block.
       -- The take's pitch mode is left alone (no correction is applied yet).
-      if resolve_take_by_guid(state.target_take_guid, true) then
+      if resolve_take_by_guid(guid, true) then
         apply_envelope_to_take("Analyze Pitch", true)
       else
-        state.missing_takes[state.target_take_guid] = true
+        state.missing_takes[guid] = true
       end
     end
     if external_change then state.last_change_count = nil end
-  elseif state.item_len > 0 then
-    state.progress = state.current_time / state.item_len
+  elseif params.item_len and params.item_len > 0 then
+    state.progress = math.min(1, state.current_time / params.item_len)
   end
 end
 
@@ -3025,6 +3291,8 @@ local function draw_graph(draw_ctx, w, h)
 
   local target_take = K.frame_target()
   local is_bypassed = is_take_pitch_bypassed(target_take)
+  -- While an analysis runs the notes shown are about to be replaced: clicks, the note menu and the keys edit nothing
+  local edits_locked = is_bypassed or state.is_analyzing
 
   -- The one button the canvas draws (Analyze Item, Open Settings, Enable): a real Button on the large preset,
   -- centred on cx with its top edge at y (its height is Theme.layout.btn_lg.h), hand cursor and tooltip.
@@ -3311,7 +3579,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   -- Click: select note (Shift/Cmd/Ctrl = multi-select), begin drag, edge drag, or marquee box select
-  if is_canvas_hovered and not on_ruler and not is_bypassed and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+  if is_canvas_hovered and not on_ruler and not edits_locked and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
     -- A new gesture starts: commit any pending arrow-key nudge as its own undo point first
     flush_nudge_burst()
 
@@ -3441,7 +3709,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   -- Right-click on note: open context menu
-  if is_canvas_hovered and not on_ruler and reaper.ImGui_IsMouseClicked(draw_ctx, 1) then
+  if is_canvas_hovered and not on_ruler and not state.is_analyzing and reaper.ImGui_IsMouseClicked(draw_ctx, 1) then
     if state.hovered_note and state.notes[state.hovered_note] then
       state.selected_note = state.hovered_note
       state.selected_notes = { [state.hovered_note] = true }
@@ -3707,7 +3975,7 @@ local function draw_graph(draw_ctx, w, h)
     and reaper.ImGui_IsWindowFocused(draw_ctx, reaper.ImGui_FocusedFlags_RootAndChildWindows())
 
   -- A bypassed take is not edited at all: neither by the mouse (gated above) nor by the keys
-  if not state.drag and not state.edge_drag and shortcuts_live and not is_bypassed and state.notes and #state.notes > 0 then
+  if not state.drag and not state.edge_drag and shortcuts_live and not edits_locked and state.notes and #state.notes > 0 then
     local shift_mod = reaper.ImGui_Mod_Shift()
     local repeat_flag = reaper.ImGui_InputFlags_Repeat()
 
@@ -3807,7 +4075,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   -- Double-click pitch zone: Snap to nearest semitone (single or batch)
-  if is_canvas_hovered and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
+  if is_canvas_hovered and not state.is_analyzing and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
     if state.hovered_note and state.hovered_zone == "pitch" then
       if not state.selected_notes[state.hovered_note] then
         state.selected_note = state.hovered_note
@@ -4544,6 +4812,11 @@ local function remove_take_core(guid)
   local take_name = (data and data.name) or "Item"
   local take_obj = resolve_take_by_guid(guid)
 
+  -- Removing the item being analysed stops its analysis first (nothing of it is stored)
+  if state.is_analyzing and (not state.analysis_params or state.analysis_params.guid == guid) then
+    K.cancel_analysis()
+  end
+
   -- A pending arrow-key nudge on the removed take is discarded with it
   if state.nudge_burst and state.nudge_burst.guid == guid then state.nudge_burst = nil end
 
@@ -4685,7 +4958,8 @@ local function clear_take_analysis(guid)
       wrote = true
       reaper.Undo_BeginBlock()
       if env and item then
-        reaper.DeleteEnvelopePointRange(env, 0, reaper.GetMediaItemInfo_Value(item, "D_LENGTH") + 1.0)
+        reaper.DeleteEnvelopePointRange(env, 0,
+          (reaper.GetMediaItemInfo_Value(item, "D_LENGTH") + 1.0) * K.take_playrate(take))   -- take time
         reaper.Envelope_SortPointsEx(env, -1)
       end
       reaper.GetSetMediaItemTakeInfo_String(take, K.TAKE_DATA_KEY, "", true)
@@ -5995,6 +6269,7 @@ end
 ---   id        "snap", "quantize", "split" (at the edit cursor) or "merge"
 ---   note_idx  the note to split (default: the primary selected note)
 K.note_action = function(id, note_idx)
+  if state.is_analyzing then return end   -- the notes are about to be replaced (see apply_envelope_to_take)
   local undo_hint = string.format(" %s+Z to undo", K.MOD_LABEL)
   if id == "merge" then
     local count = count_selected_notes()
