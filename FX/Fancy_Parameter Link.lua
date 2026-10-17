@@ -1,11 +1,15 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.4.1
+-- @version 5.4.2
 -- @changelog
---   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
+--   + Fixed project tab switching overwriting another project's links; links now reload for unsaved projects too
+--   + Fixed links driving the wrong plugin when the linked FX was removed, and drift/inverse errors below 100% strength
+--   + Multi-track links now use a star from the first track (Inverse across 3+ tracks no longer contradicts itself)
+--   + Track selection survives track reordering; second instance of a plugin can be linked
+--   + Last Touched no longer unchecks parameters; ignores input/monitor/container FX; safer preset loading
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
---   Features: multi-track selector, auto group-scan for same plugin, full-mesh linking,
+--   Features: multi-track selector, auto group-scan for same plugin, star linking from the first selected track,
 --   bidirectional engine (move any linked knob), global presets, live inspector,
 --   and settings modal.
 --   Requirements: ReaImGui extension (install via ReaPack)
@@ -100,7 +104,10 @@ local save_preset_name    = ""
 
 -- Track GUID cache with project state tracking (includes Master Track)
 local _gc, _gn, _g_state, _g_proj = {}, -1, -1, nil
+local _gc_tick, _gc_checked_tick = 0, -1   -- refresh at most once per defer tick
 local function _refresh_gc()
+  if _gc_checked_tick == _gc_tick then return end
+  _gc_checked_tick = _gc_tick
   local n = reaper.CountTracks(0)
   local state = reaper.GetProjectStateChangeCount(0)
   local proj = reaper.EnumProjects(-1, "")
@@ -125,13 +132,30 @@ local function tr_by_guid(g)
   return _gc[g]
 end
 
+-- S: Multi-track selector state
+local S = {
+  tracks = {},     -- list of tlist indices for selected tracks (remapped by GUID on tlist rebuild)
+  tracks_expanded = false, -- whether track list is expanded
+  fi     = 0,      -- selected FX index (into fxs list)
+  fxs    = {},     -- FX list (intersection across all selected tracks)
+  params = {},     -- param list for the selected plugin
+}
+
 -- Shared track list cache with project state tracking (includes Master Track)
 local _tlist_n, _tlist_state, _tlist_proj, _tlist = -1, -1, nil, nil
 local function get_tlist()
   local n = reaper.CountTracks(0)
   local state = reaper.GetProjectStateChangeCount(0)
   local proj = reaper.EnumProjects(-1, "")
+  -- GUIDs of the currently selected tracks, so S.tracks can be remapped after a rebuild
+  local prev_guids = nil
   if n ~= _tlist_n or state ~= _tlist_state or proj ~= _tlist_proj then
+    if _tlist and #S.tracks > 0 then
+      prev_guids = {}
+      for i, ti in ipairs(S.tracks) do
+        prev_guids[i] = _tlist[ti] and _tlist[ti].guid or nil
+      end
+    end
     _tlist_n, _tlist_state, _tlist_proj, _tlist = n, state, proj, nil
   end
   if not _tlist then
@@ -156,18 +180,20 @@ local function get_tlist()
         }
       end
     end
+    if prev_guids then
+      local pos_by_guid = {}
+      for j, t in ipairs(_tlist) do pos_by_guid[t.guid] = j end
+      local remapped, dropped = {}, false
+      for i = 1, #S.tracks do
+        local j = prev_guids[i] and pos_by_guid[prev_guids[i]]
+        if j then remapped[#remapped + 1] = j else dropped = true end
+      end
+      S.tracks = remapped
+      if dropped then S.fxs_stale = true end
+    end
   end
   return _tlist
 end
-
--- S: Multi-track selector state
-local S = {
-  tracks = {},     -- list of tlist indices for selected tracks
-  tracks_expanded = false, -- whether track list is expanded
-  fi     = 0,      -- selected FX index (into fxs list)
-  fxs    = {},     -- FX list (intersection across all selected tracks)
-  params = {},     -- param list for the selected plugin
-}
 
 -- M: Scan & Match state
 local M = {
@@ -202,7 +228,10 @@ local function poll_last_touched()
     end
     return
   end
-  local real_fxi = fxnum & 0xFFFFFF
+  -- Ignore take FX (item index in the high word of trnum) and record-input /
+  -- monitoring / container FX (fxnum >= 0x1000000): they are not linkable track FX.
+  if (trnum >> 16) ~= 0 or fxnum >= 0x1000000 then return end
+  local real_fxi = fxnum
   local tr = (trnum == 0) and reaper.GetMasterTrack(0) or reaper.GetTrack(0, trnum - 1)
   if not tr then
     LT.track = ""
@@ -251,8 +280,37 @@ local function resolve_fx(tr, fxi, fxguid)
         return j
       end
     end
+    -- The linked FX instance is gone: never fall back to whatever now sits at the old index
+    return -1
   end
+  -- Legacy links without a stored FX GUID: index is all we have
   return (fxi and fxi >= 0 and fxi < cnt) and fxi or -1
+end
+
+-- Dedupe key for one end of a link: track GUID + FX identity (GUID, or index for legacy) + param
+local function link_end_key(tguid, fxguid, fxi, pi)
+  local fxid = (fxguid and fxguid ~= "") and fxguid or ("#" .. tostring(fxi))
+  return tostring(tguid) .. "|" .. fxid .. "|" .. tostring(pi)
+end
+
+-- Adds both directions of a link to a dedupe set
+local function mark_link_key(set, a_guid, a_fxguid, a_fxi, a_pi, b_guid, b_fxguid, b_fxi, b_pi)
+  local ka = link_end_key(a_guid, a_fxguid, a_fxi, a_pi)
+  local kb = link_end_key(b_guid, b_fxguid, b_fxi, b_pi)
+  set[ka .. "||" .. kb] = true
+  set[kb .. "||" .. ka] = true
+end
+
+local function has_link_key(set, a_guid, a_fxguid, a_fxi, a_pi, b_guid, b_fxguid, b_fxi, b_pi)
+  return set[link_end_key(a_guid, a_fxguid, a_fxi, a_pi) .. "||" .. link_end_key(b_guid, b_fxguid, b_fxi, b_pi)] == true
+end
+
+local function existing_link_keys()
+  local set = {}
+  for _, lk in ipairs(links) do
+    mark_link_key(set, lk.a_guid, lk.a_fxguid, lk.a_fxi, lk.a_pi, lk.b_guid, lk.b_fxguid, lk.b_fxi, lk.b_pi)
+  end
+  return set
 end
 
 local function make_link(d)
@@ -292,13 +350,53 @@ local function count_checked_params()
   return count
 end
 
+-- ord = instance ordinal of this plugin name on the track (1 = first instance, 2 = second, ...)
 local function fx_list(tr)
-  local t = {}
+  local t, seen = {}, {}
   for j = 0, reaper.TrackFX_GetCount(tr) - 1 do
     local _, nm = reaper.TrackFX_GetFXName(tr, j, "")
-    t[#t + 1] = { idx = j, name = nm:match("^%a+3?:%s*(.+)$") or nm }
+    local clean = nm:match("^%a+3?:%s*(.+)$") or nm
+    seen[clean] = (seen[clean] or 0) + 1
+    t[#t + 1] = { idx = j, name = clean, ord = seen[clean] }
   end
   return t
+end
+
+-- Find the FX index of the Nth instance (default 1st) of a named plugin on a track (-1 if not found)
+local function find_fx_idx(track, plugin_name, ord)
+  if not track or not plugin_name or plugin_name == "" then return -1 end
+  ord = ord or 1
+  local n = 0
+  for j = 0, reaper.TrackFX_GetCount(track) - 1 do
+    local _, nm = reaper.TrackFX_GetFXName(track, j, "")
+    local clean = nm:match("^%a+3?:%s*(.+)$") or nm
+    if clean == plugin_name then
+      n = n + 1
+      if n == ord then return j end
+    end
+  end
+  return -1
+end
+
+-- Instance ordinal of the FX at fxi among same-named plugins on the track
+local function fx_ordinal(track, fxi)
+  local _, nm = reaper.TrackFX_GetFXName(track, fxi, "")
+  local clean = nm:match("^%a+3?:%s*(.+)$") or nm
+  local n = 0
+  for j = 0, fxi do
+    local _, nj = reaper.TrackFX_GetFXName(track, j, "")
+    if (nj:match("^%a+3?:%s*(.+)$") or nj) == clean then n = n + 1 end
+  end
+  return clean, math.max(1, n)
+end
+
+-- Index into S.fxs of the entry matching name + instance ordinal (0 if none)
+local function find_shared_fx(name, ord)
+  if not name then return 0 end
+  for j, f in ipairs(S.fxs) do
+    if f.name == name and (f.ord or 1) == (ord or 1) then return j end
+  end
+  return 0
 end
 
 local function param_list(tr, fxi)
@@ -439,14 +537,8 @@ local function compute_shared_fxs()
         found_all = false
         break
       end
-      local tr = entry.track
-      local has_it = false
-      for j = 0, reaper.TrackFX_GetCount(tr) - 1 do
-        local _, nm = reaper.TrackFX_GetFXName(tr, j, "")
-        local clean = nm:match("^%a+3?:%s*(.+)$") or nm
-        if clean == fx.name then has_it = true; break end
-      end
-      if not has_it then found_all = false; break end
+      -- The track must carry at least as many instances as this entry's ordinal
+      if find_fx_idx(entry.track, fx.name, fx.ord) < 0 then found_all = false; break end
     end
     if found_all then
       shared[#shared + 1] = fx
@@ -460,55 +552,72 @@ local function do_scan()
   local tlist = get_tlist()
   if #S.tracks < 2 or S.fi == 0 or not S.fxs[S.fi] then return end
   local plugin_name = S.fxs[S.fi].name
+  local plugin_ord  = S.fxs[S.fi].ord or 1
   -- Use first track's instance to enumerate parameters
   local first_entry = tlist[S.tracks[1]]
   if not first_entry or not first_entry.track then return end
   local first_tr = first_entry.track
-  local fxi = -1
-  for j = 0, reaper.TrackFX_GetCount(first_tr) - 1 do
-    local _, nm = reaper.TrackFX_GetFXName(first_tr, j, "")
-    local clean = nm:match("^%a+3?:%s*(.+)$") or nm
-    if clean == plugin_name then fxi = j; break end
-  end
+  local fxi = find_fx_idx(first_tr, plugin_name, plugin_ord)
   if fxi < 0 then return end
   local params = param_list(first_tr, fxi)
+
+  -- Rescanning the same plugin + tracks keeps the user's checks/modes/strengths
+  local key_parts = { plugin_name, tostring(plugin_ord) }
+  for _, ti in ipairs(S.tracks) do key_parts[#key_parts + 1] = tlist[ti] and tlist[ti].guid or "?" end
+  local scan_key = table.concat(key_parts, "|")
+  local prev = {}
+  if M.scan_plugin == (plugin_name .. "|" .. plugin_ord) then
+    for _, grp in ipairs(M.groups) do
+      for _, item in ipairs(grp.params) do prev[item.param.idx] = item end
+    end
+  end
+
   local matched = {}
   for _, p in ipairs(params) do
-    matched[#matched + 1] = {
-      param    = p,
-      checked  = false,
-      mode     = default_mode(p.name),
-      strength = (SETTINGS.default_strength or 1.0),
-    }
+    local old = prev[p.idx]
+    if old and old.param.name == p.name then
+      matched[#matched + 1] = { param = p, checked = old.checked, mode = old.mode, strength = old.strength }
+    else
+      matched[#matched + 1] = {
+        param    = p,
+        checked  = false,
+        mode     = default_mode(p.name),
+        strength = (SETTINGS.default_strength or 1.0),
+      }
+    end
   end
   S.params = params
   M.groups = build_groups(matched)
   M.scanned = true
+  M.scan_key = scan_key
+  M.scan_plugin = plugin_name .. "|" .. plugin_ord
 end
 
--- Find the FX index of a named plugin on a track (-1 if not found)
-local function find_fx_idx(track, plugin_name)
-  if not track or not plugin_name or plugin_name == "" then return -1 end
-  for j = 0, reaper.TrackFX_GetCount(track) - 1 do
-    local _, nm = reaper.TrackFX_GetFXName(track, j, "")
-    local clean = nm:match("^%a+3?:%s*(.+)$") or nm
-    if clean == plugin_name then return j end
-  end
-  return -1
+-- Key describing what do_scan would scan right now (plugin instance + tracks)
+local function current_scan_key()
+  local tlist = get_tlist()
+  local f = S.fxs[S.fi]
+  if not f then return nil end
+  local key_parts = { f.name, tostring(f.ord or 1) }
+  for _, ti in ipairs(S.tracks) do key_parts[#key_parts + 1] = tlist[ti] and tlist[ti].guid or "?" end
+  return table.concat(key_parts, "|")
 end
 
--- Create full-mesh links from scan results across all selected tracks
+-- Create links from scan results across all selected tracks.
+-- With 3+ tracks the first track is the master and every other track is linked to it
+-- (star). A full mesh is redundant for Follow and self-contradicting for Inverse.
 local function create_links_from_match()
   local tlist = get_tlist()
   if #S.tracks < 2 or S.fi == 0 or not S.fxs[S.fi] then return end
   local plugin_name = S.fxs[S.fi].name
+  local plugin_ord  = S.fxs[S.fi].ord or 1
 
   -- Resolve FX index and GUID per track
   local track_info = {}
   for _, ti in ipairs(S.tracks) do
     local t = tlist[ti]
     if t and t.track then
-      local fxi = find_fx_idx(t.track, plugin_name)
+      local fxi = find_fx_idx(t.track, plugin_name, plugin_ord)
       if fxi >= 0 then
         local fxguid = reaper.TrackFX_GetFXGUID(t.track, fxi) or ""
         track_info[#track_info + 1] = { guid = t.guid, name = t.name, fxi = fxi, fxguid = fxguid, track = t.track }
@@ -518,38 +627,28 @@ local function create_links_from_match()
   if #track_info < 2 then return end
 
   -- Build existing link set to avoid duplicates
-  local existing = {}
-  for _, lk in ipairs(links) do
-    local k1 = lk.a_guid .. "|" .. lk.a_fxi .. "|" .. lk.a_pi .. "|" .. lk.b_guid .. "|" .. lk.b_fxi .. "|" .. lk.b_pi
-    local k2 = lk.b_guid .. "|" .. lk.b_fxi .. "|" .. lk.b_pi .. "|" .. lk.a_guid .. "|" .. lk.a_fxi .. "|" .. lk.a_pi
-    existing[k1] = true
-    existing[k2] = true
-  end
+  local existing = existing_link_keys()
 
   local created_any = false
+  local ta = track_info[1]
   for _, grp in ipairs(M.groups) do
     for _, item in ipairs(grp.params) do
       if item.checked then
-        for i = 1, #track_info do
-          for j = i + 1, #track_info do
-            local ta = track_info[i]
-            local tb = track_info[j]
-            local key = ta.guid .. "|" .. ta.fxi .. "|" .. item.param.idx .. "|" .. tb.guid .. "|" .. tb.fxi .. "|" .. item.param.idx
-            if not existing[key] then
-              links[#links + 1] = make_link({
-                a_guid   = ta.guid,   a_name   = ta.name,
-                a_fxi    = ta.fxi,    a_fxguid = ta.fxguid, a_fxname = plugin_name,
-                a_pi     = item.param.idx, a_pname = item.param.name,
-                b_guid   = tb.guid,   b_name   = tb.name,
-                b_fxi    = tb.fxi,    b_fxguid = tb.fxguid, b_fxname = plugin_name,
-                b_pi     = item.param.idx, b_pname = item.param.name,
-                mode     = item.mode, strength = item.strength,
-              })
-              existing[key] = true
-              local rev = tb.guid .. "|" .. tb.fxi .. "|" .. item.param.idx .. "|" .. ta.guid .. "|" .. ta.fxi .. "|" .. item.param.idx
-              existing[rev] = true
-              created_any = true
-            end
+        local pidx = item.param.idx
+        for j = 2, #track_info do
+          local tb = track_info[j]
+          if not has_link_key(existing, ta.guid, ta.fxguid, ta.fxi, pidx, tb.guid, tb.fxguid, tb.fxi, pidx) then
+            links[#links + 1] = make_link({
+              a_guid   = ta.guid,   a_name   = ta.name,
+              a_fxi    = ta.fxi,    a_fxguid = ta.fxguid, a_fxname = plugin_name,
+              a_pi     = pidx,      a_pname  = item.param.name,
+              b_guid   = tb.guid,   b_name   = tb.name,
+              b_fxi    = tb.fxi,    b_fxguid = tb.fxguid, b_fxname = plugin_name,
+              b_pi     = pidx,      b_pname  = item.param.name,
+              mode     = item.mode, strength = item.strength,
+            })
+            mark_link_key(existing, ta.guid, ta.fxguid, ta.fxi, pidx, tb.guid, tb.fxguid, tb.fxi, pidx)
+            created_any = true
           end
         end
       end
@@ -602,6 +701,7 @@ local function save_preset_from_links(name)
       seen[key] = true
       params[#params + 1] = {
         pname    = lk.a_pname,
+        pi       = lk.a_pi,
         mode     = lk.mode,
         strength = lk.strength,
       }
@@ -666,48 +766,43 @@ local function apply_preset_direct(preset)
     return false
   end
 
-  -- Build param lookup from first track
+  -- Build param lookup from first track (first match wins for duplicate names)
   local first_params = param_list(track_info[1].track, track_info[1].fxi)
   local param_map = {}
-  for _, p in ipairs(first_params) do param_map[p.name] = p end
-
-  -- Build existing link set
-  local existing = {}
-  for _, lk in ipairs(links) do
-    local k1 = lk.a_guid .. "|" .. lk.a_fxi .. "|" .. lk.a_pi .. "|" .. lk.b_guid .. "|" .. lk.b_fxi .. "|" .. lk.b_pi
-    local k2 = lk.b_guid .. "|" .. lk.b_fxi .. "|" .. lk.b_pi .. "|" .. lk.a_guid .. "|" .. lk.a_fxi .. "|" .. lk.a_pi
-    existing[k1] = true
-    existing[k2] = true
+  for _, p in ipairs(first_params) do
+    if not param_map[p.name] then param_map[p.name] = p end
   end
 
+  -- Build existing link set
+  local existing = existing_link_keys()
+
+  -- Star from the first track (see create_links_from_match)
+  local ta = track_info[1]
   local created, skipped, total = 0, 0, 0
   for _, tp in ipairs(preset.params) do
     local pname = tp.pname or tp.src_pname  -- compat with old presets
-    local p = param_map[pname]
+    -- Prefer the stored exact index when it still carries the same name
+    local tpi = tonumber(tp.pi)
+    local p = (tpi and first_params[tpi + 1] and first_params[tpi + 1].name == pname) and first_params[tpi + 1]
+              or param_map[pname]
     if p then
-      for i = 1, #track_info do
-        for j = i + 1, #track_info do
-          total = total + 1
-          local ta = track_info[i]
-          local tb = track_info[j]
-          local key = ta.guid .. "|" .. ta.fxi .. "|" .. p.idx .. "|" .. tb.guid .. "|" .. tb.fxi .. "|" .. p.idx
-          if existing[key] then
-            skipped = skipped + 1
-          else
-            links[#links + 1] = make_link({
-              a_guid   = ta.guid,   a_name   = ta.name,
-              a_fxi    = ta.fxi,    a_fxguid = ta.fxguid, a_fxname = preset.plugin_name,
-              a_pi     = p.idx,     a_pname  = p.name,
-              b_guid   = tb.guid,   b_name   = tb.name,
-              b_fxi    = tb.fxi,    b_fxguid = tb.fxguid, b_fxname = preset.plugin_name,
-              b_pi     = p.idx,     b_pname  = p.name,
-              mode     = tp.mode,   strength = tp.strength,
-            })
-            existing[key] = true
-            local rev = tb.guid .. "|" .. tb.fxi .. "|" .. p.idx .. "|" .. ta.guid .. "|" .. ta.fxi .. "|" .. p.idx
-            existing[rev] = true
-            created = created + 1
-          end
+      for j = 2, #track_info do
+        total = total + 1
+        local tb = track_info[j]
+        if has_link_key(existing, ta.guid, ta.fxguid, ta.fxi, p.idx, tb.guid, tb.fxguid, tb.fxi, p.idx) then
+          skipped = skipped + 1
+        else
+          links[#links + 1] = make_link({
+            a_guid   = ta.guid,   a_name   = ta.name,
+            a_fxi    = ta.fxi,    a_fxguid = ta.fxguid, a_fxname = preset.plugin_name,
+            a_pi     = p.idx,     a_pname  = p.name,
+            b_guid   = tb.guid,   b_name   = tb.name,
+            b_fxi    = tb.fxi,    b_fxguid = tb.fxguid, b_fxname = preset.plugin_name,
+            b_pi     = p.idx,     b_pname  = p.name,
+            mode     = tp.mode,   strength = tp.strength,
+          })
+          mark_link_key(existing, ta.guid, ta.fxguid, ta.fxi, p.idx, tb.guid, tb.fxguid, tb.fxi, p.idx)
+          created = created + 1
         end
       end
     end
@@ -716,7 +811,7 @@ local function apply_preset_direct(preset)
     invalidate_link_groups()
     save_links()
   end
-  if skipped == total then
+  if total > 0 and skipped == total then
     preset_status_msg = string.format("Preset '%s': all links already exist", preset.name)
   elseif created == total then
     preset_status_msg = string.format("Preset '%s': %d links created \xe2\x9c\x93", preset.name, created)
@@ -741,7 +836,8 @@ use_last_touched_builder = function(silent)
     end
     return
   end
-  local real_fxi = fxnum & 0xFFFFFF
+  if (trnum >> 16) ~= 0 or fxnum >= 0x1000000 then return end
+  local real_fxi = fxnum
   local tr = (trnum == 0) and reaper.GetMasterTrack(0) or reaper.GetTrack(0, trnum - 1)
   if not tr then return end
   local tguid = reaper.GetTrackGUID(tr)
@@ -763,16 +859,20 @@ use_last_touched_builder = function(silent)
 
   -- Recompute shared FX and try to match the touched plugin
   compute_shared_fxs()
-  local _, fxname = reaper.TrackFX_GetFXName(tr, real_fxi, "")
-  local clean_name = fxname:match("^%a+3?:%s*(.+)$") or fxname
-  S.fi = 0
-  for j, f in ipairs(S.fxs) do
-    if f.name == clean_name then S.fi = j; break end
+  local clean_name, touched_ord = fx_ordinal(tr, real_fxi)
+  S.fi = find_shared_fx(clean_name, touched_ord)
+  if S.fi == 0 then
+    for j, f in ipairs(S.fxs) do
+      if f.name == clean_name then S.fi = j; break end
+    end
   end
 
-  -- Trigger scan if plugin found and 2+ tracks
+  -- Trigger scan if plugin found and 2+ tracks (skip when plugin + tracks are unchanged,
+  -- so previously checked parameters stay checked)
   if S.fi > 0 and #S.tracks >= 2 then
-    do_scan()
+    if not (M.scanned and M.scan_key ~= nil and M.scan_key == current_scan_key()) then
+      do_scan()
+    end
     -- Check the touched parameter and force its group open
     local _, pname = reaper.TrackFX_GetParamName(tr, real_fxi, paramnum, "")
     for _, grp in ipairs(M.groups) do
@@ -792,8 +892,13 @@ end
 -------------------------------------------------------------------------------
 -- 5. PERSISTENCE & STORAGE
 -------------------------------------------------------------------------------
-local function sav_path()
-  local _, f = reaper.EnumProjects(-1, "")
+-- Sidecar path for a project filename (defaults to the active project's filename)
+local function sav_path(filename)
+  local f = filename
+  if f == nil then
+    local _
+    _, f = reaper.EnumProjects(-1, "")
+  end
   if not f or f == "" then
     return reaper.GetResourcePath() .. "/Scripts/Fancy Scripts/_fancy_ipl_noproject.json"
   end
@@ -854,22 +959,86 @@ local function serialize_links(src_links)
   return JSON.encode(data)
 end
 
+-- Project the in-memory links belong to, and the sidecar path they were loaded from.
+-- Saving always targets this remembered path, never "whatever project is active now".
+local _links_proj = nil
+local _links_path = nil
+
 save_links = function()
-  return write_file(sav_path(), serialize_links(links))
+  return write_file(_links_path or sav_path(), serialize_links(links))
 end
 
-local function load_links()
-  local raw = read_file(sav_path())
-  if not raw then links = {}; invalidate_link_groups(); return end
-  local ok, data = pcall(JSON.decode, raw)
-  if not ok or type(data) ~= "table" then links = {}; invalidate_link_groups(); return end
+local function load_links(path)
+  path = path or sav_path()
+  _links_path = path
+  _links_proj = reaper.EnumProjects(-1, "")
+  -- Selection indices refer to the old link list
+  link_sel = {}
+  last_clicked_link = 0
   links = {}
-  for _, d in ipairs(data) do
-    if type(d) == "table" then
-      links[#links + 1] = make_link(d)
+  local raw = read_file(path)
+  if raw then
+    local ok, data = pcall(JSON.decode, raw)
+    if ok and type(data) == "table" then
+      for _, d in ipairs(data) do
+        if type(d) == "table" then
+          links[#links + 1] = make_link(d)
+        end
+      end
     end
   end
   invalidate_link_groups()
+end
+
+-- Reset the per-project Link Builder state (track list positions belong to the old project)
+local function reset_builder()
+  S.tracks = {}
+  S.fi     = 0
+  S.fxs    = {}
+  S.params = {}
+  S.fxs_stale = nil
+  S.tracks_expanded = false
+  M.groups  = {}
+  M.scanned = false
+  M.scan_key = nil
+  M.scan_plugin = nil
+end
+
+-- Detect project tab switches / Save As / Open-in-tab and keep links bound to their project.
+local function sync_project()
+  local proj, fn = reaper.EnumProjects(-1, "")
+  local path = sav_path(fn)
+  if proj == _links_proj and path == _links_path then return end
+
+  -- Persist the current links to the project they came from before touching anything else
+  if _links_path then save_links() end
+
+  if proj ~= _links_proj then
+    -- Different project tab
+    reset_builder()
+    load_links(path)
+    return
+  end
+
+  -- Same project tab, but its file changed (Save As, or another project opened in this tab)
+  if read_file(path) then
+    reset_builder()
+    load_links(path)
+    return
+  end
+  local resolvable = false
+  _gc_tick = _gc_tick + 1  -- force a fresh GUID lookup for the check below
+  for _, lk in ipairs(links) do
+    if tr_by_guid(lk.a_guid) or tr_by_guid(lk.b_guid) then resolvable = true; break end
+  end
+  if resolvable then
+    -- Save As: the links move with the project to its new file
+    _links_path = path
+    save_links()
+  else
+    reset_builder()
+    load_links(path)
+  end
 end
 
 local function save_settings()
@@ -897,7 +1066,24 @@ local function load_presets()
   if not raw then return end
   local ok, data = pcall(JSON.decode, raw)
   if ok and type(data) == "table" then
-    Presets.list = data
+    -- Drop malformed entries so a bad file cannot throw every frame
+    local list = {}
+    for _, p in ipairs(data) do
+      if type(p) == "table" and type(p.name) == "string" then
+        if type(p.plugin_name) ~= "string" then p.plugin_name = nil end
+        local params = {}
+        for _, tp in ipairs(type(p.params) == "table" and p.params or {}) do
+          if type(tp) == "table" and (type(tp.pname) == "string" or type(tp.src_pname) == "string") then
+            if tp.mode ~= "follow" and tp.mode ~= "inverse" then tp.mode = nil end
+            tp.strength = tonumber(tp.strength)
+            params[#params + 1] = tp
+          end
+        end
+        p.params = params
+        list[#list + 1] = p
+      end
+    end
+    Presets.list = list
   end
 end
 
@@ -938,10 +1124,16 @@ local function import_links_dialog()
       return
     end
     local added = 0
+    local existing = existing_link_keys()
     for _, d in ipairs(data) do
-      if type(d) == "table" and d.a_guid and d.b_guid then
-        links[#links + 1] = make_link(d)
-        added = added + 1
+      if type(d) == "table" and type(d.a_guid) == "string" and type(d.b_guid) == "string" then
+        local lk = make_link(d)
+        if not has_link_key(existing, lk.a_guid, lk.a_fxguid, lk.a_fxi, lk.a_pi, lk.b_guid, lk.b_fxguid, lk.b_fxi, lk.b_pi) then
+          lk.last_a, lk.last_b = nil, nil
+          links[#links + 1] = lk
+          mark_link_key(existing, lk.a_guid, lk.a_fxguid, lk.a_fxi, lk.a_pi, lk.b_guid, lk.b_fxguid, lk.b_fxi, lk.b_pi)
+          added = added + 1
+        end
       end
     end
     invalidate_link_groups()
@@ -953,6 +1145,21 @@ end
 -------------------------------------------------------------------------------
 -- 6. LINK ENGINE (Bidirectional)
 -------------------------------------------------------------------------------
+local LINK_EPS = 1e-6
+
+-- True when v moved away from the last recorded value (nil = never recorded)
+local function param_moved(last, v)
+  return last == nil or math.abs(v - last) > LINK_EPS
+end
+
+local function clamp01(v)
+  if v < 0 then return 0 end
+  if v > 1 then return 1 end
+  return v
+end
+
+-- Relation: b = 0.5 + dir * st * (a - 0.5)   (dir = +1 Follow, -1 Inverse)
+-- Inverse map (B driving A): a = 0.5 + (b - 0.5) / (dir * st)
 local function apply_links()
   if paused or #links == 0 then return end
   for _, lk in ipairs(links) do
@@ -970,21 +1177,24 @@ local function apply_links()
           local dir = (lk.mode == "follow") and 1.0 or -1.0
           local st  = lk.strength or 1.0
 
-          local a_changed = (lk.last_a ~= av)
-          local b_changed = (lk.last_b ~= bv)
+          local a_changed = param_moved(lk.last_a, av)
+          local b_changed = param_moved(lk.last_b, bv)
 
           if a_changed and not b_changed then
             -- A is driving -> compute and write B
             lk.last_a = av
-            local nv = math.max(0, math.min(1, 0.5 + dir * st * (av - 0.5)))
+            local nv = clamp01(0.5 + dir * st * (av - 0.5))
             reaper.TrackFX_SetParamNormalized(trb, fxi_b, lk.b_pi, nv)
-            lk.last_b = nv
+            -- Record what the plugin actually stored (float32 / stepped params)
+            lk.last_b = reaper.TrackFX_GetParamNormalized(trb, fxi_b, lk.b_pi)
           elseif b_changed and not a_changed then
-            -- B is driving -> compute and write A
+            -- B is driving -> invert the relation and write A
             lk.last_b = bv
-            local nv = math.max(0, math.min(1, 0.5 + dir * st * (bv - 0.5)))
-            reaper.TrackFX_SetParamNormalized(tra, fxi_a, lk.a_pi, nv)
-            lk.last_a = nv
+            if math.abs(st) > 1e-9 then
+              local nv = clamp01(0.5 + (bv - 0.5) / (dir * st))
+              reaper.TrackFX_SetParamNormalized(tra, fxi_a, lk.a_pi, nv)
+              lk.last_a = reaper.TrackFX_GetParamNormalized(tra, fxi_a, lk.a_pi)
+            end
           elseif a_changed and b_changed then
             -- Both changed (initialization or concurrent update) -- record without fighting
             lk.last_a = av
@@ -1001,6 +1211,15 @@ end
 -------------------------------------------------------------------------------
 local function draw_track_selector(tlist)
   local P = Theme.get_palette()
+  -- A selected track was deleted: refresh the shared plugin list and builder
+  if S.fxs_stale then
+    S.fxs_stale = nil
+    local cur = S.fxs[S.fi]
+    compute_shared_fxs()
+    S.fi = cur and find_shared_fx(cur.name, cur.ord) or 0
+    M.scanned = false
+    M.groups = {}
+  end
   -- Action row: Add Tracks multi-combo + Use Selected on same line
   local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
   local use_sel_text = "Use Selected"
@@ -1029,17 +1248,10 @@ local function draw_track_selector(tlist)
         end
       end
     end
-    compute_shared_fxs()
     -- Try to preserve FX selection
-    local cur_name = (S.fi > 0 and S.fxs[S.fi]) and S.fxs[S.fi].name or nil
-    if cur_name then
-      S.fi = 0
-      for fi, f in ipairs(S.fxs) do
-        if f.name == cur_name then S.fi = fi; break end
-      end
-    else
-      S.fi = 0
-    end
+    local cur = (S.fi > 0) and S.fxs[S.fi] or nil
+    compute_shared_fxs()
+    S.fi = cur and find_shared_fx(cur.name, cur.ord) or 0
     M.scanned = false
     M.groups = {}
   end
@@ -1139,8 +1351,9 @@ local function draw_track_selector(tlist)
 
       if to_remove then
         table.remove(S.tracks, to_remove)
+        local cur = (S.fi > 0) and S.fxs[S.fi] or nil
         compute_shared_fxs()
-        if S.fi > 0 and S.fi > #S.fxs then S.fi = 0 end
+        S.fi = cur and find_shared_fx(cur.name, cur.ord) or 0
         M.scanned = false
         M.groups = {}
         if #S.tracks == 0 then
@@ -1379,7 +1592,7 @@ local function draw_link_builder()
   -- Action row
   local total_params = count_checked_params()
   local n_tracks = #S.tracks
-  local n_pairs = (n_tracks * (n_tracks - 1)) / 2
+  local n_pairs = math.max(0, n_tracks - 1)  -- star: first track linked to each other track
   local total_links = total_params * n_pairs
   reaper.ImGui_Spacing(ctx)
 
@@ -1801,22 +2014,10 @@ local function get_link_groups()
   return _cached_link_groups
 end
 
-local _current_proj = ""
-
 local function draw_main()
   local P = Theme.get_palette()
   local nc, nv = Theme.push(ctx, P)
   local pushed_default = Theme.push_font(ctx, fonts.default)
-
-  -- Track project tab switching
-  local _, cur_proj = reaper.EnumProjects(-1, "")
-  if _current_proj ~= "" and cur_proj ~= _current_proj then
-    save_links()
-    _current_proj = cur_proj
-    load_links()
-  else
-    _current_proj = cur_proj
-  end
 
   Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_FirstUseEver())
 
@@ -1930,6 +2131,10 @@ local function draw_main()
           inactive_text  = P.green_l,
         }) then
           paused = not paused
+          if not paused then
+            -- Re-sync on resume (same as per-link pause) instead of snapping to stale values
+            for _, lk in ipairs(links) do lk.last_a = nil; lk.last_b = nil end
+          end
         end
 
         reaper.ImGui_SameLine(ctx, 0, L.sm)
@@ -2264,6 +2469,8 @@ local function draw_main()
                   Theme.pop_button_preset(ctx, sp_vars, sp_font)
                   if ch_s then
                     lk.strength = np_s / 100
+                    lk.last_a = nil
+                    lk.last_b = nil
                   end
                   if reaper.ImGui_IsItemDeactivatedAfterEdit(ctx) then
                     save_links()
@@ -2340,6 +2547,8 @@ end
 -- 12. DEFER LOOP
 -------------------------------------------------------------------------------
 local function loop()
+  _gc_tick = _gc_tick + 1
+  sync_project()
   apply_links()
   local open = draw_main()
   if open then reaper.defer(loop) end
