@@ -1,0 +1,14 @@
+-- @description Fancy Scripts Library
+-- @author Fancy Scripts
+-- @version 1.0.0
+-- @metapackage
+-- @changelog
+--   + Shared libraries (theme, json, utils, mapper engine, tap tempo settings) now ship as their own package
+-- @about
+--   Shared Lua libraries used by the Fancy Scripts (theme, JSON, utilities,
+--   Fancy Mapper engine, Tap Tempo settings). Install this package together
+--   with any Fancy script; it adds no actions of its own.
+-- @donation https://github.com/sponsors/TheFancyWolf
+-- @link Website https://github.com/TheFancyWolf/fancy-scripts
+-- @provides
+--   [nomain] ../_lib/*.lua
