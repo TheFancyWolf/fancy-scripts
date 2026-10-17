@@ -1,7 +1,13 @@
 -- @description Fancy Selected Track Meter
 -- @author Fancy Scripts
--- @version 9.67.1
+-- @version 9.67.2
 -- @changelog
+--   # Master track can now be metered when selected
+--   # Metering, holds, clip log and history keep running while the window is hidden
+--   # RMS meter now uses a windowed RMS estimate (previous source only worked for loudness-metered tracks)
+--   # RMS smoothing is frame-rate independent; RMS/peak holds reset on track change
+--   # Clip log works after loop/seek jumps backwards
+--   # Typed slider values and loaded settings are clamped to valid ranges
 --   + Fixed ReaImGui double-End error when a window is collapsed, fully clipped, or in an inactive dock tab
 -- @about
 --   Real-time visual metering display for selected tracks.
@@ -119,8 +125,8 @@ local State = {
 
     peak_max_l    = -150,
     peak_max_r    = -150,
-    rms_smooth_l  = 0,
-    rms_smooth_r  = 0,
+    rms_smooth_l  = -150,
+    rms_smooth_r  = -150,
 
     num_peak_max  = -150,
     num_rms_max   = -150,
@@ -148,6 +154,11 @@ local State = {
     show_clip_log      = false,
     last_clip_time     = -100,
 
+    -- Sliding window for the RMS estimate (see RMS_WINDOW_SEC)
+    rms_win            = {},
+    rms_win_sum_l      = 0.0,
+    rms_win_sum_r      = 0.0,
+
     play_state         = 0,
     play_start_time    = 0,
     last_time          = reaper.time_precise()
@@ -173,6 +184,39 @@ local PersistVisualKeys = {
 -------------------------------------------------------------------------------
 -- 5. STATE PERSISTENCE
 -------------------------------------------------------------------------------
+-- Valid ranges for persisted numeric settings (mirror the settings sliders)
+local SettingRanges = {
+    meter_scale_mode        = { 1, 2, true },
+    balance_db_scale        = { 1.0, 24.0 },
+    balance_window_sec      = { 0.1, 10.0 },
+    balance_window_sec_fast = { 0.033, 2.0 },
+    column_gap              = { 0, 100, true },
+    peak_db_min             = { -100.0, 0.0 },
+    peak_db_max             = { -100.0, 0.0 },
+    rms_db_min              = { -100.0, 0.0 },
+    rms_db_max              = { -100.0, 0.0 },
+    damping                 = { 0.01, 1.0 },
+    falloff_db_sec          = { 5.0, 100.0 },
+    rolling_window_sec      = { 1.0, 10.0 },
+    tgt_peak_db             = { -60.0, 0.0 },
+    tgt_rms_db              = { -60.0, 0.0 },
+    tgt_marker_size         = { 0, 1, true },
+    tgt_marker_indent       = { 0.0, 50.0 },
+    tgt_marker_bg_alpha     = { 0.0, 1.0 },
+    Dim_Opacity_Pct         = { 0.0, 1.0 },
+    Tooltip_Font_Size       = { 10, 36, true },
+    Settings_Font_Size      = { 10, 36, true },
+}
+
+local function ClampSetting(tbl, k)
+    local r = SettingRanges[k]
+    local v = tbl[k]
+    if not r or type(v) ~= "number" then return end
+    if v ~= v then v = r[1] end -- NaN
+    if r[3] then v = math.floor(v + 0.5) end
+    tbl[k] = math.max(r[1], math.min(r[2], v))
+end
+
 local function LoadSettings()
     -- Load Functional State
     for _, k in ipairs(PersistStateKeys) do
@@ -193,6 +237,11 @@ local function LoadSettings()
             else VisualSettings[k] = val end
         end
     end
+    -- Clamp loaded values to their valid ranges
+    for _, k in ipairs(PersistStateKeys) do ClampSetting(State, k) end
+    for _, k in ipairs(PersistVisualKeys) do ClampSetting(VisualSettings, k) end
+    if State.peak_db_min >= State.peak_db_max then State.peak_db_min = State.peak_db_max - 1 end
+    if State.rms_db_min >= State.rms_db_max then State.rms_db_min = State.rms_db_max - 1 end
 end
 
 local function SaveSettings()
@@ -233,6 +282,24 @@ local cached_settings_size = VisualSettings.Settings_Font_Size
 local function AmpToDb(amp)
     if not amp or amp <= 0.0000001 then return -150.0 end
     return 20.0 * math.log(amp, 10)
+end
+
+-- Clamp typed (Ctrl/Cmd+Click) slider values to the slider range
+local SLIDER_CLAMP = reaper.ImGui_SliderFlags_AlwaysClamp and reaper.ImGui_SliderFlags_AlwaysClamp() or 0
+
+-- Sliding window length for the RMS estimate (seconds)
+local RMS_WINDOW_SEC = 0.3
+
+-- Frame-rate independent RMS smoothing coefficient.
+-- Historically the filter used a fixed per-frame coefficient of (damping * 0.5)
+-- at the ~30 Hz defer rate. Converting that to a time constant
+-- (tau = -dt0 / ln(1 - a), dt0 = 1/30) and using alpha = 1 - exp(-dt / tau)
+-- gives the same response at 30 fps, independent of the actual frame rate.
+local RMS_REF_DT = 1.0 / 30.0
+local function RmsSmoothAlpha(damping, dt)
+    local a = math.min(math.max((damping or 0.15) * 0.5, 0.0), 0.999)
+    if a <= 0 or dt <= 0 then return 0.0 end
+    return 1.0 - (1.0 - a) ^ (dt / RMS_REF_DT)
 end
 
 local function MapRange(val, in_min, in_max, out_min, out_max)
@@ -785,6 +852,190 @@ local function loop()
     local is_warming_up = (is_playing and (now - State.play_start_time < warmup_duration))
     local do_roll_reset = false
 
+    -- Signal acquisition & processing runs every tick (even when the window is
+    -- hidden/docked away) so holds, clip log and history stay current. Drawing
+    -- below only reads the results.
+    -- 🎯 Robust Track Locking Logic
+    local track = reaper.GetSelectedTrack2(0, 0, true)
+    if State.is_locked then
+        if State.locked_track and reaper.ValidatePtr(State.locked_track, "MediaTrack*") then
+            track = State.locked_track
+        else
+            State.is_locked = false
+            State.locked_track = track
+        end
+    else
+        State.locked_track = track
+    end
+
+    -- 🧹 Reset when selected track changes
+    if track ~= State.last_active_track then
+        State.num_peak_max = -150
+        State.num_rms_max  = -150
+        State.balance_val  = 0.0
+        State.balance_val_fast = 0.0
+        State.audio_history = {}
+        State.disp_roll_peak = -150
+        State.disp_roll_rms  = -150
+        State.clip_log       = {}
+        State.last_clip_time = -100
+        State.rms_smooth_l   = -150
+        State.rms_smooth_r   = -150
+        State.peak_max_l     = -150
+        State.peak_max_r     = -150
+        State.rms_win        = {}
+        State.rms_win_sum_l  = 0.0
+        State.rms_win_sum_r  = 0.0
+        State.last_active_track = track
+    end
+
+    local cur_peak_l, cur_peak_r
+    local cur_rms_l, cur_rms_r
+
+    local track_name = "No Track Selected"
+    local track_color_imgui = VisualSettings.Color_DefaultTrk
+
+    if track then
+        local _, name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
+        if name ~= "" then track_name = name
+        else
+            local tr_num = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") or 0
+            if tr_num == -1 then track_name = "Master"
+            elseif tr_num > 0 then track_name = "Track " .. math.floor(tr_num) end
+        end
+
+        local native_color = reaper.GetTrackColor(track) or 0
+        track_color_imgui = NativeToImGuiColor(native_color, VisualSettings.Color_DimFactor)
+
+        local peak_l_amp = reaper.Track_GetPeakInfo(track, 0) or 0.0
+        local peak_r_amp = reaper.Track_GetPeakInfo(track, 1) or 0.0
+
+        cur_peak_l = AmpToDb(peak_l_amp)
+        cur_peak_r = AmpToDb(peak_r_amp)
+
+        -- RMS estimate: Track_GetPeakInfo(track, 1024/1025) only yields loudness
+        -- values on the master / loudness-metered tracks, not per-channel RMS, and
+        -- ReaScript has no direct track RMS API. Instead keep a sliding wall-clock
+        -- window (RMS_WINDOW_SEC) of the per-tick linear peak values, take the
+        -- root of the mean of their squares, and apply the sine crest factor
+        -- (1/sqrt(2)) so a steady sine reads its true RMS (matching the previous
+        -- peak * 0.7071 fallback). It is an estimate of the signal's RMS envelope.
+        local win = State.rms_win
+        win[#win + 1] = { t = now, l = peak_l_amp * peak_l_amp, r = peak_r_amp * peak_r_amp }
+        State.rms_win_sum_l = State.rms_win_sum_l + win[#win].l
+        State.rms_win_sum_r = State.rms_win_sum_r + win[#win].r
+        while #win > 1 and (now - win[1].t) > RMS_WINDOW_SEC do
+            State.rms_win_sum_l = State.rms_win_sum_l - win[1].l
+            State.rms_win_sum_r = State.rms_win_sum_r - win[1].r
+            table.remove(win, 1)
+        end
+        local n = #win
+        local mean_l = math.max(0.0, State.rms_win_sum_l / n)
+        local mean_r = math.max(0.0, State.rms_win_sum_r / n)
+        cur_rms_l = AmpToDb(math.sqrt(mean_l) * 0.7071)
+        cur_rms_r = AmpToDb(math.sqrt(mean_r) * 0.7071)
+
+        local max_incoming_peak = math.max(cur_peak_l, cur_peak_r)
+        local max_incoming_rms = math.max(cur_rms_l, cur_rms_r)
+
+        -- 🛡️ WAKE UP FROM SILENCE FIX
+        -- Snaps the smoothed RMS filter to the incoming volume if waking up from absolute digital silence.
+        -- This prevents the mathematical illusion of a 140 dB Crest Factor spike on block 1!
+        if State.rms_smooth_l < -100.0 then State.rms_smooth_l = cur_rms_l end
+        if State.rms_smooth_r < -100.0 then State.rms_smooth_r = cur_rms_r end
+
+        -- 📡 Actionable Clip Logging
+        if is_playing and max_incoming_peak >= 0.0 and not is_warming_up then
+            local play_pos = reaper.GetPlayPosition()
+            if math.abs(play_pos - State.last_clip_time) > 0.5 then
+                table.insert(State.clip_log, 1, {time = play_pos, val = max_incoming_peak})
+                if #State.clip_log > 10 then table.remove(State.clip_log) end
+                State.last_clip_time = play_pos
+            end
+        end
+
+        if max_incoming_peak > -140 and max_incoming_rms > -140 then
+            if max_incoming_peak > State.num_peak_max then State.num_peak_max = max_incoming_peak end
+            if max_incoming_rms > State.num_rms_max then State.num_rms_max = max_incoming_rms end
+
+            local current_smoothed_rms = math.max(State.rms_smooth_l, State.rms_smooth_r)
+
+            if not is_warming_up then
+                table.insert(State.audio_history, {
+                    time = now,
+                    peak = max_incoming_peak,
+                    rms = current_smoothed_rms
+                })
+            end
+        end
+
+        State.peak_max_l = State.peak_max_l - (State.falloff_db_sec * dt)
+        if cur_peak_l > State.peak_max_l then State.peak_max_l = cur_peak_l end
+
+        State.peak_max_r = State.peak_max_r - (State.falloff_db_sec * dt)
+        if cur_peak_r > State.peak_max_r then State.peak_max_r = cur_peak_r end
+
+        local alpha_rms = RmsSmoothAlpha(State.damping, dt)
+        State.rms_smooth_l = State.rms_smooth_l + (cur_rms_l - State.rms_smooth_l) * alpha_rms
+        State.rms_smooth_r = State.rms_smooth_r + (cur_rms_r - State.rms_smooth_r) * alpha_rms
+
+        local target_balance_slow = 0.0
+        local target_balance_fast = 0.0
+
+        if max_incoming_rms > -70.0 then target_balance_slow = State.rms_smooth_r - State.rms_smooth_l end
+        if max_incoming_peak > -70.0 then target_balance_fast = cur_peak_r - cur_peak_l end
+
+        local alpha_bal_slow = 1.0 - math.exp(-dt / State.balance_window_sec)
+        State.balance_val = State.balance_val + (target_balance_slow - State.balance_val) * alpha_bal_slow
+
+        local alpha_bal_fast = 1.0 - math.exp(-dt / State.balance_window_sec_fast)
+        State.balance_val_fast = State.balance_val_fast + (target_balance_fast - State.balance_val_fast) * alpha_bal_fast
+
+    else
+         State.peak_max_l = State.peak_max_l - (State.falloff_db_sec * dt)
+         State.peak_max_r = State.peak_max_r - (State.falloff_db_sec * dt)
+         local alpha_rms = RmsSmoothAlpha(State.damping, dt)
+         State.rms_smooth_l = State.rms_smooth_l + (-150.0 - State.rms_smooth_l) * alpha_rms
+         State.rms_smooth_r = State.rms_smooth_r + (-150.0 - State.rms_smooth_r) * alpha_rms
+         local alpha_bal_slow = 1.0 - math.exp(-dt / State.balance_window_sec)
+         State.balance_val = State.balance_val + (0.0 - State.balance_val) * alpha_bal_slow
+         local alpha_bal_fast = 1.0 - math.exp(-dt / State.balance_window_sec_fast)
+         State.balance_val_fast = State.balance_val_fast + (0.0 - State.balance_val_fast) * alpha_bal_fast
+    end
+
+    local max_history_window = State.rolling_window_sec
+    while #State.audio_history > 0 and (now - State.audio_history[1].time) > max_history_window do
+        table.remove(State.audio_history, 1)
+    end
+
+    State.roll_peak_max = -150
+    State.roll_rms_max = -150
+
+    if #State.audio_history > 0 then
+        for i = 1, #State.audio_history do
+            local entry = State.audio_history[i]
+            local age = now - entry.time
+            if age <= State.rolling_window_sec then
+                if entry.peak > State.roll_peak_max then State.roll_peak_max = entry.peak end
+                if entry.rms > State.roll_rms_max then State.roll_rms_max = entry.rms end
+            end
+        end
+    end
+
+    if is_playing then
+        if State.roll_peak_max > State.disp_roll_peak then State.disp_roll_peak = State.roll_peak_max
+        else State.disp_roll_peak = State.disp_roll_peak - (State.falloff_db_sec * dt)
+            if State.disp_roll_peak < State.roll_peak_max then State.disp_roll_peak = State.roll_peak_max end
+        end
+        if State.roll_rms_max > State.disp_roll_rms then State.disp_roll_rms = State.roll_rms_max
+        else State.disp_roll_rms = State.disp_roll_rms - (State.falloff_db_sec * dt)
+            if State.disp_roll_rms < State.roll_rms_max then State.disp_roll_rms = State.roll_rms_max end
+        end
+    else
+        State.disp_roll_peak = -150
+        State.disp_roll_rms  = -150
+    end
+
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(), VisualSettings.Color_Background)
     reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), 0, 0)
 
@@ -819,171 +1070,10 @@ local function loop()
         if reaper.ImGui_IsKeyPressed(ctx, reaper.ImGui_Key_L()) then
             State.is_locked = not State.is_locked
             if State.is_locked then
-                State.locked_track = reaper.GetSelectedTrack(0, 0)
+                State.locked_track = reaper.GetSelectedTrack2(0, 0, true)
             else
                 State.locked_track = nil
             end
-        end
-
-        -- 🎯 Robust Track Locking Logic
-        local track = reaper.GetSelectedTrack(0, 0)
-        if State.is_locked then
-            if State.locked_track and reaper.ValidatePtr(State.locked_track, "MediaTrack*") then
-                track = State.locked_track
-            else
-                State.is_locked = false
-                State.locked_track = track
-            end
-        else
-            State.locked_track = track
-        end
-
-        -- 🧹 Reset when selected track changes
-        if track ~= State.last_active_track then
-            State.num_peak_max = -150
-            State.num_rms_max  = -150
-            State.balance_val  = 0.0
-            State.balance_val_fast = 0.0
-            State.audio_history = {}
-            State.disp_roll_peak = -150
-            State.disp_roll_rms  = -150
-            State.clip_log       = {}
-            State.last_clip_time = -100
-            State.last_active_track = track
-        end
-
-        local cur_peak_l, cur_peak_r
-        local cur_rms_l, cur_rms_r
-
-        local track_name = "No Track Selected"
-        local track_color_imgui = VisualSettings.Color_DefaultTrk
-
-        if track then
-            local _, name = reaper.GetSetMediaTrackInfo_String(track, "P_NAME", "", false)
-            if name ~= "" then track_name = name
-            else
-                local tr_num = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") or 0
-                if tr_num == -1 then track_name = "Master"
-                elseif tr_num > 0 then track_name = "Track " .. math.floor(tr_num) end
-            end
-
-            local native_color = reaper.GetTrackColor(track) or 0
-            track_color_imgui = NativeToImGuiColor(native_color, VisualSettings.Color_DimFactor)
-
-            local peak_l_amp = reaper.Track_GetPeakInfo(track, 0) or 0.0
-            local peak_r_amp = reaper.Track_GetPeakInfo(track, 1) or 0.0
-
-            cur_peak_l = AmpToDb(peak_l_amp)
-            cur_peak_r = AmpToDb(peak_r_amp)
-
-            local rms_l_amp = reaper.Track_GetPeakInfo(track, 1024) or 0.0
-            local rms_r_amp = reaper.Track_GetPeakInfo(track, 1025) or 0.0
-
-            if rms_l_amp > 0 or rms_r_amp > 0 then
-                cur_rms_l = AmpToDb(rms_l_amp)
-                cur_rms_r = AmpToDb(rms_r_amp)
-            else
-                cur_rms_l = AmpToDb(peak_l_amp * 0.7071)
-                cur_rms_r = AmpToDb(peak_r_amp * 0.7071)
-            end
-
-            local max_incoming_peak = math.max(cur_peak_l, cur_peak_r)
-            local max_incoming_rms = math.max(cur_rms_l, cur_rms_r)
-
-            -- 🛡️ WAKE UP FROM SILENCE FIX
-            -- Snaps the smoothed RMS filter to the incoming volume if waking up from absolute digital silence.
-            -- This prevents the mathematical illusion of a 140 dB Crest Factor spike on block 1!
-            if State.rms_smooth_l < -100.0 then State.rms_smooth_l = cur_rms_l end
-            if State.rms_smooth_r < -100.0 then State.rms_smooth_r = cur_rms_r end
-
-            -- 📡 Actionable Clip Logging
-            if is_playing and max_incoming_peak >= 0.0 and not is_warming_up then
-                local play_pos = reaper.GetPlayPosition()
-                if (play_pos - State.last_clip_time) > 0.5 then
-                    table.insert(State.clip_log, 1, {time = play_pos, val = max_incoming_peak})
-                    if #State.clip_log > 10 then table.remove(State.clip_log) end
-                    State.last_clip_time = play_pos
-                end
-            end
-
-            if max_incoming_peak > -140 and max_incoming_rms > -140 then
-                if max_incoming_peak > State.num_peak_max then State.num_peak_max = max_incoming_peak end
-                if max_incoming_rms > State.num_rms_max then State.num_rms_max = max_incoming_rms end
-
-                local current_smoothed_rms = math.max(State.rms_smooth_l, State.rms_smooth_r)
-
-                if not is_warming_up then
-                    table.insert(State.audio_history, {
-                        time = now,
-                        peak = max_incoming_peak,
-                        rms = current_smoothed_rms
-                    })
-                end
-            end
-
-            State.peak_max_l = State.peak_max_l - (State.falloff_db_sec * dt)
-            if cur_peak_l > State.peak_max_l then State.peak_max_l = cur_peak_l end
-
-            State.peak_max_r = State.peak_max_r - (State.falloff_db_sec * dt)
-            if cur_peak_r > State.peak_max_r then State.peak_max_r = cur_peak_r end
-
-            State.rms_smooth_l = State.rms_smooth_l + (cur_rms_l - State.rms_smooth_l) * (State.damping * 0.5)
-            State.rms_smooth_r = State.rms_smooth_r + (cur_rms_r - State.rms_smooth_r) * (State.damping * 0.5)
-
-            local target_balance_slow = 0.0
-            local target_balance_fast = 0.0
-
-            if max_incoming_rms > -70.0 then target_balance_slow = State.rms_smooth_r - State.rms_smooth_l end
-            if max_incoming_peak > -70.0 then target_balance_fast = cur_peak_r - cur_peak_l end
-
-            local alpha_bal_slow = 1.0 - math.exp(-dt / State.balance_window_sec)
-            State.balance_val = State.balance_val + (target_balance_slow - State.balance_val) * alpha_bal_slow
-
-            local alpha_bal_fast = 1.0 - math.exp(-dt / State.balance_window_sec_fast)
-            State.balance_val_fast = State.balance_val_fast + (target_balance_fast - State.balance_val_fast) * alpha_bal_fast
-
-        else
-             State.peak_max_l = State.peak_max_l - (State.falloff_db_sec * dt)
-             State.peak_max_r = State.peak_max_r - (State.falloff_db_sec * dt)
-             State.rms_smooth_l = State.rms_smooth_l + (-150.0 - State.rms_smooth_l) * (State.damping * 0.5)
-             State.rms_smooth_r = State.rms_smooth_r + (-150.0 - State.rms_smooth_r) * (State.damping * 0.5)
-             local alpha_bal_slow = 1.0 - math.exp(-dt / State.balance_window_sec)
-             State.balance_val = State.balance_val + (0.0 - State.balance_val) * alpha_bal_slow
-             local alpha_bal_fast = 1.0 - math.exp(-dt / State.balance_window_sec_fast)
-             State.balance_val_fast = State.balance_val_fast + (0.0 - State.balance_val_fast) * alpha_bal_fast
-        end
-
-        local max_history_window = State.rolling_window_sec
-        while #State.audio_history > 0 and (now - State.audio_history[1].time) > max_history_window do
-            table.remove(State.audio_history, 1)
-        end
-
-        State.roll_peak_max = -150
-        State.roll_rms_max = -150
-
-        if #State.audio_history > 0 then
-            for i = 1, #State.audio_history do
-                local entry = State.audio_history[i]
-                local age = now - entry.time
-                if age <= State.rolling_window_sec then
-                    if entry.peak > State.roll_peak_max then State.roll_peak_max = entry.peak end
-                    if entry.rms > State.roll_rms_max then State.roll_rms_max = entry.rms end
-                end
-            end
-        end
-
-        if is_playing then
-            if State.roll_peak_max > State.disp_roll_peak then State.disp_roll_peak = State.roll_peak_max
-            else State.disp_roll_peak = State.disp_roll_peak - (State.falloff_db_sec * dt)
-                if State.disp_roll_peak < State.roll_peak_max then State.disp_roll_peak = State.roll_peak_max end
-            end
-            if State.roll_rms_max > State.disp_roll_rms then State.disp_roll_rms = State.roll_rms_max
-            else State.disp_roll_rms = State.disp_roll_rms - (State.falloff_db_sec * dt)
-                if State.disp_roll_rms < State.roll_rms_max then State.disp_roll_rms = State.roll_rms_max end
-            end
-        else
-            State.disp_roll_peak = -150
-            State.disp_roll_rms  = -150
         end
 
         local header_h = VisualSettings.Header_Height
@@ -1343,22 +1433,22 @@ local function loop()
                     end
 
                     local _
-                    _, VisualSettings.Dim_Opacity_Pct = reaper.ImGui_SliderDouble(ctx, "Unselected Dim Opacity", VisualSettings.Dim_Opacity_Pct, 0.0, 1.0, "%.2f")
+                    _, VisualSettings.Dim_Opacity_Pct = reaper.ImGui_SliderDouble(ctx, "Unselected Dim Opacity", VisualSettings.Dim_Opacity_Pct, 0.0, 1.0, "%.2f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Darkness of the overlay when no track is selected.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
                     reaper.ImGui_Text(ctx, "Typography")
                     reaper.ImGui_Separator(ctx)
-                    _, VisualSettings.Tooltip_Font_Size = reaper.ImGui_SliderInt(ctx, "Tooltip Font Size", VisualSettings.Tooltip_Font_Size, 10, 36)
+                    _, VisualSettings.Tooltip_Font_Size = reaper.ImGui_SliderInt(ctx, "Tooltip Font Size", VisualSettings.Tooltip_Font_Size, 10, 36, "%d", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Size of the hover tooltips.")
 
-                    _, VisualSettings.Settings_Font_Size = reaper.ImGui_SliderInt(ctx, "Settings Font Size", VisualSettings.Settings_Font_Size, 10, 36)
+                    _, VisualSettings.Settings_Font_Size = reaper.ImGui_SliderInt(ctx, "Settings Font Size", VisualSettings.Settings_Font_Size, 10, 36, "%d", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Size of the text in this menu.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
                     reaper.ImGui_Text(ctx, "Layout")
                     reaper.ImGui_Separator(ctx)
-                    _, State.column_gap = reaper.ImGui_SliderInt(ctx, "Column Gap (px)", State.column_gap, 0, 100)
+                    _, State.column_gap = reaper.ImGui_SliderInt(ctx, "Column Gap (px)", State.column_gap, 0, 100, "%d", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Space between the Left/Right meters and the Crest Factor column.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
@@ -1381,16 +1471,16 @@ local function loop()
                     reaper.ImGui_Dummy(ctx, 0, 10)
                     reaper.ImGui_Text(ctx, "Range")
                     reaper.ImGui_Separator(ctx)
-                    _, State.balance_db_scale = reaper.ImGui_SliderDouble(ctx, "Max Range (+/- dB)", State.balance_db_scale, 1.0, 24.0, "%.1f")
+                    _, State.balance_db_scale = reaper.ImGui_SliderDouble(ctx, "Max Range (+/- dB)", State.balance_db_scale, 1.0, 24.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Decibel range from center to edge.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
                     reaper.ImGui_Text(ctx, "Drift Speeds")
                     reaper.ImGui_Separator(ctx)
-                    _, State.balance_window_sec = reaper.ImGui_SliderDouble(ctx, "Slow Drift Speed (sec)", State.balance_window_sec, 0.1, 10.0, "%.1f")
+                    _, State.balance_window_sec = reaper.ImGui_SliderDouble(ctx, "Slow Drift Speed (sec)", State.balance_window_sec, 0.1, 10.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Integration time for sustained RMS balance.")
 
-                    _, State.balance_window_sec_fast = reaper.ImGui_SliderDouble(ctx, "Fast Drift Speed (sec)", State.balance_window_sec_fast, 0.033, 2.0, "%.3f")
+                    _, State.balance_window_sec_fast = reaper.ImGui_SliderDouble(ctx, "Fast Drift Speed (sec)", State.balance_window_sec_fast, 0.033, 2.0, "%.3f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Integration time for instantaneous Peak balance.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
@@ -1407,31 +1497,31 @@ local function loop()
                     reaper.ImGui_Text(ctx, "Peak Settings")
                     reaper.ImGui_Separator(ctx)
                     local _
-                    _, State.peak_db_min = reaper.ImGui_SliderDouble(ctx, "Min DB##Peak", State.peak_db_min, -100.0, 0.0, "%.1f")
+                    _, State.peak_db_min = reaper.ImGui_SliderDouble(ctx, "Min DB##Peak", State.peak_db_min, -100.0, 0.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Lowest decibel value shown on Peak meters.")
 
-                    _, State.peak_db_max = reaper.ImGui_SliderDouble(ctx, "Max DB##Peak", State.peak_db_max, -100.0, 0.0, "%.1f")
+                    _, State.peak_db_max = reaper.ImGui_SliderDouble(ctx, "Max DB##Peak", State.peak_db_max, -100.0, 0.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Highest decibel value shown on Peak meters.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
                     reaper.ImGui_Text(ctx, "RMS Settings")
                     reaper.ImGui_Separator(ctx)
-                    _, State.rms_db_min = reaper.ImGui_SliderDouble(ctx, "Min DB##RMS", State.rms_db_min, -100.0, 0.0, "%.1f")
+                    _, State.rms_db_min = reaper.ImGui_SliderDouble(ctx, "Min DB##RMS", State.rms_db_min, -100.0, 0.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Lowest decibel value shown on RMS meters.")
 
-                    _, State.rms_db_max = reaper.ImGui_SliderDouble(ctx, "Max DB##RMS", State.rms_db_max, -100.0, 0.0, "%.1f")
+                    _, State.rms_db_max = reaper.ImGui_SliderDouble(ctx, "Max DB##RMS", State.rms_db_max, -100.0, 0.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Highest decibel value shown on RMS meters.")
 
-                    _, State.damping = reaper.ImGui_SliderDouble(ctx, "Smoothing", State.damping, 0.01, 1.0, "%.2f")
+                    _, State.damping = reaper.ImGui_SliderDouble(ctx, "Smoothing", State.damping, 0.01, 1.0, "%.2f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "RC filter speed for the RMS calculation. Lower is slower.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
                     reaper.ImGui_Text(ctx, "Global")
                     reaper.ImGui_Separator(ctx)
-                    _, State.falloff_db_sec = reaper.ImGui_SliderDouble(ctx, "Meter Falloff (dB/s)", State.falloff_db_sec, 5.0, 100.0, "%.1f")
+                    _, State.falloff_db_sec = reaper.ImGui_SliderDouble(ctx, "Meter Falloff (dB/s)", State.falloff_db_sec, 5.0, 100.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Speed at which the meter bars drop (dB per second).")
 
-                    _, State.rolling_window_sec = reaper.ImGui_SliderDouble(ctx, "Rolling Window (sec)", State.rolling_window_sec, 1.0, 10.0, "%.1f")
+                    _, State.rolling_window_sec = reaper.ImGui_SliderDouble(ctx, "Rolling Window (sec)", State.rolling_window_sec, 1.0, 10.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Time in seconds before the rolling maximum resets.")
 
                     if State.peak_db_min >= State.peak_db_max then State.peak_db_min = State.peak_db_max - 1 end
@@ -1454,7 +1544,7 @@ local function loop()
                     _, State.tgt_peak_active = reaper.ImGui_Checkbox(ctx, "Enable Peak Target by Default##Peak", State.tgt_peak_active)
                     DrawTooltip(ctx, "Turn on the Peak target line automatically.")
 
-                    _, State.tgt_peak_db = reaper.ImGui_SliderDouble(ctx, "Default Peak Target (dB)##Peak", State.tgt_peak_db, -60.0, 0.0, "%.1f")
+                    _, State.tgt_peak_db = reaper.ImGui_SliderDouble(ctx, "Default Peak Target (dB)##Peak", State.tgt_peak_db, -60.0, 0.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Default decibel level for the Peak target.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
@@ -1463,7 +1553,7 @@ local function loop()
                     _, State.tgt_rms_active = reaper.ImGui_Checkbox(ctx, "Enable RMS Target by Default##RMS", State.tgt_rms_active)
                     DrawTooltip(ctx, "Turn on the RMS target line automatically.")
 
-                    _, State.tgt_rms_db = reaper.ImGui_SliderDouble(ctx, "Default RMS Target (dB)##RMS", State.tgt_rms_db, -60.0, 0.0, "%.1f")
+                    _, State.tgt_rms_db = reaper.ImGui_SliderDouble(ctx, "Default RMS Target (dB)##RMS", State.tgt_rms_db, -60.0, 0.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Default decibel level for the RMS target.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)
@@ -1474,10 +1564,10 @@ local function loop()
                     _, State.tgt_marker_size = reaper.ImGui_Combo(ctx, "Marker Size", State.tgt_marker_size, size_opts)
                     DrawTooltip(ctx, "Choose the size and layout of the target value handle.")
 
-                    _, State.tgt_marker_indent = reaper.ImGui_SliderDouble(ctx, "Box Indent (px)", State.tgt_marker_indent, 0.0, 50.0, "%.1f")
+                    _, State.tgt_marker_indent = reaper.ImGui_SliderDouble(ctx, "Box Indent (px)", State.tgt_marker_indent, 0.0, 50.0, "%.1f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Shrinks the target box to expose the target line underneath.")
 
-                    _, State.tgt_marker_bg_alpha = reaper.ImGui_SliderDouble(ctx, "Box Opacity", State.tgt_marker_bg_alpha, 0.0, 1.0, "%.2f")
+                    _, State.tgt_marker_bg_alpha = reaper.ImGui_SliderDouble(ctx, "Box Opacity", State.tgt_marker_bg_alpha, 0.0, 1.0, "%.2f", SLIDER_CLAMP)
                     DrawTooltip(ctx, "Transparency of the target handle background.")
 
                     reaper.ImGui_Dummy(ctx, 0, 10)

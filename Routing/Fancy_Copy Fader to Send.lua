@@ -1,7 +1,9 @@
 -- @description Fancy Copy Fader to Send
 -- @author Fancy Scripts
--- @version 1.1.0
+-- @version 1.1.1
 -- @changelog
+--   # Only copy fader volume to pre-fader sends (post-fader sends were attenuated twice)
+--   # No empty undo point when nothing changes
 --   + Migrated to shared _lib/ modules
 -- @about
 --   Sets specified Send volume to match the Main Track Fader.
@@ -37,19 +39,36 @@ local function main()
   -- Convert to 0-based index for API
   send_idx = math.floor(send_idx) - 1
 
-  -- 2. Modify selected tracks inside undo block
-  Utils.undo_block("Copy Fader to Send " .. (send_idx + 1), function()
-    local count_sel_tracks = reaper.CountSelectedTracks(0)
-    for i = 0, count_sel_tracks - 1 do
-      local track = reaper.GetSelectedTrack(0, i)
-      if track and reaper.GetTrackNumSends(track, 0) > send_idx then
-        -- Get the Main Track Volume
+  -- 2. Collect changes first so no empty undo point is created.
+  --    Only pre-fader sends (I_SENDMODE 1 = pre-FX, 3 = pre-fader/post-FX)
+  --    are updated: a post-fader send (0) already follows the fader, so
+  --    copying D_VOL into it would apply the fader attenuation twice.
+  local changes = {}
+  local count_sel_tracks = reaper.CountSelectedTracks(0)
+  for i = 0, count_sel_tracks - 1 do
+    local track = reaper.GetSelectedTrack(0, i)
+    if track and reaper.GetTrackNumSends(track, 0) > send_idx then
+      local mode = reaper.GetTrackSendInfo_Value(track, 0, send_idx, "I_SENDMODE")
+      if mode == 1 or mode == 3 then
         local main_vol = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
-        -- Set the Send Volume to match
-        reaper.SetTrackSendInfo_Value(track, 0, send_idx, "D_VOL", main_vol)
+        local send_vol = reaper.GetTrackSendInfo_Value(track, 0, send_idx, "D_VOL")
+        if send_vol ~= main_vol then
+          changes[#changes + 1] = { track = track, vol = main_vol }
+        end
       end
     end
+  end
+
+  if #changes == 0 then return end
+
+  -- 3. Apply inside a single undo block
+  reaper.PreventUIRefresh(1)
+  Utils.undo_block("Copy Fader to Send " .. (send_idx + 1), function()
+    for _, c in ipairs(changes) do
+      reaper.SetTrackSendInfo_Value(c.track, 0, send_idx, "D_VOL", c.vol)
+    end
   end)
+  reaper.PreventUIRefresh(-1)
 end
 
 -------------------------------------------------------------------------------

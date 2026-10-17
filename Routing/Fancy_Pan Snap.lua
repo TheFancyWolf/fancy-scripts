@@ -1,7 +1,14 @@
 -- @description Fancy Pan Snap
 -- @author Fancy Scripts
--- @version 1.7.1
+-- @version 1.7.2
 -- @changelog
+--   # Undo/Redo of pan changes is no longer re-snapped (kept redo history intact)
+--   # Bypass modifier now checks Shift/Alt (was Shift/Win) via js_ReaScriptAPI
+--   # Tracks using the project default pan mode are now resolved correctly
+--   # Snap grid can always reach full Left/Right (100%) for steps that do not divide 100
+--   # Deleting a send no longer causes spurious snaps on the remaining sends
+--   # Send pan envelopes are respected during playback
+--   # Stale running-state after a crash no longer stops the script from launching
 --   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
 -- @about
 --   Background auto-snap utility that snaps Track Pan, Track Width / Dual Pan,
@@ -202,6 +209,50 @@ local last_track_count = -1
 local cached_track_list = {}
 local last_cleanup_time = 0
 
+-- Undo history tracking (used to tell Undo/Redo apart from knob moves)
+local last_undo_str = nil
+local last_redo_str = nil
+
+-- Per-track send counts (keyed by track GUID) to reset send records when sends are added/removed
+local last_send_counts = {}
+
+--- Detects whether an Undo or Redo happened since the previous call.
+--- Undo leaves a non-empty redo stack; Redo moves the previous top-of-redo to
+--- the top of the undo stack. A new regular action clears the redo stack and
+--- is therefore not reported.
+--- @param proj userdata
+--- @return boolean
+local function detect_undo_redo(proj)
+  local cur_undo = reaper.Undo_CanUndo2(proj)
+  local cur_redo = reaper.Undo_CanRedo2(proj)
+  local happened = false
+  if cur_undo ~= last_undo_str or cur_redo ~= last_redo_str then
+    if cur_redo ~= nil or (last_redo_str ~= nil and cur_undo == last_redo_str) then
+      happened = true
+    end
+  end
+  last_undo_str = cur_undo
+  last_redo_str = cur_redo
+  return happened
+end
+
+--- Resolves the project default pan mode (used by tracks with I_PANMODE == -1).
+--- Falls back to balance (3) when the config variable is not readable.
+--- @return integer
+local function get_project_default_panmode()
+  local v
+  if reaper.SNM_GetIntConfigVar then
+    v = reaper.SNM_GetIntConfigVar("panmode", -1)
+    if v and v < 0 then v = nil end
+  end
+  if v == nil and reaper.get_config_var_string then
+    local ok, str = reaper.get_config_var_string("panmode")
+    if ok then v = tonumber(str) end
+  end
+  if v == nil then return 3 end
+  return math.floor(v) & 7
+end
+
 -- Custom ReaImGui floating cursor tooltip state
 local active_tip_data = nil
 local tooltip_hide_deadline = 0
@@ -229,6 +280,13 @@ local function calculate_snap(val, step_pct)
   local steps = math.floor((val / step) + 0.5)
   local snapped = steps * step
   snapped = math.max(-1.0, math.min(1.0, snapped))
+  -- The grid is anchored at 0, so when the step does not divide 1.0 evenly the
+  -- outermost grid point falls short of full L/R. Treat +/-1.0 as snap targets
+  -- too and pick whichever is nearest (ties keep the grid point).
+  local edge = (val < 0) and -1.0 or 1.0
+  if math.abs(edge - val) < math.abs(snapped - val) then
+    snapped = edge
+  end
   snapped = math.floor(snapped * 10000 + 0.5) / 10000
   if math.abs(snapped) < 1e-5 then
     snapped = 0.0
@@ -269,9 +327,9 @@ end
 --- @param imgui_ctx userdata|nil
 --- @return boolean
 local function is_bypass_active(imgui_ctx)
-  -- 1. Check JS_Mouse_GetState if available (DAW-wide: Bit 3=Shift [8], Bit 5=Alt/Option [32])
+  -- 1. Check JS_Mouse_GetState if available (DAW-wide: Shift = 8, Alt/Option = 16)
   if reaper.JS_Mouse_GetState then
-    local s = reaper.JS_Mouse_GetState(40)
+    local s = reaper.JS_Mouse_GetState(8 | 16)
     if s and s ~= 0 then return true end
   end
 
@@ -309,8 +367,18 @@ end
 --- @param track userdata  MediaTrack pointer
 --- @param param_type string
 --- @return boolean
-local function has_playback_envelope(track, param_type)
+local function has_playback_envelope(track, param_type, send_idx)
   if (reaper.GetPlayState() & 1) == 0 then return false end
+  if param_type == "send" then
+    if not send_idx then return false end
+    local ok, env = pcall(reaper.GetTrackSendInfo_Value, track, 0, send_idx, "P_ENV:<PANENV")
+    if ok and env and type(env) ~= "number"
+      and reaper.ValidatePtr(env, "TrackEnvelope*")
+      and reaper.CountEnvelopePoints(env) > 0 then
+      return true
+    end
+    return false
+  end
   local env_name
   if param_type == "pan" then
     env_name = "Pan"
@@ -376,7 +444,7 @@ local function set_param_value(track, param_type, send_idx, val)
 end
 
 --- Scans a single track parameter and triggers snap if motion settled or released.
-local function process_param(track, guid, track_name, param_type, param_name, send_idx, key, now, mouse_down, bypass)
+local function process_param(track, guid, track_name, param_type, param_name, send_idx, key, now, mouse_down, bypass, adopt)
   local val = get_param_value(track, param_type, send_idx)
   if val == nil then return end
 
@@ -401,6 +469,15 @@ local function process_param(track, guid, track_name, param_type, param_name, se
   rec.track = track
   rec.track_name = track_name
 
+  -- Value was changed by Undo/Redo: accept it as the new baseline without snapping,
+  -- so no new undo point is created and the redo history stays intact.
+  if adopt then
+    rec.last_val = val
+    rec.is_moving = false
+    rec.mouse_down_seen = false
+    return
+  end
+
   local diff = math.abs(val - rec.last_val)
 
   -- FAST PATH: If value has not changed and parameter is not in motion, exit immediately
@@ -410,10 +487,9 @@ local function process_param(track, guid, track_name, param_type, param_name, se
 
   -- Check if value has changed
   if diff > 0.0005 then
-    if not has_playback_envelope(track, param_type) then
+    if not has_playback_envelope(track, param_type, send_idx) then
       if not rec.is_moving then
         rec.is_moving = true
-        rec.drag_start_val = rec.last_val
         rec.mouse_down_seen = (mouse_down == true)
       else
         if mouse_down == true then
@@ -426,7 +502,6 @@ local function process_param(track, guid, track_name, param_type, param_name, se
       rec.last_val = val
       rec.is_moving = false
       rec.mouse_down_seen = false
-      rec.drag_start_val = nil
     end
   end
 
@@ -450,7 +525,6 @@ local function process_param(track, guid, track_name, param_type, param_name, se
     if should_snap then
       rec.is_moving = false
       rec.mouse_down_seen = false
-      rec.drag_start_val = nil
 
       -- If bypass modifier is held, allow free panning without snapping
       if bypass then
@@ -478,6 +552,10 @@ local function process_param(track, guid, track_name, param_type, param_name, se
         Utils.undo_block(undo_title, function()
           set_param_value(track, param_type, send_idx, snapped)
         end)
+        -- Record the post-snap undo state so our own undo point is not mistaken
+        -- for an external Undo/Redo on the next tick.
+        last_undo_str = reaper.Undo_CanUndo2(0)
+        last_redo_str = reaper.Undo_CanRedo2(0)
 
         rec.last_val = snapped
 
@@ -526,6 +604,9 @@ local function snap_engine_tick(imgui_ctx)
     tracked_params = {}
     active_tip_data = nil
     cached_track_list = {}
+    last_send_counts = {}
+    last_undo_str = reaper.Undo_CanUndo2(cur_proj)
+    last_redo_str = reaper.Undo_CanRedo2(cur_proj)
     if not hud_open then
       if ctx and reaper.ImGui_DestroyContext then
         pcall(reaper.ImGui_DestroyContext, ctx)
@@ -538,6 +619,8 @@ local function snap_engine_tick(imgui_ctx)
   local now = reaper.time_precise()
   local mouse_down = is_mouse_lbutton_down()
   local bypass = is_bypass_active(imgui_ctx)
+  local adopt = detect_undo_redo(cur_proj)
+  local default_panmode = nil
 
   local proj_state = reaper.GetProjectStateChangeCount(cur_proj)
   local track_count = reaper.CountTracks(cur_proj)
@@ -595,25 +678,39 @@ local function snap_engine_tick(imgui_ctx)
 
     if reaper.ValidatePtr2(cur_proj, tr, "MediaTrack*") then
       local pan_mode = math.floor(reaper.GetMediaTrackInfo_Value(tr, "I_PANMODE") + 0.5)
+      if pan_mode < 0 then
+        default_panmode = default_panmode or get_project_default_panmode()
+        pan_mode = default_panmode
+      end
 
       -- 1. Track Pan (D_PAN)
       if config.target_pan and pan_mode ~= 6 then
-        process_param(tr, tinfo.guid, tinfo.name, "pan", "Pan", nil, tinfo.key_pan, now, mouse_down, bypass)
+        process_param(tr, tinfo.guid, tinfo.name, "pan", "Pan", nil, tinfo.key_pan, now, mouse_down, bypass, adopt)
       end
 
       -- 2. Track Width / Dual Pan
       if config.target_width then
         if pan_mode == 6 then
-          process_param(tr, tinfo.guid, tinfo.name, "dual_l", "Dual Pan L", nil, tinfo.key_dual_l, now, mouse_down, bypass)
-          process_param(tr, tinfo.guid, tinfo.name, "dual_r", "Dual Pan R", nil, tinfo.key_dual_r, now, mouse_down, bypass)
+          process_param(tr, tinfo.guid, tinfo.name, "dual_l", "Dual Pan L", nil, tinfo.key_dual_l, now, mouse_down, bypass, adopt)
+          process_param(tr, tinfo.guid, tinfo.name, "dual_r", "Dual Pan R", nil, tinfo.key_dual_r, now, mouse_down, bypass, adopt)
         elseif pan_mode == 5 then
-          process_param(tr, tinfo.guid, tinfo.name, "width", "Width", nil, tinfo.key_width, now, mouse_down, bypass)
+          process_param(tr, tinfo.guid, tinfo.name, "width", "Width", nil, tinfo.key_width, now, mouse_down, bypass, adopt)
         end
       end
 
       -- 3. Send Pans
       if config.target_sends then
         local num_sends = reaper.GetTrackNumSends(tr, 0)
+        -- Send records are keyed by index: when sends are added/removed the
+        -- indices shift, so drop this track's send records and let them be
+        -- re-created from the current values (no snap on creation).
+        local prev_sends = last_send_counts[tinfo.guid]
+        if prev_sends and prev_sends ~= num_sends then
+          for s = 0, math.max(prev_sends, num_sends) - 1 do
+            tracked_params[tinfo.guid .. ":send:" .. s] = nil
+          end
+        end
+        last_send_counts[tinfo.guid] = num_sends
         if num_sends > 0 then
           for s = 0, num_sends - 1 do
             local skey = tinfo.send_keys[s]
@@ -626,7 +723,7 @@ local function snap_engine_tick(imgui_ctx)
               sname = string.format("Send %d Pan", s + 1)
               tinfo.send_names[s] = sname
             end
-            process_param(tr, tinfo.guid, tinfo.name, "send", sname, s, skey, now, mouse_down, bypass)
+            process_param(tr, tinfo.guid, tinfo.name, "send", sname, s, skey, now, mouse_down, bypass, adopt)
           end
         end
       end
@@ -639,10 +736,9 @@ local function snap_engine_tick(imgui_ctx)
   if (now - last_cleanup_time) > 5.0 then
     last_cleanup_time = now
     for k, rec in pairs(tracked_params) do
-      if not rec.is_moving then
-        if not reaper.ValidatePtr2(cur_proj, rec.track, "MediaTrack*") then
-          tracked_params[k] = nil
-        end
+      if not reaper.ValidatePtr2(cur_proj, rec.track, "MediaTrack*") then
+        tracked_params[k] = nil
+        last_send_counts[rec.guid] = nil
       end
     end
   end
@@ -1393,7 +1489,13 @@ end
 -------------------------------------------------------------------------------
 -- 8. MAIN DEFER LOOP
 -------------------------------------------------------------------------------
+local HEARTBEAT_KEY     = "pan_snap_heartbeat"
+local HEARTBEAT_STALE_S = 2.0
+
 local function loop()
+  -- Heartbeat so a new launch can tell a live instance from stale state left by a crash
+  reaper.SetExtState(EXTSTATE_SECTION, HEARTBEAT_KEY, tostring(reaper.time_precise()), false)
+
   -- Always run the background pan-snapping engine tick
   snap_engine_tick(ctx)
 
@@ -1483,7 +1585,10 @@ local function main()
 
   -- 2. Check previous HUD state
   local prev_hud_state = reaper.GetExtState(EXTSTATE_SECTION, "pan_snap_hud_open")
-  if prev_hud_state == "1" then
+  local last_beat = tonumber(reaper.GetExtState(EXTSTATE_SECTION, HEARTBEAT_KEY))
+  local instance_alive = last_beat ~= nil
+    and math.abs(reaper.time_precise() - last_beat) < HEARTBEAT_STALE_S
+  if prev_hud_state == "1" and instance_alive then
     -- Script was already running and HUD was visible -> user clicked toolbar/action to turn it OFF
     reaper.DeleteExtState(EXTSTATE_SECTION, "pan_snap_hud_open", false)
     local _, _, sec_id, cmd_id = reaper.get_action_context()
@@ -1500,6 +1605,7 @@ local function main()
 
   Utils.init_toolbar_toggle()
   reaper.SetExtState(EXTSTATE_SECTION, "pan_snap_hud_open", "1", false)
+  reaper.SetExtState(EXTSTATE_SECTION, HEARTBEAT_KEY, tostring(reaper.time_precise()), false)
 
   reaper.atexit(function()
     -- Only delete ExtState if stopping intentionally (not when replaced by a new instance)
