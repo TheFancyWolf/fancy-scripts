@@ -1,7 +1,8 @@
 -- @description Fancy Mapper Volume Down
 -- @author Fancy Scripts
--- @version 3.0.0
+-- @version 3.0.1
 -- @changelog
+--   # Reaching the bottom of the range now sets the fader to true -inf (matches the dial's Volume mode)
 --   + v3: Settings-driven config (reads from Fancy Mapper Settings)
 --   + v3: Controller-agnostic design
 -- @about
@@ -22,6 +23,7 @@
 
 local STEP_DB     = tonumber(reaper.GetExtState("FancyMapper", "vol_step_db") or "") or 1.0
 local THROTTLE_MS = tonumber(reaper.GetExtState("FancyMapper", "throttle_ms") or "") or 60
+local INF_DB      = -140.0 -- at or below: fader is -inf
 local MIN_DB      = -150.0
 
 -------------------------------------------------------------------------------
@@ -55,9 +57,9 @@ local function main()
     local track = reaper.GetSelectedTrack(0, i)
     if track then
       local vol = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
-      local db = 20 * math.log(vol, 10)
+      local db = (vol > 0) and (20 * math.log(vol, 10)) or MIN_DB
       db = math.max(db - STEP_DB, MIN_DB)
-      local new_vol = 10 ^ (db / 20)
+      local new_vol = (db <= INF_DB) and 0.0 or (10 ^ (db / 20))
       reaper.SetMediaTrackInfo_Value(track, "D_VOL", new_vol)
     end
   end

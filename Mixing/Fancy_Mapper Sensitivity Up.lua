@@ -1,7 +1,9 @@
 -- @description Fancy Mapper Sensitivity Up
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
+--   # Pressing again while the toast is showing now adjusts again (was: only closed the toast)
+--   # Values are saved with 0.01 precision so fractional steps (e.g. 0.05) no longer get stuck
 --   + v5.1: Added sensitivity scaling for volume, width, MIDI CC, velocity, and item slip
 -- @about
 --   Increases the sensitivity of the currently active Fancy Mapper mode.
@@ -22,7 +24,8 @@ if not reaper.ImGui_CreateContext then
   return
 end
 
-reaper.set_action_options(1)
+-- Re-launching while the toast is still showing: end the old toast and run again
+if reaper.set_action_options then reaper.set_action_options(1 | 2) end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
@@ -102,7 +105,7 @@ local function adjust()
   local new_val = math.min(cur + step, MODE_MAX[mode] or 5.0)
   if is_int then new_val = math.floor(new_val + 0.5) end
 
-  reaper.SetExtState("FancyMapper", key, is_int and tostring(new_val) or string.format("%.1f", new_val), true)
+  reaper.SetExtState("FancyMapper", key, is_int and tostring(new_val) or string.format("%.2f", new_val), true)
 
   local fmt = is_int and "%s: %d%s" or "%s: %.1f%s"
   return string.format(fmt, MODE_LABELS[mode], new_val, MODE_SUFFIX[mode] or "")

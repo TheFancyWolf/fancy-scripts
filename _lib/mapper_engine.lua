@@ -1,6 +1,6 @@
 -- @description Fancy Mapper Core Engine
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @about
 --   Shared engine for Fancy Mapper scripts.
 --   Provides unified configuration, throttling, context targeting,
@@ -32,31 +32,39 @@ local function get_bool(key, default)
   return v == "1" or v == "true"
 end
 
+-- Clamp a loaded number into [lo, hi]; NaN and non-numbers fall back to default
+local function clamp_num(v, default, lo, hi)
+  if type(v) ~= "number" or v ~= v then return default end
+  if lo and v < lo then v = lo end
+  if hi and v > hi then v = hi end
+  return v
+end
+
 function MapperEngine.load_config()
   return {
-    ticks                 = get_num("ticks_per_rotation", 26),
-    throttle              = get_num("throttle_ms", 60),
+    ticks                 = clamp_num(get_num("ticks_per_rotation", 26), 26, 1, 10000),
+    throttle              = clamp_num(get_num("throttle_ms", 60), 60, 0, 10000),
     scrub_unit            = get_cfg("scrub_unit", "free"),
-    scrub_secs            = get_num("scrub_seconds", 2.0),
+    scrub_secs            = clamp_num(get_num("scrub_seconds", 2.0), 2.0, 0.001, 3600),
     scrub_view            = get_bool("scrub_move_view", true),
-    fx_sens               = get_num("fx_sensitivity", 1.0),
+    fx_sens               = clamp_num(get_num("fx_sensitivity", 1.0), 1.0, 0, 100),
     fx_fallback           = get_bool("fx_pan_fallback", true),
-    pan_sens              = get_num("pan_sensitivity", 1.0),
-    vol_step              = get_num("vol_step_db", 1.0),
-    width_sens            = get_num("width_sensitivity", 1.0),
+    pan_sens              = clamp_num(get_num("pan_sensitivity", 1.0), 1.0, 0, 100),
+    vol_step              = clamp_num(get_num("vol_step_db", 1.0), 1.0, 0, 150),
+    width_sens            = clamp_num(get_num("width_sensitivity", 1.0), 1.0, 0, 100),
     width_auto_stereo_pan = get_bool("width_auto_stereo_pan", true),
     midi_cc_targets       = get_cfg("midi_cc_targets", "1"),
-    midi_cc_sens          = get_num("midi_cc_sensitivity", 1.0),
+    midi_cc_sens          = clamp_num(get_num("midi_cc_sensitivity", 1.0), 1.0, 0, 100),
     midi_cc_linear        = get_bool("midi_cc_linear", true),
-    midi_channel          = get_num("midi_channel", 1),
+    midi_channel          = clamp_num(get_num("midi_channel", 1), 1, 1, 16),
     midi_auto_arm         = get_bool("midi_auto_arm", true),
     midi_show_tooltip     = get_bool("midi_show_tooltip", true),
-    midi_vel_sens         = get_num("midi_vel_sensitivity", 1.0),
+    midi_vel_sens         = clamp_num(get_num("midi_vel_sensitivity", 1.0), 1.0, 0, 100),
     midi_vel_audition     = get_bool("midi_vel_audition", false),
-    slip_step_ms          = get_num("slip_step_ms", 10),
+    slip_step_ms          = clamp_num(get_num("slip_step_ms", 10), 10, 0, 100000),
     track_nav_scroll      = get_bool("track_nav_scroll", true),
     smooth_dial_enabled   = get_bool("smooth_dial_enabled", true),
-    smooth_dial_speed     = get_num("smooth_dial_speed", 25.0),
+    smooth_dial_speed     = clamp_num(get_num("smooth_dial_speed", 25.0), 25.0, 1.0, 1000.0),
     smooth_vol            = get_bool("smooth_vol", true),
     smooth_pan            = get_bool("smooth_pan", true),
     smooth_width          = get_bool("smooth_width", true),
@@ -162,17 +170,60 @@ local function get_track_by_guid(guid_str)
   return nil
 end
 
+-- Seconds without a daemon heartbeat before it is considered gone. Generous so a
+-- briefly stalled UI thread does not make the engine relaunch a live daemon.
+MapperEngine.DAEMON_TIMEOUT_S = 3.0
+
 function MapperEngine.is_daemon_alive()
   local now = reaper.time_precise()
   local last_ping = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "daemon_ping") or "0") or 0
-  return (now - last_ping) < 1.0
+  return (now - last_ping) < MapperEngine.DAEMON_TIMEOUT_S
+end
+
+-- Collapse "." and ".." segments so the same file always maps to one path
+-- (AddRemoveReaScript registers a new action for every distinct path string).
+local function normalize_path(path)
+  local lead = path:match("^[\\/]*")
+  local out = {}  -- { segment, separator-after-it }
+  for seg, sep in path:sub(#lead + 1):gmatch("([^\\/]+)([\\/]*)") do
+    local prev = out[#out]
+    if seg == ".." and prev and prev[1] ~= ".." and not prev[1]:match(":$") then
+      out[#out] = nil
+    elseif seg ~= "." then
+      out[#out + 1] = { seg, sep }
+    end
+  end
+  local parts = { lead }
+  for _, p in ipairs(out) do
+    parts[#parts + 1] = p[1] .. p[2]
+  end
+  return table.concat(parts)
+end
+
+-- Every smooth-dial target/state key the daemon consumes
+local SMOOTH_KEYS = {
+  "target_vol_db", "cur_vol_db", "smooth_vol_guid",
+  "target_pan", "cur_pan", "smooth_pan_guid",
+  "target_width", "cur_width", "smooth_width_guid",
+  "target_fx_val", "cur_fx_val", "smooth_fx_id",
+  "target_cc_val", "cur_cc_val",
+  "target_scrub_pos", "cur_scrub_pos",
+  "target_slip_offs", "cur_slip_offs",
+}
+
+function MapperEngine.clear_smooth_targets()
+  for _, k in ipairs(SMOOTH_KEYS) do
+    reaper.DeleteExtState(EXTSTATE_SECTION, k, false)
+  end
 end
 
 function MapperEngine.ensure_daemon_running()
   if MapperEngine.is_daemon_alive() then return true end
 
   local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
-  local daemon_path = script_dir .. "../Mixing/Fancy_Mapper Daemon.lua"
+  script_dir = normalize_path(script_dir)
+  local root_dir = script_dir:gsub("_lib[\\/]$", "")
+  local daemon_path = root_dir .. "Mixing" .. (script_dir:match("[\\/]$") or "/") .. "Fancy_Mapper Daemon.lua"
   if not reaper.file_exists(daemon_path) then
     daemon_path = script_dir .. "Fancy_Mapper Daemon.lua"
   end
@@ -188,6 +239,15 @@ end
 local function ensure_track_midi_ready(track)
   if not track then return end
 
+  -- Only prepare tracks that can actually use the live MIDI: tracks already
+  -- fed by a MIDI input, or tracks hosting an instrument. Audio tracks are
+  -- left untouched (no arming, no input change).
+  local recinput = reaper.GetMediaTrackInfo_Value(track, "I_RECINPUT")
+  local has_midi_input = recinput >= 4096
+  local has_instrument = reaper.TrackFX_GetInstrument
+    and reaper.TrackFX_GetInstrument(track) >= 0
+  if not has_midi_input and not has_instrument then return end
+
   -- 1. Record arm
   local recarm = reaper.GetMediaTrackInfo_Value(track, "I_RECARM")
   if recarm == 0 then
@@ -201,8 +261,7 @@ local function ensure_track_midi_ready(track)
   end
 
   -- 3. Record input (ensure MIDI enabled and VKB allowed)
-  local recinput = reaper.GetMediaTrackInfo_Value(track, "I_RECINPUT")
-  if recinput < 4096 then
+  if not has_midi_input then
     -- Set to All MIDI inputs, all channels (6112)
     reaper.SetMediaTrackInfo_Value(track, "I_RECINPUT", 6112)
   else
@@ -269,6 +328,159 @@ local function get_target_take()
 end
 
 -------------------------------------------------------------------------------
+-- 3b. SMOOTH-DIAL TARGET HELPERS
+-------------------------------------------------------------------------------
+
+-- Volume: at or below VOL_INF_DB a fader is -inf (written as 0.0). The same
+-- threshold is used for reading and writing so the two always agree.
+local VOL_INF_DB   = -140.0
+local VOL_MIN_DB   = -150.0
+local VOL_MAX_DB   = 12.0
+-- Raising a fader from -inf jumps straight to this level instead of crawling
+-- through the inaudible -150..-60 dB range one step at a time.
+local VOL_FLOOR_DB = -60.0
+
+local function vol_to_db(vol)
+  if vol > 0 then
+    local db = 20 * math.log(vol, 10)
+    if db > VOL_INF_DB then return db end
+  end
+  return VOL_MIN_DB
+end
+
+local function db_to_vol(db)
+  if db <= VOL_INF_DB then return 0.0 end
+  return 10 ^ (db / 20)
+end
+
+-- Next volume (dB) one step from base_db. Returns the new value and whether
+-- it was a jump up out of -inf. A fader already above VOL_MAX_DB is not
+-- pulled down by an upward step.
+local function step_vol_db(base_db, delta)
+  if delta > 0 and base_db <= VOL_INF_DB then
+    return math.max(VOL_FLOOR_DB, VOL_INF_DB + delta), true
+  end
+  local hi = math.max(VOL_MAX_DB, base_db)
+  return math.min(hi, math.max(VOL_MIN_DB, base_db + delta)), false
+end
+
+-- Per-parameter smoothing slots for track-level targets. Each slot carries the
+-- GUID of the track it belongs to, so slots never leak across tracks.
+local TRACK_TARGETS = {
+  vol   = { tgt = "target_vol_db", cur = "cur_vol_db", guid = "smooth_vol_guid",
+            eps = 0.05,  undo = "Fancy Mapper: Adjust Volume" },
+  pan   = { tgt = "target_pan",    cur = "cur_pan",    guid = "smooth_pan_guid",
+            eps = 0.005, undo = "Fancy Mapper: Adjust Pan" },
+  width = { tgt = "target_width",  cur = "cur_width",  guid = "smooth_width_guid",
+            eps = 0.005, undo = "Fancy Mapper: Adjust Width" },
+}
+
+local function read_track_target(kind, tr)
+  if kind == "vol" then return vol_to_db(reaper.GetMediaTrackInfo_Value(tr, "D_VOL")) end
+  if kind == "pan" then return reaper.GetMediaTrackInfo_Value(tr, "D_PAN") end
+  return reaper.GetMediaTrackInfo_Value(tr, "D_WIDTH")
+end
+
+local function write_track_target(kind, tr, v)
+  if kind == "vol" then
+    reaper.SetMediaTrackInfo_Value(tr, "D_VOL", db_to_vol(v))
+  elseif kind == "pan" then
+    reaper.SetMediaTrackInfo_Value(tr, "D_PAN", v)
+  else
+    reaper.SetMediaTrackInfo_Value(tr, "D_WIDTH", v)
+  end
+end
+
+local function drop_track_target(kind)
+  local spec = TRACK_TARGETS[kind]
+  reaper.DeleteExtState(EXTSTATE_SECTION, spec.tgt, false)
+  reaper.DeleteExtState(EXTSTATE_SECTION, spec.cur, false)
+  reaper.DeleteExtState(EXTSTATE_SECTION, spec.guid, false)
+end
+
+-- Returns the value the next dial step should build on for `track`. A pending
+-- target that belongs to another track is finished instantly on that track
+-- first, then the slot is re-owned by `track`.
+local function claim_track_target(kind, track, cur, max_gap)
+  local spec = TRACK_TARGETS[kind]
+  local guid = get_guid_for_track(track)
+  local tgt = tonumber(reaper.GetExtState(EXTSTATE_SECTION, spec.tgt))
+  local owner = reaper.GetExtState(EXTSTATE_SECTION, spec.guid)
+  if tgt and owner ~= guid then
+    local old_tr = get_track_by_guid(owner)
+    if old_tr then
+      write_track_target(kind, old_tr, tgt)
+      reaper.Undo_OnStateChangeEx(spec.undo, -1, -1)
+    end
+    tgt = nil
+  end
+  reaper.SetExtState(EXTSTATE_SECTION, spec.guid, guid, false)
+  if not tgt or math.abs(tgt - cur) > max_gap then tgt = cur end
+  return tgt
+end
+
+-- Daemon side: slew one track-level slot. Returns true while still moving.
+local function process_track_target(kind, alpha)
+  local spec = TRACK_TARGETS[kind]
+  local tgt_str = reaper.GetExtState(EXTSTATE_SECTION, spec.tgt)
+  if tgt_str == "" then return false end
+  local tgt = tonumber(tgt_str)
+  local tr = tgt and get_track_by_guid(reaper.GetExtState(EXTSTATE_SECTION, spec.guid))
+  if not tr then
+    drop_track_target(kind)
+    return false
+  end
+
+  local cur = read_track_target(kind, tr)
+  local done = math.abs(tgt - cur) < spec.eps
+  if kind == "vol" and tgt <= VOL_INF_DB and cur <= VOL_INF_DB then done = true end
+
+  if done then
+    write_track_target(kind, tr, tgt)
+    reaper.DeleteExtState(EXTSTATE_SECTION, spec.tgt, false)
+    reaper.DeleteExtState(EXTSTATE_SECTION, spec.cur, false)
+    reaper.Undo_OnStateChangeEx(spec.undo, -1, -1)
+    return false
+  end
+  write_track_target(kind, tr, cur + (tgt - cur) * alpha)
+  return true
+end
+
+-- FX parameter identity: owner (track or take GUID) + FX index + FX GUID + param.
+-- Resolving it again verifies the same plug-in still sits at that slot.
+local function fx_identity(track, take, fxidx, parm)
+  if take then
+    local _, take_guid = reaper.GetSetMediaItemTakeInfo_String(take, "GUID", "", false)
+    local fx_guid = reaper.TakeFX_GetFXGUID and reaper.TakeFX_GetFXGUID(take, fxidx) or ""
+    return table.concat({ "K", take_guid or "", fxidx, fx_guid or "", parm }, "|")
+  end
+  local fx_guid = reaper.TrackFX_GetFXGUID and reaper.TrackFX_GetFXGUID(track, fxidx) or ""
+  return table.concat({ "T", get_guid_for_track(track), fxidx, fx_guid or "", parm }, "|")
+end
+
+-- Returns get(), set(v) closures for an identity, or nil if it no longer resolves.
+local function resolve_fx_identity(id)
+  local kind, owner, fxidx, fx_guid, parm =
+    (id or ""):match("^([TK])|([^|]*)|(%d+)|([^|]*)|(%d+)$")
+  if not kind then return nil end
+  fxidx, parm = tonumber(fxidx), tonumber(parm)
+  if kind == "K" then
+    local take = reaper.GetMediaItemTakeByGUID and reaper.GetMediaItemTakeByGUID(0, owner)
+    if not take then return nil end
+    if fx_guid ~= "" and reaper.TakeFX_GetFXGUID
+       and reaper.TakeFX_GetFXGUID(take, fxidx) ~= fx_guid then return nil end
+    return function() return reaper.TakeFX_GetParamNormalized(take, fxidx, parm) end,
+           function(v) reaper.TakeFX_SetParamNormalized(take, fxidx, parm, v) end
+  end
+  local tr = get_track_by_guid(owner)
+  if not tr then return nil end
+  if fx_guid ~= "" and reaper.TrackFX_GetFXGUID
+     and reaper.TrackFX_GetFXGUID(tr, fxidx) ~= fx_guid then return nil end
+  return function() return reaper.TrackFX_GetParamNormalized(tr, fxidx, parm) end,
+         function(v) reaper.TrackFX_SetParamNormalized(tr, fxidx, parm, v) end
+end
+
+-------------------------------------------------------------------------------
 -- 4. MODE ADJUSTERS
 -------------------------------------------------------------------------------
 
@@ -277,18 +489,25 @@ function MapperEngine.adjust_scrub(direction, cfg)
   local unit = cfg.scrub_unit
 
   if unit == "beat" then
-    local action = direction > 0 and 40105 or 40104
+    -- 41044 = Move edit cursor forward one beat, 41045 = back one beat
+    local action = direction > 0 and 41044 or 41045
     reaper.Main_OnCommand(action, 0)
     return true
   end
 
   if unit == "measure" then
-    local action = direction > 0 and 40103 or 40102
+    -- 41042 = Move edit cursor forward one measure, 41043 = back one measure
+    local action = direction > 0 and 41042 or 41043
     reaper.Main_OnCommand(action, 0)
     return true
   end
 
   if unit == "grid" then
+    if not (reaper.BR_GetNextGridDivision and reaper.BR_GetPrevGridDivision) then
+      -- No SWS: native "View: Move cursor right/left to grid division"
+      reaper.Main_OnCommand(direction > 0 and 40647 or 40646, 0)
+      return true
+    end
     local pos = reaper.GetCursorPosition()
     local new_pos
     if direction > 0 then
@@ -355,21 +574,34 @@ function MapperEngine.adjust_fx_param(direction, cfg)
   end
 
   if cfg.smooth_dial_enabled and cfg.smooth_fx then
-    local tgt_str = reaper.GetExtState(EXTSTATE_SECTION, "target_fx_val")
-    local tgt_val = tonumber(tgt_str) or cur_val
+    local id = fx_identity(track, target_take, fxidx, parm)
+    local tgt_val = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "target_fx_val"))
+    local owner = reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_id")
+    if tgt_val and owner ~= id then
+      -- Pending move on a different parameter: finish it there first
+      local _, set_old = resolve_fx_identity(owner)
+      if set_old then
+        set_old(tgt_val)
+        reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Parameter", -1, -1)
+      end
+      tgt_val = nil
+    end
+    if not tgt_val then
+      -- Stepped params can settle short of the requested value; keep building
+      -- on the last requested value while the param still reads what we left.
+      local rest_val = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_rest_val"))
+      if rest_val and reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_rest_id") == id
+         and math.abs(rest_val - cur_val) < 1e-6 then
+        tgt_val = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_rest_tgt"))
+      end
+    end
+    tgt_val = tgt_val or cur_val
     if math.abs(tgt_val - cur_val) > 0.3 then tgt_val = cur_val end
 
     local new_tgt = math.min(1.0, math.max(0.0, tgt_val + step * direction))
     reaper.SetExtState(EXTSTATE_SECTION, "target_fx_val", tostring(new_tgt), false)
     reaper.SetExtState(EXTSTATE_SECTION, "cur_fx_val", tostring(cur_val), false)
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_is_take", is_take and "1" or "0", false)
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_track_guid", get_guid_for_track(track), false)
-    if is_take then
-      reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_item_idx", tostring(itemidx), false)
-      reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_take_idx", tostring(takeidx), false)
-    end
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_idx", tostring(fxidx), false)
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_parm", tostring(parm), false)
+    reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_id", id, false)
     reaper.SetExtState(EXTSTATE_SECTION, "smooth_last_tick", tostring(reaper.time_precise()), false)
 
     if cfg.midi_show_tooltip and reaper.TrackCtl_SetToolTip then
@@ -413,14 +645,11 @@ local function adjust_pan_on_track(track, direction, cfg)
   local step = (2.0 / cfg.ticks) * cfg.pan_sens
 
   if cfg.smooth_dial_enabled and cfg.smooth_pan then
-    local tgt_str = reaper.GetExtState(EXTSTATE_SECTION, "target_pan")
-    local tgt_pan = tonumber(tgt_str) or cur_pan
-    if math.abs(tgt_pan - cur_pan) > 0.5 then tgt_pan = cur_pan end
+    local tgt_pan = claim_track_target("pan", track, cur_pan, 0.5)
 
     local new_tgt_pan = math.min(1.0, math.max(-1.0, tgt_pan + (step * direction)))
     reaper.SetExtState(EXTSTATE_SECTION, "target_pan", tostring(new_tgt_pan), false)
     reaper.SetExtState(EXTSTATE_SECTION, "cur_pan", tostring(cur_pan), false)
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_track_guid", get_guid_for_track(track), false)
     reaper.SetExtState(EXTSTATE_SECTION, "smooth_last_tick", tostring(reaper.time_precise()), false)
 
     if cfg.midi_show_tooltip and reaper.TrackCtl_SetToolTip then
@@ -454,18 +683,19 @@ end
 
 -- 4d. Volume
 local function adjust_volume_on_track(track, direction, cfg)
-  local vol = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
-  local cur_db = (vol > 0.0000001) and (20 * math.log(vol, 10)) or -150.0
+  local cur_db = vol_to_db(reaper.GetMediaTrackInfo_Value(track, "D_VOL"))
 
   if cfg.smooth_dial_enabled and cfg.smooth_vol then
-    local tgt_str = reaper.GetExtState(EXTSTATE_SECTION, "target_vol_db")
-    local tgt_db = tonumber(tgt_str) or cur_db
-    if math.abs(tgt_db - cur_db) > 12.0 then tgt_db = cur_db end
+    local tgt_db = claim_track_target("vol", track, cur_db, 12.0)
 
-    local new_tgt_db = math.min(12.0, math.max(-150.0, tgt_db + cfg.vol_step * direction))
+    local new_tgt_db, from_inf = step_vol_db(tgt_db, cfg.vol_step * direction)
+    if from_inf then
+      -- Nothing audible to slew through below the floor: jump there directly
+      reaper.SetMediaTrackInfo_Value(track, "D_VOL", db_to_vol(new_tgt_db))
+      cur_db = new_tgt_db
+    end
     reaper.SetExtState(EXTSTATE_SECTION, "target_vol_db", tostring(new_tgt_db), false)
     reaper.SetExtState(EXTSTATE_SECTION, "cur_vol_db", tostring(cur_db), false)
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_track_guid", get_guid_for_track(track), false)
     reaper.SetExtState(EXTSTATE_SECTION, "smooth_last_tick", tostring(reaper.time_precise()), false)
 
     if cfg.midi_show_tooltip and reaper.TrackCtl_SetToolTip then
@@ -478,9 +708,8 @@ local function adjust_volume_on_track(track, direction, cfg)
     return true
   end
 
-  local db = math.min(math.max(cur_db + cfg.vol_step * direction, -150.0), 12.0)
-  local new_vol = (db <= -140.0) and 0.0 or (10 ^ (db / 20))
-  reaper.SetMediaTrackInfo_Value(track, "D_VOL", new_vol)
+  local db = step_vol_db(cur_db, cfg.vol_step * direction)
+  reaper.SetMediaTrackInfo_Value(track, "D_VOL", db_to_vol(db))
 
   if cfg.midi_show_tooltip and reaper.TrackCtl_SetToolTip then
     local mx, my = reaper.GetMousePosition()
@@ -515,14 +744,11 @@ local function adjust_width_on_track(track, direction, cfg)
   end
 
   if cfg.smooth_dial_enabled and cfg.smooth_width then
-    local tgt_str = reaper.GetExtState(EXTSTATE_SECTION, "target_width")
-    local tgt_w = tonumber(tgt_str) or cur_width
-    if math.abs(tgt_w - cur_width) > 0.5 then tgt_w = cur_width end
+    local tgt_w = claim_track_target("width", track, cur_width, 0.5)
 
     local new_tgt_w = math.min(1.0, math.max(-1.0, tgt_w + (step * direction)))
     reaper.SetExtState(EXTSTATE_SECTION, "target_width", tostring(new_tgt_w), false)
     reaper.SetExtState(EXTSTATE_SECTION, "cur_width", tostring(cur_width), false)
-    reaper.SetExtState(EXTSTATE_SECTION, "smooth_track_guid", get_guid_for_track(track), false)
     reaper.SetExtState(EXTSTATE_SECTION, "smooth_last_tick", tostring(reaper.time_precise()), false)
 
     if cfg.midi_show_tooltip and reaper.TrackCtl_SetToolTip then
@@ -712,10 +938,11 @@ function MapperEngine.adjust_midi_cc(direction, cfg)
 
   local new_val = math.floor(new_float + 0.5 + 1e-9)
 
-  -- Send live MIDI signals to VKB queue (mode 0) and Control Path (mode 1)
+  -- Send live MIDI to the virtual keyboard queue (mode 0) only; the control
+  -- path (mode 1) would also trigger MIDI-learned actions bound to these CCs.
+  reaper.SetExtState(EXTSTATE_SECTION, "last_sent_cc_val", tostring(new_val), false)
   for _, cc_num in ipairs(cc_list) do
     reaper.StuffMIDIMessage(0, status, cc_num, new_val)
-    reaper.StuffMIDIMessage(1, status, cc_num, new_val)
     reaper.SetExtState(EXTSTATE_SECTION, "live_cc_val_" .. cc_num, tostring(new_float), false)
   end
 
@@ -812,7 +1039,8 @@ end
 
 -- 4i. Marker Jump
 function MapperEngine.adjust_marker(direction, _)
-  local action = direction > 0 and 40172 or 40173
+  -- 40173 = Go to next marker/project end, 40172 = Go to previous marker/project start
+  local action = direction > 0 and 40173 or 40172
   reaper.Main_OnCommand(action, 0)
   return true
 end
@@ -878,134 +1106,59 @@ end
 -- 4l. SMOOTH DIAL SLEW PROCESSOR (60 Hz CONSUMER ENGINE)
 -------------------------------------------------------------------------------
 
+-- Daemon-local watch on the FX param being slewed (stuck detection)
+local FX_STUCK_FRAMES = 3
+local fx_watch = { id = nil, last = nil, still = 0 }
+
 function MapperEngine.process_smooth_step(dt)
   local cfg = MapperEngine.load_config()
   local speed = math.max(1.0, cfg.smooth_dial_speed or 25.0)
   local alpha = 1.0 - math.exp(-speed * dt)
   local is_busy = false
 
-  -- 1. Volume
-  local tgt_vol_str = reaper.GetExtState(EXTSTATE_SECTION, "target_vol_db")
-  if tgt_vol_str and tgt_vol_str ~= "" then
-    local tgt_db = tonumber(tgt_vol_str)
-    local tr_guid = reaper.GetExtState(EXTSTATE_SECTION, "smooth_track_guid")
-    local tr = get_track_by_guid(tr_guid)
-    if tgt_db and tr then
-      local vol = reaper.GetMediaTrackInfo_Value(tr, "D_VOL")
-      local cur_db = (vol > 0.0000001) and (20 * math.log(vol, 10)) or -150.0
-      local diff = tgt_db - cur_db
-      if math.abs(diff) < 0.05 then
-        cur_db = tgt_db
-        reaper.DeleteExtState(EXTSTATE_SECTION, "target_vol_db", false)
-        reaper.DeleteExtState(EXTSTATE_SECTION, "cur_vol_db", false)
-        reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Volume", -1, -1)
-      else
-        cur_db = cur_db + diff * alpha
-        is_busy = true
-      end
-      local new_vol = (cur_db <= -140.0) and 0.0 or (10 ^ (cur_db / 20))
-      reaper.SetMediaTrackInfo_Value(tr, "D_VOL", new_vol)
-    else
-      reaper.DeleteExtState(EXTSTATE_SECTION, "target_vol_db", false)
-    end
-  end
-
-  -- 2. Pan
-  local tgt_pan_str = reaper.GetExtState(EXTSTATE_SECTION, "target_pan")
-  if tgt_pan_str and tgt_pan_str ~= "" then
-    local tgt_pan = tonumber(tgt_pan_str)
-    local tr_guid = reaper.GetExtState(EXTSTATE_SECTION, "smooth_track_guid")
-    local tr = get_track_by_guid(tr_guid)
-    if tgt_pan and tr then
-      local cur_pan = reaper.GetMediaTrackInfo_Value(tr, "D_PAN")
-      local diff = tgt_pan - cur_pan
-      if math.abs(diff) < 0.005 then
-        cur_pan = tgt_pan
-        reaper.DeleteExtState(EXTSTATE_SECTION, "target_pan", false)
-        reaper.DeleteExtState(EXTSTATE_SECTION, "cur_pan", false)
-        reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Pan", -1, -1)
-      else
-        cur_pan = cur_pan + diff * alpha
-        is_busy = true
-      end
-      reaper.SetMediaTrackInfo_Value(tr, "D_PAN", cur_pan)
-    else
-      reaper.DeleteExtState(EXTSTATE_SECTION, "target_pan", false)
-    end
-  end
-
-  -- 3. Width
-  local tgt_w_str = reaper.GetExtState(EXTSTATE_SECTION, "target_width")
-  if tgt_w_str and tgt_w_str ~= "" then
-    local tgt_w = tonumber(tgt_w_str)
-    local tr_guid = reaper.GetExtState(EXTSTATE_SECTION, "smooth_track_guid")
-    local tr = get_track_by_guid(tr_guid)
-    if tgt_w and tr then
-      local cur_w = reaper.GetMediaTrackInfo_Value(tr, "D_WIDTH")
-      local diff = tgt_w - cur_w
-      if math.abs(diff) < 0.005 then
-        cur_w = tgt_w
-        reaper.DeleteExtState(EXTSTATE_SECTION, "target_width", false)
-        reaper.DeleteExtState(EXTSTATE_SECTION, "cur_width", false)
-        reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Width", -1, -1)
-      else
-        cur_w = cur_w + diff * alpha
-        is_busy = true
-      end
-      reaper.SetMediaTrackInfo_Value(tr, "D_WIDTH", cur_w)
-    else
-      reaper.DeleteExtState(EXTSTATE_SECTION, "target_width", false)
-    end
-  end
+  -- 1-3. Volume, Pan, Width (each slot bound to its own track)
+  if process_track_target("vol", alpha) then is_busy = true end
+  if process_track_target("pan", alpha) then is_busy = true end
+  if process_track_target("width", alpha) then is_busy = true end
 
   -- 4. FX Parameter
   local tgt_fx_str = reaper.GetExtState(EXTSTATE_SECTION, "target_fx_val")
-  if tgt_fx_str and tgt_fx_str ~= "" then
+  if tgt_fx_str ~= "" then
     local tgt_val = tonumber(tgt_fx_str)
-    local tr_guid = reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_track_guid")
-    local tr = get_track_by_guid(tr_guid)
-    local fxidx = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_idx"))
-    local parm = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_parm"))
-    local is_take = reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_is_take") == "1"
+    local id = reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_id")
+    local get_val, set_val
+    if tgt_val then get_val, set_val = resolve_fx_identity(id) end
 
-    if tgt_val and tr and fxidx and parm then
-      if is_take then
-        local item_idx = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_item_idx"))
-        local take_idx = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "smooth_fx_take_idx"))
-        local item = item_idx and reaper.GetTrackMediaItem(tr, item_idx)
-        local take = item and take_idx and reaper.GetTake(item, take_idx)
-        if take then
-          local cur_val = reaper.TakeFX_GetParamNormalized(take, fxidx, parm)
-          local diff = tgt_val - cur_val
-          if math.abs(diff) < 0.002 then
-            cur_val = tgt_val
-            reaper.DeleteExtState(EXTSTATE_SECTION, "target_fx_val", false)
-            reaper.DeleteExtState(EXTSTATE_SECTION, "cur_fx_val", false)
-            reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Parameter", -1, -1)
-          else
-            cur_val = cur_val + diff * alpha
-            is_busy = true
-          end
-          reaper.TakeFX_SetParamNormalized(take, fxidx, parm, cur_val)
-        else
-          reaper.DeleteExtState(EXTSTATE_SECTION, "target_fx_val", false)
-        end
+    if get_val then
+      local cur_val = get_val()
+      -- Stepped/quantised params never reach an in-between target: if the
+      -- read-back stops moving while we keep writing, treat it as settled.
+      if fx_watch.id == id and fx_watch.last and math.abs(cur_val - fx_watch.last) < 1e-6 then
+        fx_watch.still = fx_watch.still + 1
       else
-        local cur_val = reaper.TrackFX_GetParamNormalized(tr, fxidx, parm)
-        local diff = tgt_val - cur_val
-        if math.abs(diff) < 0.002 then
-          cur_val = tgt_val
-          reaper.DeleteExtState(EXTSTATE_SECTION, "target_fx_val", false)
-          reaper.DeleteExtState(EXTSTATE_SECTION, "cur_fx_val", false)
-          reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Parameter", -1, -1)
-        else
-          cur_val = cur_val + diff * alpha
-          is_busy = true
-        end
-        reaper.TrackFX_SetParamNormalized(tr, fxidx, parm, cur_val)
+        fx_watch.still = 0
+      end
+      fx_watch.id, fx_watch.last = id, cur_val
+
+      local diff = tgt_val - cur_val
+      if math.abs(diff) < 0.002 or fx_watch.still >= FX_STUCK_FRAMES then
+        set_val(tgt_val)
+        reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_rest_id", id, false)
+        reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_rest_tgt", tostring(tgt_val), false)
+        reaper.SetExtState(EXTSTATE_SECTION, "smooth_fx_rest_val", tostring(get_val()), false)
+        reaper.DeleteExtState(EXTSTATE_SECTION, "target_fx_val", false)
+        reaper.DeleteExtState(EXTSTATE_SECTION, "cur_fx_val", false)
+        fx_watch.id, fx_watch.last, fx_watch.still = nil, nil, 0
+        reaper.Undo_OnStateChangeEx("Fancy Mapper: Adjust Parameter", -1, -1)
+      else
+        set_val(cur_val + diff * alpha)
+        is_busy = true
       end
     else
       reaper.DeleteExtState(EXTSTATE_SECTION, "target_fx_val", false)
+      reaper.DeleteExtState(EXTSTATE_SECTION, "cur_fx_val", false)
+      reaper.DeleteExtState(EXTSTATE_SECTION, "smooth_fx_id", false)
+      fx_watch.id, fx_watch.last, fx_watch.still = nil, nil, 0
     end
   end
 
@@ -1035,7 +1188,6 @@ function MapperEngine.process_smooth_step(dt)
         local status = 0xB0 | ((chan - 1) & 0x0F)
         for _, cc_num in ipairs(cc_list) do
           reaper.StuffMIDIMessage(0, status, cc_num, send_val)
-          reaper.StuffMIDIMessage(1, status, cc_num, send_val)
           reaper.SetExtState(EXTSTATE_SECTION, "live_cc_val_" .. cc_num, tostring(cur_val), false)
         end
       end
@@ -1138,8 +1290,7 @@ function MapperEngine.reset_current_context()
   local cfg = MapperEngine.load_config()
 
   if mode == "pan" then
-    reaper.DeleteExtState(EXTSTATE_SECTION, "target_pan", false)
-    reaper.DeleteExtState(EXTSTATE_SECTION, "cur_pan", false)
+    drop_track_target("pan")
     local tr = get_target_track()
     if tr then
       reaper.Undo_BeginBlock()
@@ -1156,8 +1307,7 @@ function MapperEngine.reset_current_context()
   end
 
   if mode == "volume" then
-    reaper.DeleteExtState(EXTSTATE_SECTION, "target_vol_db", false)
-    reaper.DeleteExtState(EXTSTATE_SECTION, "cur_vol_db", false)
+    drop_track_target("vol")
     local tr = get_target_track()
     if tr then
       reaper.Undo_BeginBlock()
@@ -1174,8 +1324,7 @@ function MapperEngine.reset_current_context()
   end
 
   if mode == "width" then
-    reaper.DeleteExtState(EXTSTATE_SECTION, "target_width", false)
-    reaper.DeleteExtState(EXTSTATE_SECTION, "cur_width", false)
+    drop_track_target("width")
     local tr = get_target_track()
     if tr then
       local pan_mode = math.floor(reaper.GetMediaTrackInfo_Value(tr, "I_PANMODE"))
@@ -1262,12 +1411,17 @@ function MapperEngine.reset_current_context()
     local status = 0xB0 | ((chan - 1) & 0x0F)
 
     local reset_val = 0
-    reaper.SetExtState(EXTSTATE_SECTION, "live_cc_val", tostring(reset_val), false)
+    -- Shared live value follows what was actually sent (CC10 pan centres at 64)
+    local all_pan = true
+    for _, cc_num in ipairs(cc_list) do
+      if cc_num ~= 10 then all_pan = false; break end
+    end
+    reaper.SetExtState(EXTSTATE_SECTION, "live_cc_val", tostring(all_pan and 64 or reset_val), false)
+    reaper.DeleteExtState(EXTSTATE_SECTION, "last_sent_cc_val", false)
 
     for _, cc_num in ipairs(cc_list) do
       local def_val = (cc_num == 10) and 64 or reset_val
       reaper.StuffMIDIMessage(0, status, cc_num, def_val)
-      reaper.StuffMIDIMessage(1, status, cc_num, def_val)
       reaper.SetExtState(EXTSTATE_SECTION, "live_cc_val_" .. cc_num, tostring(def_val), false)
     end
 
@@ -1301,9 +1455,13 @@ function MapperEngine.reset_current_context()
     return
   end
 
-  -- Default / "fx": Reset last-touched FX parameter to default value
+  -- Navigation modes (scrub, track nav, marker, transient) have nothing to reset
+  if mode ~= "fx" then return end
+
+  -- "fx": Reset last-touched FX parameter to default value
   reaper.DeleteExtState(EXTSTATE_SECTION, "target_fx_val", false)
   reaper.DeleteExtState(EXTSTATE_SECTION, "cur_fx_val", false)
+  reaper.DeleteExtState(EXTSTATE_SECTION, "smooth_fx_id", false)
 
   local retval, trackidx, itemidx, takeidx, fxidx, parm =
         reaper.GetTouchedOrFocusedFX(0)

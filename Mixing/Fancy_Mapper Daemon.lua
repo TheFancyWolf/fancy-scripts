@@ -1,7 +1,9 @@
 -- @description Fancy Mapper Daemon
 -- @author Fancy Scripts
--- @version 5.2.0
+-- @version 5.2.1
 -- @changelog
+--   # Relaunching the daemon now stops it cleanly instead of showing REAPER's "already running" dialog
+--   # Stopping the daemon discards pending smooth-dial targets
 --   + Initial release: 60 Hz background slew engine for universal Smooth Dial
 -- @about
 --   Background consumer daemon for Fancy Mapper.
@@ -18,6 +20,10 @@
 -------------------------------------------------------------------------------
 -- 1. SHARED LIBRARY BOOTSTRAP
 -------------------------------------------------------------------------------
+-- Re-launching a running daemon (toolbar click, or the engine waking it)
+-- terminates it cleanly instead of prompting "script is already running".
+if reaper.set_action_options then reaper.set_action_options(1) end
+
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
 
@@ -44,7 +50,7 @@ local function main()
   local last_ping = tonumber(reaper.GetExtState(EXTSTATE_SECTION, "daemon_ping") or "0") or 0
 
   -- If already running and invoked manually (e.g. toolbar click), toggle off
-  if (now - last_ping) < 1.0 then
+  if (now - last_ping) < MapperEngine.DAEMON_TIMEOUT_S then
     reaper.SetExtState(EXTSTATE_SECTION, "daemon_stop", "1", false)
     return
   end
@@ -58,6 +64,8 @@ local function main()
 
   local function cleanup()
     reaper.SetExtState(EXTSTATE_SECTION, "daemon_ping", "0", false)
+    -- Drop pending targets so a later wake does not replay stale moves
+    MapperEngine.clear_smooth_targets()
     set_toggle_state(0)
   end
 

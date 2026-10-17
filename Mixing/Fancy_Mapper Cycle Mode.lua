@@ -1,7 +1,8 @@
 -- @description Fancy Mapper Cycle Mode
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
+--   # Tapping the shortcut again while the ring is open now confirms the hovered mode (was: closed the ring without selecting)
 --   + v5.1: Added Width, Multi-CC, Velocity, Track Nav, Marker, Transient, Item Slip
 --   + v5.1: Cut Send mode
 --   + v5.1: Dynamic sector geometry supporting custom enabled modes in Settings
@@ -33,18 +34,39 @@ end
 -------------------------------------------------------------------------------
 -- 1. BOOTSTRAP & DEDUPLICATION / SECOND-TAP CONFIRMATION
 -------------------------------------------------------------------------------
-reaper.set_action_options(1)
+-- Re-launching while the ring is open terminates the open ring and starts this
+-- new instance (no "already running" dialog). The open ring publishes its
+-- hovered mode each frame and notes when it was terminated mid-selection, so
+-- the new instance can treat the relaunch as the confirming second tap.
+if reaper.set_action_options then reaper.set_action_options(1 | 2) end
+
+local HANDOFF_S = 0.5   -- max age of the open ring's heartbeat / termination note
 
 local now_ts = reaper.time_precise()
 local is_ring_active = reaper.GetExtState("FancyMapper", "ring_active")
+local ring_beat = tonumber(reaper.GetExtState("FancyMapper", "ring_heartbeat")) or 0
+local ring_killed = tonumber(reaper.GetExtState("FancyMapper", "ring_killed_ts")) or 0
+local ring_alive = is_ring_active == "1" and (now_ts - ring_beat) < HANDOFF_S
+local ring_was_killed = (now_ts - ring_killed) < HANDOFF_S
 
 -- If already open, tapping the shortcut again confirms the hovered mode
-if is_ring_active == "1" then
+if ring_alive or ring_was_killed then
   local last_tap = tonumber(reaper.GetExtState("FancyMapper", "ring_last_tap") or "0") or 0
   if (now_ts - last_tap) > 0.15 then
-    reaper.SetExtState("FancyMapper", "ring_second_tap", "1", false)
+    reaper.SetExtState("FancyMapper", "ring_killed_ts", "0", false)
+    local hover = reaper.GetExtState("FancyMapper", "ring_hover")
+    if hover ~= "" then
+      reaper.SetExtState("FancyMapper", "mode", hover, false)
+    end
+    if ring_alive then
+      -- Ring still running (relaunch did not terminate it): let it flash & close
+      reaper.SetExtState("FancyMapper", "ring_second_tap", "1", false)
+    end
+    return
   end
-  return
+  -- Key bounce right after opening: keep a still-running ring as is; if the
+  -- relaunch terminated it, fall through and reopen it.
+  if ring_alive then return end
 end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
@@ -165,6 +187,7 @@ local dwell_sector = -1
 local dwell_start = 0
 local confirmed = nil
 local confirm_time = 0
+local published_hover = nil  -- last value written to ring_hover
 
 -------------------------------------------------------------------------------
 -- 5. SECTOR MATH & HELPERS
@@ -336,6 +359,7 @@ end
 local function loop()
   local now = reaper.time_precise()
   local elapsed = now - start_time
+  reaper.SetExtState("FancyMapper", "ring_heartbeat", tostring(now), false)
 
   -- Confirmation animation complete → close
   if confirmed and (now - confirm_time) > CONFIRM_S then
@@ -413,6 +437,14 @@ local function loop()
           dwell_start = now
         end
       end
+    end
+
+    -- Publish the hovered (selectable) mode for a confirming relaunch
+    local hover_id = (not confirmed and hovered >= 0 and MODES[hovered + 1].active)
+      and MODES[hovered + 1].id or ""
+    if hover_id ~= published_hover then
+      reaper.SetExtState("FancyMapper", "ring_hover", hover_id, false)
+      published_hover = hover_id
     end
 
     -- Draw the radial action ring
@@ -499,6 +531,10 @@ local function main()
   reaper.SetExtState("FancyMapper", "ring_active", "1", false)
   reaper.SetExtState("FancyMapper", "ring_last_tap", tostring(start_time), false)
   reaper.SetExtState("FancyMapper", "ring_second_tap", "0", false)
+  reaper.SetExtState("FancyMapper", "ring_heartbeat", tostring(start_time), false)
+  reaper.SetExtState("FancyMapper", "ring_killed_ts", "0", false)
+  reaper.SetExtState("FancyMapper", "ring_hover", "", false)
+  published_hover = ""
 
   ctx   = reaper.ImGui_CreateContext("Fancy Mapper Ring")
   fonts = Theme.create_fonts(ctx)
@@ -513,6 +549,11 @@ local function main()
   end
 
   reaper.atexit(function()
+    -- Still marked active here = terminated from outside (e.g. the shortcut
+    -- relaunched); normal closes clear ring_active before exiting.
+    if reaper.GetExtState("FancyMapper", "ring_active") == "1" then
+      reaper.SetExtState("FancyMapper", "ring_killed_ts", tostring(reaper.time_precise()), false)
+    end
     reaper.SetExtState("FancyMapper", "ring_active", "0", false)
     reaper.SetExtState("FancyMapper", "ring_second_tap", "0", false)
   end)
