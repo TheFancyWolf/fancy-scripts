@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 1.1.1
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Only copy fader volume to pre-fader sends (post-fader sends were attenuated twice)
 --   # No empty undo point when nothing changes
 --   + Migrated to shared _lib/ modules
@@ -12,13 +13,16 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. BOOTSTRAP & MODULES
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Utils = require("utils")
 

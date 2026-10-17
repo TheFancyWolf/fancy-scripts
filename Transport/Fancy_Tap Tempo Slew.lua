@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 1.1.0
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Tap tempo ignores a stray tap (median of the intervals, missed or doubled taps folded in)
 --   # Restart gap is never shorter than one and a half beats at the minimum tempo
 --   # Instant change inside a linear tempo ramp no longer retimes the ramp before the play position
@@ -21,7 +22,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. SETTINGS
@@ -29,6 +29,10 @@
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Settings = require("tap_tempo_settings")
 local CONFIG = Settings.load() -- re-read on every press (each press relaunches)

@@ -1,3 +1,4 @@
+-- @noindex
 -- Fancy Scripts — Shared Utilities
 -- Common helpers for REAPER scripting: dependency checks, undo blocks, math.
 -- Loaded via: local Utils = require("utils")

@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 5.4.2
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   + Fixed project tab switching overwriting another project's links; links now reload for unsaved projects too
 --   + Fixed links driving the wrong plugin when the linked FX was removed, and drift/inverse errors below 100% strength
 --   + Multi-track links now use a star from the first track (Inverse across 3+ tracks no longer contradicts itself)
@@ -17,7 +18,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 --   [data] ../toolbar_icons/toolbar_fancy_parameter_link.png > toolbar_icons/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/150/toolbar_fancy_parameter_link.png > toolbar_icons/150/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/200/toolbar_fancy_parameter_link.png > toolbar_icons/200/toolbar_fancy_parameter_link.png
@@ -41,6 +41,10 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Theme = require("theme")
 local JSON  = require("json")

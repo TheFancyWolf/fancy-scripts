@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.5.1
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Switching or removing items during an analysis cancels it instead of storing it on the wrong item
 --   # Split, merge and trim no longer shift untouched notes; edited notes keep their correction
 --   # Bypassed notes after a legato edit return to the original pitch; envelope points stay in time order
@@ -16,7 +17,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
@@ -28,6 +28,10 @@ end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Theme = require("theme")
 local JSON  = require("json")

@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 9.67.2
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Master track can now be metered when selected
 --   # Metering, holds, clip log and history keep running while the window is hidden
 --   # RMS meter now uses a windowed RMS estimate (previous source only worked for loudness-metered tracks)
@@ -17,7 +18,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -37,6 +37,10 @@ local ctx = reaper.ImGui_CreateContext('Selected Track Meter', reaper.ImGui_Conf
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Theme = require("theme")
 

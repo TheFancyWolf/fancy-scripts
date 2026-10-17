@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 5.2.1
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Relaunching the daemon now stops it cleanly instead of showing REAPER's "already running" dialog
 --   # Stopping the daemon discards pending smooth-dial targets
 --   + Initial release: 60 Hz background slew engine for universal Smooth Dial
@@ -15,7 +16,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. SHARED LIBRARY BOOTSTRAP
@@ -26,6 +26,10 @@ if reaper.set_action_options then reaper.set_action_options(1) end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local MapperEngine = require("mapper_engine")
 local EXTSTATE_SECTION = "FancyMapper"

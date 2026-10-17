@@ -1,7 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.3.1
+-- @version 1.3.2
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   + Show the new canvas palette (P.canvas) and the icon_target preset (24 px target)
 -- @about
 --   Visual style guide that renders every design token, color, font size,
@@ -12,7 +13,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -30,6 +30,10 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Theme = require("theme")
 

@@ -58,10 +58,39 @@ jobs:
         run: |
           set -o pipefail
           reapack-index --rebuild --commit -m "chore: update index.xml [skip ci]" 2>&1 | tee "$RUNNER_TEMP/reapack-index.log"
-          if grep -i "warning:" "$RUNNER_TEMP/reapack-index.log" | grep -i "conflict"; then
-            echo "::error::reapack-index reported conflicts"
-            exit 1
-          fi
+
+      - name: Verify every script is indexed at its current version
+        run: |
+          python3 - <<'PY'
+          import os, re, sys, xml.etree.ElementTree as ET
+          idx = ET.parse("index.xml").getroot()
+          indexed = {}
+          for cat in idx.iter("category"):
+              for pkg in cat.iter("reapack"):
+                  key = cat.get("name") + "/" + pkg.get("name")
+                  indexed[key] = {v.get("name") for v in pkg.iter("version")}
+          missing = []
+          for root, _, files in os.walk("."):
+              if "/." in root:
+                  continue
+              for f in files:
+                  if not f.endswith(".lua"):
+                      continue
+                  path = os.path.join(root, f)[2:]
+                  head = open(path, encoding="utf-8", errors="replace").read(4000)
+                  if "@noindex" in head:
+                      continue
+                  m = re.search(r"^--\s*@version\s+(\S+)", head, re.M)
+                  if not m:
+                      continue
+                  if m.group(1) not in indexed.get(path, set()):
+                      missing.append(f"{path} {m.group(1)}")
+          if missing:
+              print("::error::Not in index.xml (check reapack-index warnings above):")
+              print("\n".join(missing))
+              sys.exit(1)
+          print(f"OK: {len(indexed)} packages indexed")
+          PY
 
       - name: Push updated index
         run: |

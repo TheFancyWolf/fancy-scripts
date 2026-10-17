@@ -18,6 +18,7 @@ The easiest way to install and stay updated:
    ```
 3. Go to **Extensions > ReaPack > Browse Packages...**
 4. Search for **"Fancy"**, right-click → **Install**, and click **Apply**.
+5. Also install **Fancy Scripts Library** — it contains the shared code every script needs.
 
 ---
 

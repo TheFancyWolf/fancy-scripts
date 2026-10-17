@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 5.1.1
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Pressing again while the toast is showing now adjusts again (was: only closed the toast)
 --   # Values are saved with 0.01 precision so fractional steps (e.g. 0.05) no longer get stuck
 --   + v5.1: Added sensitivity scaling for volume, width, MIDI CC, velocity, and item slip
@@ -14,7 +15,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
@@ -29,6 +29,10 @@ if reaper.set_action_options then reaper.set_action_options(1 | 2) end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 local Theme = require("theme")
 
 -------------------------------------------------------------------------------

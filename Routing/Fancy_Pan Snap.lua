@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 1.7.2
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Undo/Redo of pan changes is no longer re-snapped (kept redo history intact)
 --   # Bypass modifier now checks Shift/Alt (was Shift/Win) via js_ReaScriptAPI
 --   # Tracks using the project default pan mode are now resolved correctly
@@ -20,7 +21,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -41,6 +41,10 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Theme = require("theme")
 local JSON  = require("json")

@@ -1,7 +1,8 @@
 -- @description Fancy Mapper Reset Parameter
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   + v5.1: Context-aware reset across all modes (FX default, pan center, volume 0dB, width 100%, MIDI vel, MIDI CC, item slip)
 -- @about
 --   Resets the active parameter based on current Fancy Mapper mode.
@@ -18,10 +19,13 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local MapperEngine = require("mapper_engine")
 

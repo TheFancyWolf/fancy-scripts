@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 5.1.1
 -- @changelog
+--   + Shared libraries now ship in the separate "Fancy Scripts Library" package
 --   # Tapping the shortcut again while the ring is open now confirms the hovered mode (was: closed the ring without selecting)
 --   + v5.1: Added Width, Multi-CC, Velocity, Track Nav, Marker, Transient, Item Slip
 --   + v5.1: Cut Send mode
@@ -18,7 +19,6 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 0. DEPENDENCY CHECK
@@ -71,6 +71,10 @@ end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.MB("This script requires the \"Fancy Scripts Library\" package.\n\nInstall it via Extensions > ReaPack > Browse packages.", "Fancy Scripts", 0)
+  return
+end
 
 local Theme = require("theme")
 
