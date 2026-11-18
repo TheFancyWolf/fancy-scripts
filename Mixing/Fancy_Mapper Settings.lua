@@ -1,7 +1,8 @@
 -- @description Fancy Mapper Settings
 -- @author Fancy Scripts
--- @version 5.2.0
+-- @version 5.2.1
 -- @changelog
+--   + Fix: symbols the new font lacks no longer show as ?
 --   + v5.2: Mode panel: pick a mode to see only its settings and button actions
 --   + v5.2: Guided calibration dialog (counts ticks without rebinding the dial)
 --   + v5.2: Action Ring mode chips, per-mode smoothing toggles, HUD & toast settings in General
@@ -712,9 +713,9 @@ local function draw_smooth()
 
   local daemon_on = MapperEngine.is_daemon_alive()
   if daemon_on then
-    Theme.badge(ctx, "● Slew Daemon: Active (60 Hz)", { color = P.green })
+    Theme.badge(ctx, "Slew Daemon: Active (60 Hz)", { color = P.green })
   else
-    Theme.badge(ctx, "○ Slew Daemon: Standby (Auto-Wake)", { color = P.text_dim })
+    Theme.badge(ctx, "Slew Daemon: Standby (Auto-Wake)", { color = P.text_dim })
   end
   hover_tip("Background 60 Hz consumer daemon. Auto-wakes when you turn the dial, slews parameters smoothly, and auto-sleeps after 10 seconds of idle dial activity (0% CPU when not in use).")
 

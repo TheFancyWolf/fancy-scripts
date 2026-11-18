@@ -57,6 +57,9 @@
 --   icon_target={size=xl,pad=sm}->24px (WCAG 2.5.8 minimum target for frequent / destructive icon buttons)
 --   Pass via opts.preset: Theme.icon_btn(ctx, id, fn, {preset = L.icon_sm})
 --
+-- ICONS -- Theme.icons.<name>(dl, cx, cy, half_size, color), vector shapes for the draw list:
+--   play pause close plus info tri_down tri_up tri_left tri_right slider gear check dot ring
+--
 -- FONTS -- Theme.font_sizes: small=11 default=13 medium=14 large=16 header=18  (Fira Sans, bundled in _lib/fonts/)
 --   create_fonts(ctx)          -> {default,small,medium,large,header,default_bold,medium_bold,large_bold}
 --   attach_fonts(ctx, fonts)   -> call once before first frame
@@ -1340,6 +1343,31 @@ function Theme.icons.info(dl, cx, cy, hs, col)
   reaper.ImGui_DrawList_AddRectFilled(dl, cx - stem_hw, stem_top, cx + stem_hw, stem_bot, col, stem_hw)
 end
 
+--- Check mark (two line segments: short stroke down, long stroke up).
+--- Use for: selected rows, "done" / "on" markers.
+function Theme.icons.check(dl, cx, cy, hs, col)
+  local th = math.max(1.5, hs * 0.3)
+  local ox, oy = math.floor(cx), math.floor(cy)
+  local x1, y1 = ox - math.floor(hs * 0.8), oy
+  local x2, y2 = ox - math.floor(hs * 0.25), oy + math.floor(hs * 0.6)
+  local x3, y3 = ox + math.floor(hs * 0.85), oy - math.floor(hs * 0.6)
+  reaper.ImGui_DrawList_AddLine(dl, x1, y1, x2, y2, col, th)
+  reaper.ImGui_DrawList_AddLine(dl, x2, y2, x3, y3, col, th)
+end
+
+--- Filled dot (filled circle).
+--- Use for: "on" / active status markers.
+function Theme.icons.dot(dl, cx, cy, hs, col)
+  reaper.ImGui_DrawList_AddCircleFilled(dl, cx, cy, hs * 0.7, col)
+end
+
+--- Ring (circle outline).
+--- Use for: "off" / inactive status markers.
+function Theme.icons.ring(dl, cx, cy, hs, col)
+  local th = math.max(1.0, hs * 0.25)
+  reaper.ImGui_DrawList_AddCircle(dl, cx, cy, hs * 0.7, col, 0, th)
+end
+
 --- ▾ Triangle down (downward-pointing).
 --- Use for: dropdown indicators, expand/collapse, sort direction.
 function Theme.icons.tri_down(dl, cx, cy, hs, col)
@@ -2505,7 +2533,7 @@ end
 ---   opts.tooltip         (string)   Hover tooltip text
 ---   opts.compact         (boolean)  Use tight vertical padding inside popup (default: true)
 ---   opts.close_on_select (boolean)  Close popup after selecting an item (default: false)
----   opts.check_mark      (string)   Prefix for selected items (default: "\xe2\x9c\x93 ")
+---   opts.check_mark      (string)   Text prefix for selected items (default: a Theme.icons.check drawn in the prefix slot)
 --- @return number|nil toggled_idx  1-based index of the toggled item, or nil if no interaction
 --- @return boolean|nil is_now_selected  New boolean selection state of the toggled item
 --- @return boolean changed  Whether a selection was modified this frame
@@ -2554,12 +2582,14 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
 
     local sel_flags = opts.close_on_select and reaper.ImGui_SelectableFlags_None()
                       or (reaper.ImGui_SelectableFlags_NoAutoClosePopups and reaper.ImGui_SelectableFlags_NoAutoClosePopups() or reaper.ImGui_SelectableFlags_None())
-    local check_prefix = opts.check_mark or "\xe2\x9c\x93 "
+    -- Selected rows draw Theme.icons.check in the prefix slot (same reserved width as unselected rows);
+    -- a caller's own opts.check_mark text still replaces it.
+    local check_prefix = opts.check_mark
     local blank_prefix = "   "
 
     for i, item in ipairs(items) do
       local is_sel = _is_item_selected(selected, item, i, opts.get_id)
-      local prefix = is_sel and check_prefix or blank_prefix
+      local prefix = (is_sel and check_prefix) or blank_prefix
       local label_text = _get_combo_item_label(item, i, opts.get_label)
       local row_label = prefix .. label_text .. "##mitem_" .. i
 
@@ -2567,6 +2597,15 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
         toggled_idx = i
         is_now_selected = not is_sel
         changed = true
+      end
+      if is_sel and not check_prefix then
+        -- Theme.selectable left the row as the last item: draw the check in its prefix slot
+        local rx1, ry1 = reaper.ImGui_GetItemRectMin(ctx)
+        local _, ry2 = reaper.ImGui_GetItemRectMax(ctx)
+        local slot_w = reaper.ImGui_CalcTextSize(ctx, blank_prefix)
+        local hs = math.max(2, math.floor((ry2 - ry1) * 0.2))
+        Theme.icons.check(reaper.ImGui_GetWindowDrawList(ctx), rx1 + L.sm + slot_w * 0.5,
+          (ry1 + ry2) * 0.5, hs, _get_palette().text)
       end
     end
 

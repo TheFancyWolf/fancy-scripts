@@ -88,9 +88,6 @@ local RETURNS = {
   ImGui_SetMouseCursor = {},
   ImGui_MouseCursor_Hand = { 7 },
   ImGui_IsPopupOpen = { false },
-  ImGui_DrawList_AddLine = {},
-  ImGui_DrawList_AddCircle = {},
-  ImGui_DrawList_AddCircleFilled = {},
   ImGui_DrawList_AddTriangleFilled = {},
   ImGui_DrawList_AddBezierCubic = {},
   ImGui_DrawList_PushClipRect = {},
@@ -184,6 +181,12 @@ function M.new(opts)
     local c = record("ImGui_DrawList_AddRect", dl, x1, y1, x2, y2, color, ...)
     c.x1, c.y1, c.x2, c.y2, c.color = x1, y1, x2, y2, color
     check_fail("ImGui_DrawList_AddRect")
+  end
+  for _, name in ipairs({ "ImGui_DrawList_AddLine", "ImGui_DrawList_AddCircle", "ImGui_DrawList_AddCircleFilled" }) do
+    raw[name] = function(dl, ...)
+      record(name, dl, ...)
+      check_fail(name)
+    end
   end
   raw.ImGui_DrawList_AddText = function(dl, x, y, color, text, ...)
     local c = record("ImGui_DrawList_AddText", dl, x, y, color, text, ...)

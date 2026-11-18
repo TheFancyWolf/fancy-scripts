@@ -655,6 +655,100 @@ test("canvas: curated ruler is the note column's grey; its labels read on it ove
 end)
 
 -------------------------------------------------------------------------------
+-- Task 5: symbols the font lacks are drawn as icons or ASCII
+test("icons: check, dot and ring exist and each draws", function()
+  local T, stub = load_theme({})
+  for _, name in ipairs({ "check", "dot", "ring" }) do
+    assert(type(T.icons[name]) == "function", name .. " is a function")
+    stub.calls = {}
+    T.icons[name]("dl", 10, 10, 6, 0xFFFFFFFF)
+    local n = count(stub.calls, "ImGui_DrawList_AddLine") + count(stub.calls, "ImGui_DrawList_AddCircle")
+              + count(stub.calls, "ImGui_DrawList_AddCircleFilled")
+    assert(n >= 1, name .. " issued no draw-list call")
+  end
+end)
+
+test("multi_combo: a selected row draws the check icon, not a check glyph", function()
+  local T, stub = load_theme({})
+  local r = reaper
+  r.ImGui_BeginCombo = function() return true end
+  stub.calls = {}
+  T.multi_combo("ctx", "##m", { "A", "B" }, { true })
+  for _, c in ipairs(all(stub.calls, "ImGui_DrawList_AddText")) do
+    assert(not tostring(c[6]):find("\xe2\x9c\x93", 1, true), "AddText drew a check glyph")
+  end
+  assert(count(stub.calls, "ImGui_DrawList_AddLine") >= 2, "the check icon (two segments) was drawn")
+end)
+
+--- Source text with comments removed (strings kept raw). Callers blank lines marked `allow-glyph` first.
+local function code_only(src)
+  local out, i, n = {}, 1, #src
+  while i <= n do
+    local c = src:sub(i, i)
+    if src:sub(i, i + 1) == "--" then
+      local eq = src:match("^%-%-%[(=*)%[", i)
+      if eq then
+        local _, e = src:find("]" .. eq .. "]", i, true)
+        i = (e or n) + 1
+      else
+        local e = src:find("\n", i, true)
+        i = e or (n + 1)
+      end
+    elseif c == '"' or c == "'" then
+      local j = i + 1
+      while j <= n and src:sub(j, j) ~= c do
+        if src:sub(j, j) == "\\" then j = j + 1 end
+        j = j + 1
+      end
+      out[#out + 1] = src:sub(i, j)
+      i = j + 1
+    else
+      local eq = src:match("^%[(=*)%[", i)
+      if eq then
+        local _, e = src:find("]" .. eq .. "]", i, true)
+        e = e or n
+        out[#out + 1] = src:sub(i, e)
+        i = e + 1
+      else
+        out[#out + 1] = c
+        i = i + 1
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+test("source: no script or library string holds a glyph the font lacks", function()
+  local files = { "_lib/theme.lua", "Pitch/Fancy_Pitch Correct.lua", "FX/Fancy_Parameter Link.lua",
+                  "Mixing/Fancy_Mapper Settings.lua", "Utility/Fancy_Design System.lua" }
+  -- UTF-8 bytes of: check, small right tri, left tri, small down tri, left-right arrow, black circle, white circle
+  local seqs = { "\xe2\x9c\x93", "\xe2\x96\xb8", "\xe2\x97\x80", "\xe2\x96\xbe", "\xe2\x86\x94", "\xe2\x97\x8f", "\xe2\x97\x8b" }
+  local cps = { "2713", "25b8", "25c0", "25be", "2194", "25cf", "25cb" }
+  local allowed = 0
+  for _, path in ipairs(files) do
+    local f = assert(io.open(path, "rb")); local src = f:read("a"); f:close()
+    local lines = {}
+    for line in (src .. "\n"):gmatch("(.-)\n") do
+      if line:find("allow-glyph", 1, true) then
+        allowed = allowed + 1
+        lines[#lines + 1] = ""
+      else
+        lines[#lines + 1] = line
+      end
+    end
+    local text = code_only(table.concat(lines, "\n"))
+    for k, seq in ipairs(seqs) do
+      assert(not text:find(seq, 1, true), path .. " holds the literal glyph U+" .. cps[k])
+      local esc = ""
+      for b in seq:gmatch(".") do esc = esc .. "\\x" .. string.format("%02x", b:byte()) end
+      assert(not text:lower():find(esc, 1, true), path .. " holds the escaped glyph U+" .. cps[k])
+      assert(not text:lower():find("\\u{" .. cps[k] .. "}", 1, true), path .. " holds a \\u escape for U+" .. cps[k])
+    end
+  end
+  assert(allowed <= 1, "at most one allow-glyph line (the draw-time label substitution)")
+end)
+
+-------------------------------------------------------------------------------
 
 print(string.format("\n%d tests, %d failed", total, failures))
 os.exit(failures == 0 and 0 or 1)

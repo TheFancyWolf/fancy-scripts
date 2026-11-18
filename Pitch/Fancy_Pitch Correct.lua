@@ -6439,7 +6439,7 @@ K.INFO_SECTIONS = {
   { title = "Icons", rows = {
     { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
     { "× (top right)", "Close the window (Esc when floating)" },
-    { "▸ / ◀", "Hide / show the Pitched Items panel" },
+    { "> / <", "Hide / show the Pitched Items panel" },
     { "Checkbox (item row)", "Pitch envelope active / bypassed" },
     { "× (item row)", "Remove the item from Pitched Items" },
     { "* after a value", "Set for this item only" },
@@ -7302,8 +7302,13 @@ do
   local BAR_SCOPE_TAGS = { note = "Note", item = "Item", global = "Global" }
   -- Appended to a badge label when its value is overridden for the item (or the selected note)
   local BAR_OVERRIDE_MARK = "*"
-  -- The button that folds the three timing badges; %s is the override mark when one of them is overridden
-  local BAR_TIMING_FMT = "Timing%s ▾"
+  -- The button that folds the three timing badges; %s is the override mark when one of them is overridden.
+  -- A Theme.icons.tri_down (half size BAR_TIMING_ICON_HS) is drawn after the label; the gap and the icon's
+  -- width are reserved in the button's width.
+  local BAR_TIMING_FMT = "Timing%s"
+  local BAR_TIMING_ICON_HS = 4
+  local BAR_TIMING_ICON_GAP = Theme.layout.sm
+  local BAR_TIMING_ICON_W = math.ceil(BAR_TIMING_ICON_HS * 1.4)
   local BAR_TIMING_TIP = "Transition, Onset Ramp and Legato Gap"
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
@@ -7354,7 +7359,8 @@ do
       s.unit_w[spec.id] = widest + mark_w + s.pad_x
       s.timing_label_w = math.max(s.timing_label_w, bar_text_w(bctx, PARAM_LABELS[spec.key] or spec.key) + mark_w)
     end
-    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, BAR_OVERRIDE_MARK)) + s.pad_x
+    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, BAR_OVERRIDE_MARK))
+      + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W + s.pad_x
     for _, spec in ipairs(BAR_ACTIONS) do
       s.unit_w[spec.id] = bar_text_w(bctx, spec.label) + s.pad_x
     end
@@ -7683,8 +7689,23 @@ do
       end
 
       reaper.ImGui_BeginDisabled(bctx, inspector_reason ~= nil)
-      local pressed = reaper.ImGui_Button(bctx,
-        string.format(BAR_TIMING_FMT, overridden and BAR_OVERRIDE_MARK or "") .. "###bar_timing", s.unit_w.timing, 0)
+      -- Label and icon are centred together: the label is aligned so the icon's slot fits to its right
+      local label = string.format(BAR_TIMING_FMT, overridden and BAR_OVERRIDE_MARK or "")
+      local label_w = bar_text_w(bctx, label)
+      local slack = s.unit_w.timing - s.pad_x - label_w
+      local align_x = slack > 0 and math.max(0, math.min(1, (slack - BAR_TIMING_ICON_GAP - BAR_TIMING_ICON_W) * 0.5 / slack)) or 0.5
+      reaper.ImGui_PushStyleVar(bctx, reaper.ImGui_StyleVar_ButtonTextAlign(), align_x, 0.5)
+      local pressed = reaper.ImGui_Button(bctx, label .. "###bar_timing", s.unit_w.timing, 0)
+      reaper.ImGui_PopStyleVar(bctx)
+      do
+        local bx1, by1 = reaper.ImGui_GetItemRectMin(bctx)
+        local bx2, by2 = reaper.ImGui_GetItemRectMax(bctx)
+        local text_x = bx1 + s.pad_x * 0.5 + (bx2 - bx1 - s.pad_x - label_w) * align_x
+        local icon_col = Theme.get_palette().text
+        if inspector_reason ~= nil then icon_col = Theme.with_alpha(icon_col, 0.5) end
+        Theme.icons.tri_down(reaper.ImGui_GetWindowDrawList(bctx),
+          text_x + label_w + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W * 0.5, (by1 + by2) * 0.5, BAR_TIMING_ICON_HS, icon_col)
+      end
       reaper.ImGui_EndDisabled(bctx)
       if inspector_reason then
         bar_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
