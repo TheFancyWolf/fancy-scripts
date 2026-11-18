@@ -54,7 +54,7 @@ Units, left to right, in four groups (a group break is `L.xl` with a hairline in
 - **Note actions**: Snap, Quantize, Split, Merge.
 - **Right** (right-aligned on row 1): **…** (More) and Close.
 
-**More** popup: Analyze / Re-Analyze (Cancel while analysing, and the button itself reads the progress, as before), Reset (same scope-aware label), separator, Layers ▸ (the four layer checkboxes with swatches), Settings, Keyboard Shortcuts & Help.
+**More** popup: Analyze / Re-Analyze (Cancel while analysing, and the button itself reads the progress, as before), Reset (same scope-aware label), separator, Layers ▸ (the four layer checkboxes with swatches), Note Tone (checkable: plays a tone at the note's pitch while a note is dragged; on by default), Settings, Keyboard Shortcuts & Help.
 
 **Plans**, first that fits, chosen from the content width alone:
 
@@ -105,8 +105,9 @@ Bottom-left of the note area. Shows, first that applies: the status message (4 s
 - Timing button: `Timing ▾` (`Timing* ▾` when one of the three is overridden); tooltip `Transition, Onset Ramp and Legato Gap`
 - Key tooltip: `Key: the root note of the scale`; Scale tooltip: `Scale: marks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to`
 - Z with nothing selected: status `Select a note to zoom to it`
-- More: `…`; tooltip `More: Analyze, Reset, Layers, Settings, Help`; while analysing `Analyzing. Open to cancel`
-- More items: `Layers`, `Settings`, `Keyboard Shortcuts & Help`
+- More: `…`; tooltip `More: Analyze, Reset, Layers, Note Tone, Settings, Help`; while analysing `Analyzing. Open to cancel`
+- More items: `Layers`, `Note Tone`, `Settings`, `Keyboard Shortcuts & Help`
+- Note Tone tooltip: `Play a tone at the note's pitch while you drag it`
 - Pill: `%d notes selected`
 - Help rows: `Alt + Wheel` → `Zoom the pitch axis`; `Shift + Wheel` → `Scroll the pitch axis`; `Z` → `Zoom to the selected notes`; `F` → `Show the whole item, fit the pitch range`; `Drag the overview strip` → `Scroll; drag an end to zoom`; `Drag the pitch strip` → `Scroll; drag an end to zoom`; "Right-click a dock value" → "Right-click a top bar value"
 

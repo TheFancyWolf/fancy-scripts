@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.6.1
+-- @version 2.7.0
 -- @changelog
---   # Clicking the time ruler moves the edit cursor (and playback follows), so you can split or play from there
+--   + A sine note tone sounds at the note's pitch while you drag it up or down, so you can place it by ear. Switch it on or off with Note Tone in the "..." menu
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui

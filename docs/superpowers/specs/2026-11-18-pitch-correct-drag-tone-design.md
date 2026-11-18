@@ -46,7 +46,7 @@ placed by ear as well as by eye. Today the script is silent until the drag is re
 
 1. **REAPER's Tone Generator on the Monitoring FX chain (picked).** At the start of a pitch drag the script
    adds `JS: Tone Generator` to the Monitoring FX chain (the master track's input-FX slot), sets Dry Mix to
-   0 dB so everything else passes untouched, and each frame sets Base Frequency to
+   0 dB so everything else passes untouched, and each frame sets the pitch (through Note, Octave and Fine Tune over a fixed 440 Hz; see Builder's findings) to
    `440 * 2 ^ ((note pitch - 69) / 12)`. On release it removes the effect. The Monitoring chain is global,
    not part of the project: no undo point, no dirty flag. Nothing to install, no file to generate. Costs:
    the effect is visible in the Monitoring FX window during a drag; it is heard after the master, so it is
@@ -72,7 +72,7 @@ My calls (correct any of them):
 - **When it starts.** Once the pointer leaves the 2 px click dead zone, so a click that only selects stays
   silent. It stops on mouse release.
 - **Pitch.** The note's target pitch (`controls.center_pitch`), read every frame, clamped like the note
-  and to the generator's 20 Hz floor.
+  and to the floor of A0 (MIDI 21; see Builder's findings).
 - **Level and shape.** Sine, about -18 dB. The Wet Mix is ramped up over the first few frames and down
   before removal so the start and stop do not click.
 - **Setting.** Decided by the user: the on/off toggle lives in the top bar's "…" (More) menu, not in
@@ -102,3 +102,11 @@ My calls (correct any of them):
 - Real REAPER: drag a note, confirm the Tone Generator is on the Monitoring chain and its frequency
   tracks the note, confirm it is gone after release, after closing the window mid-drag, and with the setting off. Audible quality
   (level, glide smoothness) has to be judged by the user: the test rig cannot hear.
+
+## Builder's findings
+
+- Pitch is set through the generator's Note / Octave / Fine Tune sliders over a fixed 440 Hz, because its Base Frequency slider is quantised to 1 Hz. So the glide moves in 1-cent steps and the floor is A0 (MIDI 21), not 20 Hz.
+- The effect is added per drag (about 3 ms) rather than kept bypassed on the chain.
+- Adding and removing a Monitoring FX left the project state count and the undo history unchanged in real REAPER. The "project modified" flag could not be checked, because the test project was already modified.
+- Real-REAPER tests a-h passed on 2026-11-18.
+- How the tone sounds (level, glide, any click at the start) has not been judged by ear.
