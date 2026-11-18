@@ -1,10 +1,10 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.5.0
+-- @version 2.6.0
 -- @changelog
---   + Undo/redo keeps the editor in sync; destructive actions ask first; Esc, Space and shortcuts follow REAPER conventions
---   + Timeline zoom, scroll and ruler; responsive header, dock and Pitched Items panel; Cancel for analysis; settings persist
---   + Higher-contrast canvas, larger destructive targets, and canvas colours from the shared theme
+--   + Notes are solid blocks with the item's waveform inside; labels and pitch-centre spots show for the hovered and selected notes only
+--   + The pitch range fits the notes; an overview strip and a pitch strip zoom and scroll each axis; Z zooms to the selection, F shows everything
+--   + Every control is in one top bar (Layers, Settings, Help, Analyze and Reset under "…"); status and hints show on the canvas
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -156,7 +156,7 @@ do
     for i, item in ipairs(list) do out[i] = item[field] end
     return out
   end
-  COMBO_LABELS.keys = labels_of(SCALE_KEYS, "display")  -- the header Key combo previews the short name ...
+  COMBO_LABELS.keys = labels_of(SCALE_KEYS, "display")  -- the top bar's Key combo previews the short name ...
   COMBO_LABELS.key_names = labels_of(SCALE_KEYS, "name") -- ... and lists the long one
   COMBO_LABELS.scales = labels_of(SCALE_DEFINITIONS, "name")
   COMBO_LABELS.pitchmodes = labels_of(PITCHMODE_FLAT, "name")
@@ -215,7 +215,7 @@ local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
 
-  -- How long a status message replaces the dock's hint line
+  -- How long a status message replaces the hint on the canvas's status pill
   STATUS_SECONDS = 4.0,
 
   -- Platform label of REAPER's command modifier, for "Cmd+Z to undo" style messages
@@ -237,7 +237,7 @@ local K = {
   -- simply takes more frames
   ANALYSIS_SLICE_S = 0.008,
 
-  -- Analysis Cancel: the header's Analyze slot turns into this button while an analysis runs (see hdr_draw_analyze)
+  -- Analysis Cancel: More's Analyze item turns into this while an analysis runs (see hdr_draw_more)
   CANCEL_FMT = "Cancel %d%%",
   CANCELLED_TEXT = "Analysis cancelled.",
 
@@ -279,7 +279,21 @@ local K = {
   RULER_WIDEN = 1.5,       -- a label interval that does not fit grows to the next 1-2-5 step above interval * this
   RULER_MAX_TRIES = 8,     -- widenings tried before the ruler gives up on making every label fit
 
-  -- Canvas colours are not defined here: draw_graph and the Layers popup swatches read the same Theme palette tokens
+  -- Pitch view of the canvas (see draw_graph): the range is fitted to the notes unless the user chose one
+  PITCH_PAD_ST = 2,        -- semitones shown above the highest and below the lowest note
+  PITCH_MIN_FIT_ST = 12,   -- the fitted range never shows fewer semitones than this (a one-note item is not one giant row)
+  PITCH_MIN_VIEW_ST = 3,   -- never zoom the pitch axis in beyond this many semitones
+  ZOOM_SEL_PAD = 0.1,      -- Z (zoom to selection): this fraction of the selection's length is added on each side ...
+  ZOOM_SEL_PAD_ST = 3,     -- ... and this many semitones above and below
+  WAVE_STEP_PX = 2,        -- the loudness envelope inside a note (the fallback, see below) is drawn in bars at least this wide
+  -- The waveform inside the notes is the item's own peaks, as REAPER draws them in the arrange view (K.take_wave)
+  WAVE_RATE = 400,         -- peaks asked per second of item: about the finest REAPER keeps in its peak files, so no audio is read
+  WAVE_MAX_SAMPLES = 200000, -- ... but never more than this many for the whole item (a longer item gets a lower rate)
+  WAVE_RETRY_S = 0.5,      -- peaks that are not built yet are asked for again after this long
+  WAVE_COL_PX = 1,         -- the waveform is drawn in columns this wide
+  LABEL_MAX_SELECTED = 8,  -- with more notes selected than this, only the hovered and the primary note carry a label
+
+  -- Canvas colours are not defined here: draw_graph and the Layers menu swatches read the same Theme palette tokens
   -- (Theme.get_palette().canvas, see section 4A of _lib/theme.lua), which follow the theme mode.
   SPOT_R = Theme.layout.sm,                          -- smart-spot circle radius
   ANCHOR_R = Theme.layout.sm + Theme.layout.xs,      -- trend-anchor diamond half-diagonal
@@ -287,13 +301,14 @@ local K = {
   EDGE_GRAB = Theme.layout.sm * 2,                   -- note edge grab zone, per side
   EDGE_GRAB_HOVER = Theme.layout.sm * 3,             -- ... while the pointer rests on that edge
   EDGE_GRAB_MAX_FRAC = 0.25,                         -- a zone never takes more than this fraction of the block width (both edges stay usable)
+  VIEW_GRIP = Theme.layout.md,                       -- grab width of each end of the overview / pitch strip thumb
 }
 
 local state = {
   is_analyzing = false,
   progress = 0,
   results = {}, -- array of { time, freq, note }
-  analysis_empty = false, -- the last analysis of the target found no pitched notes (drives the dock hint; the canvas message reads it too)
+  analysis_empty = false, -- the last analysis of the target found no pitched notes (the canvas message reads it)
 
   -- Settings > Pitch Shift Engine: the algorithm written to the item (an entry of PITCHMODE_FLAT) and whether to write it at all
   preset_pitchmode_idx = DEFAULTS.preset_pitchmode_idx,
@@ -334,6 +349,9 @@ local state = {
   context_menu_note = nil, -- index of note for right-click context menu
   view_t0 = nil,        -- visible time window of the canvas, seconds relative to the item start; nil = the whole item
   view_t1 = nil,        -- (both nil or both set; changed by the wheel in draw_graph, reset when the target changes or the model is analysed or cleared, kept through undo / redo of the same take)
+  view_p0 = nil,        -- visible pitch range of the canvas, semitones (MIDI note numbers); nil = fitted to the notes
+  view_p1 = nil,        -- (both nil or both set; same lifetime as view_t0 / view_t1, see K.reset_view)
+  view_drag = nil,      -- a drag on the overview strip or the pitch strip: { kind ("t_pan" / "t0" / "t1" / "p_pan" / "p0" / "p1"), start (pointer x or y), a0, a1 (the window when it began) }
 
   -- Visualization toggles
   show_note_blocks = true,
@@ -363,12 +381,12 @@ local state = {
   -- The target as loop_body resolved it this frame (see K.frame_target)
   frame = { guid = nil, take = nil, item = nil },
   -- The canvas's drawing cache (see K.canvas_cache_begin): the mapping the cached coordinates belong to (map, gen counts
-  -- its changes), the raw min / max of the analysis frames, the raw pitch trace, and one entry per note (weak keys)
-  draw_cache = { gen = 0, map = {}, range = { n = 0 }, raw = {}, notes = setmetatable({}, { __mode = "k" }) },
+  -- its changes), the raw min / max and the loudest frame of the analysis, the item's waveform peaks, the raw pitch trace, and one entry per note (weak keys)
+  draw_cache = { gen = 0, map = {}, range = { n = 0 }, peak = { n = 0, max = 0 }, wave = { n = 0 }, raw = {}, notes = setmetatable({}, { __mode = "k" }) },
   clipper = nil,            -- the Pitched Items list clipper (kept here so it is not garbage-collected)
   clipper_ctx = nil,        -- the ImGui context it was created for
 
-  -- Status channel (drawn in the bottom dock) and the pending confirmation request (see request_confirm)
+  -- Status channel (drawn on the canvas's status pill, see K.canvas_status) and the pending confirmation request (see request_confirm)
   status = { text = "", until_time = 0 },
   confirm = nil,
 
@@ -400,6 +418,13 @@ local state = {
   scale_idx = 1,     -- 1..6 (1 = Major)
   scale_pc_set = {}  -- pitch class lookup set [0..11] = true/false
 }
+
+--- The canvas shows the whole item and the pitch range fitted to its notes again; a drag on a strip is dropped.
+K.reset_view = function()
+  state.view_t0, state.view_t1 = nil, nil
+  state.view_p0, state.view_p1 = nil, nil
+  state.view_drag = nil
+end
 
 --- Settings: choose the pitch algorithm written to the items (an index into PITCHMODE_FLAT).
 K.set_pitch_algorithm = function(idx)
@@ -443,7 +468,7 @@ local function get_override_level(note, key)
   return "global"
 end
 
---- Show a short message in the bottom dock for STATUS_SECONDS (replaces the dock's hint line).
+--- Show a short message on the canvas's status pill for STATUS_SECONDS (it replaces the hint there).
 local function set_status(msg)
   state.status.text = msg or ""
   state.status.until_time = reaper.time_precise() + K.STATUS_SECONDS
@@ -749,8 +774,8 @@ local function get_target_take()
   return take, K.take_item(take)
 end
 
---- The target of this frame: what loop_body resolved once at the start of the frame (state.frame), so the header,
---- canvas, dock and sidebar do not each ask again. Only valid while the target is still the one that was resolved
+--- The target of this frame: what loop_body resolved once at the start of the frame (state.frame), so the top bar,
+--- canvas and sidebar do not each ask again. Only valid while the target is still the one that was resolved
 --- (a click may switch it mid-frame): then it is resolved again (from the cache).
 K.frame_target = function()
   local frame = state.frame
@@ -1056,7 +1081,7 @@ local function reset_analysis_model()
   state.drag = nil
   state.marquee = nil
   state.nudge_burst = nil
-  state.view_t0, state.view_t1 = nil, nil   -- the canvas shows the whole item again
+  K.reset_view()   -- the canvas shows the whole item again
 end
 
 --- True when the take has no Pitch envelope yet, or it is bypassed / hidden, i.e. when
@@ -1113,7 +1138,7 @@ local function start_analysis()
   state.analysis_empty = false
   state.progress = 0
   state.nudge_burst = nil
-  state.view_t0, state.view_t1 = nil, nil   -- the canvas shows the whole item again
+  K.reset_view()   -- the canvas shows the whole item again
 
   -- Ensure take pitch envelope is created and active on the take upfront (own named undo point,
   -- and only when it actually changes something)
@@ -1587,7 +1612,7 @@ end
 --- Drop every in-flight gesture and selection, and show the whole item again (used when the model under
 --- them is replaced).
 local function clear_interaction_state()
-  state.view_t0, state.view_t1 = nil, nil
+  K.reset_view()
   state.selected_note = nil
   state.selected_notes = {}
   state.hovered_note = nil
@@ -1605,7 +1630,7 @@ end
 --- REAPER's item selection.
 local function adopt_take_data(guid, data)
   local same_target = (state.target_take_guid == guid)
-  local view_t0, view_t1 = state.view_t0, state.view_t1
+  local view_t0, view_t1, view_p0, view_p1 = state.view_t0, state.view_t1, state.view_p0, state.view_p1
   state.target_take_guid = guid
   state.target_take_name = data.name
   state.results = data.results
@@ -1616,8 +1641,10 @@ local function adopt_take_data(guid, data)
   state.sample_rate = data.sample_rate
   -- An analysed item that has no notes is "analysed, nothing found" (not "ready to analyze")
   state.analysis_empty = (data.notes ~= nil and #data.notes == 0 and data.results ~= nil and #data.results > 0)
-  clear_interaction_state()   -- also shows the whole item again (state.view_t0 / view_t1) ...
-  if same_target then state.view_t0, state.view_t1 = view_t0, view_t1 end   -- ... unless the same take was reloaded (undo / redo): the zoom stays
+  clear_interaction_state()   -- also shows the whole item and the fitted pitch range again (K.reset_view) ...
+  if same_target then   -- ... unless the same take was reloaded (undo / redo): the zoom stays
+    state.view_t0, state.view_t1, state.view_p0, state.view_p1 = view_t0, view_t1, view_p0, view_p1
+  end
 
   if data.key_idx then state.key_idx = data.key_idx end
   if data.scale_idx then state.scale_idx = data.scale_idx end
@@ -2727,7 +2754,7 @@ local function process_analysis_step()
     state.progress = 1.0
     run_hybrid_segmentation()
     state.analysis_empty = (not state.notes or #state.notes == 0)
-    state.view_t0, state.view_t1 = nil, nil   -- the new model is shown whole
+    K.reset_view()   -- the new model is shown whole
 
     -- Store into multi-item session cache, then persist inside ONE named undo block
     if state.target_take_guid then
@@ -2891,6 +2918,131 @@ K.results_range = function(results)
   return range.has, range.min, range.max
 end
 
+--- The loudest frame (RMS) of `results`, for scaling the amplitude envelope drawn inside the notes; 0 when no
+--- frame carries one (an analysis saved before the RMS was stored). Incremental, like K.results_range.
+K.results_peak = function(results)
+  local peak = state.draw_cache.peak
+  local n = #results
+  if peak.results ~= results or n < peak.n then
+    peak.results, peak.n, peak.max = results, 0, 0
+  end
+  for i = peak.n + 1, n do
+    local rms = results[i].rms
+    if rms and rms > peak.max then peak.max = rms end
+  end
+  peak.n = n
+  return peak.max
+end
+
+--- The waveform of the target item: its peaks from REAPER (the ones the arrange view draws), one maximum and one
+--- minimum per 1 / rate seconds from the item's start, first channel. Returns the cache table (buf = reaper.array
+--- holding `total` maxima then `total` minima, n = how many of each REAPER returned, rate = peaks per second,
+--- peak = the largest absolute value, gen = counts the fetches), or nil while there is nothing to draw (no item,
+--- peaks not built yet, a silent item): the caller then falls back to the loudness envelope of the analysis.
+--- The peaks are fetched once per item and again only when something they depend on changed (another take, the
+--- item's length, the take's start offset, play rate or source): that is looked at when the project state changed,
+--- not on every frame.
+K.take_wave = function(take, item)
+  if not take or not item then return nil end
+  local wv = state.draw_cache.wave
+  if wv.take ~= take or wv.count ~= state.cache.count then
+    local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0
+    local offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    local src = reaper.GetMediaItemTake_Source(take)
+    if wv.take ~= take or wv.len ~= len or wv.offs ~= offs or wv.playrate ~= playrate or wv.src ~= src then
+      wv.take, wv.len, wv.offs, wv.playrate, wv.src = take, len, offs, playrate, src
+      wv.n, wv.stale, wv.retry_at = 0, true, 0
+    end
+    wv.count = state.cache.count
+  end
+
+  if wv.stale and wv.len > 0 and reaper.time_precise() >= wv.retry_at then
+    local total = math.max(1, math.min(K.WAVE_MAX_SAMPLES, math.ceil(wv.len * K.WAVE_RATE)))
+    local rate = total / wv.len
+    local buf = K.fit_array(wv.buf, total * 2)
+    local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION") or 0
+    -- One channel, no extra data. The return value's low 20 bits are the number of peaks written per block
+    local ret = reaper.GetMediaItemTake_Peaks(take, rate, pos, 1, total, 0, buf)
+    local got = math.min(total, (math.tointeger(ret) or 0) & 0xFFFFF)
+    wv.buf = buf
+    if got > 0 then
+      local peak = 0
+      for i = 1, got do
+        local hi, lo = math.abs(buf[i]), math.abs(buf[total + i])
+        if hi > peak then peak = hi end
+        if lo > peak then peak = lo end
+      end
+      wv.n, wv.total, wv.rate, wv.peak = got, total, rate, peak
+      wv.stale = false
+      wv.gen = (wv.gen or 0) + 1
+    else
+      wv.n = 0
+      wv.retry_at = reaper.time_precise() + K.WAVE_RETRY_S   -- the peaks are not built yet: ask again shortly
+    end
+  end
+
+  if wv.n > 0 and wv.peak > 0 then return wv end
+  return nil
+end
+
+--- The waveform of `note` between the screen positions x0 and x1 (the visible part of its block), as columns
+--- WAVE_COL_PX wide: e.w_cols holds, per column, its x and the highest and lowest sample in it as fractions of the
+--- item's peak (-1 .. 1), and e.w_n how many columns there are. Kept per note until the mapping, the block's
+--- extent or the peaks change; the block's height is not part of it, so a pitch drag reuses it.
+K.note_wave = function(note, wave, x0, x1, x_to_t)
+  local dc = state.draw_cache
+  local e = K.note_entry(note)
+  if not (e.w_cols and e.w_gen == dc.gen and e.w_wave == wave.gen and e.w_x0 == x0 and e.w_x1 == x1) then
+    local cols = e.w_cols or {}
+    local buf, n, total, rate, peak = wave.buf, wave.n, wave.total, wave.rate, wave.peak
+    local step = K.WAVE_COL_PX
+    local count = 0
+    local x = x0
+    while x < x1 do
+      -- The peaks this column covers (times are relative to the item's start, as the note times are)
+      local i0 = math.floor(x_to_t(x) * rate) + 1
+      local i1 = math.floor(x_to_t(math.min(x1, x + step)) * rate) + 1
+      if i0 < 1 then i0 = 1 end
+      if i1 > n then i1 = n end
+      if i0 <= i1 then
+        local hi, lo = buf[i0], buf[total + i0]
+        for i = i0 + 1, i1 do
+          local a, b = buf[i], buf[total + i]
+          if a > hi then hi = a end
+          if b < lo then lo = b end
+        end
+        local base = count * 3
+        cols[base + 1], cols[base + 2], cols[base + 3] = x, hi / peak, lo / peak
+        count = count + 1
+      end
+      x = x + step
+    end
+    e.w_cols, e.w_n, e.w_gen, e.w_wave, e.w_x0, e.w_x1 = cols, count, dc.gen, wave.gen, x0, x1
+  end
+  return e
+end
+
+--- The pitch range the notes need: the lowest and highest of every note's centre pitch (where it is now) and
+--- original pitch (where its raw curve is), each +- half a semitone. has = false when there are no notes.
+K.notes_pitch_fit = function(notes)
+  local lo, hi = math.huge, -math.huge
+  for _, note in ipairs(notes or {}) do
+    local cp = note.controls and note.controls.center_pitch
+    if cp then
+      if cp - 0.5 < lo then lo = cp - 0.5 end
+      if cp + 0.5 > hi then hi = cp + 0.5 end
+    end
+    local avg = note.avg_note
+    if avg then
+      if avg - 0.5 < lo then lo = avg - 0.5 end
+      if avg + 0.5 > hi then hi = avg + 0.5 end
+    end
+  end
+  if hi < lo then return false, 0, 0 end
+  return true, lo, hi
+end
+
 --- Once per frame, after the canvas mapping is final: records it (px, py = the note area's top-left corner, w, h =
 --- its size, vt0 .. vt1 = the visible time window, min_note, note_range = the pitch range) and counts a change in
 --- state.draw_cache.gen, which every cached array carries and compares.
@@ -3015,15 +3167,20 @@ local function draw_graph(draw_ctx, w, h)
   reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + h, P.bg)
   reaper.ImGui_DrawList_AddRect(draw_list, px, py, px + w, py + h, P.border)
 
-  local piano_w = 40
+  -- The canvas rectangle (full_px, py, full_w, full_h) is carved into the note-name column on the left, the note
+  -- area (px, py, w, h: every time / pitch conversion below maps onto it), the pitch strip on the right and the
+  -- overview strip along the bottom. The two strips come off w and h once there is something to show (see below).
+  local line_h = reaper.ImGui_GetTextLineHeight(draw_ctx) or 0
+  local piano_w = math.max(L.xxxl + L.md, (reaper.ImGui_CalcTextSize(draw_ctx, "G#-1") or 0) + L.sm * 2)
   local full_px = px
   local full_w = w
+  local full_h = h
   px = px + piano_w
   w = w - piano_w
 
   reaper.ImGui_DrawList_PushClipRect(draw_list, full_px, py, full_px + full_w, py + h, true)
 
-  local target_take = K.frame_target()
+  local target_take, target_item = K.frame_target()
   local is_bypassed = is_take_pitch_bypassed(target_take)
 
   -- The one button the canvas draws (Analyze Item, Open Settings, Enable): a real Button on the large preset,
@@ -3055,7 +3212,7 @@ local function draw_graph(draw_ctx, w, h)
   local function restore_canvas_layout()
     if buttons_used then
       reaper.ImGui_SetCursorScreenPos(draw_ctx, full_px, py)
-      reaper.ImGui_Dummy(draw_ctx, full_w, h)
+      reaper.ImGui_Dummy(draw_ctx, full_w, full_h)
     end
   end
 
@@ -3100,34 +3257,49 @@ local function draw_graph(draw_ctx, w, h)
       end
     end
 
+    -- The empty canvases carry their own centred message: the pill adds only a status message or the selection issue
+    K.canvas_status(draw_list, full_px + L.sm, py + full_h - L.sm, full_w - L.sm * 2, false)
     restore_canvas_layout()
     reaper.ImGui_DrawList_PopClipRect(draw_list)
     return
   end
 
-  -- Find min/max notes for vertical scaling (the analysis frames' part is cached, see K.results_range)
-  local has_notes, min_note, max_note = K.results_range(state.results)
-  -- Include moved blocks in range calculation
-  if state.notes then
-    for _, note in ipairs(state.notes) do
-      if note.controls then
-        local cp = note.controls.center_pitch
-        if cp + 0.5 > max_note then max_note = cp + 0.5 end
-        if cp - 0.5 < min_note then min_note = cp - 0.5 end
-      end
-    end
-  end
-
-  if not has_notes then
+  -- PITCH RANGE. The fit follows the notes (their centre and their original pitch), not every analysis frame: a
+  -- stray octave error in the raw curve must not squeeze the melody into a third of the canvas. While there are no
+  -- notes yet (an analysis in progress) the frames are all there is. ext_min .. ext_max is everything there is to
+  -- see (the fit widened to the raw curve): the track of the pitch strip and the limit of a range the user chose.
+  local has_frames, raw_min, raw_max = K.results_range(state.results)   -- cached, see K.results_range
+  if not has_frames then
+    K.canvas_status(draw_list, full_px + L.sm, py + full_h - L.sm, full_w - L.sm * 2, false)
     reaper.ImGui_DrawList_PopClipRect(draw_list)
     return
   end
+  local has_fit, fit_min, fit_max = K.notes_pitch_fit(state.notes)
+  if not has_fit then fit_min, fit_max = raw_min, raw_max end
+  fit_min = math.floor(fit_min - K.PITCH_PAD_ST)
+  fit_max = math.ceil(fit_max + K.PITCH_PAD_ST)
+  if fit_max - fit_min < K.PITCH_MIN_FIT_ST then
+    local grow = K.PITCH_MIN_FIT_ST - (fit_max - fit_min)
+    fit_min = fit_min - grow // 2
+    fit_max = fit_max + (grow - grow // 2)
+  end
+  local ext_min = math.min(fit_min, math.floor(raw_min - K.PITCH_PAD_ST))
+  local ext_max = math.max(fit_max, math.ceil(raw_max + K.PITCH_PAD_ST))
 
-  -- Add padding
-  min_note = math.floor(min_note - 2)
-  max_note = math.ceil(max_note + 2)
-  local note_range = max_note - min_note
-  if note_range < 1 then note_range = 1 end
+  -- The range on screen: the fit, or the one the user chose (state.view_p0 / view_p1), kept inside the extent
+  local min_note, max_note = fit_min, fit_max
+  if state.view_p0 and state.view_p1 then
+    local span = math.max(math.min(K.PITCH_MIN_VIEW_ST, ext_max - ext_min), math.min(ext_max - ext_min, state.view_p1 - state.view_p0))
+    min_note = math.max(ext_min, math.min(ext_max - span, state.view_p0))
+    max_note = min_note + span
+  end
+  local note_range = math.max(1, max_note - min_note)
+
+  -- There is something to show: the strips take their room from the note area
+  local ov_h = math.min(line_h * 2, h * 0.25)   -- overview strip (below the note area)
+  local pv_w = L.xl                             -- pitch strip (right of the note area)
+  h = h - ov_h
+  w = w - pv_w
 
   local duration = state.end_time - state.start_time
   if duration <= 0 then duration = 1 end
@@ -3173,6 +3345,24 @@ local function draw_graph(draw_ctx, w, h)
     set_view(state.view_t0, 0, state.view_t1 - state.view_t0)
   end
 
+  -- The same for the pitch axis: show p0 .. p1 (semitones), never fewer than PITCH_MIN_VIEW_ST and never outside
+  -- the extent. The range stays the user's until K.reset_view (F, a double-click on the pitch strip, a new model).
+  local function set_pitch_view(p0, p1)
+    local span = math.max(math.min(K.PITCH_MIN_VIEW_ST, ext_max - ext_min), math.min(ext_max - ext_min, p1 - p0))
+    p0 = math.max(ext_min, math.min(ext_max - span, p0))
+    state.view_p0, state.view_p1 = p0, p0 + span
+    min_note, max_note = p0, p0 + span
+    note_range = math.max(1, span)
+    px_per_st = h / note_range
+  end
+  -- Back to the range fitted to the notes
+  local function fit_pitch_view()
+    state.view_p0, state.view_p1 = nil, nil
+    min_note, max_note = fit_min, fit_max
+    note_range = math.max(1, max_note - min_note)
+    px_per_st = h / note_range
+  end
+
   -- Index range [i0, i1] of `list` (entries sorted by .time) that reaches the visible window, with one entry of
   -- margin on each side so a curve still runs off the canvas edge. Empty list -> 1, 0.
   local function visible_range(list)
@@ -3197,13 +3387,16 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   local mx, my = reaper.ImGui_GetMousePos(draw_ctx)
 
-  -- The time ruler is an overlay along the top of the note area: it owns the pointer there
-  local line_h = reaper.ImGui_GetTextLineHeight(draw_ctx) or 0
+  -- The time ruler is an overlay along the top of the note area: it owns the pointer there. So do the overview
+  -- strip (below the note area, the corner under the pitch strip included) and the pitch strip (right of it).
   local ruler_h = line_h + L.xs * 2
   local on_ruler = is_canvas_hovered and mx >= px and mx <= px + w and my >= py and my <= py + ruler_h
+  local on_overview = is_canvas_hovered and my > py + h
+  local on_pstrip = is_canvas_hovered and mx > px + w and my <= py + h
 
-  if is_canvas_hovered and not gesture then
-    -- Ctrl/Cmd + wheel zooms around the pointer; the plain wheel scrolls the window (a no-op while the whole
+  if is_canvas_hovered and not gesture and not state.view_drag then
+    -- Ctrl/Cmd + wheel zooms the timeline around the pointer, Alt + wheel zooms the pitch axis around it,
+    -- Shift + wheel scrolls the pitch axis, and the plain wheel scrolls the timeline (a no-op while the whole
     -- item is visible). Ignored during a gesture (the mapping must not change under it) and while the script
     -- window itself can scroll (the wheel belongs to it then).
     local wheel_y, wheel_x = reaper.ImGui_GetMouseWheel(draw_ctx)
@@ -3211,12 +3404,20 @@ local function draw_graph(draw_ctx, w, h)
     if (reaper.ImGui_GetScrollMaxY(draw_ctx) or 0) > 0 then wheel_y, wheel_x = 0, 0 end
     local span = vt1 - vt0
     local wheel_mods = reaper.ImGui_GetKeyMods(draw_ctx) or 0
+    local notches = wheel_y ~= 0 and wheel_y or wheel_x   -- Shift turns the wheel sideways on some systems: either axis counts
     if wheel_y ~= 0 and (wheel_mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then
       local frac = math.max(0, math.min(1, (mx - px) / math.max(w, 1)))
       set_view(x_to_t(px + frac * w), frac, span / K.ZOOM_STEP ^ wheel_y)
-    elseif span < duration - K.VIEW_EPS_S and (wheel_y ~= 0 or wheel_x ~= 0) then
-      local notches = wheel_y ~= 0 and wheel_y or wheel_x   -- wheel up / left = earlier
-      set_view(vt0 - notches * K.SCROLL_STEP * span, 0, span)
+    elseif notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Alt()) ~= 0 then
+      local frac = math.max(0, math.min(1, (py + h - my) / math.max(h, 1)))   -- 0 = bottom of the note area, 1 = top
+      local anchor = min_note + frac * note_range
+      local new_span = note_range / K.ZOOM_STEP ^ notches
+      set_pitch_view(anchor - frac * new_span, anchor + (1 - frac) * new_span)
+    elseif notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Shift()) ~= 0 then
+      local step = notches * K.SCROLL_STEP * note_range   -- wheel up = higher notes
+      set_pitch_view(min_note + step, max_note + step)
+    elseif span < duration - K.VIEW_EPS_S and notches ~= 0 then
+      set_view(vt0 - notches * K.SCROLL_STEP * span, 0, span)   -- wheel up / left = earlier
     end
     -- Double-click on the ruler shows the whole item again
     if on_ruler and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
@@ -3224,8 +3425,99 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  ---------------------------------------------------------------------------
+  -- OVERVIEW STRIP and PITCH STRIP: the one visible zoom / scroll control of each axis
+  ---------------------------------------------------------------------------
+  -- Each strip is a track (the whole item / the whole pitch extent) with a thumb marking what the note area shows.
+  -- Dragging the thumb scrolls, dragging one of its ends zooms (the other end stays put), a double-click shows
+  -- everything again (the whole item / the range fitted to the notes), and a press outside the thumb brings the
+  -- window there. The thumbs are worked out again when they are drawn: a gesture below moves them.
+  local pitch_ext = math.max(1, ext_max - ext_min)
+  local function overview_thumb()   -- left x, right x
+    return px + (vt0 - item_t0) / duration * w, px + (vt1 - item_t0) / duration * w
+  end
+  local function pitch_thumb()      -- top y, bottom y
+    return py + (ext_max - max_note) / pitch_ext * h, py + (ext_max - min_note) / pitch_ext * h
+  end
+
+  if (on_overview or on_pstrip) and not is_bypassed and not gesture and not state.view_drag then
+    local a0, a1, pos
+    if on_overview then
+      a0, a1 = overview_thumb()
+      pos = math.max(px, math.min(px + w, mx))
+    else
+      a0, a1 = pitch_thumb()
+      pos = my
+    end
+    local grab = math.min(K.VIEW_GRIP, (a1 - a0) * K.EDGE_GRAB_MAX_FRAC)
+    local on_start = math.abs(pos - a0) <= grab   -- the thumb's left end / top end
+    local on_end = math.abs(pos - a1) <= grab     -- its right end / bottom end
+    if on_start or on_end then
+      reaper.ImGui_SetMouseCursor(draw_ctx, on_overview and reaper.ImGui_MouseCursor_ResizeEW() or reaper.ImGui_MouseCursor_ResizeNS())
+    else
+      reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_Hand())
+    end
+    if canvas_tip_ready then
+      Theme.tooltip(draw_ctx, on_overview and "Drag to scroll. Drag an end to zoom. Double-click: whole item"
+        or "Drag to scroll. Drag an end to zoom. Double-click: fit the notes")
+    end
+
+    if reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
+      if on_overview then set_view(item_t0, 0, duration) else fit_pitch_view() end
+    elseif reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+      flush_nudge_burst()   -- a new gesture starts: commit a pending arrow-key nudge first
+      local kind = on_start and "0" or (on_end and "1" or "_pan")
+      if kind == "_pan" and (pos < a0 or pos > a1) then
+        -- Outside the thumb: the window is centred on the press, and the drag carries on from there
+        if on_overview then
+          local span = vt1 - vt0
+          set_view(item_t0 + (pos - px) / math.max(w, 1) * duration - span * 0.5, 0, span)
+        else
+          local centre = ext_max - (pos - py) / math.max(h, 1) * pitch_ext
+          set_pitch_view(centre - note_range * 0.5, centre + note_range * 0.5)
+        end
+      end
+      if on_overview then
+        state.view_drag = { kind = "t" .. kind, start = mx, a0 = vt0, a1 = vt1 }
+      else
+        -- p0 = the bottom end (the lowest pitch shown), p1 = the top end; the thumb's top is its "start"
+        state.view_drag = { kind = "p" .. (kind == "0" and "1" or (kind == "1" and "0" or kind)), start = my, a0 = min_note, a1 = max_note }
+      end
+    end
+  end
+
+  if state.view_drag then
+    local vd = state.view_drag
+    if not reaper.ImGui_IsMouseDown(draw_ctx, 0) then
+      state.view_drag = nil
+    elseif vd.kind:sub(1, 1) == "t" then
+      reaper.ImGui_SetMouseCursor(draw_ctx, vd.kind == "t_pan" and reaper.ImGui_MouseCursor_Hand() or reaper.ImGui_MouseCursor_ResizeEW())
+      local dt = (mx - vd.start) / math.max(w, 1) * duration
+      if vd.kind == "t_pan" then
+        set_view(vd.a0 + dt, 0, vd.a1 - vd.a0)
+      elseif vd.kind == "t0" then
+        set_view(vd.a1, 1, vd.a1 - (vd.a0 + dt))   -- the right end stays where it is
+      else
+        set_view(vd.a0, 0, (vd.a1 + dt) - vd.a0)   -- the left end stays where it is
+      end
+    else
+      reaper.ImGui_SetMouseCursor(draw_ctx, vd.kind == "p_pan" and reaper.ImGui_MouseCursor_Hand() or reaper.ImGui_MouseCursor_ResizeNS())
+      local dp = -(my - vd.start) / math.max(h, 1) * pitch_ext   -- the strip runs downwards: down = lower notes
+      local min_span = math.min(K.PITCH_MIN_VIEW_ST, pitch_ext)
+      if vd.kind == "p_pan" then
+        set_pitch_view(vd.a0 + dp, vd.a1 + dp)
+      elseif vd.kind == "p1" then
+        set_pitch_view(vd.a0, math.max(vd.a0 + min_span, math.min(ext_max, vd.a1 + dp)))   -- the bottom end stays
+      else
+        set_pitch_view(math.min(vd.a1 - min_span, math.max(ext_min, vd.a0 + dp)), vd.a1)   -- the top end stays
+      end
+    end
+  end
+  -- Nothing on a note is hovered, clicked or dragged from the ruler or a strip, nor while a strip is dragged
+  local off_notes = on_ruler or on_overview or on_pstrip or state.view_drag ~= nil
+
   -- Text on a small panel-coloured pill (C.pill_bg), so it stays readable over any canvas surface (HC1): the text tokens
-  -- (C.pill_text, C.marquee_text) are fitted to >= 4.5:1 on the pill over every row and the brightest piano key. The pill
+  -- (C.pill_text, C.marquee_text) are fitted to >= 4.5:1 on the pill over every row and every note fill. The pill
   -- is kept inside the note area (below the ruler); with flip_dx it moves to the left of x when it would run past the right edge.
   local function pill_text(x, y, text, col, flip_dx)
     local tw, th = reaper.ImGui_CalcTextSize(draw_ctx, text)
@@ -3244,7 +3536,7 @@ local function draw_graph(draw_ctx, w, h)
 
   -- Hit-test: find hovered note, zone, and edge handles
   local prev_edge = state.hovered_edge   -- the edge the pointer rested on last frame keeps a larger grab zone
-  if is_canvas_hovered and not on_ruler and not is_bypassed and not gesture and state.notes then
+  if is_canvas_hovered and not off_notes and not is_bypassed and not gesture and state.notes then
     state.hovered_note = nil
     state.hovered_zone = nil
     state.hovered_edge = nil
@@ -3262,7 +3554,7 @@ local function draw_graph(draw_ctx, w, h)
         local grab_l = math.min(cap, (prev_edge and prev_edge.note_idx == n_idx and prev_edge.edge == "left") and K.EDGE_GRAB_HOVER or K.EDGE_GRAB)
         local grab_r = math.min(cap, (prev_edge and prev_edge.note_idx == n_idx and prev_edge.edge == "right") and K.EDGE_GRAB_HOVER or K.EDGE_GRAB)
 
-        -- Check edge handles first (higher priority than zone hover); the piano column is not part of the note
+        -- Check edge handles first (higher priority than zone hover); the note-name column is not part of the note
         -- area, so a note running past the window's left edge is not grabbed from the keys
         if mx >= px - grab_l and my >= top_y and my <= bot_y then
           if math.abs(mx - sx) <= grab_l then
@@ -3304,14 +3596,14 @@ local function draw_graph(draw_ctx, w, h)
     elseif state.hovered_zone == "drift" or state.hovered_zone == "vibrato" then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_Hand())
     end
-  elseif (not is_canvas_hovered or is_bypassed or on_ruler) and not state.drag and not state.edge_drag and not state.marquee then
+  elseif (not is_canvas_hovered or is_bypassed or off_notes) and not state.drag and not state.edge_drag and not state.marquee then
     state.hovered_note = nil
     state.hovered_zone = nil
     state.hovered_edge = nil
   end
 
   -- Click: select note (Shift/Cmd/Ctrl = multi-select), begin drag, edge drag, or marquee box select
-  if is_canvas_hovered and not on_ruler and not is_bypassed and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+  if is_canvas_hovered and not off_notes and not is_bypassed and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
     -- A new gesture starts: commit any pending arrow-key nudge as its own undo point first
     flush_nudge_burst()
 
@@ -3441,7 +3733,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   -- Right-click on note: open context menu
-  if is_canvas_hovered and not on_ruler and reaper.ImGui_IsMouseClicked(draw_ctx, 1) then
+  if is_canvas_hovered and not off_notes and reaper.ImGui_IsMouseClicked(draw_ctx, 1) then
     if state.hovered_note and state.notes[state.hovered_note] then
       state.selected_note = state.hovered_note
       state.selected_notes = { [state.hovered_note] = true }
@@ -3744,7 +4036,7 @@ local function draw_graph(draw_ctx, w, h)
         nudge_selected_notes(-0.10, "down")
       end
 
-      -- S: Snap to nearest semitone (the status line reports it, as for the dock's Snap button)
+      -- S: Snap to nearest semitone (the status line reports it, as for the top bar's Snap button)
       if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_S()) then
         K.note_action("snap")
       end
@@ -3803,6 +4095,34 @@ local function draw_graph(draw_ctx, w, h)
       end
     end
 
+    -- F: the whole item again, with the pitch range fitted to the notes. Z: both axes zoom to the selected notes.
+    -- Not during a marquee: the mapping must not change under a gesture. Both need exact modifiers, so
+    -- Cmd/Ctrl+Z still reaches REAPER's undo.
+    if not gesture then
+      if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_F()) then
+        set_view(item_t0, 0, duration)
+        fit_pitch_view()
+      elseif reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Z()) then
+        local t_lo, t_hi, p_lo, p_hi = math.huge, -math.huge, math.huge, -math.huge
+        local function include(idx)
+          local n = state.notes[idx]
+          if n and n.controls then
+            t_lo, t_hi = math.min(t_lo, n.start_time), math.max(t_hi, n.end_time)
+            p_lo, p_hi = math.min(p_lo, n.controls.center_pitch), math.max(p_hi, n.controls.center_pitch)
+          end
+        end
+        for idx in pairs(state.selected_notes) do include(idx) end
+        if state.selected_note then include(state.selected_note) end
+        if t_hi > t_lo then
+          local pad = math.max((t_hi - t_lo) * K.ZOOM_SEL_PAD, K.MIN_VIEW_SPAN_S * 0.5)
+          set_view(t_lo - pad, 0, (t_hi - t_lo) + pad * 2)
+          set_pitch_view(p_lo - K.ZOOM_SEL_PAD_ST, p_hi + K.ZOOM_SEL_PAD_ST)
+        else
+          set_status("Select a note to zoom to it")
+        end
+      end
+    end
+
     -- Space is forwarded to the user's own REAPER binding by forward_space_to_reaper() in loop_body (HC6).
   end
 
@@ -3822,13 +4142,15 @@ local function draw_graph(draw_ctx, w, h)
   K.canvas_cache_begin(px, py, w, h, vt0, vt1, min_note, note_range)
 
   ---------------------------------------------------------------------------
-  -- DRAW NOTE GRID & PIANO ROLL (IN-SCALE TINTING & OUT-OF-SCALE DIMMING)
+  -- DRAW ROWS (one quiet surface: in-scale rows a tint, out-of-scale rows a step darker, the root row marked)
   ---------------------------------------------------------------------------
+  -- Everything from here to the playhead is clipped to the note area: the note-name column and the two strips
+  -- are drawn after it, and a block that runs past the window's edge must not reach them.
   local root_pc = (state.key_idx - 1) % 12
   local is_chromatic = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic")
+  reaper.ImGui_DrawList_PushClipRect(draw_list, px, py, px + w, py + h, true)
 
   for n = math.floor(min_note), math.ceil(max_note) do
-    local y = py + h - ((n - min_note) / note_range) * h
     local key_top = py + h - ((n + 0.5 - min_note) / note_range) * h
     local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
     local is_black_key = (n % 12 == 1 or n % 12 == 3 or n % 12 == 6
@@ -3837,7 +4159,6 @@ local function draw_graph(draw_ctx, w, h)
     local in_scale = is_pitch_in_scale(pc)
     local is_root = (pc == root_pc)
 
-    -- 1. Canvas row background & grid line
     local row_bg
     local row_tint = nil
     local grid_color
@@ -3867,51 +4188,23 @@ local function draw_graph(draw_ctx, w, h)
     if row_tint then
       reaper.ImGui_DrawList_AddRectFilled(draw_list, px, key_top, px + w, key_bot, row_tint)
     end
-    reaper.ImGui_DrawList_AddLine(draw_list, px, y, px + w, y, grid_color)
-
-    -- 2. Piano roll keys
-    local key_color
-    local text_col
-
-    -- Label colours (WCAG 2.x on the key): every label that is drawn is >= 4.5:1 (each key_text_* token is fitted on its key)
-    if is_chromatic then
-      key_color = is_black_key and C.key_plain_black or C.key_white
-      text_col = is_black_key and C.key_text_plain_black or C.key_text_plain_white
-    elseif in_scale then
-      if is_root then
-        key_color = is_black_key and C.key_tonic_black or C.key_tonic_white
-        text_col = is_black_key and C.key_text_tonic_black or C.key_text_tonic_white
-      else
-        key_color = is_black_key and C.key_black or C.key_white
-        text_col = is_black_key and C.key_text_black or C.key_text_white
-      end
-    else
-      -- Out-of-scale keys dimmed; only their C is labelled (below)
-      key_color = is_black_key and C.key_dim_black or C.key_dim_white
-      text_col = is_black_key and C.key_text_dim_black or C.key_text_dim_white
-    end
-
-    reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, key_top, full_px + piano_w, key_bot, key_color)
-    reaper.ImGui_DrawList_AddRect(draw_list, full_px, key_top, full_px + piano_w, key_bot, C.key_outline)
-
-    -- Accent indicator strip for root key
-    if not is_chromatic and is_root then
-      reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px + piano_w - 3, key_top, full_px + piano_w, key_bot, C.key_tonic_strip)
-    end
-
-    -- Every in-scale key is labelled while a row is at least a text line tall; below that only the C keys are, so
-    -- labels never overlap. Out-of-scale keys are dimmed: they carry a label on C only (orientation)
-    if (px_per_st >= line_h or n % 12 == 0) and (in_scale or pc == 0) then
-      local label = midi_to_name(n)
-      local text_y = (key_top + key_bot) * 0.5 - line_h * 0.5
-      reaper.ImGui_DrawList_AddText(draw_list, full_px + 2, text_y, text_col, label)
-    end
+    -- A hairline along the row's lower edge (the rows differ little in colour: the line tells them apart)
+    reaper.ImGui_DrawList_AddLine(draw_list, px, key_bot, px + w, key_bot, grid_color)
   end
 
   ---------------------------------------------------------------------------
   -- DRAW NOTE BLOCKS (interactive, positioned by center_pitch)
   ---------------------------------------------------------------------------
+  -- Labels are collected here and drawn after the curves (see NOTE LABELS): { x, top, bot, text }
+  local labels = {}
   if state.show_note_blocks and state.notes then
+    -- Inside the blocks: the item's real waveform (its peaks from REAPER), or, while those are not available, the
+    -- loudness envelope of the analysis, scaled by its loudest frame
+    local wave = K.take_wave(target_take, target_item)
+    local peak_rms = (not wave) and K.results_peak(state.results) or 0
+    local selected_n = 0
+    for _ in pairs(state.selected_notes) do selected_n = selected_n + 1 end
+    local label_all_selected = selected_n <= K.LABEL_MAX_SELECTED
     for n_idx, note in ipairs(state.notes) do
       -- Only blocks that reach the visible window are drawn
       if note.controls and note.end_time >= vt0 and note.start_time <= vt1 then
@@ -3989,15 +4282,63 @@ local function draw_graph(draw_ctx, w, h)
           end
         else
           reaper.ImGui_DrawList_AddRectFilled(draw_list,
-            sx, top_y, ex, bot_y, fill)
+            sx, top_y, ex, bot_y, fill, L.xs)
+        end
+
+        -- The waveform inside the block (C.note_wave), around the block's centre line: the item's own audio between
+        -- the note's start and end, scaled so the loudest sample of the item just fills a block. It is linear: a
+        -- quiet note looks quiet.
+        local wave_half = (bot_y - top_y) * 0.5 - L.xs
+        local mid_y = (top_y + bot_y) * 0.5
+        if wave and wave_half >= 1 and not is_bypassed_note then
+          local wave_x0, wave_x1 = math.max(sx, px), math.min(ex, px + w)
+          if wave_x1 > wave_x0 then
+            local cols = K.note_wave(note, wave, wave_x0, wave_x1, x_to_t)   -- cached, see K.note_wave
+            local col_w = K.WAVE_COL_PX
+            local c = cols.w_cols
+            for k = 0, cols.w_n - 1 do
+              local col_x = c[k * 3 + 1]
+              local y0 = mid_y - c[k * 3 + 2] * wave_half
+              local y1 = mid_y - c[k * 3 + 3] * wave_half
+              if y1 - y0 < 1 then   -- silence is a hairline, not a gap
+                local centre = (y0 + y1) * 0.5
+                y0, y1 = centre - 0.5, centre + 0.5
+              end
+              reaper.ImGui_DrawList_AddRectFilled(draw_list, col_x, y0, col_x + col_w, y1, C.note_wave)
+            end
+          end
+        -- Fallback while REAPER has no peaks for the item: the loudness (RMS) of the analysis frames, as mirrored bars.
+        -- One bar per frame, or per few frames when they are closer than WAVE_STEP_PX; an analysis saved without the
+        -- RMS draws none. It shows where the note is loud, not the audio itself.
+        elseif peak_rms > 0 and wave_half >= 1 and note.frames and not is_bypassed_note then
+          local wf0, wf1 = visible_range(note.frames)
+          if wf1 > wf0 then
+            local wave_w = t_to_x(note.frames[wf1].time) - t_to_x(note.frames[wf0].time)
+            local stride = math.max(1, math.ceil(K.WAVE_STEP_PX * (wf1 - wf0) / math.max(wave_w, 1)))
+            local i = wf0
+            while i < wf1 do
+              local j = math.min(wf1, i + stride)
+              local rms = 0
+              for k = i, j - 1 do
+                local frame_rms = note.frames[k].rms
+                if frame_rms and frame_rms > rms then rms = frame_rms end
+              end
+              local amp = wave_half * math.sqrt(math.min(1, rms / peak_rms))
+              local bar_x0 = math.max(sx, t_to_x(note.frames[i].time))
+              local bar_x1 = math.min(ex, t_to_x(note.frames[j].time))
+              if amp >= 0.5 and bar_x1 > bar_x0 then
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, bar_x0, mid_y - amp, bar_x1, mid_y + amp, C.note_wave)
+              end
+              i = j
+            end
+          end
         end
 
         -- Border (thicker for selected notes)
         reaper.ImGui_DrawList_AddRect(draw_list,
-          sx, top_y, ex, bot_y, border, 0, 0, is_selected and 2.0 or 1.0)
+          sx, top_y, ex, bot_y, border, L.xs, 0, is_selected and 2.0 or 1.0)
 
         if is_bypassed_note then
-          local mid_y = top_y + (bot_y - top_y) * 0.5
           reaper.ImGui_DrawList_AddLine(draw_list, sx, mid_y, ex, mid_y, border, 1.5)
         end
 
@@ -4038,24 +4379,29 @@ local function draw_graph(draw_ctx, w, h)
             ex - handle_w, top_y, ex + 1, bot_y, right_handle_col)
         end
 
-        -- An edited note also carries a small square (C.note_edit_mark) in its top-left corner (not green alone); the label moves over
-        local label_x = math.max(sx, px) + L.sm   -- stays readable while the block runs past the left edge
+        -- An edited note also carries a small square (C.note_edit_mark) in its top-left corner (not green alone)
         if is_mod then
+          local mark_x = math.max(sx, px) + L.sm   -- stays visible while the block runs past the left edge
           local mark = math.min(K.EDIT_MARK, bot_y - top_y - L.xs * 2, block_w - L.sm * 2)
           if mark >= L.xs then
-            reaper.ImGui_DrawList_AddRectFilled(draw_list, label_x, top_y + L.xs, label_x + mark, top_y + L.xs + mark, C.note_edit_mark)
-            label_x = label_x + mark + L.xs
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, mark_x, top_y + L.xs, mark_x + mark, top_y + L.xs + mark, C.note_edit_mark)
           end
         end
 
-        -- Note label: name + cents deviation (always visible). Each label token is fitted to >= 4.5:1 over its note fill
-        local nearest = math.floor(cp + 0.5)
-        local cents = math.floor((cp - nearest) * 100 + 0.5)
-        local sign = cents >= 0 and "+" or ""
-        local label = string.format("%s %s%d\xC2\xA2", midi_to_name(nearest), sign, cents)
-        local text_y = (top_y + bot_y) * 0.5 - 7
-        local text_color = is_mod and C.note_label_edited or (is_selected and C.note_label_selected or C.note_label)
-        reaper.ImGui_DrawList_AddText(draw_list, label_x, text_y, text_color, label)
+        -- Note label (name + cents deviation): only for the hovered note and the selected ones, on a pill beside the
+        -- block (drawn after the curves). The row already names the pitch of every other note. A selection larger than
+        -- LABEL_MAX_SELECTED labels its primary note alone; the note a pitch drag holds reads the same in the drag readout.
+        local held = state.drag and state.drag.dirty and state.drag.zone == "pitch"
+          and (state.drag.anchor_idx or state.drag.note_idx) == n_idx
+        if not held and (is_hov or n_idx == state.selected_note or (is_selected and label_all_selected)) then
+          local nearest = math.floor(cp + 0.5)
+          local cents = math.floor((cp - nearest) * 100 + 0.5)
+          local sign = cents >= 0 and "+" or ""
+          labels[#labels + 1] = {
+            x = math.max(sx, px), top = top_y, bot = bot_y,
+            text = string.format("%s %s%d\xC2\xA2", midi_to_name(nearest), sign, cents),
+          }
+        end
       end
     end
   end
@@ -4075,7 +4421,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
-  -- DRAW RAW PITCH CURVE (purple)
+  -- DRAW RAW PITCH CURVE (the text colour: the blocks own the accent)
   ---------------------------------------------------------------------------
   if state.show_raw_pitch then
     -- Only the part of the curve that reaches the visible window; unvoiced gaps at either end are skipped so
@@ -4085,7 +4431,7 @@ local function draw_graph(draw_ctx, w, h)
     while r1 < #state.results and not state.results[r1].note do r1 = r1 + 1 end
     local polyline = K.raw_trace(state.results, r0, r1, t_to_x)   -- cached, see K.raw_trace
     if polyline then
-      reaper.ImGui_DrawList_AddPolyline(draw_list, polyline, C.trace, 0, 2.0)
+      reaper.ImGui_DrawList_AddPolyline(draw_list, polyline, C.trace, 0, 1.5)
     end
   end
 
@@ -4093,7 +4439,7 @@ local function draw_graph(draw_ctx, w, h)
   -- DRAW TREND, SMART SPOTS, VIBRATO REGIONS & CORRECTED PITCH PREVIEW
   ---------------------------------------------------------------------------
   if state.notes then
-    for _, note in ipairs(state.notes) do
+    for n_idx, note in ipairs(state.notes) do
       -- The frames of this note that reach the visible window (f0 > f1: none)
       local f0, f1 = 1, 0
       if note.frames then f0, f1 = visible_range(note.frames) end
@@ -4128,8 +4474,10 @@ local function draw_graph(draw_ctx, w, h)
         reaper.ImGui_DrawList_AddPolyline(draw_list, K.note_trend(note, f0, f1, t_to_x), C.trend, 0, 1.0)
       end
 
-      -- Smart spots: yellow circles (peaks / valleys) and cyan diamonds (the trend's anchors): shape, not colour alone
-      if state.show_smart_spots and note.smart_spots then
+      -- Smart spots: yellow circles (peaks / valleys) and cyan diamonds (the trend's anchors): shape, not colour alone.
+      -- Only on the hovered note and the selected ones: on every note at once they bury the notes themselves.
+      if state.show_smart_spots and note.smart_spots
+          and (state.hovered_note == n_idx or state.selected_note == n_idx or state.selected_notes[n_idx]) then
         for _, spot in ipairs(note.smart_spots) do
           if spot.time >= vt0 and spot.time <= vt1 then
             local x = t_to_x(spot.time)
@@ -4151,6 +4499,18 @@ local function draw_graph(draw_ctx, w, h)
           and note.controls and note.trend and note.modulation then
         reaper.ImGui_DrawList_AddPolyline(draw_list, K.note_preview(note, f0, f1, t_to_x), C.preview, 0, 2.0)
       end
+    end
+  end
+
+  ---------------------------------------------------------------------------
+  -- DRAW NOTE LABELS (collected with the blocks): a pill above each block, or below it when the ruler is in the way
+  ---------------------------------------------------------------------------
+  do
+    local pill_h = line_h + L.xs * 2
+    for _, lb in ipairs(labels) do
+      local y = lb.top - pill_h - L.xs
+      if y < py + ruler_h then y = lb.bot + L.xs end
+      pill_text(lb.x, y, lb.text, C.pill_text)
     end
   end
 
@@ -4177,7 +4537,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
-  -- DRAW TIME RULER (overlay along the top of the note area, not the piano column)
+  -- DRAW TIME RULER (overlay along the top of the note area, not the note-name column)
   ---------------------------------------------------------------------------
   do
     local span = vt1 - vt0
@@ -4265,7 +4625,7 @@ local function draw_graph(draw_ctx, w, h)
         tip = string.format("Vibrato: %.0f%%%s",
           d_note.controls.vibrato_scale * 100, count_suffix)
       end
-      -- Beside the pointer, never outside the note area (nor over the piano keys or the ruler)
+      -- Beside the pointer, never outside the note area (nor over the note-name column or the ruler)
       pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
     end
   elseif canvas_tip_ready and state.hovered_note and not state.drag and not state.marquee then
@@ -4302,6 +4662,7 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   -- PLAYHEAD CURSOR LINE
   ---------------------------------------------------------------------------
+  local playhead_t = nil   -- the cursor's time while it is inside the item (the overview strip marks it too)
   local _, item_for_cursor = K.frame_target()
   if item_for_cursor then
     local item_pos = reaper.GetMediaItemInfo_Value(item_for_cursor, "D_POSITION")
@@ -4311,17 +4672,103 @@ local function draw_graph(draw_ctx, w, h)
       and reaper.GetPlayPosition()
       or  reaper.GetCursorPosition()
     local item_rel = project_pos - item_pos
-    -- Only draw if cursor is within the item's time range and the visible window
-    if item_rel >= state.start_time and item_rel <= state.end_time and item_rel >= vt0 and item_rel <= vt1 then
-      local cursor_x = t_to_x(item_rel)
-      reaper.ImGui_DrawList_AddLine(draw_list,
-        cursor_x, py, cursor_x, py + h, C.playhead, 1.5)
+    if item_rel >= state.start_time and item_rel <= state.end_time then
+      playhead_t = item_rel
+      -- The line is drawn only inside the visible window. Its head sits in the ruler: the line is the same colour as
+      -- the pitch trace, and the head is what tells it from a spike of the trace
+      if item_rel >= vt0 and item_rel <= vt1 then
+        local cursor_x = t_to_x(item_rel)
+        reaper.ImGui_DrawList_AddLine(draw_list,
+          cursor_x, py, cursor_x, py + h, C.playhead, 1.5)
+        reaper.ImGui_DrawList_AddTriangleFilled(draw_list,
+          cursor_x - L.sm, py, cursor_x + L.sm, py, cursor_x, py + L.md, C.playhead)
+      end
+    end
+  end
+
+  reaper.ImGui_DrawList_PopClipRect(draw_list)   -- the note area
+
+  ---------------------------------------------------------------------------
+  -- DRAW NOTE-NAME COLUMN (a flat strip left of the rows; the root row carries an accent strip and an accent name)
+  ---------------------------------------------------------------------------
+  reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, py, px, py + full_h, C.gutter_bg)
+  reaper.ImGui_DrawList_PushClipRect(draw_list, full_px, py, px, py + h, true)
+  for n = math.floor(min_note), math.ceil(max_note) do
+    local key_top = py + h - ((n + 0.5 - min_note) / note_range) * h
+    local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
+    local pc = (n % 12 + 12) % 12
+    local is_root = (not is_chromatic) and pc == root_pc
+    reaper.ImGui_DrawList_AddLine(draw_list, full_px, key_bot, px, key_bot, C.grid)
+    if is_root then
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, px - L.xs - L.border, key_top, px, key_bot, C.gutter_strip)
+    end
+    -- Every row is named while a row is at least a text line tall; below that only the C rows are, so the names
+    -- never overlap. Out-of-scale rows are named in the dimmer colour (every name is >= 4.5:1 on the column).
+    if px_per_st >= line_h or pc == 0 then
+      local text_col = C.gutter_text_dim
+      if is_root then
+        text_col = C.gutter_text_tonic
+      elseif is_chromatic or is_pitch_in_scale(pc) then
+        text_col = C.gutter_text
+      end
+      reaper.ImGui_DrawList_AddText(draw_list, full_px + L.sm, (key_top + key_bot) * 0.5 - line_h * 0.5, text_col, midi_to_name(n))
+    end
+  end
+  reaper.ImGui_DrawList_PopClipRect(draw_list)
+  reaper.ImGui_DrawList_AddLine(draw_list, px, py, px, py + h, P.border)
+
+  ---------------------------------------------------------------------------
+  -- DRAW PITCH STRIP (right of the note area) and OVERVIEW STRIP (below it): track, thumb, end grips
+  ---------------------------------------------------------------------------
+  do
+    local x0, x1 = px + w, px + w + pv_w
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, py, x1, py + h, C.overview_bg)
+    reaper.ImGui_DrawList_AddLine(draw_list, x0, py, x0, py + h, P.border)
+    local ty0, ty1 = pitch_thumb()
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x0 + L.xs, ty0, x1 - L.xs, ty1, C.view_fill, L.rounding)
+    reaper.ImGui_DrawList_AddRect(draw_list, x0 + L.xs, ty0, x1 - L.xs, ty1, C.view_border, L.rounding)
+    if ty1 - ty0 >= L.xxl then   -- room for a grip inside each end
+      local gx0, gx1 = x0 + L.sm + L.border, x1 - L.sm - L.border
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, gx0, ty0 + L.sm, gx1, ty0 + L.sm + L.xs, C.view_grip)
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, gx0, ty1 - L.sm - L.xs, gx1, ty1 - L.sm, C.view_grip)
+    end
+  end
+  do
+    local y0, y1 = py + h, py + full_h
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, px, y0, full_px + full_w, y1, C.overview_bg)
+    reaper.ImGui_DrawList_AddLine(draw_list, full_px, y0, full_px + full_w, y0, P.border)
+    -- Every note, small: placed by time over the whole item and by pitch over the fitted range
+    local lane_h = (y1 - y0) - L.sm * 2
+    if state.notes and lane_h > 0 then
+      local fit_span = math.max(1, fit_max - fit_min)
+      local bar_h = math.max(L.xs, math.min(L.sm, lane_h / fit_span))
+      for _, note in ipairs(state.notes) do
+        if note.controls then
+          local nx0 = px + (note.start_time - item_t0) / duration * w
+          local nx1 = math.max(nx0 + 1, px + (note.end_time - item_t0) / duration * w)
+          local frac = math.max(0, math.min(1, (note.controls.center_pitch - fit_min) / fit_span))
+          local cy = y1 - L.sm - frac * lane_h
+          reaper.ImGui_DrawList_AddRectFilled(draw_list, nx0, cy - bar_h * 0.5, nx1, cy + bar_h * 0.5, C.overview_note)
+        end
+      end
+    end
+    local tx0, tx1 = overview_thumb()
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, tx0, y0 + L.xs, tx1, y1 - L.xs, C.view_fill, L.rounding)
+    reaper.ImGui_DrawList_AddRect(draw_list, tx0, y0 + L.xs, tx1, y1 - L.xs, C.view_border, L.rounding)
+    if tx1 - tx0 >= L.xxl then   -- room for a grip inside each end
+      local gy0, gy1 = y0 + L.sm + L.border, y1 - L.sm - L.border
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, tx0 + L.sm, gy0, tx0 + L.sm + L.xs, gy1, C.view_grip)
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, tx1 - L.sm - L.xs, gy0, tx1 - L.sm, gy1, C.view_grip)
+    end
+    if playhead_t then
+      local cursor_x = px + (playhead_t - item_t0) / duration * w
+      reaper.ImGui_DrawList_AddLine(draw_list, cursor_x, y0, cursor_x, y1, C.playhead)
     end
   end
 
   -- Bypassed Overlay: yellow (a state to get out of, not an error), with the way out as a button
   if is_bypassed then
-    reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, py, full_px + full_w, py + h, C.scrim)
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, py, full_px + full_w, py + full_h, C.scrim)
 
     local txt_main = "BYPASSED"
     local sub_txt = "Pitch envelope is bypassed"
@@ -4359,6 +4806,10 @@ local function draw_graph(draw_ctx, w, h)
       toggle_take_pitch_bypass(target_take)
     end
   end
+
+  -- Status pill, bottom-left of the note area (over the scrim too): a status message while it lasts, else the hint
+  -- for the state the editor is in (K.status_line)
+  K.canvas_status(draw_list, px + L.sm, py + h - L.sm, w - L.sm * 2, not is_bypassed)
 
   -- Note Context Menu (Phase 4)
   if reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu") then
@@ -4611,7 +5062,7 @@ local function remove_take_core(guid)
       state.hovered_note = nil
       state.drag = nil
       state.marquee = nil
-      state.view_t0, state.view_t1 = nil, nil
+      K.reset_view()
       state.start_time = nil
       state.end_time = nil
       state.item_len = nil
@@ -5222,13 +5673,13 @@ local function draw_body_split(P, avail_w, total_h)
     local canvas_w = reaper.ImGui_GetContentRegionAvail(ctx)
     draw_graph(ctx, math.max(canvas_w, BODY.min_graph_w), total_h)
 
-    -- Right: Pitched Items panel, inset from the grip
+    -- Right: Pitched Items panel, inset from the grip and, by as much, from the window's edge (the window has no padding)
     reaper.ImGui_TableSetColumnIndex(ctx, 1)
     local grip_x, grip_y = reaper.ImGui_GetCursorScreenPos(ctx)
     local column_w = reaper.ImGui_GetContentRegionAvail(ctx)
     state.sidebar_w = column_w
     reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.sm)
-    local panel_w = math.max(column_w, BODY.min_sidebar_w) - L.sm
+    local panel_w = math.max(column_w, BODY.min_sidebar_w) - L.sm * 2
     if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", panel_w, total_h, 0) then
       render_pitched_items_sidebar(ctx)
       reaper.ImGui_EndChild(ctx)
@@ -5548,7 +5999,7 @@ K.pop_danger = function()
   reaper.ImGui_PopStyleColor(ctx, 3)
 end
 
---- A checkbox for a canvas layer (state[key]: the Layers popup and Settings > Diagnostics). The change is saved at once:
+--- A checkbox for a canvas layer (state[key]: the Layers menu and Settings > Diagnostics). The change is saved at once:
 --- a click is a whole edit, so it is one write.
 K.layer_checkbox = function(label, key)
   local changed, on = reaper.ImGui_Checkbox(ctx, label, state[key])
@@ -5787,13 +6238,19 @@ K.INFO_SECTIONS = {
     { "Drag Note Edge", "Trim note start / end boundary" },
     { K.MOD_LABEL .. " + Wheel", "Zoom the timeline" },
     { "Wheel", "Scroll the timeline (when zoomed)" },
+    { "Alt + Wheel", "Zoom the pitch axis" },
+    { "Shift + Wheel", "Scroll the pitch axis" },
+    { "Z", "Zoom to the selected notes" },
+    { "F", "Show the whole item, fit the pitch range" },
+    { "Drag the overview strip", "Scroll; drag an end to zoom" },
+    { "Drag the pitch strip", "Scroll; drag an end to zoom" },
     { "↑ / ↓", "Nudge pitch ±1 semitone" },
     { "Shift + ↑ / ↓", "Fine-tune pitch ±10 cents" },
     { "S / Double-Click", "Snap note to nearest semitone" },
     { "Q", "Quantize selected note(s) to scale" },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch" },
     { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset" },
-    { "Right-click a dock value", "Item override and reset" },
+    { "Right-click a top bar value", "Item override and reset" },
     { "Double-click a value", "Reset to its default" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
     { "Snap / Quantize / Split / Merge buttons", "Same as S / Q / X / M" },
@@ -5805,8 +6262,7 @@ K.INFO_SECTIONS = {
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
   { title = "Icons", rows = {
-    { "Gear icon", "Settings & audio engine" },
-    { "Info icon", "This help window" },
+    { "… (top right)", "More: Analyze, Reset, Layers, Settings, Help" },
     { "× (top right)", "Close the window (Esc when floating)" },
     { "▸ / ◀", "Hide / show the Pitched Items panel" },
     { "Checkbox (item row)", "Pitch envelope active / bypassed" },
@@ -5989,7 +6445,7 @@ local function target_take_exists()
   return state.target_take_guid ~= nil and resolve_take_by_guid(state.target_take_guid, true) ~= nil
 end
 
---- Run a note command and say what happened in the status line. The dock's action buttons, their keys (S, Q, X, M),
+--- Run a note command and say what happened in the status line. The top bar's action buttons, their keys (S, Q, X, M),
 --- the note menu and the pitch-zone double-click all come through here, so they report alike. A refusal or a
 --- no-op says why; a success names the count and promises an undo point only when one was written.
 ---   id        "snap", "quantize", "split" (at the edit cursor) or "merge"
@@ -6187,47 +6643,67 @@ local function forward_space_to_reaper()
 end
 
 -------------------------------------------------------------------------------
--- HEADER BAR
+-- TOP BAR
 -------------------------------------------------------------------------------
--- One row at normal widths:  brand, title | target badge | Key, Scale | Analyze, Reset ... Layers,
--- Settings, Info, Close (right-aligned). Every width is measured from the longest label its control can
--- show. Which elements appear, and on how many rows, is a HDR_PLANS entry chosen from the content width
--- alone (never from the selected item or the note selection), so nothing jumps while working. As the
--- width shrinks the plans drop, in order: the "Key:" / "Scale:" labels, the title, Analyze / Reset
--- (into a "…" popup), and finally wrap the controls onto a second and third row. The item badge takes
+-- Every control of the window, in one place above the canvas, in four groups read from broad to specific:
+--   Clip          brand, target badge, Key, Scale
+--   Correction    scope pill + Strength, then Transition / Onset Ramp / Legato Gap as badges, or one "Timing"
+--                 button that opens the three in a popup
+--   Note actions  Snap, Quantize, Split, Merge
+--   Right         "…" (More: Analyze / Cancel, Reset, Layers, Settings, Help) and Close, right-aligned on row 1
+-- The Correction and Note action units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this section
+-- places them. Every width is measured from the longest label its control can show. Which units appear, and on
+-- how many rows, is a HDR_PLANS entry chosen from the content width alone (never from the selected item or the
+-- note selection), so nothing jumps while working. As the width shrinks the plans, in order: fold the three
+-- timing badges into "Timing", then wrap the groups onto a second, third and fourth row. The item badge takes
 -- the width its row has left and truncates its text with an ellipsis.
 
 local hdr_static = nil        -- widths that depend only on fonts and style (measured once)
 local hdr_was_docked = nil    -- IsWindowDocked of the previous frame (nil until known): size constraints are for floating windows only
 
--- Chunk-level names of this section (loop_body and the bottom dock use them): everything else stays
+-- Chunk-level names of this section (loop_body and the top bar controls use them): everything else stays
 -- private to the block below, so it does not count against the chunk's 200-local limit.
 local measure_header_static, hdr_min_content_w, hdr_fit_text, draw_header
 
 do
   local HDR_NO_TARGET_TEXT = "No Audio Item"
-  local HDR_LAYERS_LABEL = "Layers ▾"
   local HDR_ELLIPSIS = "…"
   local HDR_PROGRESS_LONGEST = "100%"
-  -- Every label of the Analyze slot: while analysing it reads "Cancel <N>%", so the slot is planned for "Cancel 100%"
-  local HDR_ANALYZE_LABELS = { "Analyze", "Re-Analyze", string.format(K.CANCEL_FMT, 100) }
-  -- Longest label of the Reset button: the layout plan reserves this so it does not change with the selection
-  local HDR_RESET_LONGEST = "Reset selected (999)"
-  -- Why Analyze / Reset are disabled (shown beside them when there is room, and in their tooltips)
+  -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = "Select an audio item"
   local HDR_REASON_NO_NOTES = "Analyze an item first"
+  local HDR_MORE_TIP = "More: Analyze, Reset, Layers, Settings, Help"
 
-  local HDR_FULL_ROW = { "brand", "fancy", "title", "badge", "key", "scale", "analyze", "reset" }
+  -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
+  local HDR_CLIP = { "brand", "badge", "key", "scale" }
+  local HDR_CORR_FULL = { "retune", "trans", "ramp", "legato" }
+  local HDR_CORR_FOLDED = { "retune", "timing" }
+  local HDR_ACTIONS = { "snap", "quantize", "split", "merge" }
+  local HDR_GROUP = {}
+  for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
+  for _, id in ipairs(HDR_CORR_FULL) do HDR_GROUP[id] = "correction" end
+  HDR_GROUP.timing = "correction"
+  for _, id in ipairs(HDR_ACTIONS) do HDR_GROUP[id] = "actions" end
+
+  --- One row holding the units of every list given, in order.
+  local function hdr_row(...)
+    local row = {}
+    for _, list in ipairs({ ... }) do
+      for _, id in ipairs(list) do row[#row + 1] = id end
+    end
+    return row
+  end
+
   local HDR_PLANS = {
-    { labels = true,  rows = { HDR_FULL_ROW } },
-    { labels = false, rows = { HDR_FULL_ROW } },
-    { labels = false, rows = { { "brand", "badge", "key", "scale", "analyze", "reset" } } },
-    { labels = false, rows = { { "brand", "badge", "key", "scale", "more" } } },
-    { labels = false, rows = { { "brand", "fancy", "title" }, { "badge", "key", "scale", "more" } } },
-    { labels = false, rows = { { "brand" }, { "badge", "more" }, { "key", "scale" } } },
+    { rows = { hdr_row(HDR_CLIP, HDR_CORR_FULL, HDR_ACTIONS) } },
+    { rows = { hdr_row(HDR_CLIP, HDR_CORR_FOLDED, HDR_ACTIONS) } },
+    { rows = { HDR_CLIP, hdr_row(HDR_CORR_FULL, HDR_ACTIONS) } },
+    { rows = { HDR_CLIP, hdr_row(HDR_CORR_FOLDED, HDR_ACTIONS) } },
+    { rows = { HDR_CLIP, HDR_CORR_FOLDED, HDR_ACTIONS } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_CORR_FOLDED, HDR_ACTIONS } },
   }
-  -- The narrowest header a floating window keeps (two rows, no title): row 1 is the brand + the right group
-  local HDR_FLOATING_MIN_ROW = { "badge", "key", "scale", "more" }
+  -- The plan a first-use window is sized for: two rows, nothing folded
+  local HDR_FIRST_USE_PLAN = HDR_PLANS[3]
   for _, plan in ipairs(HDR_PLANS) do
     for r, row in ipairs(plan.rows) do
       for _, id in ipairs(row) do
@@ -6249,44 +6725,33 @@ do
     return w
   end
 
-  --- Measure everything in the header that does not change from frame to frame. Call with the default
+  --- Measure everything in the top bar that does not change from frame to frame. Call with the default
   --- font and the Theme style pushed (before Begin is fine).
   measure_header_static = function()
     local L = Theme.layout
     local s = {}
     s.frame_h = reaper.ImGui_GetFrameHeight(ctx)
     s.pad_x = L.md * 2                                    -- FramePadding.x on both sides of a label
-    s.icon_sz = L.icon_md.size + L.icon_md.pad * 2
     s.close_sz = L.icon_target.size + L.icon_target.pad * 2   -- Close is destructive: the 24 px minimum target (WCAG 2.5.8)
     s.brand_sz = L.row_h
-    s.row_h = math.max(L.row_h, s.brand_sz, s.icon_sz, s.close_sz, s.frame_h)
+    s.row_h = math.max(L.row_h, s.brand_sz, s.close_sz, s.frame_h)
 
-    local pushed = Theme.push_font(ctx, fonts.large_bold)
-    s.fancy_w, s.fancy_h = reaper.ImGui_CalcTextSize(ctx, "FANCY")
-    Theme.pop_font(ctx, pushed)
-    pushed = Theme.push_font(ctx, fonts.large)
-    s.title_w, s.title_h = reaper.ImGui_CalcTextSize(ctx, "PITCH CORRECT")
-    Theme.pop_font(ctx, pushed)
-
-    s.key_lbl_w = hdr_text_w("Key:")
-    s.scale_lbl_w = hdr_text_w("Scale:")
     s.key_w = Theme.calc_combo_width(ctx, COMBO_LABELS.keys)
     -- Width of the Key list: Theme.selectable draws its text itself, so the popup only grows to fit if the
     -- rows are given the width of the longest name ("C# / Db") plus the text padding on both sides
     s.key_list_w = math.max(s.key_w, hdr_max_text_w(COMBO_LABELS.key_names) + L.sm * 2)
     s.scale_w = Theme.calc_combo_width(ctx, COMBO_LABELS.scales)
-    s.analyze_w = hdr_max_text_w(HDR_ANALYZE_LABELS) + s.pad_x
-    s.reset_longest_w = hdr_text_w(HDR_RESET_LONGEST) + s.pad_x
-    s.layers_w = hdr_text_w(HDR_LAYERS_LABEL) + s.pad_x
     s.more_w = math.max(hdr_text_w(HDR_ELLIPSIS), hdr_text_w(HDR_PROGRESS_LONGEST)) + s.pad_x
     s.no_target_w = hdr_text_w(HDR_NO_TARGET_TEXT) + s.pad_x  -- the badge never plans narrower than this
     s.badge_min_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
-    -- Layers, gear, info, close: the real gaps between them (see hdr_draw_right)
-    s.right_w = s.layers_w + L.md + s.icon_sz + L.sm + s.icon_sz + L.lg + s.close_sz
+    -- More, Close: the real gap between them (see hdr_draw_right)
+    s.right_w = s.more_w + L.lg + s.close_sz
+    -- The Correction and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
+    s.bar = K.bar_measure(ctx)
     return s
   end
 
-  --- `text` shortened with a trailing ellipsis to at most max_w wide (cached: the header runs every frame).
+  --- `text` shortened with a trailing ellipsis to at most max_w wide (cached: the top bar runs every frame).
   hdr_fit_text = function(text, max_w)
     if hdr_text_w(text) <= max_w then return text end
     local key = text .. "\0" .. tostring(math.floor(max_w))
@@ -6313,34 +6778,28 @@ do
     return result
   end
 
-  --- Gap placed before an element when it follows another one on the same row: tight inside a group
-  --- (brand / FANCY / title, Key / Scale), a group break everywhere else.
-  local function hdr_gap_before(id)
+  --- Gap placed before the unit `id` when it follows `prev` on the same row: a group break (with a separator
+  --- line in it) where the group changes, the standard gap inside the Clip group, tight everywhere else.
+  local function hdr_gap_before(prev, id)
     local L = Theme.layout
-    if id == "fancy" then return L.sm end
-    if id == "title" then return L.xs end
-    if id == "badge" or id == "scale" then return L.md end
-    return L.lg
+    if HDR_GROUP[prev] ~= HDR_GROUP[id] then return L.xl end
+    if HDR_GROUP[id] == "clip" then return L.md end
+    return L.sm
   end
 
-  local function hdr_element_w(id, s, labels, badge_w, reset_w)
-    local L = Theme.layout
+  local function hdr_element_w(id, s, badge_w)
     if id == "brand" then return s.brand_sz end
-    if id == "fancy" then return s.fancy_w end
-    if id == "title" then return s.title_w end
     if id == "badge" then return badge_w end
-    if id == "key" then return labels and (s.key_lbl_w + L.xs + s.key_w) or s.key_w end
-    if id == "scale" then return labels and (s.scale_lbl_w + L.xs + s.scale_w) or s.scale_w end
-    if id == "analyze" then return s.analyze_w end
-    if id == "reset" then return reset_w end
-    return s.more_w -- "more"
+    if id == "key" then return s.key_w end
+    if id == "scale" then return s.scale_w end
+    return s.bar.unit_w[id] or 0
   end
 
-  local function hdr_row_w(row, s, labels, badge_w, reset_w)
+  local function hdr_row_w(row, s, badge_w)
     local w = 0
     for i, id in ipairs(row) do
-      if i > 1 then w = w + hdr_gap_before(id) end
-      w = w + hdr_element_w(id, s, labels, badge_w, reset_w)
+      if i > 1 then w = w + hdr_gap_before(row[i - 1], id) end
+      w = w + hdr_element_w(id, s, badge_w)
     end
     return w
   end
@@ -6353,8 +6812,8 @@ do
     for pi, plan in ipairs(HDR_PLANS) do
       local fits, room = true, 0
       for r, row in ipairs(plan.rows) do
-        local reserved = (r == 1) and (L.lg + s.right_w) or 0
-        local left = avail_w - hdr_row_w(row, s, plan.labels, 0, s.reset_longest_w) - reserved
+        local reserved = (r == 1) and (L.xl + s.right_w) or 0
+        local left = avail_w - hdr_row_w(row, s, 0) - reserved
         if r == plan.badge_row then
           room = left
           if left < s.no_target_w then fits = false end
@@ -6370,17 +6829,21 @@ do
     return chosen, math.min(badge_natural_w, math.max(badge_room, s.badge_min_w))
   end
 
-  --- Content width the narrowest floating header needs (two rows, no title). With `full`: the width the
-  --- first plan needs to be chosen (title, "Key:" / "Scale:" labels, one row), its badge at its floor.
-  hdr_min_content_w = function(s, full)
+  --- Content width a plan needs to be chosen: its widest row, the badge at its floor, row 1 with the right group.
+  local function hdr_plan_w(plan, s)
     local L = Theme.layout
-    if full then
-      local plan = HDR_PLANS[1]
-      return hdr_row_w(plan.rows[1], s, plan.labels, s.no_target_w, s.reset_longest_w) + L.lg + s.right_w
+    local w = 0
+    for r, row in ipairs(plan.rows) do
+      w = math.max(w, hdr_row_w(row, s, s.no_target_w) + ((r == 1) and (L.xl + s.right_w) or 0))
     end
-    local row1 = s.brand_sz + L.lg + s.right_w
-    local row2 = hdr_row_w(HDR_FLOATING_MIN_ROW, s, false, s.no_target_w, 0)
-    return math.max(row1, row2)
+    return w
+  end
+
+  --- Content width the narrowest floating window keeps (the last plan: four rows). With `full`: the width a
+  --- first-use window opens with (two rows, nothing folded). The second value is the number of rows of that plan.
+  hdr_min_content_w = function(s, full)
+    local plan = full and HDR_FIRST_USE_PLAN or HDR_PLANS[#HDR_PLANS]
+    return hdr_plan_w(plan, s), #plan.rows
   end
 
   --- The pitch algorithm line of the item badge tooltip: the algorithm the item uses now, and who chose it
@@ -6424,12 +6887,7 @@ do
   end
 
   local function hdr_draw_key(hs)
-    local P, L, s = hs.P, Theme.layout, hs.s
-    if hs.labels then
-      Theme.align(ctx)
-      reaper.ImGui_TextColored(ctx, P.accent_l, "Key:")
-      reaper.ImGui_SameLine(ctx, 0, L.xs)
-    end
+    local s = hs.s
     -- Previews the short name ("C#") but lists the full one ("C# / Db"), so it stays a plain BeginCombo
     reaper.ImGui_SetNextItemWidth(ctx, s.key_w)
     if reaper.ImGui_BeginCombo(ctx, "##key_selector", SCALE_KEYS[state.key_idx].display) then
@@ -6445,20 +6903,15 @@ do
       reaper.ImGui_EndCombo(ctx)
     end
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, "Musical Key (Root Pitch Class)")
+      Theme.tooltip(ctx, "Key: the root note of the scale")
     end
   end
 
   local function hdr_draw_scale(hs)
-    local P, L, s = hs.P, Theme.layout, hs.s
-    if hs.labels then
-      Theme.align(ctx)
-      reaper.ImGui_TextColored(ctx, P.accent_l, "Scale:")
-      reaper.ImGui_SameLine(ctx, 0, L.xs)
-    end
+    local s = hs.s
     local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, state.scale_idx, {
       w = s.scale_w,
-      tooltip = "Musical Scale — highlights in-scale piano roll rows and sets the scale Quantize (Q) snaps to",
+      tooltip = "Scale: marks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to",
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
@@ -6467,51 +6920,38 @@ do
     end
   end
 
-  --- Analyze / Re-Analyze. While analysing the same slot is the Cancel button, with the progress in its label, so
-  --- nothing moves (Esc is not bound to it: on a floating window Esc closes the window, which cancels too).
-  local function hdr_draw_analyze(hs)
-    local s = hs.s
-    if state.is_analyzing then
-      local clicked = reaper.ImGui_Button(ctx,
-        string.format(K.CANCEL_FMT, math.floor(state.progress * 100)) .. "###top_analyze", s.analyze_w, 0)
-      if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-        Theme.tooltip(ctx, hs.has_notes and "Stop analyzing. The item keeps its previous analysis"
-          or "Stop analyzing this item")
-      end
-      if clicked then K.cancel_analysis() end
-      return
+  --- The Layers submenu of More: each layer shows how it looks on the canvas, a swatch from the same canvas
+  --- tokens and shape, before its label (the labels carry no colour word).
+  local function hdr_draw_layers(hs)
+    local P, L = hs.P, Theme.layout
+    local LC = P.canvas
+    local sw_w, sw_h = L.xl, reaper.ImGui_GetFrameHeight(ctx)
+    local function layer_checkbox(label, key, draw_swatch)
+      reaper.ImGui_Dummy(ctx, sw_w, sw_h)
+      local sx, sy = reaper.ImGui_GetItemRectMin(ctx)
+      draw_swatch(reaper.ImGui_GetWindowDrawList(ctx), sx, sy + sw_h * 0.5)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
+      K.layer_checkbox(label, key)
     end
-    reaper.ImGui_BeginDisabled(ctx, not hs.has_target)
-    local clicked = reaper.ImGui_Button(ctx, hs.analyze_label .. "###top_analyze", s.analyze_w, 0)
-    reaper.ImGui_EndDisabled(ctx)
-    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-      if not hs.has_target then
-        Theme.tooltip(ctx, HDR_REASON_NO_TARGET .. " in REAPER to analyze it.")
-      else
-        Theme.tooltip(ctx, hs.has_notes and "Detect the pitch of this item again" or "Detect the pitch of the selected audio item")
-      end
-    end
-    if clicked then request_analyze() end
+    layer_checkbox("Note Blocks", "show_note_blocks", function(dl, x, cy)
+      reaper.ImGui_DrawList_AddRectFilled(dl, x, cy - L.sm, x + sw_w, cy + L.sm, LC.note_fill)
+      reaper.ImGui_DrawList_AddRect(dl, x, cy - L.sm, x + sw_w, cy + L.sm, LC.note_border)
+    end)
+    layer_checkbox("Pitch Trace", "show_raw_pitch", function(dl, x, cy)
+      reaper.ImGui_DrawList_AddLine(dl, x, cy, x + sw_w, cy, LC.trace, 2.0)
+    end)
+    layer_checkbox("Preview Curve", "show_preview", function(dl, x, cy)
+      reaper.ImGui_DrawList_AddLine(dl, x, cy, x + sw_w, cy, LC.preview, 2.0)
+    end)
+    layer_checkbox("Vibrato Shading", "show_vibrato_regions", function(dl, x, cy)
+      reaper.ImGui_DrawList_AddRectFilled(dl, x, cy - L.sm, x + sw_w, cy + L.sm, Theme.with_alpha(LC.vibrato, 1.0))   -- the band is translucent on the canvas; the swatch is its opaque hue
+    end)
   end
 
-  --- Reset: the label names the scope (the selection, or every note) and its count.
-  local function hdr_draw_reset(hs)
-    reaper.ImGui_BeginDisabled(ctx, not hs.has_notes)
-    local clicked = reaper.ImGui_Button(ctx, hs.reset_label .. "###top_reset", hs.reset_w, 0)
-    reaper.ImGui_EndDisabled(ctx)
-    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-      if hs.has_notes then
-        Theme.tooltip(ctx, "Reset selected note(s) to original pitch, or reset all notes if none selected")
-      else
-        Theme.tooltip(ctx, HDR_REASON_NO_NOTES .. ". There are no notes to reset.")
-      end
-    end
-    if clicked then request_reset(hs.reset_sel_n, hs.reset_note_n) end
-  end
-
-  --- "…" button and popup holding Analyze and Reset, for widths where they no longer fit in the row. The
-  --- items carry the same disabled reasons as the buttons (in the shortcut column). While analysing the same
-  --- button shows the progress ("42%") and its popup offers Cancel in place of Analyze.
+  --- "…" (More) and its popup: Analyze / Re-Analyze and Reset (with the reason beside a disabled one), then
+  --- Layers, Settings and Help. While analysing the button reads the progress ("42%") and the popup offers
+  --- Cancel in place of Analyze (Esc is not bound to Cancel: on a floating window Esc closes the window, which
+  --- cancels too).
   local function hdr_draw_more(hs)
     local s = hs.s
     local analyzing = state.is_analyzing
@@ -6520,10 +6960,10 @@ do
       reaper.ImGui_OpenPopup(ctx, "##hdr_more_popup")
     end
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, analyzing and "Analyzing. Open to cancel" or "More: Analyze and Reset")
+      Theme.tooltip(ctx, analyzing and "Analyzing. Open to cancel" or HDR_MORE_TIP)
     end
     if reaper.ImGui_BeginPopup(ctx, "##hdr_more_popup") then
-      -- HC5: Esc closes this popup (innermost)
+      -- HC5: Esc closes this popup (innermost); the window-level handler ignores Esc while a popup is open
       if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
       if analyzing then
         if reaper.ImGui_MenuItem(ctx, string.format(K.CANCEL_FMT, pct) .. "###more_analyze") then
@@ -6537,120 +6977,53 @@ do
           (not hs.has_notes) and HDR_REASON_NO_NOTES or nil, false, hs.has_notes) then
         request_reset(hs.reset_sel_n, hs.reset_note_n)
       end
+      reaper.ImGui_Separator(ctx)
+      if reaper.ImGui_BeginMenu(ctx, "Layers") then
+        hdr_draw_layers(hs)
+        reaper.ImGui_EndMenu(ctx)
+      end
+      if reaper.ImGui_MenuItem(ctx, "Settings") then
+        show_settings_modal = true
+      end
+      if reaper.ImGui_MenuItem(ctx, "Keyboard Shortcuts & Help") then
+        show_info_modal = true
+      end
       reaper.ImGui_EndPopup(ctx)
     end
   end
 
-  --- Layers, Settings, Info and Close, right-aligned on the current row. Returns true when Close was clicked.
+  --- More and Close, right-aligned on the current row. Returns true when Close was clicked.
   local function hdr_draw_right(hs)
-    local P, L, s = hs.P, Theme.layout, hs.s
+    local L, s = Theme.layout, hs.s
     reaper.ImGui_SameLine(ctx, 0, 0)
     -- Never start left of the previous element plus a group gap, however narrow the row is
-    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
-    Theme.right_align(ctx, math.min(s.right_w, math.max(0, avail_w - L.lg)))
+    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx) - hs.margin
+    Theme.right_align(ctx, math.min(s.right_w, math.max(0, avail_w - L.xl)), hs.margin)
 
-    -- Layers ▾
-    if reaper.ImGui_Button(ctx, HDR_LAYERS_LABEL .. "###top_layers", s.layers_w, 0) then
-      reaper.ImGui_OpenPopup(ctx, "##layers_popup")
-    end
-    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, "Toggle visual display layers on the piano roll canvas")
-    end
+    hdr_draw_more(hs)
 
-    if reaper.ImGui_BeginPopup(ctx, "##layers_popup") then
-      -- HC5: Esc closes this popup (innermost); the window-level handler ignores Esc while a popup is open
-      if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
-      Theme.align(ctx)
-      reaper.ImGui_TextColored(ctx, P.accent, "Display Layers")
-      reaper.ImGui_Separator(ctx)
-      -- Each layer shows how it looks on the canvas: a swatch from the same canvas tokens and shape, before its label
-      -- (the labels carry no colour word)
-      local LC = P.canvas
-      local sw_w, sw_h = L.xl, reaper.ImGui_GetFrameHeight(ctx)
-      local function layer_checkbox(label, key, draw_swatch)
-        reaper.ImGui_Dummy(ctx, sw_w, sw_h)
-        local sx, sy = reaper.ImGui_GetItemRectMin(ctx)
-        draw_swatch(reaper.ImGui_GetWindowDrawList(ctx), sx, sy + sw_h * 0.5)
-        reaper.ImGui_SameLine(ctx, 0, L.sm)
-        K.layer_checkbox(label, key)
-      end
-      layer_checkbox("Note Blocks", "show_note_blocks", function(dl, x, cy)
-        reaper.ImGui_DrawList_AddRectFilled(dl, x, cy - L.sm, x + sw_w, cy + L.sm, LC.note_fill)
-        reaper.ImGui_DrawList_AddRect(dl, x, cy - L.sm, x + sw_w, cy + L.sm, LC.note_border)
-      end)
-      layer_checkbox("Pitch Trace", "show_raw_pitch", function(dl, x, cy)
-        reaper.ImGui_DrawList_AddLine(dl, x, cy, x + sw_w, cy, LC.trace, 2.0)
-      end)
-      layer_checkbox("Preview Curve", "show_preview", function(dl, x, cy)
-        reaper.ImGui_DrawList_AddLine(dl, x, cy, x + sw_w, cy, LC.preview, 2.0)
-      end)
-      layer_checkbox("Vibrato Shading", "show_vibrato_regions", function(dl, x, cy)
-        reaper.ImGui_DrawList_AddRectFilled(dl, x, cy - L.sm, x + sw_w, cy + L.sm, Theme.with_alpha(LC.vibrato, 1.0))   -- the band is translucent on the canvas; the swatch is its opaque hue
-      end)
-      reaper.ImGui_EndPopup(ctx)
-    end
-
-    -- Settings, Info: 24 px apart (centre to centre); the destructive Close sits a group gap away.
-    -- An icon shorter than the frame is centred on the row's framed widgets.
-    reaper.ImGui_SameLine(ctx, 0, L.md)
-    Theme.align(ctx, nil, s.icon_sz)
-    if Theme.icon_btn(ctx, "##hdr_settings", Theme.icons.gear, { preset = L.icon_md, tooltip = "Settings & Audio Engine" }) then
-      show_settings_modal = true
-    end
-
-    reaper.ImGui_SameLine(ctx, 0, L.sm)
-    Theme.align(ctx, nil, s.icon_sz)
-    if Theme.icon_btn(ctx, "##hdr_info", Theme.icons.info, { preset = L.icon_md, tooltip = "Keyboard Shortcuts & Help" }) then
-      show_info_modal = true
-    end
-
+    -- The destructive Close sits a group gap away. An icon shorter than the frame is centred on the row's
+    -- framed widgets.
     reaper.ImGui_SameLine(ctx, 0, L.lg)
     Theme.align(ctx, nil, s.close_sz)
     return Theme.icon_btn(ctx, "##hdr_close", Theme.icons.close, {
       preset = L.icon_target,
-      icon_size = L.icon_md.size,   -- same glyph as gear and info; only the click target is 24 px
+      icon_size = L.icon_md.size,   -- the glyph of the medium icons; only the click target is 24 px
       w = s.close_sz, h = s.close_sz,   -- icon_btn sizes the button from icon_size unless told otherwise
       tooltip = hs.docked and "Close. Your corrections stay on the items" or "Close (Esc). Your corrections stay on the items",
     })
   end
 
-  local function hdr_draw_element(id, hs)
-    local P, s = hs.P, hs.s
-    if id == "brand" then
-      Theme.brand_icon(ctx, s.brand_sz, s.row_h)
-    elseif id == "fancy" then
-      Theme.align(ctx, nil, s.fancy_h)  -- the larger text is centred on the framed widgets, not top-aligned
-      local pushed = Theme.push_font(ctx, fonts.large_bold)
-      reaper.ImGui_TextColored(ctx, P.yellow, "FANCY")
-      Theme.pop_font(ctx, pushed)
-    elseif id == "title" then
-      Theme.align(ctx, nil, s.title_h)
-      local pushed = Theme.push_font(ctx, fonts.large)
-      reaper.ImGui_Text(ctx, "PITCH CORRECT")
-      Theme.pop_font(ctx, pushed)
-    elseif id == "badge" then
-      hdr_draw_target_badge(hs)
-    elseif id == "key" then
-      hdr_draw_key(hs)
-    elseif id == "scale" then
-      hdr_draw_scale(hs)
-    elseif id == "analyze" then
-      hdr_draw_analyze(hs)
-    elseif id == "reset" then
-      hdr_draw_reset(hs)
-    else
-      hdr_draw_more(hs)
-    end
-  end
-
-  --- Draws the header. Returns true when Close was clicked.
-  draw_header = function(P, docked, has_target, has_notes, target_take, target_item)
+  --- Draws the top bar. `right_margin` is the room kept free at the right end of every row (the window has no
+  --- padding of its own). Returns true when Close was clicked.
+  draw_header = function(P, docked, has_target, has_notes, target_take, target_item, right_margin)
     local L = Theme.layout
     local s = hdr_static
+    right_margin = right_margin or 0
     -- Real booleans: a nil reaching MenuItem's `enabled` would mean "enabled"
     has_target = has_target and true or false
     has_notes = has_notes and true or false
-    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
+    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx) - right_margin
 
     local badge_text = has_target and state.target_take_name or HDR_NO_TARGET_TEXT
     local plan, badge_w = hdr_choose_plan(s, avail_w, hdr_text_w(badge_text) + s.pad_x)
@@ -6664,36 +7037,39 @@ do
       reset_label = string.format("Reset %d %s", reset_note_n, plural(reset_note_n, "note", "notes"))
     end
 
-    local reason = nil  -- one short line beside the disabled control, none while analysing (the bar shows it)
-    if not state.is_analyzing then
-      if not has_target then
-        reason = HDR_REASON_NO_TARGET
-      elseif not has_notes then
-        reason = HDR_REASON_NO_NOTES
-      end
-    end
-
     local hs = {
-      P = P, s = s, docked = docked, labels = plan.labels, badge_w = badge_w,
+      P = P, s = s, docked = docked, badge_w = badge_w, margin = right_margin,
       has_target = has_target, has_notes = has_notes, target_take = target_take, target_item = target_item,
       analyze_label = has_notes and "Re-Analyze" or "Analyze",
-      reset_label = reset_label, reset_w = hdr_text_w(reset_label) + s.pad_x,
-      reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
+      reset_label = reset_label, reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
     }
+    -- The Correction and Note action units draw themselves (see TOP BAR CONTROLS)
+    local draw_unit = K.bar_frame(ctx, has_target, target_item, s.bar)
+    local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
 
     local close_clicked = false
     for r, row in ipairs(plan.rows) do
       for i, id in ipairs(row) do
-        if i > 1 then reaper.ImGui_SameLine(ctx, 0, hdr_gap_before(id)) end
-        hdr_draw_element(id, hs)
-        if id == "reset" and reason then
-          -- The reason goes after Reset, in space the right group does not need: nothing moves for it
-          reaper.ImGui_SameLine(ctx, 0, L.md)
-          local left = reaper.ImGui_GetContentRegionAvail(ctx) - ((r == 1) and (L.lg + s.right_w) or 0)
-          if left >= hdr_text_w(reason) then
-            Theme.align(ctx)
-            reaper.ImGui_TextColored(ctx, P.text_dim, reason)
+        if i > 1 then
+          local gap = hdr_gap_before(row[i - 1], id)
+          reaper.ImGui_SameLine(ctx, 0, gap)
+          if HDR_GROUP[row[i - 1]] ~= HDR_GROUP[id] then
+            -- A hairline in the middle of the group break
+            local sep_x, sep_y = reaper.ImGui_GetCursorScreenPos(ctx)
+            sep_x = sep_x - math.floor(gap * 0.5)
+            reaper.ImGui_DrawList_AddLine(draw_list, sep_x, sep_y + L.xs, sep_x, sep_y + s.frame_h - L.xs, P.border)
           end
+        end
+        if id == "brand" then
+          Theme.brand_icon(ctx, s.brand_sz, s.row_h)
+        elseif id == "badge" then
+          hdr_draw_target_badge(hs)
+        elseif id == "key" then
+          hdr_draw_key(hs)
+        elseif id == "scale" then
+          hdr_draw_scale(hs)
+        else
+          draw_unit(id)
         end
       end
       if r == 1 then close_clicked = hdr_draw_right(hs) end
@@ -6703,176 +7079,86 @@ do
 end
 
 -------------------------------------------------------------------------------
--- BOTTOM DOCK
+-- TOP BAR CONTROLS
 -------------------------------------------------------------------------------
--- Two groups, drawn in every state (disabled, with the reason, when there is nothing to act on):
--- the Inspector (Correction Strength slider + Transition / Onset Ramp / Legato Gap badges) and the Actions strip (Snap, Quantize,
--- Split, Merge). plan_dock() flows the groups onto as many rows as the width needs, from the width alone
--- (never from the selection or the status text), so nothing under the cursor moves while working; loop_body
--- asks it for the row count BEFORE it lays out the canvas. The status / hint text takes the room left after
--- the last control row when there is enough, else a row of its own. The selection count and the key / scale
--- sit in a right-aligned slot of that row.
-
--- Chunk-level names of this section: everything else stays private to the block below, so it does not
--- count against the chunk's 200-local limit.
-local plan_dock, layout_dock_texts, mark_stale_takes, render_bottom_dock
+-- The units of the Correction and Note action groups, drawn in every state (disabled, with the reason, when
+-- there is nothing to act on): the Inspector (scope pill + Strength slider, then the Transition / Onset Ramp /
+-- Legato Gap badges or the "Timing" button that folds them) and the actions (Snap, Quantize, Split, Merge).
+-- K.bar_measure gives their widths, each from its longest label, so a value, an override mark or a selection
+-- never changes the layout; K.bar_frame returns the function that draws one unit this frame. The top bar
+-- (above) decides where they go. The status line that used to sit beside them is a pill on the canvas
+-- (K.canvas_status).
 
 do
-  -- The Correction Strength slider's label: the full name, or the short one when the full name would cost the dock a row
-  -- (plan_dock decides from the width alone; the tooltip always carries the full name)
-  local DOCK_STRENGTH_LABEL = PARAM_LABELS.retune_speed
-  local DOCK_STRENGTH_SHORT = "Correction"
-  -- Where a value comes from, in words (the badge colour is only a second cue): the strength slider shows it after itself
-  local DOCK_SCOPE_TAGS = { note = "· note", item = "· item", global = "· global" }
+  -- The Correction Strength slider's label in the bar (the tooltip carries the full name)
+  local BAR_STRENGTH_LABEL = "Strength"
+  -- Where the Strength value comes from, on the pill before it (the pill's colour is only a second cue)
+  local BAR_SCOPE_TAGS = { note = "Note", item = "Item", global = "Global" }
   -- Appended to a badge label when its value is overridden for the item (or the selected note)
-  local DOCK_OVERRIDE_MARK = "*"
-  -- Why the controls are disabled (the state hint below is the inline reason; the tooltips repeat these)
-  local DOCK_REASON_ANALYZING = "Wait for the analysis to finish"
-  local DOCK_REASON_NO_TARGET = "Select an audio item"
-  local DOCK_REASON_NOT_ANALYZED = "Analyze an item first"
-  local DOCK_REASON_NOTE_OVERRIDE = "Overridden on this note. Right-click the note to change it."
-  local DOCK_HINT_NO_TARGET = "Select an audio item in REAPER"
-  local DOCK_HINT_NO_NOTES = "No pitched notes found. Try Vocal Range or Detection Mode in Settings"
-  local DOCK_HINT_SELECT_NOTE = "Select a note to edit it"
+  local BAR_OVERRIDE_MARK = "*"
+  -- The button that folds the three timing badges; %s is the override mark when one of them is overridden
+  local BAR_TIMING_FMT = "Timing%s ▾"
+  local BAR_TIMING_TIP = "Transition, Onset Ramp and Legato Gap"
+  -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
+  local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
+  local BAR_REASON_NO_TARGET = "Select an audio item"
+  local BAR_REASON_NOT_ANALYZED = "Analyze an item first"
+  local BAR_REASON_NOTE_OVERRIDE = "Overridden on this note. Right-click the note to change it."
+  local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
 
   -- Value badges: label format, edit range. The item override menu and the edit popup use the key.
-  local DOCK_BADGES = {
+  local BAR_BADGES = {
     { id = "trans",  key = "transition_ms",       fmt = "Transition: %.0fms", min = 5,  max = 60 },
     { id = "ramp",   key = "onset_ramp_ms",       fmt = "Onset Ramp: %.0fms", min = 5,  max = 60 },
     { id = "legato", key = "legato_threshold_ms", fmt = "Legato Gap: %.0fms", min = 50, max = 300 },
   }
-  -- Actions strip: same commands as the keys
-  local DOCK_ACTIONS = {
+  -- Actions: same commands as the keys
+  local BAR_ACTIONS = {
     { id = "snap",     label = "Snap",     tip = "Snap to nearest semitone (S)" },
     { id = "quantize", label = "Quantize", tip = "Quantize to the active scale (Q)" },
     { id = "split",    label = "Split",    tip = "Split at the edit cursor (X)" },
     { id = "merge",    label = "Merge",    tip = "Merge the selected notes (M)" },
   }
-  local DOCK_BADGE_BY_ID, DOCK_ACTION_BY_ID = {}, {}
-  for _, spec in ipairs(DOCK_BADGES) do DOCK_BADGE_BY_ID[spec.id] = spec end
-  for _, spec in ipairs(DOCK_ACTIONS) do DOCK_ACTION_BY_ID[spec.id] = spec end
-  -- The status text follows the controls on their last row only when at least this much text fits there
-  local DOCK_STATUS_MIN_SAMPLE = DOCK_HINT_NO_TARGET
+  local BAR_BADGE_BY_ID, BAR_ACTION_BY_ID = {}, {}
+  for _, spec in ipairs(BAR_BADGES) do BAR_BADGE_BY_ID[spec.id] = spec end
+  for _, spec in ipairs(BAR_ACTIONS) do BAR_ACTION_BY_ID[spec.id] = spec end
 
-  local function dock_text_w(dock_ctx, text)
-    return (reaper.ImGui_CalcTextSize(dock_ctx, text)) or 0
+  local function bar_text_w(bctx, text)
+    return (reaper.ImGui_CalcTextSize(bctx, text)) or 0
   end
 
   --- Widths that depend only on the font and the tokens: every label is measured at its longest, so a value,
-  --- an override mark or a selection never changes the layout.
-  local function measure_dock(dock_ctx)
+  --- an override mark or a selection never changes the layout. unit_w[id] is the width of the unit `id`.
+  K.bar_measure = function(bctx)
     local L = Theme.layout
-    local s = {}
-    s.frame_h = reaper.ImGui_GetFrameHeight(dock_ctx) or 0
+    local s = { unit_w = {} }
+    s.frame_h = reaper.ImGui_GetFrameHeight(bctx) or 0
     s.pad_x = L.md * 2                  -- FramePadding.x on both sides of a label (what Theme.badge and Button use)
     s.slider_w = L.xxxl * 2 + L.md
-    s.edit_w = L.xxxl * 4               -- the drag inside a badge's edit popup
+    s.edit_w = L.xxxl * 4               -- the drag inside a badge's edit popup and in the Timing popup
     s.scope_w = 0
-    for _, tag in pairs(DOCK_SCOPE_TAGS) do s.scope_w = math.max(s.scope_w, dock_text_w(dock_ctx, tag)) end
-    s.strength_w = {}   -- width of the slider unit, by the label it shows
-    for _, label in ipairs({ DOCK_STRENGTH_LABEL, DOCK_STRENGTH_SHORT }) do
-      s.strength_w[label] = dock_text_w(dock_ctx, label) + L.sm + s.slider_w + L.sm + s.scope_w
+    for _, tag in pairs(BAR_SCOPE_TAGS) do s.scope_w = math.max(s.scope_w, bar_text_w(bctx, tag)) end
+    s.scope_w = s.scope_w + s.pad_x
+    s.unit_w.retune = s.scope_w + L.sm + bar_text_w(bctx, BAR_STRENGTH_LABEL) + L.sm + s.slider_w
+    local mark_w = bar_text_w(bctx, BAR_OVERRIDE_MARK)
+    s.timing_label_w = 0                -- the label column of the Timing popup
+    for _, spec in ipairs(BAR_BADGES) do
+      local widest = math.max(bar_text_w(bctx, string.format(spec.fmt, spec.min)),
+        bar_text_w(bctx, string.format(spec.fmt, spec.max)))
+      s.unit_w[spec.id] = widest + mark_w + s.pad_x
+      s.timing_label_w = math.max(s.timing_label_w, bar_text_w(bctx, PARAM_LABELS[spec.key] or spec.key) + mark_w)
     end
-    s.badge_w, s.action_w = {}, {}
-    local mark_w = dock_text_w(dock_ctx, DOCK_OVERRIDE_MARK)
-    for _, spec in ipairs(DOCK_BADGES) do
-      local widest = math.max(dock_text_w(dock_ctx, string.format(spec.fmt, spec.min)),
-        dock_text_w(dock_ctx, string.format(spec.fmt, spec.max)))
-      s.badge_w[spec.id] = widest + mark_w + s.pad_x
+    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, BAR_OVERRIDE_MARK)) + s.pad_x
+    for _, spec in ipairs(BAR_ACTIONS) do
+      s.unit_w[spec.id] = bar_text_w(bctx, spec.label) + s.pad_x
     end
-    for _, spec in ipairs(DOCK_ACTIONS) do
-      s.action_w[spec.id] = dock_text_w(dock_ctx, spec.label) + s.pad_x
-    end
-    s.status_min_w = dock_text_w(dock_ctx, DOCK_STATUS_MIN_SAMPLE)
     return s
-  end
-
-  --- Lay the dock out for a content width: `rows` is a list of rows of { id, x, w } (x from the row start), and
-  --- `row_count` includes the status row when the status text needs a row of its own. Inspector and Actions
-  --- share a row when both fit (a group gap apart), else Actions starts a new row; a group wider than a row
-  --- wraps unit by unit.
-  plan_dock = function(dock_ctx, avail_w)
-    local L = Theme.layout
-    local s = measure_dock(dock_ctx)
-    avail_w = math.max(0, avail_w or 0)
-
-    local actions = {}
-    for _, spec in ipairs(DOCK_ACTIONS) do actions[#actions + 1] = { id = spec.id, w = s.action_w[spec.id] } end
-
-    --- The plan for one label of the strength slider.
-    local function flow(strength_label)
-      local inspector = { { id = "retune", w = s.strength_w[strength_label] } }
-      for _, spec in ipairs(DOCK_BADGES) do inspector[#inspector + 1] = { id = spec.id, w = s.badge_w[spec.id] } end
-
-      local rows, row, row_w = {}, {}, 0
-      rows[1] = row
-      for _, group in ipairs({ inspector, actions }) do
-        local group_w = 0
-        for i, unit in ipairs(group) do group_w = group_w + unit.w + ((i > 1) and L.sm or 0) end
-        local lead_gap = 0
-        if #row > 0 then
-          if row_w + L.lg + group_w <= avail_w then
-            lead_gap = L.lg
-          else
-            row, row_w = {}, 0
-            rows[#rows + 1] = row
-          end
-        end
-        for i, unit in ipairs(group) do
-          local gap = (i == 1) and lead_gap or L.sm
-          if #row > 0 and row_w + gap + unit.w > avail_w then
-            row, row_w, gap = {}, 0, 0
-            rows[#rows + 1] = row
-          end
-          local x = (#row > 0) and (row_w + gap) or 0
-          row[#row + 1] = { id = unit.id, x = x, w = unit.w }
-          row_w = x + unit.w
-        end
-      end
-
-      local status_x = row_w + L.lg
-      local inline = (avail_w - status_x) >= s.status_min_w
-      if not inline then status_x = 0 end
-      return {
-        s = s, rows = rows, avail_w = avail_w, status_inline = inline, status_x = status_x,
-        row_count = #rows + (inline and 0 or 1), strength_label = strength_label,
-      }
-    end
-
-    -- The full name, unless the short one saves a row
-    local plan = flow(DOCK_STRENGTH_LABEL)
-    local short = flow(DOCK_STRENGTH_SHORT)
-    if short.row_count < plan.row_count then plan = short end
-    return plan
-  end
-
-  --- Place the status / hint text (left) and the selection / key text (right-aligned) in the room from x0 to
-  --- the row end. The message wins: when both do not fit, only the message is drawn (truncated to the room).
-  --- Never returns an offset left of x0. Returns left text, right text, offset of the right text.
-  layout_dock_texts = function(dock_ctx, x0, avail_w, left_text, right_text)
-    local L = Theme.layout
-    local room = math.max(0, avail_w - x0)
-    if room <= 0 then return "", "", x0 end
-    local left_w = (left_text ~= "") and dock_text_w(dock_ctx, left_text) or 0
-    local right_w = dock_text_w(dock_ctx, right_text)
-    if left_w + ((left_w > 0) and L.lg or 0) + right_w <= room then
-      return left_text, right_text, x0 + room - right_w
-    end
-    if left_w > 0 then
-      local fitted = hdr_fit_text(left_text, room)
-      if dock_text_w(dock_ctx, fitted) > room then return "", "", x0 end
-      return fitted, "", x0
-    end
-    local fitted = hdr_fit_text(right_text, room)
-    local fitted_w = dock_text_w(dock_ctx, fitted)
-    if fitted_w > room then return "", "", x0 end
-    return "", fitted, x0 + room - fitted_w
   end
 
   --- Flag the other session items whose stored envelope was written with the old global default of `key`:
   --- those without an item value for it and with an edited note that inherits it (an untouched item has no
   --- envelope to go stale). Returns how many were flagged.
-  mark_stale_takes = function(key)
+  local function mark_stale_takes(key)
     local n = 0
     for _, guid in ipairs(state.session_order) do
       local data = state.session_takes[guid]
@@ -6902,33 +7188,17 @@ do
   end
 
   --- Where a value comes from, for tooltips. `marked` = the badge form, which explains its trailing mark.
-  local function dock_scope_tip(level, marked)
-    if level == "note" then return DOCK_REASON_NOTE_OVERRIDE end
+  local function bar_scope_tip(level, marked)
+    if level == "note" then return BAR_REASON_NOTE_OVERRIDE end
     if level == "item" then
-      return marked and (DOCK_OVERRIDE_MARK .. " = overridden for this item") or "Overridden for this item."
+      return marked and (BAR_OVERRIDE_MARK .. " = overridden for this item") or "Overridden for this item."
     end
-    if marked then return "Global default, used by every item without its own value. A " .. DOCK_OVERRIDE_MARK .. " marks an item override." end
+    if marked then return "Global default, used by every item without its own value. A " .. BAR_OVERRIDE_MARK .. " marks an item override." end
     return "Global default, used by every item without its own value."
   end
 
-  --- `has_target` / `target_item` come from loop_body (the header's view of the target); `plan` from plan_dock.
-  render_bottom_dock = function(dock_ctx, has_target, target_item, plan)
-    local P = Theme.get_palette()
-    local L = Theme.layout
-    if has_target == nil then has_target = (state.target_take_guid ~= nil) end
-    plan = plan or plan_dock(dock_ctx, reaper.ImGui_GetContentRegionAvail(dock_ctx))
-    local s = plan.s
-
-    -- A status message (set_status) replaces the hint text until it expires
-    local status_text = nil
-    if state.status.text ~= "" and reaper.time_precise() < state.status.until_time then
-      status_text = state.status.text
-    end
-
-    local has_data = (#state.results > 0 and state.notes ~= nil and #state.notes > 0)
-    local take_data = state.target_take_guid and state.session_takes[state.target_take_guid] or nil
-
-    -- Selection: how many notes, and the note itself when there is exactly one
+  --- How many notes are selected, and the index of one of them (the note itself when exactly one is).
+  local function bar_selection()
     local sel_count, sel_idx = 0, nil
     if state.notes then
       for idx in pairs(state.selected_notes) do
@@ -6938,31 +7208,71 @@ do
         sel_count, sel_idx = 1, state.selected_note
       end
     end
+    return sel_count, sel_idx
+  end
+
+  --- The status line: a status message (set_status) while it lasts, else what the window is doing or waiting
+  --- for; "" when there is nothing to say. `editing` = notes are on the canvas and can be edited (an empty
+  --- canvas carries its own centred message, and a bypassed one its badge, so neither adds a hint).
+  K.status_line = function(editing)
+    if state.status.text ~= "" and reaper.time_precise() < state.status.until_time then
+      return state.status.text
+    end
+    if state.is_analyzing then
+      return string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor((state.progress or 0) * 100))
+    end
+    if not (state.frame.take and state.target_take_name) then
+      return state.selection_issue or ""
+    end
+    if editing then
+      local sel_count = bar_selection()
+      if sel_count == 0 then return BAR_HINT_SELECT_NOTE end
+      if sel_count > 1 then return string.format("%d notes selected", sel_count) end
+    end
+    return ""
+  end
+
+  --- Draw the status line on a pill whose bottom-left corner is (x, bottom_y), at most max_w wide (the text is
+  --- shortened with an ellipsis). The canvas calls it on every path it leaves by, so a status message shows in
+  --- every state. C.pill_text is >= 4.5:1 on the pill over every canvas surface.
+  K.canvas_status = function(draw_list, x, bottom_y, max_w, editing)
+    local text = K.status_line(editing)
+    if text == "" then return end
+    local L = Theme.layout
+    local C = Theme.get_palette().canvas
+    local room = max_w - L.sm * 2
+    if room <= 0 then return end
+    text = hdr_fit_text(text, room)
+    local text_w, text_h = reaper.ImGui_CalcTextSize(ctx, text)
+    if (text_w or 0) > room then return end   -- not even the ellipsis fits
+    local top_y = bottom_y - text_h - L.xs * 2
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x, top_y, x + text_w + L.sm * 2, bottom_y, C.pill_bg, L.rounding)
+    reaper.ImGui_DrawList_AddText(draw_list, x + L.sm, top_y + L.xs, C.pill_text, text)
+  end
+
+  --- The units of this frame. `has_target` / `target_item` come from loop_body (the top bar's view of the
+  --- target); `s` from K.bar_measure. Returns draw_unit(id) for the ids "retune", "trans", "ramp", "legato",
+  --- "timing", "snap", "quantize", "split" and "merge".
+  K.bar_frame = function(bctx, has_target, target_item, s)
+    local P = Theme.get_palette()
+    local L = Theme.layout
+    if has_target == nil then has_target = (state.target_take_guid ~= nil) end
+
+    local has_data = (#state.results > 0 and state.notes ~= nil and #state.notes > 0)
+    local take_data = state.target_take_guid and state.session_takes[state.target_take_guid] or nil
+
+    -- Selection: how many notes, and the note itself when there is exactly one
+    local sel_count, sel_idx = bar_selection()
     local single_note = (sel_count == 1) and state.notes[sel_idx] or nil
 
-    -- Why the Inspector and Actions are disabled (nil = usable)
+    -- Why the Inspector and the actions are disabled (nil = usable)
     local inspector_reason = nil
     if state.is_analyzing then
-      inspector_reason = DOCK_REASON_ANALYZING
+      inspector_reason = BAR_REASON_ANALYZING
     elseif not has_target then
-      inspector_reason = DOCK_REASON_NO_TARGET
+      inspector_reason = BAR_REASON_NO_TARGET
     elseif not has_data then
-      inspector_reason = DOCK_REASON_NOT_ANALYZED
-    end
-
-    -- The state line: what the window is doing / waiting for (a status message replaces it)
-    local hint = ""
-    local target_name = state.target_take_name or "this item"
-    if state.is_analyzing then
-      hint = string.format("Analyzing %s… %d%%", target_name, math.floor((state.progress or 0) * 100))
-    elseif not has_target then
-      hint = state.selection_issue or DOCK_HINT_NO_TARGET
-    elseif has_data then
-      if sel_count == 0 then hint = DOCK_HINT_SELECT_NOTE end
-    elseif state.analysis_empty then
-      hint = DOCK_HINT_NO_NOTES
-    else
-      hint = string.format("Ready to analyze %s", target_name)
+      inspector_reason = BAR_REASON_NOT_ANALYZED
     end
 
     --- Value and where it comes from for a cascade key: the selected note's own value when it has one
@@ -6970,6 +7280,13 @@ do
       local value = get_effective(single_note, key)
       if value == nil then value = DEFAULTS[key] end
       return value, get_override_level(single_note, key)
+    end
+
+    --- Text and background of a pill / badge by where its value comes from
+    local function level_colors(level)
+      if level == "note" then return P.accent2_l, P.accent2_d end
+      if level == "item" then return P.accent_l, P.accent_d end
+      return P.text_dim, P.card
     end
 
     --- Write an edited value: to the item override when there is one, else to the global default. The global default is
@@ -7020,48 +7337,57 @@ do
 
     --- Right-click menu of a cascade control (call right after the control).
     local function item_override_menu(key)
-      if not reaper.ImGui_BeginPopupContextItem(dock_ctx, "##ctx_" .. key) then return end
+      if not reaper.ImGui_BeginPopupContextItem(bctx, "##ctx_" .. key) then return end
       -- HC5: Esc closes this menu (innermost)
-      if reaper.ImGui_Shortcut(dock_ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(dock_ctx) end
+      if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
       local has_override = take_data ~= nil and take_data.overrides ~= nil and take_data.overrides[key] ~= nil
-      if reaper.ImGui_MenuItem(dock_ctx, "Override for this item", nil, has_override, take_data ~= nil) then
+      if reaper.ImGui_MenuItem(bctx, "Override for this item", nil, has_override, take_data ~= nil) then
         toggle_item_override(key)
       end
-      if reaper.ImGui_MenuItem(dock_ctx, "Reset to default") then
+      if reaper.ImGui_MenuItem(bctx, "Reset to default") then
         reset_cascade_param(key)
       end
-      reaper.ImGui_EndPopup(dock_ctx)
+      reaper.ImGui_EndPopup(bctx)
     end
 
     --- Tooltip for the item just drawn, gated on the hover delay. A disabled item passes
     --- HoveredFlags_AllowWhenDisabled as `extra_flags` so its reason still shows.
-    local function dock_tooltip(text, extra_flags)
+    local function bar_tooltip(text, extra_flags)
       local flags = reaper.ImGui_HoveredFlags_ForTooltip() | (extra_flags or 0)
-      if reaper.ImGui_IsItemHovered(dock_ctx, flags) and not reaper.ImGui_IsItemActive(dock_ctx) then
-        Theme.tooltip(dock_ctx, text)
+      if reaper.ImGui_IsItemHovered(bctx, flags) and not reaper.ImGui_IsItemActive(bctx) then
+        Theme.tooltip(bctx, text)
       end
     end
 
     local function draw_retune()
       local value, level = cascade_view("retune_speed")
       local disabled = (inspector_reason ~= nil) or (level == "note")
-      Theme.align(dock_ctx)
-      reaper.ImGui_TextDisabled(dock_ctx, plan.strength_label or DOCK_STRENGTH_LABEL)
-      reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
 
-      reaper.ImGui_BeginDisabled(dock_ctx, disabled)
-      reaper.ImGui_PushItemWidth(dock_ctx, s.slider_w)
-      local rs_c, rs_v, rs_committed, rs_reset = param_drag(dock_ctx, "rt_speed", nil, value * 100, 0, 100, "%.0f%%")
-      reaper.ImGui_PopItemWidth(dock_ctx)
-      reaper.ImGui_EndDisabled(dock_ctx)
+      -- Scope pill: where the value comes from, which is also what an edit changes
+      local fg, bg = level_colors(level)
+      Theme.badge(bctx, BAR_SCOPE_TAGS[level] or BAR_SCOPE_TAGS.global, {
+        color = fg, bg = bg, id = "bar_scope", w = s.scope_w,
+      })
+      bar_tooltip("Where " .. PARAM_LABELS.retune_speed .. " comes from.\n" .. bar_scope_tip(level, false))
+
+      reaper.ImGui_SameLine(bctx, 0, L.sm)
+      Theme.align(bctx)
+      reaper.ImGui_TextDisabled(bctx, BAR_STRENGTH_LABEL)
+      reaper.ImGui_SameLine(bctx, 0, L.sm)
+
+      reaper.ImGui_BeginDisabled(bctx, disabled)
+      reaper.ImGui_PushItemWidth(bctx, s.slider_w)
+      local rs_c, rs_v, rs_committed, rs_reset = param_drag(bctx, "rt_speed", nil, value * 100, 0, 100, "%.0f%%")
+      reaper.ImGui_PopItemWidth(bctx)
+      reaper.ImGui_EndDisabled(bctx)
 
       if inspector_reason then
-        dock_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
       elseif level == "note" then
-        dock_tooltip(DOCK_REASON_NOTE_OVERRIDE, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(BAR_REASON_NOTE_OVERRIDE, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
       else
-        dock_tooltip(string.format("%s: how much of the pitch correction is applied.\n%s\nDrag to change (%s-drag: fine adjust). Double-click: reset. Right-click: item override.",
-          DOCK_STRENGTH_LABEL, dock_scope_tip(level, false), K.MOD_LABEL))
+        bar_tooltip(string.format("%s: how much of the pitch correction is applied.\n%s\nDrag to change (%s-drag: fine adjust). Double-click: reset. Right-click: item override.",
+          PARAM_LABELS.retune_speed, bar_scope_tip(level, false), K.MOD_LABEL))
       end
       if not disabled then
         item_override_menu("retune_speed")
@@ -7076,65 +7402,111 @@ do
           end
         end
       end
+    end
 
-      reaper.ImGui_SameLine(dock_ctx, 0, L.sm)
-      Theme.align(dock_ctx)
-      reaper.ImGui_TextColored(dock_ctx, P.text_dim, DOCK_SCOPE_TAGS[level] or DOCK_SCOPE_TAGS.global)
+    --- The drag that edits a timing value (in a badge's popup and in the Timing popup), and what its changes do.
+    local function edit_timing(spec, value)
+      local key = spec.key
+      reaper.ImGui_PushItemWidth(bctx, s.edit_w)
+      local c, v, committed, reset = param_drag(bctx, "s_" .. key, nil, value, spec.min, spec.max, "%.0f ms")
+      reaper.ImGui_PopItemWidth(bctx)
+      if reset then
+        reset_cascade_param(key)
+      else
+        if c then write_cascade_value(key, v) end
+        if committed then K.save_settings("cascade") end
+        if committed and take_data then
+          apply_envelope_to_take("Adjust " .. (PARAM_LABELS[key] or key))
+          note_global_edit(key)
+        end
+      end
+    end
+
+    --- HC5: Esc closes the popup being drawn, unless a popup opened from it (a typed-entry field) is open:
+    --- that one is innermost.
+    local function close_popup_on_esc()
+      if not reaper.ImGui_IsPopupOpen(bctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
+         and reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then
+        reaper.ImGui_CloseCurrentPopup(bctx)
+      end
     end
 
     local function draw_badge(spec)
       local key = spec.key
       local value, level = cascade_view(key)
       local disabled = (inspector_reason ~= nil) or (level == "note")
-      local fg, bg = P.text_dim, P.card
-      if level == "note" then
-        fg, bg = P.accent2_l, P.accent2_d
-      elseif level == "item" then
-        fg, bg = P.accent_l, P.accent_d
-      end
-      local txt = string.format(spec.fmt, value) .. ((level ~= "global") and DOCK_OVERRIDE_MARK or "")
+      local fg, bg = level_colors(level)
+      local txt = string.format(spec.fmt, value) .. ((level ~= "global") and BAR_OVERRIDE_MARK or "")
 
-      Theme.align(dock_ctx)
-      reaper.ImGui_BeginDisabled(dock_ctx, disabled)
-      local pressed = Theme.badge(dock_ctx, txt, {
-        color = fg, bg = bg, interactive = true, id = "dock_" .. spec.id, w = s.badge_w[spec.id],
+      Theme.align(bctx)
+      reaper.ImGui_BeginDisabled(bctx, disabled)
+      local pressed = Theme.badge(bctx, txt, {
+        color = fg, bg = bg, interactive = true, id = "bar_" .. spec.id, w = s.unit_w[spec.id],
       })
-      reaper.ImGui_EndDisabled(dock_ctx)
+      reaper.ImGui_EndDisabled(bctx)
 
       if inspector_reason then
-        dock_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
       elseif level == "note" then
-        dock_tooltip(DOCK_REASON_NOTE_OVERRIDE, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(BAR_REASON_NOTE_OVERRIDE, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
       else
-        dock_tooltip(string.format("%s: %.0f ms\n%s\nLeft-click to edit. Right-click for item override and reset.",
-          PARAM_LABELS[key] or key, value, dock_scope_tip(level, true)))
+        bar_tooltip(string.format("%s: %.0f ms\n%s\nLeft-click to edit. Right-click for item override and reset.",
+          PARAM_LABELS[key] or key, value, bar_scope_tip(level, true)))
       end
 
       if not disabled then item_override_menu(key) end
       if pressed then
-        reaper.ImGui_OpenPopup(dock_ctx, "##edit_" .. key)
+        reaper.ImGui_OpenPopup(bctx, "##edit_" .. key)
       end
 
-      if reaper.ImGui_BeginPopup(dock_ctx, "##edit_" .. key) then
-        -- HC5: Esc closes this editor, unless its typed-entry popup is open: that one is innermost
-        if not reaper.ImGui_IsPopupOpen(dock_ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
-           and reaper.ImGui_Shortcut(dock_ctx, reaper.ImGui_Key_Escape()) then
-          reaper.ImGui_CloseCurrentPopup(dock_ctx)
-        end
-        reaper.ImGui_PushItemWidth(dock_ctx, s.edit_w)
-        local c, v, committed, reset = param_drag(dock_ctx, "s_" .. key, nil, value, spec.min, spec.max, "%.0f ms")
-        if reset then
-          reset_cascade_param(key)
-        else
-          if c then write_cascade_value(key, v) end
-          if committed then K.save_settings("cascade") end
-          if committed and take_data then
-            apply_envelope_to_take("Adjust " .. (PARAM_LABELS[key] or key))
-            note_global_edit(key)
+      if reaper.ImGui_BeginPopup(bctx, "##edit_" .. key) then
+        close_popup_on_esc()
+        edit_timing(spec, value)
+        reaper.ImGui_EndPopup(bctx)
+      end
+    end
+
+    --- "Timing": the three timing values behind one button, for widths where their badges do not fit. Its popup
+    --- holds one row per value: the name (with the override mark) and the same drag a badge opens.
+    local function draw_timing()
+      local overridden = false
+      for _, spec in ipairs(BAR_BADGES) do
+        local _, level = cascade_view(spec.key)
+        if level ~= "global" then overridden = true end
+      end
+
+      reaper.ImGui_BeginDisabled(bctx, inspector_reason ~= nil)
+      local pressed = reaper.ImGui_Button(bctx,
+        string.format(BAR_TIMING_FMT, overridden and BAR_OVERRIDE_MARK or "") .. "###bar_timing", s.unit_w.timing, 0)
+      reaper.ImGui_EndDisabled(bctx)
+      if inspector_reason then
+        bar_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+      else
+        bar_tooltip(overridden and (BAR_TIMING_TIP .. "\n" .. BAR_OVERRIDE_MARK .. " = one of them is set for this item or note")
+          or BAR_TIMING_TIP)
+      end
+      if pressed then reaper.ImGui_OpenPopup(bctx, "##bar_timing_popup") end
+
+      if reaper.ImGui_BeginPopup(bctx, "##bar_timing_popup") then
+        close_popup_on_esc()
+        local row_x = reaper.ImGui_GetCursorPosX(bctx) or 0
+        for _, spec in ipairs(BAR_BADGES) do
+          local key = spec.key
+          local value, level = cascade_view(key)
+          Theme.align(bctx)
+          reaper.ImGui_Text(bctx, (PARAM_LABELS[key] or key) .. ((level ~= "global") and BAR_OVERRIDE_MARK or ""))
+          reaper.ImGui_SameLine(bctx, row_x + s.timing_label_w + L.lg, 0)
+          reaper.ImGui_BeginDisabled(bctx, level == "note")
+          edit_timing(spec, value)
+          reaper.ImGui_EndDisabled(bctx)
+          if level == "note" then
+            bar_tooltip(BAR_REASON_NOTE_OVERRIDE, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+          else
+            bar_tooltip(bar_scope_tip(level, true) .. "\nRight-click for item override and reset.")
+            item_override_menu(key)
           end
         end
-        reaper.ImGui_PopItemWidth(dock_ctx)
-        reaper.ImGui_EndPopup(dock_ctx)
+        reaper.ImGui_EndPopup(bctx)
       end
     end
 
@@ -7179,47 +7551,24 @@ do
 
     local function draw_action(spec)
       local reason = action_reason(spec.id)
-      reaper.ImGui_BeginDisabled(dock_ctx, reason ~= nil)
-      local clicked = reaper.ImGui_Button(dock_ctx, spec.label .. "###dock_" .. spec.id, s.action_w[spec.id], 0)
-      reaper.ImGui_EndDisabled(dock_ctx)
-      dock_tooltip(reason and (spec.tip .. "\n" .. reason) or spec.tip,
+      reaper.ImGui_BeginDisabled(bctx, reason ~= nil)
+      local clicked = reaper.ImGui_Button(bctx, spec.label .. "###bar_" .. spec.id, s.unit_w[spec.id], 0)
+      reaper.ImGui_EndDisabled(bctx)
+      bar_tooltip(reason and (spec.tip .. "\n" .. reason) or spec.tip,
         reason and reaper.ImGui_HoveredFlags_AllowWhenDisabled() or 0)
       if clicked and not reason then K.note_action(spec.id, sel_idx) end
     end
 
-    -- Controls: the rows planned from the width; every unit sits at its planned x, whatever its neighbours drew
-    local left_x = reaper.ImGui_GetCursorPosX(dock_ctx) or 0
-    for _, row in ipairs(plan.rows) do
-      for i, unit in ipairs(row) do
-        if i > 1 then reaper.ImGui_SameLine(dock_ctx, left_x + unit.x, 0) end
-        if unit.id == "retune" then
-          draw_retune()
-        elseif DOCK_BADGE_BY_ID[unit.id] then
-          draw_badge(DOCK_BADGE_BY_ID[unit.id])
-        else
-          draw_action(DOCK_ACTION_BY_ID[unit.id])
-        end
+    return function(id)
+      if id == "retune" then
+        draw_retune()
+      elseif id == "timing" then
+        draw_timing()
+      elseif BAR_BADGE_BY_ID[id] then
+        draw_badge(BAR_BADGE_BY_ID[id])
+      elseif BAR_ACTION_BY_ID[id] then
+        draw_action(BAR_ACTION_BY_ID[id])
       end
-    end
-
-    -- Status / hint text (left) and selection count + key / scale (right-aligned): the message replaces the hint
-    local scale_str = string.format("%s %s", SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name)
-    local right_text = (sel_count > 0) and string.format("%d Selected  •  %s", sel_count, scale_str) or scale_str
-    local wanted = status_text or hint
-    local left_text, right_shown, right_x = layout_dock_texts(dock_ctx, plan.status_x, plan.avail_w, wanted, right_text)
-    -- Inline, the text continues the last control row; otherwise it opens the row the plan reserved
-    if left_text ~= "" then
-      if plan.status_inline then reaper.ImGui_SameLine(dock_ctx, left_x + plan.status_x, 0) end
-      Theme.align(dock_ctx)
-      reaper.ImGui_TextColored(dock_ctx, P.text_dim, left_text)
-      if left_text ~= wanted then dock_tooltip(wanted) end
-    elseif not plan.status_inline then
-      reaper.ImGui_Dummy(dock_ctx, 0, s.frame_h)   -- the row exists even when there is nothing to say
-    end
-    if right_shown ~= "" then
-      reaper.ImGui_SameLine(dock_ctx, left_x + right_x, 0)
-      Theme.align(dock_ctx)
-      reaper.ImGui_TextColored(dock_ctx, P.text_dim, right_shown)
     end
   end
 end
@@ -7239,23 +7588,27 @@ local function loop_body()
   local nc, nv = Theme.push(ctx, P)
   local pushed_font = Theme.push_font(ctx, fonts.default)
 
+  -- The window itself has no padding: the canvas and the Pitched Items panel run to its left, right and bottom
+  -- edges. ImGui takes a window's padding when Begin is called, so it is 0 for that call only (see below): the top
+  -- bar keeps pad_x / pad_v around it by hand, and the popups opened from the window get the usual padding.
   local pad_x = L.md + L.xs
   local pad_v = L.sm + L.xs
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), pad_x, pad_v)
   reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(), L.md, pad_v)
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), 0, 0)
   nv = nv + 2
 
-  -- First use: 920 x 620, wider when the full header (title, Key: / Scale: labels, one row) needs it, so
-  -- it opens unabbreviated. A saved size wins over this (Cond_FirstUseEver)
+  -- First use: 920 x 620, wider when the top bar on two rows with nothing folded needs it, so it opens
+  -- unabbreviated. A saved size wins over this (Cond_FirstUseEver)
   hdr_static = hdr_static or measure_header_static()
   Theme.center_next_window(ctx, math.max(920, math.ceil(hdr_min_content_w(hdr_static, true) + pad_x * 2)), 620,
     reaper.ImGui_Cond_FirstUseEver())
-  -- A floating window never gets narrower than the header needs (two rows); a docked one takes its
-  -- dock's size, and the header wraps further to fit (see HEADER BAR)
+  -- A floating window never gets narrower, nor shorter, than the narrowest top bar needs (its last plan: every
+  -- group on a row of its own); a docked one takes its dock's size, and the bar is clipped (see TOP BAR)
   if hdr_was_docked == false then
+    local min_content_w, min_rows = hdr_min_content_w(hdr_static)
     reaper.ImGui_SetNextWindowSizeConstraints(ctx,
-      hdr_min_content_w(hdr_static) + pad_x * 2,
-      hdr_static.frame_h + pad_v * 3 + hdr_static.row_h * 2,
+      min_content_w + pad_x * 2,
+      hdr_static.frame_h + pad_v * (min_rows + 1) + hdr_static.row_h * min_rows,
       K.SIZE_UNBOUNDED, K.SIZE_UNBOUNDED)
   end
   local win_flags = reaper.ImGui_WindowFlags_NoCollapse()
@@ -7263,6 +7616,9 @@ local function loop_body()
     | reaper.ImGui_WindowFlags_NoNavInputs()
 
   local visible, open = reaper.ImGui_Begin(ctx, 'Fancy Pitch Correct', true, win_flags)
+  -- The window has taken its (zero) padding: everything opened from here on gets the usual one
+  reaper.ImGui_PopStyleVar(ctx, 1)
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(), pad_x, pad_v)
   -- HC5: cached right after Begin (IsWindowDocked reports the current window). A docked window never
   -- closes on Esc. Whether a popup was already open when the frame started is remembered too, so the
   -- press that closes a modal can never also reach the window-level Esc handler below.
@@ -7281,7 +7637,7 @@ local function loop_body()
       if cur_sel_take and not sel_is_midi then
         cur_guid = get_take_guid(cur_sel_take)
       end
-      -- Why the selected item cannot be a target (the dock hint and the badge tooltip say it); nil for an
+      -- Why the selected item cannot be a target (the status pill and the badge tooltip say it); nil for an
       -- audio item or no selection
       state.selection_issue = nil
       if cur_sel_item and not cur_guid then
@@ -7308,7 +7664,7 @@ local function loop_body()
             state.hovered_note = nil
             state.drag = nil
             state.marquee = nil
-            state.view_t0, state.view_t1 = nil, nil
+            K.reset_view()
             state.start_time = 0
             state.item_len = reaper.GetMediaItemInfo_Value(cur_sel_item, "D_LENGTH")
             state.end_time = state.item_len
@@ -7317,24 +7673,24 @@ local function loop_body()
       end
     end
 
-    -- The target, asked once per frame: the header, canvas, dock and sidebar read it from state.frame
+    -- The target, asked once per frame: the top bar, canvas and sidebar read it from state.frame
     local target_take, target_item = get_target_take()
     state.frame.guid, state.frame.take, state.frame.item = state.target_take_guid, target_take, target_item
     local has_target = (target_take ~= nil and state.target_take_name ~= nil)
     local has_notes = (state.notes and #state.notes > 0)
 
-    -- 1. Header bar (widths and wrapping: see HEADER BAR above)
-    if draw_header(P, docked, has_target, has_notes, target_take, target_item) then
+    -- 1. Top bar: every control (widths and wrapping: see TOP BAR above). The window has no padding, so the bar
+    -- brings its own margins: pad_v above it, pad_x on its left (the indent) and on its right (draw_header)
+    reaper.ImGui_SetCursorPosY(ctx, (reaper.ImGui_GetCursorPosY(ctx) or 0) + pad_v)
+    reaper.ImGui_Indent(ctx, pad_x)
+    if draw_header(P, docked, has_target, has_notes, target_take, target_item, pad_x) then
       open = false
     end
+    reaper.ImGui_Unindent(ctx, pad_x)
 
-    -- 2. Main Body: Canvas + (optional) Pitched Items Sidebar
-    local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-    -- The dock's real height: its rows for this width (see BOTTOM DOCK), each a frame tall with the item
-    -- spacing between them, plus the spacing between the body and the first row
-    local dock_plan = plan_dock(ctx, avail_w)
-    local footer_h = dock_plan.row_count * (dock_plan.s.frame_h + pad_v)
-    local body_h = avail_h - footer_h
+    -- 2. Main Body: Canvas + (optional) Pitched Items Sidebar. It takes everything below the top bar: there is
+    -- no bottom row (the status line is a pill on the canvas, see K.canvas_status)
+    local avail_w, body_h = reaper.ImGui_GetContentRegionAvail(ctx)
     local total_h = math.max(60, body_h)
 
     -- The panel is drawn only when the window has room for it beside a usable canvas; otherwise the
@@ -7359,16 +7715,13 @@ local function loop_body()
         msg_x + math.max(0, (avail_w - msg_w) * 0.5), msg_y + (body_h - msg_h) * 0.5, P.text_dim, msg)
     end
     state.sidebar_tabled = split_drawn
-
-    -- 4. Bottom Row: Inspector & Action Bar
-    render_bottom_dock(ctx, has_target, target_item, dock_plan)
   end
 
   -- Pop custom window padding & item spacing before rendering modals
   reaper.ImGui_PopStyleVar(ctx, 2)
   nv = nv - 2
 
-  -- 5. Render Modals (ReaImGui's Begin calls End itself when it returns false)
+  -- 3. Render Modals (ReaImGui's Begin calls End itself when it returns false)
   if visible then
     draw_settings_modal()
     draw_info_modal()

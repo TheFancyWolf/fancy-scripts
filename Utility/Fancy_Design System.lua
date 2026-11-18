@@ -1,8 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.3.1
+-- @version 1.3.2
 -- @changelog
---   + Show the new canvas palette (P.canvas) and the icon_target preset (24 px target)
+--   + Show the new canvas tokens: note-name column, note envelope, overview and range strips
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -221,15 +221,17 @@ local CANVAS_GROUPS = {
     "row", "row_black", "row_tonic", "row_dim", "row_dim_black", "row_plain", "row_plain_black" } },
   { "Row tints & grid", "accent tints over the in-scale and root rows, and the lines between rows", {
     "row_tint", "row_tonic_tint", "grid", "grid_tonic", "grid_dim", "grid_plain", "grid_plain_black" } },
+  { "Note-name column", "the flat strip left of the rows: labels >= 4.5:1, the root row's strip >= 3:1", {
+    "gutter_bg", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "gutter_strip" } },
   { "Piano keys", "fixed in both theme modes (a piano does not follow the REAPER theme); the root strip follows the accent", {
     "key_white", "key_black", "key_plain_black", "key_tonic_white", "key_tonic_black",
     "key_dim_white", "key_dim_black", "key_outline", "key_tonic_strip" } },
   { "Key labels", "text on the keys (>= 4.5:1)", {
     "key_text_white", "key_text_black", "key_text_plain_white", "key_text_plain_black",
     "key_text_tonic_white", "key_text_tonic_black", "key_text_dim_white", "key_text_dim_black" } },
-  { "Note blocks", "fills are translucent over the row; borders are >= 3:1 on every row", {
+  { "Note blocks", "near-opaque fills; borders are >= 3:1 on every row; note_wave is the amplitude envelope inside", {
     "note_fill", "note_border", "note_edited", "note_edited_border", "note_selected", "note_selected_edited",
-    "note_selected_border", "note_bypassed", "note_bypassed_border" } },
+    "note_selected_border", "note_bypassed", "note_bypassed_border", "note_wave" } },
   { "Note labels", "text on the note fills (>= 4.5:1) and the edited-note corner mark", {
     "note_label", "note_label_selected", "note_label_edited", "note_edit_mark" } },
   { "Zones & handles", "hover highlights over a note and its trim handles (resting handle >= 3:1)", {
@@ -238,6 +240,8 @@ local CANVAS_GROUPS = {
     "trace", "preview", "vibrato", "trend", "spot", "anchor", "marker_split", "marker_split_text", "playhead" } },
   { "Selection & overlays", "marquee, pills behind canvas text, time-ruler strip, bypass scrim", {
     "marquee_fill", "marquee_border", "marquee_text", "pill_bg", "pill_text", "ruler_bg", "scrim" } },
+  { "Overview & range strips", "the track, the notes on it, and the thumb marking the visible window (>= 3:1 on the track)", {
+    "overview_bg", "overview_note", "view_fill", "view_border", "view_grip" } },
 }
 
 --- Draws the P.canvas tokens as labelled swatches: one titled group per CANVAS_GROUPS entry, at most
