@@ -38,6 +38,36 @@ local function contains(list, value) -- luacheck: ignore 211 (used by later task
   return false
 end
 
+local REAPERTIPS, LIGHT = stub_lib.REAPERTIPS, stub_lib.LIGHT
+
+--- WCAG 2.x relative luminance of 0xRRGGBBAA (alpha ignored), written independently of the library.
+local function lum(c)
+  local function ch(shift)
+    local v = ((c >> shift) & 0xFF) / 255
+    if v <= 0.03928 then return v / 12.92 end
+    return ((v + 0.055) / 1.055) ^ 2.4
+  end
+  return 0.2126 * ch(24) + 0.7152 * ch(16) + 0.0722 * ch(8)
+end
+
+--- Alpha-composites fg over the opaque colour under; returns an opaque colour.
+local function composite(fg, under)
+  local a = (fg & 0xFF) / 255
+  local out = 0
+  for shift = 24, 8, -8 do
+    local f, u = (fg >> shift) & 0xFF, (under >> shift) & 0xFF
+    out = out | (math.floor(f * a + u * (1 - a) + 0.5) << shift)
+  end
+  return out | 0xFF
+end
+
+--- WCAG contrast of fg (alpha composited first) over the opaque colour bg.
+local function contrast(fg, bg)
+  local l1, l2 = lum(composite(fg, bg)), lum(bg)
+  if l1 < l2 then l1, l2 = l2, l1 end
+  return (l1 + 0.05) / (l2 + 0.05)
+end
+
 -------------------------------------------------------------------------------
 -- Runner
 -------------------------------------------------------------------------------
@@ -100,6 +130,68 @@ test("fonts: old ReaImGui without CreateFontFromFile still works", function()
   assert(fonts.default ~= nil and fonts.default_bold ~= nil)
   local c = first(stub.calls, "ImGui_CreateFont")
   assert(c[3] == 13, "old API passes the size as the second argument")
+end)
+
+-------------------------------------------------------------------------------
+-- Task 2: palette
+-------------------------------------------------------------------------------
+
+test("palette: curated values", function()
+  local T = load_theme({ mode = "fancy" })
+  local P = T.build_palette()
+  local want = {
+    bg = 0x323232FF, panel = 0x3E3E3EFF, card = 0x424242FF, text = 0xD9D9D9FF, accent = 0x46B9FEFF,
+    accent2 = 0xA990F5FF, blue = 0xA990F5FF, green = 0x44CD8CFF, red = 0xE45E65FF, yellow = 0xFEC13AFF,
+    border = 0x181818FF, outline = 0x181818FF, sep = 0x1D1D1DFF,
+    btn = 0x454545FF, btn_h = 0x585858FF, btn_a = 0x2E2E2EFF, btn_on = 0x46B9FEFF,
+    well = 0x2A2A2AFF, thumb = 0xC2C2C2FF, thumb_a = 0xD9D9D9FF,
+    tab = 0x383838FF, tab_h = 0x4D4D4DFF, tab_sel = 0x585858FF, hover = 0x4D4D4DFF, title = 0x2D2D2DFF,
+    scroll = 0xFFFFFF2B, scroll_h = 0xFFFFFF42, scroll_a = 0xFFFFFF59,
+  }
+  for k, v in pairs(want) do assert(P[k] == v, string.format("%s: want %08X got %08X", k, v, P[k] or 0)) end
+  assert(P.select == T.with_alpha(P.accent, 0.25))
+end)
+
+test("palette: every pre-existing field is still there", function()
+  local P = load_theme({ mode = "fancy" }).build_palette()
+  for _, k in ipairs({ "bg", "panel", "card", "text", "text_dim", "accent", "accent_h", "accent_d", "accent_e",
+    "accent_l", "accent_press", "accent2", "accent2_h", "accent2_d", "accent2_e", "accent2_l", "blue", "blue_h",
+    "blue_d", "blue_e", "blue_l", "green", "green_h", "green_d", "green_l", "red", "red_h", "red_d", "red_l",
+    "yellow", "yellow_l", "border", "sep", "dim_bg", "table_row", "table_row_alt", "slider_grab_active", "canvas" }) do
+    assert(P[k] ~= nil, k)
+  end
+end)
+
+local function contrast_rules(P)
+  for _, s in ipairs({ P.bg, P.panel, P.card, P.btn, P.well }) do
+    assert(contrast(P.text, s) >= 4.5, "text")
+    assert(contrast(P.text_dim, s) >= 4.5, "text_dim")
+  end
+  assert(contrast(P.on_text, P.btn_on) >= 4.5, "on_text on btn_on")
+  assert(contrast(P.btn_on, P.btn) >= 3.0, "on vs off face")
+  assert(contrast(P.thumb, P.well) >= 3.0, "thumb on well")
+  assert(contrast(P.accent, P.well) >= 3.0, "check mark on well")
+  for _, s in ipairs({ P.bg, P.panel, P.card }) do
+    assert(contrast(P.text, composite(P.select, s)) >= 4.5, "text on selected row")
+    assert(contrast(P.accent, s) >= 3.0, "selection bar")
+  end
+end
+
+test("palette: contrast rules, curated", function() contrast_rules(load_theme({ mode = "fancy" }).build_palette()) end)
+test("palette: contrast rules, Match Theme on Reapertips", function()
+  contrast_rules(load_theme({ mode = "match", theme = REAPERTIPS }).build_palette()) end)
+test("palette: contrast rules, Match Theme on a light theme", function()
+  contrast_rules(load_theme({ mode = "match", theme = LIGHT }).build_palette()) end)
+
+test("palette: curated mode ignores the REAPER theme", function()
+  local a = load_theme({ mode = "fancy", theme = LIGHT }).build_palette()
+  assert(a.bg == 0x323232FF and a.btn == 0x454545FF)
+end)
+
+test("palette: overrides win for old and new fields", function()
+  local P = load_theme({ mode = "fancy" }).build_palette({ accent = 0xFF0000FF, btn = 0x111111FF, well = 0x222222FF })
+  assert(P.accent == 0xFF0000FF and P.btn == 0x111111FF and P.well == 0x222222FF)
+  assert(P.btn_on == 0xFF0000FF, "btn_on follows an overridden accent")
 end)
 
 -------------------------------------------------------------------------------

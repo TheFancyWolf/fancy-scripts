@@ -274,28 +274,47 @@ end
 -------------------------------------------------------------------------------
 local FANCY_PALETTE = {
   -- Base surfaces
-  bg       = 0x12121EFF,
-  panel    = 0x1C1C30FF,
-  card     = 0x22223AFF,
+  bg       = 0x323232FF,
+  panel    = 0x3E3E3EFF,
+  card     = 0x424242FF,
 
-  -- Text
-  text     = 0xFFFFFFFF,
-  text_dim = 0x8E8EADFF,
+  -- Text (text_dim starts here and is fitted to 4.5:1 on the surfaces by build_palette)
+  text     = 0xD9D9D9FF,
+  text_dim = 0xA0A0A0FF,
 
-  -- Accent (primary purple)
-  accent   = 0x8B70FAFF,
+  -- Accent (primary blue)
+  accent   = 0x46B9FEFF,
 
-  -- Accent (secondary blue)
-  accent2  = 0x4DA6FFFF,
+  -- Accent (secondary violet; the blue* fields are aliases)
+  accent2  = 0xA990F5FF,
 
   -- Semantic base colors
-  green    = 0x56E39FFF,
-  red      = 0xF45B69FF,
-  yellow   = 0xFFCC66FF,
-  blue     = 0x4DA6FFFF,
+  green    = 0x44CD8CFF,
+  red      = 0xE45E65FF,
+  yellow   = 0xFEC13AFF,
+  blue     = 0xA990F5FF,
 
   -- Structural base
-  border   = 0x737373FF,
+  border   = 0x181818FF,
+  sep      = 0x1D1D1DFF,
+
+  -- Control roles
+  btn      = 0x454545FF,  -- resting face of buttons, combos, inactive toggles
+  btn_h    = 0x585858FF,  -- hovered face
+  btn_a    = 0x2E2E2EFF,  -- pressed face
+  on_text  = 0x0F2B3BFF,  -- label on the "on" face (fitted)
+  outline  = 0x181818FF,  -- 1 px control frame
+  well     = 0x2A2A2AFF,  -- recessed inputs, slider grooves, checkbox boxes
+  thumb    = 0xC2C2C2FF,  -- slider grab
+  thumb_a  = 0xD9D9D9FF,  -- slider grab while dragged
+  tab      = 0x383838FF,
+  tab_h    = 0x4D4D4DFF,
+  tab_sel  = 0x585858FF,
+  hover    = 0x4D4D4DFF,  -- hovered selectable / menu row
+  scroll   = 0xFFFFFF2B,  -- scrollbar grab: white at 17 %
+  scroll_h = 0xFFFFFF42,  -- 26 %
+  scroll_a = 0xFFFFFF59,  -- 35 %
+  title    = 0x2D2D2DFF,  -- title bar, docked header strip
 }
 
 -------------------------------------------------------------------------------
@@ -816,28 +835,42 @@ function Theme.build_palette(overrides)
   local mode = Theme.get_mode()
   local P = {}
   overrides = overrides or {}
+  local F = FANCY_PALETTE
+  local fancy = mode == Theme.MODE_FANCY
 
-  if mode == Theme.MODE_FANCY then
-    -- Curated Fancy Dark palette
-    P.bg       = overrides.bg       or FANCY_PALETTE.bg
-    P.panel    = overrides.panel    or FANCY_PALETTE.panel
-    P.card     = overrides.card     or FANCY_PALETTE.card
-    P.text     = overrides.text     or FANCY_PALETTE.text
-    P.text_dim = overrides.text_dim or FANCY_PALETTE.text_dim
-    P.accent   = overrides.accent   or FANCY_PALETTE.accent
-    P.border   = overrides.border   or FANCY_PALETTE.border
+  -- Surfaces, accent and the control faces the text has to read on
+  if fancy then
+    P.bg     = overrides.bg     or F.bg
+    P.panel  = overrides.panel  or F.panel
+    P.card   = overrides.card   or F.card
+    P.accent = overrides.accent or F.accent
+    P.btn    = overrides.btn    or F.btn
+    P.well   = overrides.well   or F.well
+  else
+    -- Everything from the REAPER theme (surfaces, accent from the edit cursor, control faces)
+    P.bg     = overrides.bg     or read_theme_color("col_main_bg2",    F.bg)
+    P.panel  = overrides.panel  or read_theme_color("col_tr1_bg",      F.panel)
+    P.card   = overrides.card   or read_theme_color("col_tr2_bg",      F.card)
+    P.accent = overrides.accent or read_theme_color("col_cursor",      F.accent)
+    P.btn    = overrides.btn    or read_theme_color("col_buttonbg",    F.btn)
+    P.well   = overrides.well   or read_theme_color("col_main_editbk", F.well)
+  end
+  P.select = overrides.select or with_alpha(P.accent, 0.25)
 
-  elseif mode == Theme.MODE_MATCH then
-    -- Everything from REAPER theme (surfaces, text, borders, and accent from edit cursor)
-    P.bg       = overrides.bg       or read_theme_color("col_main_bg2",  FANCY_PALETTE.bg)
-    P.panel    = overrides.panel    or read_theme_color("col_tr1_bg",    FANCY_PALETTE.panel)
-    P.card     = overrides.card     or read_theme_color("col_tr2_bg",    FANCY_PALETTE.card)
-    P.text     = overrides.text     or read_theme_color("col_main_text", FANCY_PALETTE.text)
-    -- text_dim / border are fitted to WCAG on the three surfaces they are drawn on (text 4.5:1, border 3:1)
-    local surfaces = { P.bg, P.panel, P.card }
-    P.text_dim = overrides.text_dim or fit_contrast(read_theme_color("col_tcp_text", FANCY_PALETTE.text_dim), surfaces, 4.5)
-    P.accent   = overrides.accent   or read_theme_color("col_cursor", FANCY_PALETTE.accent)
-    P.border   = overrides.border   or fit_contrast(read_theme_color("col_main_3dhl", FANCY_PALETTE.border), surfaces, 3.0)
+  -- Text is fitted (4.5:1) on the three surfaces, the control face, the well and a selected row (the select
+  -- tint over each surface); text_dim on the surfaces and faces. A curated, un-overridden text already reaches it.
+  local base_surfaces = { P.bg, P.panel, P.card }
+  local faces = { P.bg, P.panel, P.card, P.btn, P.well }      -- text_dim: the surfaces and control faces
+  local surfaces = { P.bg, P.panel, P.card, P.btn, P.well }   -- text: those plus a selected row
+  for _, s in ipairs(base_surfaces) do surfaces[#surfaces + 1] = composite_over(P.select, s) end
+  if fancy then
+    P.text     = overrides.text     or F.text
+    P.text_dim = overrides.text_dim or fit_contrast(F.text_dim, faces, 4.5)
+    P.border   = overrides.border   or F.border
+  else
+    P.text     = overrides.text     or fit_contrast(read_theme_color("col_main_text", F.text), surfaces, 4.5)
+    P.text_dim = overrides.text_dim or fit_contrast(read_theme_color("col_tcp_text", F.text_dim), faces, 4.5)
+    P.border   = overrides.border   or fit_contrast(read_theme_color("col_main_3dhl", F.border), base_surfaces, 3.0)
   end
 
   -- Semantic base colors & secondary accent
@@ -882,8 +915,10 @@ function Theme.build_palette(overrides)
   P.yellow_l  = overrides.yellow_l  or lighten(P.yellow, 0.70)
 
   -- Derive structural colors
-  -- sep = Separator lines (20% accent): Separator
-  P.sep    = overrides.sep    or with_alpha(P.accent, 0.20)
+  -- sep = hairline (Separator): a fixed grey in the curated mode, a step darker than the window in Match Theme
+  local sep_default = F.sep
+  if not fancy then sep_default = darken(P.bg, luminance(P.bg) > 0.179 and 0.12 or 0.42) end
+  P.sep    = overrides.sep    or sep_default
   -- dim_bg = Modal overlay background (85% darkened bg): ModalWindowDimBg
   P.dim_bg = overrides.dim_bg or with_alpha(darken(P.bg, 0.70), 0.85)
 
@@ -895,6 +930,49 @@ function Theme.build_palette(overrides)
 
   -- slider_grab_active = Lighter accent for active slider grab: SliderGrabActive
   P.slider_grab_active = overrides.slider_grab_active or lighten(P.accent, 0.15)
+
+  -- Control roles (see the design spec, section 2)
+  local dark_text = luminance(P.text) > 0.179          -- light text on a dark theme: "toward text" is lighter
+  local function toward(c, f) return dark_text and lighten(c, f) or darken(c, f) end
+  local function away(c, f) return dark_text and darken(c, f) or lighten(c, f) end
+  P.outline = overrides.outline or (fancy and F.outline or P.border)
+  P.btn_on  = overrides.btn_on  or (fancy and P.accent or fit_contrast(P.accent, { P.btn }, 3.0))
+  -- on_text: the dark label colour on btn_on, or white / black when that cannot reach 4.5:1
+  local on_text = fit_contrast(F.on_text, { P.btn_on }, 4.5)
+  if contrast_over(on_text, P.btn_on) < 4.5 then
+    on_text = contrast_over(0xFFFFFFFF, P.btn_on) >= contrast_over(0x000000FF, P.btn_on) and 0xFFFFFFFF or 0x000000FF
+  end
+  P.on_text = overrides.on_text or on_text
+  P.well_h  = overrides.well_h  or lighten(P.well, 0.06)
+  P.well_a  = overrides.well_a  or lighten(P.well, 0.12)
+  if fancy then
+    P.btn_h    = overrides.btn_h    or F.btn_h
+    P.btn_a    = overrides.btn_a    or F.btn_a
+    P.thumb    = overrides.thumb    or F.thumb
+    P.thumb_a  = overrides.thumb_a  or F.thumb_a
+    P.tab      = overrides.tab      or F.tab
+    P.tab_h    = overrides.tab_h    or F.tab_h
+    P.tab_sel  = overrides.tab_sel  or F.tab_sel
+    P.hover    = overrides.hover    or F.hover
+    P.scroll   = overrides.scroll   or F.scroll
+    P.scroll_h = overrides.scroll_h or F.scroll_h
+    P.scroll_a = overrides.scroll_a or F.scroll_a
+    P.title    = overrides.title    or F.title
+  else
+    -- Steps of the same size as the curated ones, toward / away from the text colour
+    P.btn_h    = overrides.btn_h    or toward(P.btn, 0.13)
+    P.btn_a    = overrides.btn_a    or away(P.btn, 0.33)
+    P.thumb    = overrides.thumb    or fit_contrast(toward(P.well, 0.75), { P.well }, 3.0)
+    P.thumb_a  = overrides.thumb_a  or P.text
+    P.tab      = overrides.tab      or toward(P.bg, 0.04)
+    P.tab_h    = overrides.tab_h    or toward(P.bg, 0.16)
+    P.tab_sel  = overrides.tab_sel  or toward(P.bg, 0.23)
+    P.hover    = overrides.hover    or toward(P.bg, 0.16)
+    P.scroll   = overrides.scroll   or with_alpha(P.text, 0.17)
+    P.scroll_h = overrides.scroll_h or with_alpha(P.text, 0.26)
+    P.scroll_a = overrides.scroll_a or with_alpha(P.text, 0.35)
+    P.title    = overrides.title    or read_theme_color("docker_bg", F.title)
+  end
 
   -- Canvas colours for custom-drawn editors (piano roll, keys, notes, curves): see section 4A
   return attach_canvas(P, mode, overrides)
