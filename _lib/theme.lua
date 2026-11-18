@@ -25,7 +25,7 @@
 --   Structure:  border, sep, dim_bg           (borders, separators, modal overlay; border >= 3:1 on bg/panel/card)
 --   Table:      table_row, table_row_alt      (alternating row backgrounds)
 --   Controls:   slider_grab_active            (slider grab while dragging)
---   Canvas:     canvas = { row*, grid*, key_*, key_text_*, note_*, zone_*, handle*, trace, preview, trend, ... }
+--   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, handle*, trace, preview, overview_*, view_*, ... }
 --               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy Dark,
 --               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
@@ -316,11 +316,13 @@ end
 -------------------------------------------------------------------------------
 -- 4A. CANVAS PALETTE (P.canvas)
 -------------------------------------------------------------------------------
---- Colours for custom-drawn editor canvases (piano-roll rows and grid, piano keys and their labels, note blocks,
---- zone highlights, trim handles, curves and markers, marquee, playhead, pills, ruler, scrim). Built by
+--- Colours for custom-drawn editor canvases (piano-roll rows and grid, the note-name column, piano keys and their
+--- labels, note blocks, zone highlights, trim handles, curves and markers, marquee, playhead, pills, ruler, the
+--- overview / range strips, scrim). Built by
 --- Theme.build_palette() into P.canvas for both modes:
----   Fancy Dark   fixed values (the colours the Pitch Correct canvas drew with hex literals), plus a few that are
----                exactly a palette colour or an alpha of it (noted per token).
+---   Fancy Dark   fixed values, plus the ones that are a palette colour, a shade or an alpha of it (noted per
+---                token). Notes are solid blocks in the accent colour (green once edited); the rows are one quiet
+---                surface, so the notes are the first thing the eye lands on.
 ---   Match Theme  derived from P.bg / P.panel / P.text / P.accent / P.green / P.blue / P.yellow so the canvas
 ---                follows a dark or a light REAPER theme. Every text token is fitted to >= 4.5:1 and every object
 ---                boundary to >= 3:1 (WCAG 2.x, alpha composited first) against the surfaces it is drawn on.
@@ -526,22 +528,29 @@ local function build_canvas_fancy(P)
   local C = {}
   -- Rows (what a note sits on). row* = in the scale, row_tonic = the key's root, row_dim* = out of the scale,
   -- row_plain* = no scale chosen (Chromatic). *_black = the row of a black piano key.
-  C.row             = 0x212230FF
-  C.row_black       = 0x1B1B26FF
-  C.row_tonic       = 0x222032FF
-  C.row_dim         = 0x131317FF
-  C.row_dim_black   = 0x111114FF
-  C.row_plain       = 0x202020FF
-  C.row_plain_black = 0x161616FF
+  -- The steps between them are small on purpose: the rows are a background, the notes carry the picture.
+  C.row             = 0x1C1C2AFF
+  C.row_black       = 0x1A1A27FF
+  C.row_tonic       = 0x1E1C2EFF
+  C.row_dim         = 0x161620FF
+  C.row_dim_black   = 0x14141DFF
+  C.row_plain       = 0x1C1C24FF
+  C.row_plain_black = 0x18181FFF
   -- Accent tints drawn over the in-scale / root rows (follow P.accent)
-  C.row_tint        = with_alpha(P.accent, 0.05)
-  C.row_tonic_tint  = with_alpha(P.accent, 0.12)
-  -- Grid lines between rows
-  C.grid            = with_alpha(P.accent, 0.16)
-  C.grid_tonic      = with_alpha(P.accent, 0.35)
-  C.grid_dim        = 0x1A1A20FF
-  C.grid_plain      = 0x333333FF
-  C.grid_plain_black = 0x222222FF
+  C.row_tint        = with_alpha(P.accent, 0.03)
+  C.row_tonic_tint  = with_alpha(P.accent, 0.10)
+  -- Grid lines between rows: hairlines in the text colour, the root row's in the accent
+  C.grid            = with_alpha(P.text, 0.05)
+  C.grid_tonic      = with_alpha(P.accent, 0.25)
+  C.grid_dim        = 0x1E1E28FF
+  C.grid_plain      = 0x2A2A32FF
+  C.grid_plain_black = 0x24242CFF
+  -- Note-name column (a flat strip left of the rows): labels >= 4.5:1 on gutter_bg, the root row's strip >= 3:1
+  C.gutter_bg         = P.panel
+  C.gutter_text       = with_alpha(P.text, 0.80)
+  C.gutter_text_dim   = P.text_dim
+  C.gutter_text_tonic = P.accent_l
+  C.gutter_strip      = P.accent
   -- Piano keys (fixed in both modes: a piano does not change colour with the REAPER theme)
   C.key_white       = 0xDDDDDDFF
   C.key_black       = 0x1E1E24FF
@@ -561,30 +570,34 @@ local function build_canvas_fancy(P)
   C.key_text_tonic_black = P.accent_l
   C.key_text_dim_white   = P.text
   C.key_text_dim_black   = P.text
-  -- Note blocks: fills are translucent over the row
-  C.note_fill            = 0x2A364499
-  C.note_border          = 0x6F829CFF
-  C.note_edited          = 0x3FA34D77
+  -- Note blocks: near-opaque shades of the accent (untouched) and of green (edited), dark enough for P.text to
+  -- read on them (>= 4.5:1). A selected block is a brighter shade inside a border in the text colour, so the
+  -- selection does not rest on the fill alone. note_wave is the amplitude envelope drawn inside a block.
+  C.note_fill            = with_alpha(darken(P.accent, 0.28), 0.92)
+  C.note_border          = P.accent
+  C.note_edited          = with_alpha(darken(P.green, 0.50), 0.92)
   C.note_edited_border   = P.green
-  C.note_selected        = 0x4477AA88
-  C.note_selected_edited = 0x3FA34D99
-  C.note_selected_border = P.accent
+  C.note_selected        = with_alpha(darken(P.accent, 0.15), 0.96)
+  C.note_selected_edited = with_alpha(darken(P.green, 0.45), 0.96)
+  C.note_selected_border = P.text
   C.note_bypassed        = 0x2A2A2A55
   C.note_bypassed_border = 0x555555AA
-  C.note_label           = 0xDDDDDDDD
+  C.note_label           = P.text
   C.note_label_selected  = P.text
-  C.note_label_edited    = 0xFFFFFFFF
+  C.note_label_edited    = P.text
   C.note_edit_mark       = P.text
+  C.note_wave            = with_alpha(P.text, 0.22)
   -- Zone highlights and trim handles (over a note block)
   C.zone_drift      = with_alpha(P.blue, 0.267)
   C.zone_shift      = 0xFFAA4444
   C.zone_divider    = with_alpha(P.text, 0.20)
   C.handle          = with_alpha(P.text, 0.80)
   C.handle_hover    = P.text
-  C.handle_drag     = P.accent
-  -- Curves, markers, selection, playhead
-  C.trace           = P.accent
-  C.preview         = with_alpha(P.green, 0.80)
+  C.handle_drag     = P.yellow   -- not the accent: the blocks are accent-coloured
+  -- Curves, markers, selection, playhead. The trace and the playhead are the text colour (the blocks own the
+  -- accent); the preview is a light green that reads on the edited (green) block it is drawn over.
+  C.trace           = with_alpha(P.text, 0.90)
+  C.preview         = with_alpha(lighten(P.green, 0.45), 0.90)
   C.vibrato         = 0xFFAA4418
   C.trend           = 0x00FFFFFF
   C.spot            = 0xFFFF00FF
@@ -594,7 +607,14 @@ local function build_canvas_fancy(P)
   C.marquee_fill    = with_alpha(P.accent, 0.18)
   C.marquee_border  = with_alpha(P.accent, 0.85)
   C.marquee_text    = P.accent_l
-  C.playhead        = P.accent
+  C.playhead        = P.text
+  -- Overview strip (every note, small, under the rows) and range strip (beside them): the track, the notes on
+  -- it, and the thumb that marks the visible window (fill, border and end grips)
+  C.overview_bg     = darken(P.bg, 0.25)
+  C.overview_note   = P.accent
+  C.view_fill       = with_alpha(P.accent, 0.16)
+  C.view_border     = P.accent
+  C.view_grip       = P.accent_l
   -- Overlays: pills (readouts, zone names), ruler strip, scrim
   C.pill_bg         = with_alpha(P.panel, 0.90)
   C.pill_text       = P.text
@@ -611,8 +631,8 @@ end
 --- palette colour named in the comment and move only as far as the contrast rule needs.
 --- Tokens not assigned below keep their build_canvas_fancy value, by design: the piano keys and their
 --- black/white labels and outline (key_white ... key_text_tonic_white), and the accent / text / blue / panel /
---- bg alphas that already follow the palette (row_tint, row_tonic_tint, grid, grid_tonic, zone_drift,
---- zone_divider, marquee_fill, marquee_border, pill_bg, ruler_bg, scrim).
+--- bg alphas that already follow the palette (row_tint, row_tonic_tint, grid, grid_tonic, gutter_bg, zone_drift,
+--- zone_divider, marquee_fill, marquee_border, view_fill, pill_bg, ruler_bg, scrim).
 local function build_canvas_match(P)
   local C = build_canvas_fancy(P)
   local bg = P.bg
@@ -625,12 +645,12 @@ local function build_canvas_match(P)
   -- is 4.58:1 at mid-grey), so the steps shrink as the background approaches mid-grey (k = 1 on clearly dark
   -- or light themes).
   local k = math.min(1, math.max(0.3, math.abs(luminance(bg) - 0.179) / 0.09))
-  C.row             = toward(bg, 0.065 * k)   -- in scale, white key
+  C.row             = toward(bg, 0.045 * k)   -- in scale, white key
   C.row_black       = toward(bg, 0.035 * k)   -- in scale, black key
-  C.row_tonic       = toward(bg, 0.07 * k)    -- the key's root (plus the accent tint)
+  C.row_tonic       = toward(bg, 0.05 * k)    -- the key's root (plus the accent tint)
   C.row_dim         = bg                      -- out of scale: the window background
-  C.row_dim_black   = away(bg, 0.10 * k)      -- out of scale, black key
-  C.row_plain       = toward(bg, 0.06 * k)    -- no scale chosen, white key
+  C.row_dim_black   = away(bg, 0.04 * k)      -- out of scale, black key
+  C.row_plain       = toward(bg, 0.04 * k)    -- no scale chosen, white key
   C.row_plain_black = toward(bg, 0.02 * k)    -- no scale chosen, black key
   C.grid_dim        = toward(bg, 0.05)        -- grid lines: fixed steps toward the text colour
   C.grid_plain      = toward(bg, 0.14)
@@ -650,13 +670,20 @@ local function build_canvas_match(P)
   C.key_text_dim_white   = fit_contrast(P.text, { C.key_dim_white }, 4.5)            -- text, >= 4.5:1 on the dimmed white key
   C.key_text_dim_black   = fit_contrast(P.text, { C.key_dim_black }, 4.5)            -- text, >= 4.5:1 on the dimmed black key
 
-  -- Note blocks: translucent blue (untouched, selected) and green (edited) tints moved "away" from the text
-  -- colour (darker on a dark theme, lighter on a light one), so a label can always read on them; borders are
-  -- the palette hue fitted to >= 3:1 on every row
-  C.note_fill            = with_alpha(away(P.blue, 0.35), 0.45)    -- untouched note: muted blue
-  C.note_edited          = with_alpha(away(P.green, 0.45), 0.50)   -- edited note: muted green
-  C.note_selected        = with_alpha(away(P.blue, 0.15), 0.60)    -- selected note: brighter blue
-  C.note_selected_edited = with_alpha(away(P.green, 0.35), 0.65)   -- selected edited note
+  -- Note-name column: the panel colour; its labels fitted to >= 4.5:1 and the root row's strip to >= 3:1 on it
+  local gutter = { C.gutter_bg }
+  C.gutter_text       = fit_contrast(with_alpha(P.text, 0.80), gutter, 4.5)          -- in-scale row name
+  C.gutter_text_dim   = fit_contrast(P.text_dim, gutter, 4.5)                        -- out-of-scale row name
+  C.gutter_text_tonic = fit_contrast(P.accent_l, gutter, 4.5)                        -- the root row's name
+  C.gutter_strip      = fit_contrast(P.accent, gutter, 3.0)                          -- the root row's strip
+
+  -- Note blocks: near-opaque shades of the accent (untouched, selected) and of green (edited) moved "away" from
+  -- the text colour (darker on a dark theme, lighter on a light one), so a label can always read on them; borders
+  -- are the palette hue fitted to >= 3:1 on every row
+  C.note_fill            = with_alpha(away(P.accent, 0.28), 0.92)  -- untouched note: a shade of the accent
+  C.note_edited          = with_alpha(away(P.green, 0.50), 0.92)   -- edited note: a shade of green
+  C.note_selected        = with_alpha(away(P.accent, 0.15), 0.96)  -- selected note: closer to the accent
+  C.note_selected_edited = with_alpha(away(P.green, 0.45), 0.96)   -- selected edited note
   C.note_bypassed        = with_alpha(toward(bg, 0.10), 0.33)      -- bypassed note: a faint grey
   -- A fill that would leave the label no room (a mid-grey theme) is pushed further away until white (dark
   -- theme) or black (light theme) reads on it, so the label fit below can always succeed
@@ -671,9 +698,12 @@ local function build_canvas_match(P)
     C[key] = fitted
   end
   C.note_bypassed_border = with_alpha(toward(bg, 0.30), 0.67)   -- dimmed on purpose (a disabled state)
-  C.note_border          = fit_contrast(P.blue, rows, 3.0)        -- blue, >= 3:1 on every row
+  C.note_border          = fit_contrast(P.accent, rows, 3.0)      -- accent, >= 3:1 on every row
   C.note_edited_border   = fit_contrast(P.green, rows, 3.0)       -- green, >= 3:1 on every row
-  C.note_selected_border = fit_contrast(P.accent, rows, 3.0)      -- accent, >= 3:1 on every row
+  -- The selection border is the text colour, fitted to >= 3:1 on every row and on both selected fills
+  C.note_selected_border = fit_contrast(P.text,
+    concat_lists(rows, over_each({ C.note_selected, C.note_selected_edited }, row_ends)), 3.0, rows)
+  C.note_wave            = with_alpha(ink, 0.22)                  -- the amplitude envelope inside a block (decoration)
 
   -- Labels on the block fills as they show over the rows (>= 4.5:1)
   local plain_fills    = over_each({ C.note_fill, C.note_bypassed }, row_ends)
@@ -700,7 +730,7 @@ local function build_canvas_match(P)
   end
   C.handle       = fit_contrast(with_alpha(P.text, 0.80), rest_on, 3.0)          -- text (80 % alpha) at rest
   C.handle_hover = fit_contrast((C.handle & 0xFFFFFF00) | 0xFF, edge_on, 3.0)   -- the resting handle made opaque
-  C.handle_drag  = fit_contrast(P.accent, edge_on, 3.0)                          -- accent while the edge is dragged
+  C.handle_drag  = fit_contrast(P.yellow, edge_on, 3.0)                          -- yellow while the edge is dragged (the blocks are accent-coloured)
 
   -- Curves and markers are drawn straight on a row or on a note block, and the vibrato wash goes over all of that: each
   -- palette hue is fitted to >= 3:1 on every one of those persistent surfaces (and the playhead also on the ruler strip),
@@ -714,15 +744,23 @@ local function build_canvas_match(P)
   local shown    = concat_lists(rows, blocks)                           -- rows and note blocks (no wash): split markers and their label
   local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
   local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
-  C.trace      = fit_contrast(P.accent, line_on, 3.0, rows, true)                -- raw pitch trace: accent
-  C.playhead   = C.trace                                                         -- the playhead line: same as the trace
-  C.preview    = fit_contrast(with_alpha(P.green, 0.80), curve_on, 3.0, rows, true)   -- corrected-pitch preview: green (80 % alpha)
+  C.trace      = fit_contrast(with_alpha(P.text, 0.90), line_on, 3.0, rows, true)   -- raw pitch trace: text colour (90 % alpha)
+  C.playhead   = fit_contrast(P.text, line_on, 3.0, rows, true)                  -- the playhead line: text colour
+  C.preview    = fit_contrast(with_alpha(toward(P.green, 0.45), 0.90), curve_on, 3.0, rows, true)   -- corrected-pitch preview: a green toward the text colour
   C.trend      = fit_contrast(C.trend, curve_on, 3.0, rows, true)                -- trend line: the Fancy Dark cyan (apart from marker_split's blue)
   C.anchor     = C.trend                                                         -- trend anchor diamond: same as the trend
   C.spot       = fit_contrast(P.yellow, curve_on, 3.0, rows, true)               -- smart-spot circle: yellow
   -- Split markers are drawn before the wash: the line on rows and blocks, its label on rows and blocks
   C.marker_split      = fit_contrast(with_alpha(P.blue, 0.67), shown, 3.0, rows, true)   -- split-point line: blue (67 % alpha)
   C.marker_split_text = fit_contrast(P.blue_l, shown, 4.5, rows)                    -- split-point label: blue_l, >= 4.5:1
+
+  -- Overview and range strips: a track a step away from the background; the notes on it, the thumb's border and
+  -- its grips are fitted to >= 3:1 on the track, with and without the thumb's own fill over it
+  C.overview_bg   = away(bg, 0.25)
+  local track     = { C.overview_bg, composite_over(C.view_fill, C.overview_bg) }
+  C.overview_note = fit_contrast(P.accent, track, 3.0)
+  C.view_border   = fit_contrast(P.accent, track, 3.0)
+  C.view_grip     = fit_contrast(P.accent_l, track, 3.0)
 
   -- BYPASSED badge: the card, inside a border drawn over the dimmed canvas (the scrim over rows, blocks and the wash)
   local card   = { P.card }
