@@ -48,7 +48,7 @@ placed by ear as well as by eye. Today the script is silent until the drag is re
    adds `JS: Tone Generator` to the Monitoring FX chain (the master track's input-FX slot), sets Dry Mix to
    0 dB so everything else passes untouched, and each frame sets the pitch (through Note, Octave and Fine Tune over a fixed 440 Hz; see Builder's findings) to
    `440 * 2 ^ ((note pitch - 69) / 12)`. On release it removes the effect. The Monitoring chain is global,
-   not part of the project: no undo point, no dirty flag. Nothing to install, no file to generate. Costs:
+   not part of the project: no undo point (the dirty flag is unverified; see Builder's findings). Nothing to install, no file to generate. Costs:
    the effect is visible in the Monitoring FX window during a drag; it is heard after the master, so it is
    not affected by track or master FX; if REAPER itself dies mid-drag the effect could be left behind (the
    script removes any leftover the next time it starts).
@@ -89,11 +89,11 @@ My calls (correct any of them):
 ## Left to the builder
 
 - Add-per-drag versus keeping one bypassed instance while the window is open: pick whichever starts
-  without an audible delay in real REAPER.
+  without an audible delay in real REAPER. (Resolved: added per drag; see Builder's findings.)
 - Verify the Monitoring FX addressing (`TrackFX_AddByName` with `recFX`, index offset `0x1000000` on the
-  master track) and `TrackFX_SetNamedConfigParm(..., "renamed_name", ...)` with `reaper-dev` before use.
+  master track) and `TrackFX_SetNamedConfigParm(..., "renamed_name", ...)` with `reaper-dev` before use. (Resolved: the real-REAPER tests a-h used both; see Builder's findings.)
 - Confirm in real REAPER that adding and removing a Monitoring FX makes no undo point and does not mark
-  the project modified. If it does, stop and report.
+  the project modified. If it does, stop and report. (Done for undo; dirty flag not checked, see Builder's findings.)
 - `docs/design/pitch-correct.md` gains the More menu item; `CHANGELOG.md` gains the entry.
 
 ## Verification
@@ -108,5 +108,5 @@ My calls (correct any of them):
 - Pitch is set through the generator's Note / Octave / Fine Tune sliders over a fixed 440 Hz, because its Base Frequency slider is quantised to 1 Hz. So the glide moves in 1-cent steps and the floor is A0 (MIDI 21), not 20 Hz.
 - The effect is added per drag (about 3 ms) rather than kept bypassed on the chain.
 - Adding and removing a Monitoring FX left the project state count and the undo history unchanged in real REAPER. The "project modified" flag could not be checked, because the test project was already modified.
-- Real-REAPER tests a-h passed on 2026-11-18.
+- Real-REAPER tests a-h passed on 2026-11-18. These are the checks listed in Task 4 of `docs/superpowers/plans/2026-11-18-pitch-correct-drag-tone.md`: (a) the tone follows the note, (b) it stops after release, (c) the user's own Tone Generator is left alone, (d) closing mid-drag, a click only, and other zones, (e) a leftover tagged instance is removed at start, (f) the pitch range floor, (g) the Note Tone toggle, (h) a screenshot of the More menu.
 - How the tone sounds (level, glide, any click at the start) has not been judged by ear.
