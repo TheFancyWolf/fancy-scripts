@@ -1,10 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.6.0
+-- @version 2.6.1
 -- @changelog
---   + Notes are solid blocks with the item's waveform inside; labels and pitch-centre spots show for the hovered and selected notes only
---   + The pitch range fits the notes; an overview strip and a pitch strip zoom and scroll each axis; Z zooms to the selection, F shows everything
---   + Every control is in one top bar (Layers, Settings, Help, Analyze and Reset under "…"); status and hints show on the canvas
+--   # Clicking the time ruler moves the edit cursor (and playback follows), so you can split or play from there
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -3422,6 +3420,13 @@ local function draw_graph(draw_ctx, w, h)
     -- Double-click on the ruler shows the whole item again
     if on_ruler and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
       set_view(item_t0, 0, duration)
+    elseif on_ruler and reaper.ImGui_IsMouseClicked(draw_ctx, 0) then
+      -- Click on the ruler moves the edit cursor there, and playback follows it (as on REAPER's own ruler)
+      local _, ruler_item = K.frame_target()
+      if ruler_item then
+        local item_pos = reaper.GetMediaItemInfo_Value(ruler_item, "D_POSITION")
+        reaper.SetEditCurPos(item_pos + x_to_t(mx), false, true)
+      end
     end
   end
 
@@ -4597,7 +4602,7 @@ local function draw_graph(draw_ctx, w, h)
     end
 
     if on_ruler and state.view_t0 and not gesture then
-      Theme.tooltip(draw_ctx, "Double-click to show the whole item")
+      Theme.tooltip(draw_ctx, "Click to move the edit cursor. Double-click: whole item")
     end
   end
 
@@ -6236,6 +6241,7 @@ K.INFO_SECTIONS = {
     { "Shift + Drag Center Zone", "Adjust Transition" },
     { "Shift + Drag Right Zone", "Adjust Scoop shape" },
     { "Drag Note Edge", "Trim note start / end boundary" },
+    { "Click the time ruler", "Move the edit cursor (playback follows)" },
     { K.MOD_LABEL .. " + Wheel", "Zoom the timeline" },
     { "Wheel", "Scroll the timeline (when zoomed)" },
     { "Alt + Wheel", "Zoom the pitch axis" },
