@@ -1,8 +1,8 @@
 -- @description Fancy Tap Tempo Slew Settings
 -- @author Fancy Scripts
--- @version 1.0.0
+-- @version 1.0.1
 -- @changelog
---   + Initial release
+--   + New look from the shared design system: matches the Reapertips Theme
 -- @about
 --   Settings window for Fancy Tap Tempo Slew: instant or glide, taps per
 --   change, whether the tempo updates on every tap or once per group, the
@@ -14,6 +14,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK

@@ -1,10 +1,8 @@
 -- @description Fancy Mapper Cycle Mode
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
---   + v5.1: Added Width, Multi-CC, Velocity, Track Nav, Marker, Transient, Item Slip
---   + v5.1: Cut Send mode
---   + v5.1: Dynamic sector geometry supporting custom enabled modes in Settings
+--   + New look from the shared design system: matches the Reapertips Theme
 -- @about
 --   Directional action ring for switching Fancy Mapper modes.
 --   Assign to a shortcut or controller button (e.g. keyboard hotkey, controller button, or middle click):
@@ -18,6 +16,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 0. DEPENDENCY CHECK

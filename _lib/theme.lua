@@ -6,14 +6,16 @@
 -- =============================================================================
 --
 -- PALETTE -- Theme.build_palette([overrides]) / Theme.get_palette() returns table with:
---   Surfaces:   bg, panel, card               (window bg, popups, frame bg)
---   Text:       text, text_dim                (primary, secondary)
---   Accent:     accent      = active state    (ButtonActive, CheckMark, SliderGrab)
---               accent_h    = hover  (40%)    (ButtonHovered, HeaderHovered, FrameBgActive)
---               accent_d    = dim    (20%)    (Button, Header, FrameBgHovered, ScrollbarGrab)
---               accent_e    = subtle (12.5%)  (TableBorderLight)
+--   Look:       Fancy = the Reaper Tips look, fixed values (greys, blue accent). Match Theme = surfaces, text and
+--               accent read from the active REAPER theme; every role below is derived and contrast-fitted.
+--   Surfaces:   bg, panel, card               (window, popups / raised strips, cards / table header)
+--   Text:       text, text_dim                (primary, secondary; both fitted to 4.5:1 on the surfaces and control faces)
+--   Accent:     accent      = active state    (CheckMark, TabSelectedOverline, selection bar, toggle-on face)
+--               accent_h    = hover  (40%)    (SeparatorHovered)
+--               accent_d    = dim    (20%)    (kept for scripts; the style stack no longer tints resting controls)
+--               accent_e    = subtle (12.5%)  (kept for scripts)
 --               accent_l    = light  (70%)    (High-contrast text on badges/active toggles)
---   Secondary:  accent2 / blue = active state (secondary accent, info, badge highlights)
+--   Secondary:  accent2 / blue = a soft violet in Fancy (secondary accent, info, badge highlights; blue* are aliases)
 --               accent2_h / blue_h = hover (40%)
 --               accent2_d / blue_d = dim   (20%)
 --               accent2_e / blue_e = subtle (12.5%)
@@ -21,18 +23,35 @@
 --   Semantic:   green/green_h/green_d/green_l (success, enabled, positive)
 --               red/red_h/red_d/red_l         (error, delete, destructive)
 --               yellow/yellow_l               (warning, caution)
---               blue/blue_h/blue_d/blue_e/blue_l (info, secondary accent)
---   Structure:  border, sep, dim_bg           (borders, separators, modal overlay; border >= 3:1 on bg/panel/card)
+--   Structure:  border, sep, dim_bg           (border = control outline, same value as outline in Fancy; sep = neutral
+--                                              hairline, no accent tint; dim_bg = modal overlay)
 --   Table:      table_row, table_row_alt      (alternating row backgrounds)
---   Controls:   slider_grab_active            (slider grab while dragging)
+--   Controls:   btn / btn_h / btn_a           resting / hovered / pressed face of buttons, combos, inactive toggles
+--               btn_on, on_text               face of an active toggle, and its label (fitted to 4.5:1)
+--               outline                       1 px frame around controls
+--               well, well_h, well_a          recessed inputs, slider grooves, checkbox boxes, progress track
+--               thumb, thumb_a                slider grab, and while dragged (slider_grab_active is kept)
+--               tab, tab_h, tab_sel           tab faces (the selected tab also has an accent line on top)
+--               hover, select                 hovered / selected row of a selectable or menu item (select = accent at 25%)
+--               scroll, scroll_h, scroll_a    scrollbar grab: 17 / 26 / 35% (white in Fancy, text colour in Match Theme)
+--               title                         title bar and docked header strip
 --   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, handle*, trace, preview, overview_*, view_*, ... }
---               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy Dark,
+--               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy,
 --               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
+--               Theme.label_on(fill) -> a dark or light label colour that reads on fill (4.5:1)
+--
+-- CONTRAST RULE (docs/design/README.md, "Contrast")
+--   Text and labels: 4.5:1 always, in both modes.
+--   Meaningful state (toggle on, focus, slider thumb, check mark, playhead, note borders, the selection bar of library
+--   rows): 3:1 against what it sits on.
+--   The resting outline and face of a labelled control follow the theme, no minimum (outline is about 1.4:1 on bg).
+--   The select tint of rows is exempt from 3:1; library rows add a 2 px accent bar that carries it.
 --
 -- THEME MODES & PREFS -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
---   MODE_FANCY="fancy"  Curated dark, purple accent
---   MODE_MATCH="match"  Everything from REAPER theme (including edit cursor accent)
+--   MODE_FANCY="fancy"  Curated Reaper Tips look (label "Fancy")
+--   MODE_MATCH="match"  Everything from REAPER theme (including edit cursor accent) (label "Match Theme")
+--   Theme.mode_labels   = { "Fancy", "Match Theme" } (settings combo labels, in mode order)
 --   Theme.get_show_tooltips() / .set_show_tooltips(bool) Global tooltip visibility
 --
 -- LAYOUT TOKENS -- Theme.layout.*
@@ -66,14 +85,22 @@
 --   push_font(ctx, font, [sz]) -> bool (safe pcall, auto-resolves size from registry)
 --   pop_font(ctx, pushed)      -> conditional pop
 --   fonts.tooltip = fonts.default (backward-compat alias)
+--   Font source: _lib/fonts/FiraSans-Regular.otf and -Bold.otf (SIL OFL 1.1, fonts/OFL.txt); if a file cannot be
+--   loaded, an installed "Fira Sans", then the system sans-serif. Theme.font_source = "file" | "family" | "system".
 --
 -- STYLE -- Theme.push(ctx, [palette]) -> nc, nv / Theme.pop(ctx, [nc], [nv])
 --   Counts are returned, not fixed: pass them to pop (no counts = those of the last push).
---   Colors: roles of the Reaper Tips palette: Button*3 btn, FrameBg*3 well, Slider*2 thumb,
---           Header select/hover, Tab* tab (skipped on ReaImGui without them), Scrollbar* scroll,
---           TitleBg*2 title, Popup panel, Border outline, Separator*3, Table*5, Text, TextDisabled
+--   Colors: Button*3 btn / btn_h / btn_a, FrameBg*3 well (+ a step each), SliderGrab*2 thumb / thumb_a,
+--           CheckMark accent, Header select / hover / stronger select, Tab* tab / tab_h / tab_sel (skipped on
+--           ReaImGui without them), Scrollbar* scroll (bg transparent), TitleBg*2 title, PopupBg panel,
+--           Border outline, Separator sep (hovered / active keep the accent), Table* sep / bg / card,
+--           Text, TextDisabled
 --   Vars:   Window/Frame/GrabRounding (2), ItemSpacing (4,4), FramePadding (8,4), WindowPadding (8,8),
 --           CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize (1)
+--
+-- WIDGETS -- toggle_button: off = btn face, on = solid btn_on with on_text. badge: quiet well tag; with opts.color a
+--   solid fill and a fitted label. combo / multi_combo: preview is a button face. icon_btn: transparent at rest.
+--   selectable: hover / select tint plus a 2 px accent bar on the left of a selected row.
 
 local Theme = {}
 
@@ -211,7 +238,7 @@ function Theme.invalidate_palette()
 end
 
 -------------------------------------------------------------------------------
--- 3. CURATED FANCY DARK PALETTE (BASE COLORS)
+-- 3. CURATED FANCY PALETTE (BASE COLORS)
 -------------------------------------------------------------------------------
 local FANCY_PALETTE = {
   -- Base surfaces

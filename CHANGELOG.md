@@ -4,6 +4,19 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.8.0 (`Pitch/Fancy_Pitch Correct.lua`)** — New look: matches the Reapertips Theme. Greys with a blue accent, flat outlined buttons, recessed slider grooves and input boxes, square-ish corners, tighter spacing and Fira Sans type. The canvas follows the same look: quiet recessed rows, blue notes (green once edited), a violet for split markers and the drift zone. Layout, controls and behaviour are unchanged. Symbols the new font lacks (check marks, arrows, dots) are drawn as small icons or plain text.
+
+- **Design system (`_lib/theme.lua`, `_lib/fonts/`)** — The curated mode takes the look of the Reapertips REAPER theme, and the mode that was called "Fancy Dark" is now called **"Fancy"** (your saved choice carries over):
+  - **Colours and shapes**: grey surfaces, a blue accent (`#46B9FE`) and a soft violet for the secondary accent, which was blue. Buttons, combos and toggles are flat, outlined and 2 px rounded; a toggle that is on is a solid accent fill with a dark label. Sliders, checkboxes and inputs sit in recessed wells with a light slider thumb; tabs, scrollbars, hovered and selected rows, title strips, tooltips and popups follow the theme. A selected row in a library list also gets a thin accent bar.
+  - **Type and spacing**: Fira Sans (Regular and Bold) is bundled in `_lib/fonts/` under the SIL Open Font License, with its licence text. If the files cannot be loaded, an installed Fira Sans and then the system font are used, with no error. Sizes are 11 / 13 / 14 / 16 / 18; spacing is tighter (4 px between items, 8 px window padding) and buttons are 15 / 21 / 22 px tall.
+  - **Match Theme** keeps reading surfaces, text and accent from the active REAPER theme and gets the same shapes, spacing and font, with every new colour fitted for contrast.
+  - **For script authors**: new palette roles (`btn`, `btn_h`, `btn_a`, `btn_on`, `on_text`, `outline`, `well`, `thumb`, `tab`, `hover`, `select`, `scroll`, `title` and their variants), `Theme.label_on(fill)`, `Theme.mode_labels`, the icons `check`, `dot` and `ring`, and `Theme.push` now returns the counts it pushed (`Theme.pop` with no counts pops them). No existing field, token or widget was removed.
+  - **Contrast**: text and labels stay at 4.5:1 and state that carries meaning at 3:1; the resting outline and face of a control now follow the theme with no minimum. See `docs/design/README.md`.
+
+- **Fancy Design System v1.4.0 (`Utility/Fancy_Design System.lua`)** — Shows the new control roles and a row of raw ImGui controls (button, checkbox, slider, input, tabs, scrollbar); the mode is labelled "Fancy".
+
+- **Other scripts** — These scripts ship the design system's font files and pick up the new look: Fancy Parameter Link v5.4.2, Fancy Mapper Settings v5.2.1, Fancy Mapper Cycle Mode v5.1.1, Fancy Mapper Sensitivity Up v5.1.1, Fancy Mapper Sensitivity Down v5.1.1, Fancy Tap Tempo Slew Settings v1.0.1, Fancy Pan Snap v1.8.0 (the menu entry "Secondary Accent (Blue)" is now "Secondary Accent", since that colour is violet), and Fancy Selected Track Meter v9.67.2 (fonts only; its own drawing is unchanged).
+
 - **Fancy Pitch Correct v2.7.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Fix: Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z now undo and redo in REAPER while the Pitch Correct window is focused. The window kept those keys to itself, so nothing happened. A pending arrow-key nudge is committed first, so the undo takes that nudge back.
 
 - **Fancy Pitch Correct v2.7.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Note tone while dragging:

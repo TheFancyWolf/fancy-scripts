@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 5.4.2
 -- @changelog
+--   + New look from the shared design system: matches the Reapertips Theme
 --   + Fix: symbols the new font lacks no longer show as ?
 --   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
 -- @about
@@ -15,6 +16,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 --   [data] ../toolbar_icons/toolbar_fancy_parameter_link.png > toolbar_icons/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/150/toolbar_fancy_parameter_link.png > toolbar_icons/150/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/200/toolbar_fancy_parameter_link.png > toolbar_icons/200/toolbar_fancy_parameter_link.png

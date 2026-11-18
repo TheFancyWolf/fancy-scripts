@@ -2,6 +2,7 @@
 -- @author Fancy Scripts
 -- @version 5.2.1
 -- @changelog
+--   + New look from the shared design system: matches the Reapertips Theme
 --   + Fix: symbols the new font lacks no longer show as ?
 --   + v5.2: Mode panel: pick a mode to see only its settings and button actions
 --   + v5.2: Guided calibration dialog (counts ticks without rebinding the dial)
@@ -24,6 +25,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK

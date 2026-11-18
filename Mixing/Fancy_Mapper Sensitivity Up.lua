@@ -1,8 +1,8 @@
 -- @description Fancy Mapper Sensitivity Up
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
---   + v5.1: Added sensitivity scaling for volume, width, MIDI CC, velocity, and item slip
+--   + New look from the shared design system: matches the Reapertips Theme
 -- @about
 --   Increases the sensitivity of the currently active Fancy Mapper mode.
 --   Shows a brief toast with the new value. Step size is configurable
@@ -13,6 +13,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
