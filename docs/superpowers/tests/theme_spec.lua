@@ -68,6 +68,20 @@ local function contrast(fg, bg)
   return (l1 + 0.05) / (l2 + 0.05)
 end
 
+--- Colours pushed by Theme.push, keyed by enum name (last push wins).
+local function pushed_colors(stub)
+  local out = {}
+  for _, c in ipairs(all(stub.calls, "ImGui_PushStyleColor")) do out[stub.enum_name(c[2])] = c[3] end
+  return out
+end
+
+--- Style vars pushed by Theme.push, keyed by enum name; value is { a, b }.
+local function pushed_vars(stub)
+  local out = {}
+  for _, c in ipairs(all(stub.calls, "ImGui_PushStyleVar")) do out[stub.enum_name(c[2])] = { c[3], c[4] } end
+  return out
+end
+
 -------------------------------------------------------------------------------
 -- Runner
 -------------------------------------------------------------------------------
@@ -211,6 +225,71 @@ test("palette: Match text is the stronger of the two theme text colours", functi
     local P = load_theme({ mode = "match", theme = fx }).build_palette()
     assert(P.text ~= P.text_dim and contrast(P.text, P.bg) > contrast(P.text_dim, P.bg))
   end
+end)
+
+-------------------------------------------------------------------------------
+-- Task 3: layout tokens and style stack
+-------------------------------------------------------------------------------
+
+test("push: counts match what was pushed, and pop balances", function()
+  local T, stub = load_theme({ mode = "fancy" })
+  local nc, nv = T.push("ctx", T.build_palette())
+  assert(nc == count(stub.calls, "ImGui_PushStyleColor") and nv == count(stub.calls, "ImGui_PushStyleVar"))
+  T.pop("ctx") -- no counts: defaults must match
+  assert(last(stub.calls, "ImGui_PopStyleColor")[2] == nc and last(stub.calls, "ImGui_PopStyleVar")[2] == nv)
+  T.pop("ctx", 3, 2) -- explicit counts win
+  assert(last(stub.calls, "ImGui_PopStyleColor")[2] == 3 and last(stub.calls, "ImGui_PopStyleVar")[2] == 2)
+end)
+
+test("push: role mapping", function()
+  local T, stub = load_theme({ mode = "fancy" })
+  local P = T.build_palette(); T.push("ctx", P)
+  local col = pushed_colors(stub)
+  local want = {
+    Button = P.btn, ButtonHovered = P.btn_h, ButtonActive = P.btn_a,
+    FrameBg = P.well, FrameBgHovered = P.well_h, FrameBgActive = P.well_a,
+    SliderGrab = P.thumb, SliderGrabActive = P.thumb_a, CheckMark = P.accent,
+    Header = P.select, HeaderHovered = P.hover,
+    Tab = P.tab, TabHovered = P.tab_h, TabSelected = P.tab_sel, TabSelectedOverline = P.accent,
+    TabDimmed = P.tab, TabDimmedSelected = P.tab_sel,
+    ScrollbarGrab = P.scroll, ScrollbarGrabHovered = P.scroll_h, ScrollbarGrabActive = P.scroll_a,
+    Separator = P.sep, SeparatorHovered = P.accent_h, SeparatorActive = P.accent,
+    TitleBg = P.title, TitleBgActive = P.title, PopupBg = P.panel, Border = P.outline,
+    WindowBg = P.bg, Text = P.text, TextDisabled = P.text_dim,
+    TableHeaderBg = P.card, TableBorderStrong = P.sep, TableBorderLight = P.sep, TableRowBg = P.bg,
+  }
+  for k, v in pairs(want) do assert(col["ImGui_Col_" .. k] == v, k) end
+  assert(col.ImGui_Col_ScrollbarBg & 0xFF == 0, "scrollbar track is transparent")
+  assert(col.ImGui_Col_HeaderActive >> 8 == P.select >> 8 and (col.ImGui_Col_HeaderActive & 0xFF) > (P.select & 0xFF),
+    "HeaderActive is select, stronger")
+  assert(col.ImGui_Col_TableRowBgAlt ~= P.bg and col.ImGui_Col_TableRowBgAlt == T.lighten(P.bg, 0.03))
+end)
+
+test("push: style vars", function()
+  local T, stub = load_theme({ mode = "fancy" })
+  T.push("ctx", T.build_palette())
+  local v = pushed_vars(stub)
+  assert(v.ImGui_StyleVar_FrameRounding[1] == 2 and v.ImGui_StyleVar_GrabRounding[1] == 2 and v.ImGui_StyleVar_WindowRounding[1] == 2)
+  assert(v.ImGui_StyleVar_ItemSpacing[1] == 4 and v.ImGui_StyleVar_ItemSpacing[2] == 4)
+  assert(v.ImGui_StyleVar_WindowPadding[1] == 8 and v.ImGui_StyleVar_WindowPadding[2] == 8)
+  assert(v.ImGui_StyleVar_FramePadding[1] == 8 and v.ImGui_StyleVar_FramePadding[2] == 4)
+  assert(v.ImGui_StyleVar_FrameBorderSize[1] == 1)
+end)
+
+test("push: an older ReaImGui without the Tab colours still balances", function()
+  local T, stub = load_theme({ mode = "fancy", missing = { "ImGui_Col_TabSelected", "ImGui_Col_TabSelectedOverline",
+    "ImGui_Col_TabDimmed", "ImGui_Col_TabDimmedSelected" } })
+  local nc = T.push("ctx", T.build_palette())
+  assert(nc == count(stub.calls, "ImGui_PushStyleColor"))
+  assert(pushed_colors(stub).ImGui_Col_TabSelected == nil and pushed_colors(stub).ImGui_Col_Tab ~= nil)
+  T.pop("ctx"); assert(last(stub.calls, "ImGui_PopStyleColor")[2] == nc)
+end)
+
+test("layout: scale unchanged, rounding 2", function()
+  local L = load_theme({}).layout
+  assert(L.xs == 2 and L.sm == 4 and L.md == 8 and L.lg == 12 and L.xl == 16 and L.xxl == 24 and L.xxxl == 32)
+  assert(L.rounding == 2 and L.border == 1)
+  assert(L.btn_sm.h == 15 and L.btn_default.h == 21 and L.btn_lg.h == 22)
 end)
 
 -------------------------------------------------------------------------------

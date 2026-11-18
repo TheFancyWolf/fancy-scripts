@@ -37,15 +37,15 @@
 --
 -- LAYOUT TOKENS -- Theme.layout.*
 --   Scale:      xs=2  sm=4  md=8  lg=12  xl=16  xxl=24  xxxl=32 (unified scale)
---   Rounding:   rounding=sm (4) (universal: windows, frames, grabs, drawlist)
+--   Rounding:   rounding=xs (2) (universal: windows, frames, grabs, drawlist)
 --   Table:      row_h=xxl (24)  chk_col_w=xxl (24)  indent=xxxl (32)
 --   Modals:     modal_sm/md/lg/xl = {w, h}
 --   Misc:       tooltip_wrap=300  section_gap=sm (4)
 --
 -- BUTTON PRESETS -- height flows from font + padding (no hardcoded heights)
---   btn_sm = {pad_x=sm, pad_y=xs, font="small", h=16}   Push FramePadding + font
---   btn_default = global FramePadding (md,sm) (h=22)    No override needed
---   btn_lg = {pad_x=lg, pad_y=sm, font="medium", h=24}  Push FramePadding + font
+--   btn_sm = {pad_x=sm, pad_y=xs, font="small", h=15}   Push FramePadding + font
+--   btn_default = global FramePadding (md,sm) (h=21)    No override needed
+--   btn_lg = {pad_x=lg, pad_y=sm, font="medium", h=22}  Push FramePadding + font
 --   Usage:
 --     PushStyleVar(ctx, FramePadding, L.btn_lg.pad_x, L.btn_lg.pad_y)
 --     push_font(ctx, fonts[L.btn_lg.font])
@@ -64,75 +64,13 @@
 --   pop_font(ctx, pushed)      -> conditional pop
 --   fonts.tooltip = fonts.default (backward-compat alias)
 --
--- STYLE -- Theme.push(ctx, [palette]) -> nc=32, nv=10 / Theme.pop(ctx, nc, nv)
---   Colors: WindowBg, TitleBg*2, Header*3, Button*3, FrameBg*3, Slider*2, CheckMark,
---           Popup, ModalDim, Separator*3, Table*5, Scrollbar*3, ScrollbarGrabActive,
---           Text, TextDisabled, Border
---   Vars:   WindowRounding, FrameRounding, GrabRounding, ItemSpacing, FramePadding,
---           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize
---
--- ICONS -- function(dl, cx, cy, half_size, color)
---   Theme.icons: play, pause, close, plus, info, tri_down, tri_up, tri_left, tri_right, slider, gear
---
--- WIDGETS
---   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip (hand cursor on hover)
---   icon_btn_colored(ctx, id, icon_fn, [opts]) -> bool  opts: +bg,bg_hover,bg_active,icon_color
---   selectable(ctx, label, [sel], [flags], [w], [h], [opts])  Rounded Selectable; a label wider than the item is
---                                              shortened with "..." and shown in full in a tooltip
---   tooltip(ctx, text, [max_w])                The widgets' opts.tooltip show on HoveredFlags_ForTooltip (also when disabled)
---   section_divider(ctx, label, [opts])        opts: tooltip,color,preset,icon_size,w,h,icon_color
---   collapsing_header(ctx, label, [opts])      Safe collapsing header (opts: default_open, flags)
---   progress_bar(ctx, fraction, [opts])        Meter/progress bar (opts: preset,fonts,fill_color,bg_color,overlay)
---   toggle_button(ctx, id, label, is_act, [o]) Button-derived toggle button (opts: preset,fonts,w,h,colors)
---   badge(ctx, label, [opts])                  Button-derived status badge (opts: preset,fonts,color,bg,w,h)
---   push_button_preset(ctx, fonts, preset)     -> var_count, pushed_font (e.g. for sliders, combos)
---   pop_button_preset(ctx, var_count, pfont)   Pops styling pushed by push_button_preset
---   combo(ctx, id, items, selected_idx, [opts]) Standardized combo box (opts: w, placeholder, get_label)
---   multi_combo(ctx, id, items, sel, [opts])   Standardized multi-select combo (compact, full-row hover/click)
---   header(ctx, opts)                          Standardized window header bar (title, FANCY prefix, settings, close)
---   center_next_window(ctx, w, h)
---   brand_icon(ctx, [size], [target_h])
---   get_palette()                              Get active cached palette
---   invalidate_palette()                       Clear internal widget palette cache
---
--- ALIGNMENT
---   align(ctx, [row_h], [item_h])     PRIMARY — call before every item on a row
---                                      No args: text↔widget baseline alignment
---                                      row_h:   center item in explicit row (tables)
---                                      item_h:  custom-height item override
---                                      nil,item_h: center short item in default row
---                                                  (e.g. btn_sm next to default text)
---   vcenter(ctx, item_h, row_h)        Low-level: cursor math (use align() instead)
---   right_align(ctx, item_w, [margin]) Cursor X: right-align next item
---   hcenter(ctx, item_w)               Cursor X: center next item
---
--- SETTINGS
---   settings_widget(ctx, [opts])        Reactive theme mode combo (opts: w, label, align, margin)
---   tooltip_setting_widget(ctx, [opts]) Global show tooltips checkbox (opts: label)
---   calc_combo_width(ctx, items, [p])   Calculates reactive width from font metrics + labels
---
--- MINIMAL TEMPLATE:
---   local Theme = require("theme")
---   local ctx = reaper.ImGui_CreateContext("Script Name")
---   local fonts = Theme.create_fonts(ctx)
---   Theme.attach_fonts(ctx, fonts)
---   local function loop()
---     local P = Theme.get_palette()
---     local nc, nv = Theme.push(ctx, P)
---     local pushed = Theme.push_font(ctx, fonts.default)
---     local visible, open = reaper.ImGui_Begin(ctx, "Script Name", true)
---     if visible then reaper.ImGui_Text(ctx, "Hello"), reaper.ImGui_End(ctx) end
---     Theme.pop_font(ctx, pushed)
---     Theme.pop(ctx, nc, nv)
---     if open then reaper.defer(loop) end
---   end
---   reaper.defer(loop)
---
--- =============================================================================
--- RULES: NO hardcoded hex colors, pixel values, fonts, or icon functions.
--- Colors from build_palette(). Dims from layout.*. Fonts from create_fonts().
--- Icons from icons.*. Alignment from align() (primary) / right_align / hcenter.
--- =============================================================================
+-- STYLE -- Theme.push(ctx, [palette]) -> nc, nv / Theme.pop(ctx, [nc], [nv])
+--   Counts are returned, not fixed: pass them to pop (no counts = those of the last push).
+--   Colors: roles of the Reaper Tips palette: Button*3 btn, FrameBg*3 well, Slider*2 thumb,
+--           Header select/hover, Tab* tab (skipped on ReaImGui without them), Scrollbar* scroll,
+--           TitleBg*2 title, Popup panel, Border outline, Separator*3, Table*5, Text, TextDisabled
+--   Vars:   Window/Frame/GrabRounding (2), ItemSpacing (4,4), FramePadding (8,4), WindowPadding (8,8),
+--           CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize (1)
 
 local Theme = {}
 
@@ -1020,15 +958,15 @@ Theme.layout = {
   xxxl = S.xxxl,  -- 3x: tree/hierarchy indent
 
   -- ── Rounding ───────────────────────────────────────────────────────────
-  rounding     = S.sm,  -- universal corner radius (windows, frames, grabs, drawlist)
-  border       = 1,     -- hairline border width (FrameBorderSize); colour is P.border (>= 3:1)
+  rounding     = S.xs,  -- universal corner radius (windows, frames, grabs, drawlist)
+  border       = 1,     -- hairline border width (FrameBorderSize); colour is P.outline (no contrast minimum)
 
   -- ── Button size presets ─────────────────────────────────────────────────
   -- Height flows from font + padding. Default uses global FramePadding (md, sm).
   -- Pass opts.preset (or use push_button_preset) for sm/lg variants.
-  btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small",   h = 16 },
-  btn_default  = { pad_x = S.md, pad_y = S.sm, font = "default", h = 22 },
-  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 24 },
+  btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small",   h = 15 },
+  btn_default  = { pad_x = S.md, pad_y = S.sm, font = "default", h = 21 },
+  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 22 },
 
   -- ── Icon size presets ───────────────────────────────────────────────────
   -- Button dimension = size + pad * 2. Default icon_btn uses icon_md.
@@ -1065,69 +1003,95 @@ Theme.layout = {
 --- Call at the start of each frame, before ImGui_Begin.
 --- @param ctx userdata  ImGui context
 --- @param palette table|nil  Palette from build_palette() / get_palette() (builds default if nil)
---- @return integer color_count  Number of style colors pushed (32)
---- @return integer var_count  Number of style vars pushed (10)
+--- @return integer color_count  Number of style colors pushed (pass to Theme.pop)
+--- @return integer var_count  Number of style vars pushed (pass to Theme.pop)
+-- Counts of the last push on this library. Every push pushes the same number on a
+-- given ReaImGui, so a pop without counts can use them, whichever context pushed.
+local pushed_nc, pushed_nv = 0, 0
+
 function Theme.push(ctx, palette)
   local P = palette or Theme.get_palette()
   local L = Theme.layout
+  local nc, nv = 0, 0
 
-  -- Style colors (32 total)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(),             P.bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBg(),              P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBgActive(),        P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),               P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),         P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),               P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),         P.accent_press)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),              P.card)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(),       P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrab(),           P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrabActive(),     P.slider_grab_active)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_CheckMark(),            P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PopupBg(),              P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ModalWindowDimBg(),     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(),            P.sep)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorHovered(),     P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorActive(),      P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableHeaderBg(),        P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(),    P.sep)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),     P.accent_e)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableRowBg(),           P.table_row)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableRowBgAlt(),        P.table_row_alt)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarBg(),          P.bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrab(),        P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabHovered(), P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabActive(),  P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),                 P.text)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TextDisabled(),         P.text_dim)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(),               P.border)
+  local function col(name, value)
+    reaper.ImGui_PushStyleColor(ctx, reaper["ImGui_Col_" .. name](), value)
+    nc = nc + 1
+  end
+  -- Tab colours: names newer than ReaImGui 0.9 are skipped when the enum does not exist.
+  local function col_opt(name, value)
+    if reaper["ImGui_Col_" .. name] then col(name, value) end
+  end
+  local function var(name, a, b)
+    reaper.ImGui_PushStyleVar(ctx, reaper["ImGui_StyleVar_" .. name](), a, b)
+    nv = nv + 1
+  end
 
-  -- Style vars (10 total — all values from layout tokens)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding(),  L.rounding)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(),   L.rounding)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_GrabRounding(),    L.rounding)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(),     L.md, L.sm)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(),    L.md, L.sm)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(),   L.lg, L.lg)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding(),     L.sm, L.xs)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemInnerSpacing(),L.sm, L.sm)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_IndentSpacing(),   L.indent)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameBorderSize(), L.border)
+  local select_a = P.select & 0xFF
 
-  return 32, 10
+  col("WindowBg",             P.bg)
+  col("TitleBg",              P.title)
+  col("TitleBgActive",        P.title)
+  col("Header",               P.select)
+  col("HeaderHovered",        P.hover)
+  col("HeaderActive",         (P.select & 0xFFFFFF00) | math.min(255, select_a * 2))
+  col("Button",               P.btn)
+  col("ButtonHovered",        P.btn_h)
+  col("ButtonActive",         P.btn_a)
+  col("FrameBg",              P.well)
+  col("FrameBgHovered",       P.well_h)
+  col("FrameBgActive",        P.well_a)
+  col("SliderGrab",           P.thumb)
+  col("SliderGrabActive",     P.thumb_a)
+  col("CheckMark",            P.accent)
+  col("PopupBg",              P.panel)
+  col("ModalWindowDimBg",     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
+  col("Separator",            P.sep)
+  col("SeparatorHovered",     P.accent_h) -- hovered / active mark a draggable splitter
+  col("SeparatorActive",      P.accent)
+  col_opt("Tab",                 P.tab)
+  col_opt("TabHovered",          P.tab_h)
+  col_opt("TabSelected",         P.tab_sel)
+  col_opt("TabSelectedOverline", P.accent)
+  col_opt("TabDimmed",           P.tab)
+  col_opt("TabDimmedSelected",   P.tab_sel)
+  col("TableHeaderBg",        P.card)
+  col("TableBorderStrong",    P.sep)
+  col("TableBorderLight",     P.sep)
+  col("TableRowBg",           P.bg)
+  col("TableRowBgAlt",        lighten(P.bg, 0.03))
+  col("ScrollbarBg",          with_alpha(P.bg, 0)) -- transparent: the surface shows through
+  col("ScrollbarGrab",        P.scroll)
+  col("ScrollbarGrabHovered", P.scroll_h)
+  col("ScrollbarGrabActive",  P.scroll_a)
+  col("Text",                 P.text)
+  col("TextDisabled",         P.text_dim)
+  col("Border",               P.outline)
+
+  var("WindowRounding",   L.rounding)
+  var("FrameRounding",    L.rounding)
+  var("GrabRounding",     L.rounding)
+  var("ItemSpacing",      L.sm, L.sm)
+  var("FramePadding",     L.md, L.sm)
+  var("WindowPadding",    L.md, L.md)
+  var("CellPadding",      L.sm, L.xs)
+  var("ItemInnerSpacing", L.sm, L.sm)
+  var("IndentSpacing",    L.indent)
+  var("FrameBorderSize",  L.border)
+
+  pushed_nc, pushed_nv = nc, nv
+  return nc, nv
 end
 
---- Pops all Fancy Scripts ImGui styles from the stack.
---- Call after ImGui_End, using the counts returned by Theme.push().
+--- Pops the styles pushed by Theme.push().
+--- Call after ImGui_End, using the counts returned by Theme.push(). Without counts,
+--- the counts of the last push are used.
 --- @param ctx userdata  ImGui context
---- @param nc integer|nil  Number of colors to pop (default 32)
---- @param nv integer|nil  Number of vars to pop (default 9)
+--- @param nc integer|nil  Number of colors to pop (default: what push pushed)
+--- @param nv integer|nil  Number of vars to pop (default: what push pushed)
 function Theme.pop(ctx, nc, nv)
-  reaper.ImGui_PopStyleColor(ctx, nc or 32)
-  reaper.ImGui_PopStyleVar(ctx, nv or 10)
+  reaper.ImGui_PopStyleColor(ctx, nc or pushed_nc)
+  reaper.ImGui_PopStyleVar(ctx, nv or pushed_nv)
 end
 
 -------------------------------------------------------------------------------
