@@ -269,7 +269,10 @@ local K = {
   -- (see K.tone_tick). The P_* entries are its 0-based parameter indices; MON is added to an FX index to address the
   -- Monitoring FX chain, which lives on the master track
   TONE = {
-    FX_NAME = "JS: Tone Generator",
+    FX_NAME = "JS:synthesis/tonegenerator",   -- the path form: a third-party JSFX named "Tone Generator" never matches
+    -- TrackFX_AddByName's instantiate value: <= -1000 is an insertion position, -1000 = first in the chain. First, so
+    -- the tone passes through the user's own Monitoring FX (monitor trim, dim, correction) instead of bypassing them
+    INSERT_FIRST = -1000,
     TAG = "Fancy Pitch Correct Tone",   -- the renamed_name that marks the effect as ours
     LEVEL_DB = -18,                     -- Wet Mix at full gain
     SILENT_DB = -120,                   -- Wet Mix when silent (the lowest the generator allows)
@@ -1134,13 +1137,17 @@ local function tone_add()
   local T = K.TONE
   local master = tone_master()
   if not master then return false end
-  local idx = reaper.TrackFX_AddByName(master, T.FX_NAME, true, -1)
+  -- Whatever index comes back is the one used (the effect is first in the chain, so normally 0)
+  local idx = reaper.TrackFX_AddByName(master, T.FX_NAME, true, T.INSERT_FIRST)
   if not idx or idx < 0 then return false end
   local fx = T.MON + idx
   -- The effect is born with Wet -12 dB and Dry -6 dB: silence it and pass the monitored audio untouched first
   reaper.TrackFX_SetParam(master, fx, T.P_WET, T.SILENT_DB)
   reaper.TrackFX_SetParam(master, fx, T.P_DRY, 0)
-  reaper.TrackFX_SetNamedConfigParm(master, fx, "renamed_name", T.TAG)
+  if not reaper.TrackFX_SetNamedConfigParm(master, fx, "renamed_name", T.TAG) then
+    tone_delete(fx)   -- an untagged effect could not be told apart from the user's own: count it as an add failure
+    return false
+  end
   reaper.TrackFX_SetParam(master, fx, T.P_FREQ, T.BASE_HZ)
   reaper.TrackFX_SetParam(master, fx, T.P_SHAPE, 0)
   local guid = reaper.TrackFX_GetFXGUID(master, fx)
@@ -1175,6 +1182,12 @@ K.tone_tick = function(pitch)
   if pitch then
     tone.gain = math.min(1, tone.gain + 1 / T.RAMP_FRAMES)
     local note, octave, fine = K.tone_params(pitch)
+    -- Fine Tune first: when a semitone is crossed, Note / Octave and Fine Tune change together, and this order never
+    -- lets the tone pass through a wrong in-between pitch
+    if fine ~= tone.fine then
+      reaper.TrackFX_SetParam(master, fx, T.P_FINE, fine)
+      tone.fine = fine
+    end
     if note ~= tone.note then
       reaper.TrackFX_SetParam(master, fx, T.P_NOTE, note)
       tone.note = note
@@ -1182,10 +1195,6 @@ K.tone_tick = function(pitch)
     if octave ~= tone.octave then
       reaper.TrackFX_SetParam(master, fx, T.P_OCTAVE, octave)
       tone.octave = octave
-    end
-    if fine ~= tone.fine then
-      reaper.TrackFX_SetParam(master, fx, T.P_FINE, fine)
-      tone.fine = fine
     end
   else
     tone.gain = math.max(0, tone.gain - 1 / T.RAMP_FRAMES)
@@ -1196,7 +1205,11 @@ K.tone_tick = function(pitch)
     end
   end
   local wet_db = T.LEVEL_DB + 20 * math.log(tone.gain, 10)
-  reaper.TrackFX_SetParam(master, fx, T.P_WET, math.max(T.SILENT_DB, wet_db))
+  wet_db = math.max(T.SILENT_DB, wet_db)
+  if wet_db ~= tone.wet then   -- only when it changed since the last frame
+    reaper.TrackFX_SetParam(master, fx, T.P_WET, wet_db)
+    tone.wet = wet_db
+  end
 end
 
 --- Remove the tone effect at once: the instance in state.tone, then every Monitoring FX tagged K.TONE.TAG (a leftover
@@ -7924,10 +7937,12 @@ local function loop_body()
   service_nudge_burst(not visible or not open or popup_open)
 
   -- The note tone follows a pitch drag, once per frame whatever was drawn (a hidden window or an open modal must
-  -- still let a fade-out finish)
+  -- still let a fade-out finish). It gets a pitch only while the left button is physically down: the drag ends in
+  -- draw_graph, which does not run while the window is hidden, so a release then would leave state.drag set
   local tone_pitch = nil
   local drag = state.drag
-  if state.note_tone and drag and drag.zone == "pitch" and drag.dirty and not drag.shift_mode then
+  if state.note_tone and drag and drag.zone == "pitch" and drag.dirty and not drag.shift_mode
+      and reaper.ImGui_IsMouseDown(ctx, 0) then
     local note = state.notes and state.notes[drag.note_idx]
     tone_pitch = note and note.controls and note.controls.center_pitch or nil
   end
