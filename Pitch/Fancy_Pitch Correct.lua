@@ -265,6 +265,22 @@ local K = {
     max_freq = { 200, 2000 },
   },
 
+  -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
+  -- (see K.tone_tick). The P_* entries are its 0-based parameter indices; MON is added to an FX index to address the
+  -- Monitoring FX chain, which lives on the master track
+  TONE = {
+    FX_NAME = "JS: Tone Generator",
+    TAG = "Fancy Pitch Correct Tone",   -- the renamed_name that marks the effect as ours
+    LEVEL_DB = -18,                     -- Wet Mix at full gain
+    SILENT_DB = -120,                   -- Wet Mix when silent (the lowest the generator allows)
+    RAMP_FRAMES = 3,                    -- frames a fade in or out takes (avoids clicks)
+    BASE_HZ = 440,                      -- fixed Base Frequency; the pitch is set through Note / Octave / Fine Tune
+    MIN_PITCH = 21,                     -- lowest MIDI pitch the tone follows (A0)
+    MAX_PITCH = 127,
+    P_WET = 0, P_DRY = 1, P_FREQ = 2, P_NOTE = 3, P_OCTAVE = 4, P_FINE = 5, P_SHAPE = 6,
+    MON = 0x1000000,
+  },
+
   -- The Pitched Items panel never gets narrower than this (BODY.min_sidebar_w); a stored width is checked against it
   SIDEBAR_MIN_W = 160,
 
@@ -307,6 +323,11 @@ local state = {
   progress = 0,
   results = {}, -- array of { time, freq, note }
   analysis_empty = false, -- the last analysis of the target found no pitched notes (the canvas message reads it)
+
+  -- Note tone (see K.tone_tick)
+  note_tone = true,      -- play the tone while a note is dragged
+  tone = nil,            -- the running tone effect: { guid, gain (0..1 fade), note, octave, fine (last values sent) }
+  tone_failed = false,   -- the effect could not be added; K.tone_tick does not retry until this is cleared
 
   -- Settings > Pitch Shift Engine: the algorithm written to the item (an entry of PITCHMODE_FLAT) and whether to write it at all
   preset_pitchmode_idx = DEFAULTS.preset_pitchmode_idx,
@@ -1061,6 +1082,135 @@ K.release_analysis = function()
   state.is_analyzing = false
   state.analysis_params = nil
   if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
+end
+
+--- The Monitoring FX chain's host: the master track (nil if REAPER gives none).
+local function tone_master()
+  return reaper.GetMasterTrack(0)
+end
+
+--- Delete the Monitoring FX at `fx` (an index with K.TONE.MON added). Never raises; returns true on success.
+local function tone_delete(fx)
+  local master = tone_master()
+  if not master then return false end
+  local ok, deleted = pcall(reaper.TrackFX_Delete, master, fx)
+  return ok and deleted == true
+end
+
+--- Split a MIDI pitch into the Tone Generator's whole-step sliders: Note 0..11 (0 = A), Octave -4..4 and Fine Tune in
+--- whole cents -50..50, over the fixed Base Frequency. It plays BASE_HZ * 2 ^ (octave + note / 12 + fine / 1200),
+--- so 69 is 440 Hz. The pitch is clamped to MIN_PITCH..MAX_PITCH first.
+K.tone_params = function(pitch)
+  local T = K.TONE
+  pitch = math.max(T.MIN_PITCH, math.min(T.MAX_PITCH, pitch))
+  local cents = math.floor((pitch - 69) * 100 + 0.5)
+  local semis = math.floor(cents / 100 + 0.5)
+  local fine = cents - semis * 100
+  return semis % 12, semis // 12, fine
+end
+
+--- The Monitoring FX index (K.TONE.MON added) of the tone effect: the one whose GUID is `guid` or, when `guid` is
+--- nil, the first one renamed to K.TONE.TAG. nil when there is none.
+K.tone_find = function(guid)
+  local master = tone_master()
+  if not master then return nil end
+  for i = 0, reaper.TrackFX_GetRecCount(master) - 1 do
+    local fx = K.TONE.MON + i
+    if guid then
+      if reaper.TrackFX_GetFXGUID(master, fx) == guid then return fx end
+    else
+      local ok, name = reaper.TrackFX_GetNamedConfigParm(master, fx, "renamed_name")
+      if ok and name == K.TONE.TAG then return fx end
+    end
+  end
+  return nil
+end
+
+--- Add the tone effect silently and remember it in state.tone. Returns false (and state.tone stays nil) on failure.
+local function tone_add()
+  local T = K.TONE
+  local master = tone_master()
+  if not master then return false end
+  local idx = reaper.TrackFX_AddByName(master, T.FX_NAME, true, -1)
+  if not idx or idx < 0 then return false end
+  local fx = T.MON + idx
+  -- The effect is born with Wet -12 dB and Dry -6 dB: silence it and pass the monitored audio untouched first
+  reaper.TrackFX_SetParam(master, fx, T.P_WET, T.SILENT_DB)
+  reaper.TrackFX_SetParam(master, fx, T.P_DRY, 0)
+  reaper.TrackFX_SetNamedConfigParm(master, fx, "renamed_name", T.TAG)
+  reaper.TrackFX_SetParam(master, fx, T.P_FREQ, T.BASE_HZ)
+  reaper.TrackFX_SetParam(master, fx, T.P_SHAPE, 0)
+  local guid = reaper.TrackFX_GetFXGUID(master, fx)
+  if not guid then
+    tone_delete(fx)
+    return false
+  end
+  state.tone = { guid = guid, gain = 0 }
+  return true
+end
+
+--- Drive the note tone; call once per frame. With a pitch (MIDI note number) the tone fades in and follows it; with
+--- nil it fades out and the effect is deleted. Does nothing while there is neither a tone nor a pitch. Adding or
+--- deleting Monitoring FX makes no undo point, so this never opens an undo block.
+K.tone_tick = function(pitch)
+  local T = K.TONE
+  if not state.tone then
+    if not pitch or state.tone_failed then return end
+    if not tone_add() then
+      state.tone_failed = true
+      set_status("Note tone unavailable: REAPER's Tone Generator effect was not found")
+      return
+    end
+  end
+  local tone = state.tone
+  local master = tone_master()
+  local fx = master and K.tone_find(tone.guid)
+  if not fx then   -- the user deleted the effect mid-drag
+    state.tone = nil
+    return
+  end
+  if pitch then
+    tone.gain = math.min(1, tone.gain + 1 / T.RAMP_FRAMES)
+    local note, octave, fine = K.tone_params(pitch)
+    if note ~= tone.note then
+      reaper.TrackFX_SetParam(master, fx, T.P_NOTE, note)
+      tone.note = note
+    end
+    if octave ~= tone.octave then
+      reaper.TrackFX_SetParam(master, fx, T.P_OCTAVE, octave)
+      tone.octave = octave
+    end
+    if fine ~= tone.fine then
+      reaper.TrackFX_SetParam(master, fx, T.P_FINE, fine)
+      tone.fine = fine
+    end
+  else
+    tone.gain = math.max(0, tone.gain - 1 / T.RAMP_FRAMES)
+    if tone.gain < 1e-6 then
+      tone_delete(fx)
+      state.tone = nil
+      return
+    end
+  end
+  local wet_db = T.LEVEL_DB + 20 * math.log(tone.gain, 10)
+  reaper.TrackFX_SetParam(master, fx, T.P_WET, math.max(T.SILENT_DB, wet_db))
+end
+
+--- Remove the tone effect at once: the instance in state.tone, then every Monitoring FX tagged K.TONE.TAG (a leftover
+--- of a crashed run). Idempotent, safe before any tone started and at exit; never raises.
+K.tone_kill = function()
+  pcall(function()
+    local tone = state.tone
+    if tone then
+      local fx = K.tone_find(tone.guid)
+      if fx then tone_delete(fx) end
+    end
+    for _ = 1, 64 do   -- bounded: a delete that keeps failing must not hang the exit
+      local fx = K.tone_find(nil)
+      if not fx or not tone_delete(fx) then break end
+    end
+  end)
+  state.tone = nil
 end
 
 --- Drop the in-memory analysis (results, notes, selection, a running analysis). Writes nothing to
