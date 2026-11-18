@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.7.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Fix: Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z now undo and redo in REAPER while the Pitch Correct window is focused. The window kept those keys to itself, so nothing happened. A pending arrow-key nudge is committed first, so the undo takes that nudge back.
+
 - **Fancy Pitch Correct v2.7.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Note tone while dragging:
   - **Hear the pitch as you drag**: while you drag a note up or down, a sine tone sounds at the pitch the note is on and glides with it (in 1-cent steps), so you can place the note by ear. With several notes dragged together it follows the note you grabbed. It stops when you release the mouse. The lowest tone is A0 (MIDI 21): lower notes sound at A0.
   - **Pitch drags only**: a click that only selects, Stability and Vibrato drags, Shift drags, edge trims, arrow-key nudges, Snap and Quantize stay silent.

@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.7.0
+-- @version 2.7.1
 -- @changelog
---   + A sine note tone sounds at the note's pitch while you drag it up or down, so you can place it by ear. Switch it on or off with Note Tone in the "..." menu
+--   # Fix: Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z undo and redo while the window is focused
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -248,6 +248,10 @@ local K = {
 
   -- Plain Space's fallback when the user bound none: Transport: Play/stop (see Space forwarding, HC6)
   SPACE_FALLBACK_CMD = 40044,
+
+  -- Edit: Undo / Edit: Redo, run for Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z (see forward_undo_to_reaper)
+  UNDO_CMD = 40029,
+  REDO_CMD = 40030,
 
   -- SetNextWindowSizeConstraints: "no maximum"
   SIZE_UNBOUNDED = 1e6,
@@ -4269,7 +4273,7 @@ local function draw_graph(draw_ctx, w, h)
 
     -- F: the whole item again, with the pitch range fitted to the notes. Z: both axes zoom to the selected notes.
     -- Not during a marquee: the mapping must not change under a gesture. Both need exact modifiers, so
-    -- Cmd/Ctrl+Z still reaches REAPER's undo.
+    -- Cmd/Ctrl+Z is left for forward_undo_to_reaper() in loop_body.
     if not gesture then
       if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_F()) then
         set_view(item_t0, 0, duration)
@@ -6815,6 +6819,29 @@ local function forward_space_to_reaper()
   end
 end
 
+--- Forward Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z to REAPER's Undo / Redo: ReaImGui keeps the keys of a focused
+--- window, so REAPER never sees them otherwise. Same gate as the Space forwarding, and not during a mouse
+--- gesture on the canvas. A pending arrow-key nudge is committed first, so the undo takes that nudge back.
+local function forward_undo_to_reaper()
+  if state.drag or state.edge_drag or state.marquee
+     or not reaper.ImGui_IsWindowFocused(ctx, reaper.ImGui_FocusedFlags_RootAndChildWindows())
+     or reaper.ImGui_IsAnyItemActive(ctx)
+     or reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId()) then
+    return
+  end
+  local undo_chord = reaper.ImGui_Mod_Ctrl() | reaper.ImGui_Key_Z()
+  local cmd
+  if reaper.ImGui_Shortcut(ctx, undo_chord) then
+    cmd = K.UNDO_CMD
+  elseif reaper.ImGui_Shortcut(ctx, reaper.ImGui_Mod_Shift() | undo_chord) then
+    cmd = K.REDO_CMD
+  end
+  if cmd then
+    flush_nudge_burst()
+    reaper.Main_OnCommand(cmd, 0)
+  end
+end
+
 -------------------------------------------------------------------------------
 -- TOP BAR
 -------------------------------------------------------------------------------
@@ -7927,6 +7954,9 @@ local function loop_body()
 
     -- HC6: Space and its modifier chords go to the user's own REAPER bindings
     forward_space_to_reaper()
+
+    -- Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z go to REAPER's Undo / Redo
+    forward_undo_to_reaper()
 
     reaper.ImGui_End(ctx)
   end
