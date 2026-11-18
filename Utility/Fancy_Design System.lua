@@ -1,8 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.3.2
+-- @version 1.4.0
 -- @changelog
---   + Show the new canvas tokens: note-name column, note envelope, overview and range strips
+--   + Reaper Tips look: control role swatches and a row of raw ImGui controls (button, checkbox, slider, input, tabs, scrollbar); the curated mode is now labelled "Fancy"
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -51,6 +51,10 @@ local demo_mode_active     = false
 local demo_combo_items     = { "Pro-Q 4 (FabFilter)", "Ozone 11 (iZotope)", "Decapitator (Soundtoys)", "ValhallaVintageVerb" }
 local demo_combo_sel       = 1
 local demo_multi_combo_sel = { [1] = true, [3] = true }
+local demo_raw_check       = true
+local demo_raw_slider      = 0.4
+local demo_raw_text        = "Lead Vox"
+local push_nc, push_nv     = 0, 0   -- what Theme.push pushed last frame
 
 -- Script-specific layout — uses Theme.layout values as building blocks
 local UI = {
@@ -123,7 +127,8 @@ local function color_swatch(label, color)
 end
 
 --- Draws a row of color swatches with a group title and optional description.
-local function swatch_row(title, swatches, desc)
+--- With `per_line`, the swatches wrap after that many per line.
+local function swatch_row(title, swatches, desc, per_line)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.accent)
   reaper.ImGui_Text(ctx, title)
   reaper.ImGui_PopStyleColor(ctx, 1)
@@ -138,7 +143,11 @@ local function swatch_row(title, swatches, desc)
   for i, s in ipairs(swatches) do
     color_swatch(s[1], s[2])
     if i < #swatches then
-      reaper.ImGui_SameLine(ctx, 0, L.xl)
+      if per_line and i % per_line == 0 then
+        vspace(L.md)
+      else
+        reaper.ImGui_SameLine(ctx, 0, L.xl)
+      end
     end
   end
   vspace(L.xxxl)
@@ -264,7 +273,7 @@ local function draw_canvas_palette()
   end
 
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "P.canvas: colours for custom-drawn editors. Fixed in Fancy Dark; derived and contrast-fitted in Match Theme.")
+  reaper.ImGui_Text(ctx, "P.canvas: colours for custom-drawn editors. Fixed in Fancy; derived and contrast-fitted in Match Theme.")
   reaper.ImGui_PopStyleColor(ctx, 1)
   vspace(L.md)
 
@@ -364,6 +373,29 @@ local function draw_colors_section()
     { "slider_grab_active", P.slider_grab_active },
   }, "Slider grab while dragging")
 
+  swatch_row("CONTROL ROLES", {
+    { "btn",      P.btn },
+    { "btn_h",    P.btn_h },
+    { "btn_a",    P.btn_a },
+    { "btn_on",   P.btn_on },
+    { "on_text",  P.on_text },
+    { "outline",  P.outline },
+    { "well",     P.well },
+    { "well_h",   P.well_h },
+    { "well_a",   P.well_a },
+    { "thumb",    P.thumb },
+    { "thumb_a",  P.thumb_a },
+    { "tab",      P.tab },
+    { "tab_h",    P.tab_h },
+    { "tab_sel",  P.tab_sel },
+    { "hover",    P.hover },
+    { "select",   P.select },
+    { "scroll",   P.scroll },
+    { "scroll_h", P.scroll_h },
+    { "scroll_a", P.scroll_a },
+    { "title",    P.title },
+  }, "Button faces, on state, outline, wells, slider thumb, tabs, rows, scrollbar, title strip", 7)
+
   -- Canvas palette (collapsed by default: 60+ tokens)
   if Theme.collapsing_header(ctx, "Canvas palette##ds_canvas_palette") then
     reaper.ImGui_Indent(ctx, L.md)
@@ -387,9 +419,7 @@ local function draw_typography_section()
   -- Font check: confirms which font loaded and that the UI symbols exist in it
   Theme.section_divider(ctx, "FONT CHECK")
   reaper.ImGui_Text(ctx, "Font source: " .. tostring(Theme.font_source))
-  local pushed_sym = Theme.push_font(ctx, fonts.default)
   reaper.ImGui_Text(ctx, "\u{2713}  \u{25B8}  \u{25C0}  \u{25BE}  \u{2194}  \u{25CF}  \u{25CB}")
-  Theme.pop_font(ctx, pushed_sym)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
   reaper.ImGui_Text(ctx, "Seven symbols should show above. Boxes or gaps mean the font lacks them.")
   reaper.ImGui_PopStyleColor(ctx, 1)
@@ -458,8 +488,8 @@ local function draw_layout_section()
   dimension_bar("xxxl = 32", L.xxxl, P.green)
   vspace(L.sm)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "Pushed by Theme.push():  FramePadding(md,sm)  WindowPadding(lg,lg)")
-  reaper.ImGui_Text(ctx, "  ItemSpacing(md,sm)  CellPadding(sm,xs)  InnerSpacing(sm,sm)")
+  reaper.ImGui_Text(ctx, "Pushed by Theme.push():  FramePadding(md,sm)  WindowPadding(md,md)")
+  reaper.ImGui_Text(ctx, "  ItemSpacing(sm,sm)  CellPadding(sm,xs)  InnerSpacing(sm,sm)")
   reaper.ImGui_PopStyleColor(ctx, 1)
   vspace(L.xxxl)
 
@@ -614,11 +644,49 @@ local function draw_widgets_section()
     L.md, L.sm,
     L.btn_lg.pad_x, L.btn_lg.pad_y, L.btn_lg.font))
   reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.md)
+
+  -- Raw ImGui controls: no library widget, the look comes from Theme.push alone
+  Theme.align(ctx)
+  reaper.ImGui_Text(ctx, "Raw ImGui:")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  reaper.ImGui_Button(ctx, "Button##demo_raw_btn")
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  local chg_ck, new_ck = reaper.ImGui_Checkbox(ctx, "Checkbox##demo_raw_check", demo_raw_check)
+  if chg_ck then demo_raw_check = new_ck end
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  reaper.ImGui_SetNextItemWidth(ctx, 140)
+  local chg_sl, new_sl = reaper.ImGui_SliderDouble(ctx, "##demo_raw_slider", demo_raw_slider, 0.0, 1.0, "%.2f")
+  if chg_sl then demo_raw_slider = new_sl end
+  reaper.ImGui_SameLine(ctx, 0, L.md)
+  reaper.ImGui_SetNextItemWidth(ctx, 140)
+  local chg_tx, new_tx = reaper.ImGui_InputText(ctx, "##demo_raw_input", demo_raw_text)
+  if chg_tx then demo_raw_text = new_tx end
+  vspace(L.sm)
+  if reaper.ImGui_BeginTabBar(ctx, "##demo_raw_tabs") then
+    if reaper.ImGui_BeginTabItem(ctx, "Tab one##demo_raw_tab1") then
+      reaper.ImGui_Text(ctx, "Selected tab: tab_sel face. The other tab is tab, tab_h on hover.")
+      reaper.ImGui_EndTabItem(ctx)
+    end
+    if reaper.ImGui_BeginTabItem(ctx, "Tab two##demo_raw_tab2") then
+      reaper.ImGui_Text(ctx, "Second tab content.")
+      reaper.ImGui_EndTabItem(ctx)
+    end
+    reaper.ImGui_EndTabBar(ctx)
+  end
+  local child_flags = (reaper.ImGui_ChildFlags_Borders and reaper.ImGui_ChildFlags_Borders())
+                   or (reaper.ImGui_ChildFlags_Border and reaper.ImGui_ChildFlags_Border()) or 0
+  if reaper.ImGui_BeginChild(ctx, "##demo_raw_scroll", 320, L.xxxl * 2, child_flags) then
+    for i = 1, 12 do
+      reaper.ImGui_Text(ctx, string.format("Scrolling row %d: the scrollbar grab is a white tint", i))
+    end
+    reaper.ImGui_EndChild(ctx)
+  end
   vspace(L.xxxl)
 
   -- icon_btn
   Theme.section_divider(ctx, "Theme.icon_btn(ctx, id, icon_fn, [opts])", {
-    tooltip = "Invisible button with DrawList icon overlay. Pass opts.preset for size tier.",
+    tooltip = "Transparent button with DrawList icon overlay; btn_h face on hover. Pass opts.preset for size tier.",
   })
   reaper.ImGui_Text(ctx, "sm:")
   reaper.ImGui_SameLine(ctx, 0, L.sm)
@@ -774,15 +842,7 @@ local function draw_widgets_section()
   reaper.ImGui_SameLine(ctx, 0, L.md)
   local toggle_lbl = demo_badge_active and "ACTIVE" or "MUTED"
   if Theme.toggle_button(ctx, "demo_toggle_switch", toggle_lbl, demo_badge_active, {
-    active_bg      = P.accent_d,
-    active_hover   = P.accent_h,
-    active_active  = P.accent,
-    active_text    = P.accent_l,
-    inactive_bg    = P.card,
-    inactive_hover = P.panel,
-    inactive_active= P.accent_d,
-    inactive_text  = P.text_dim,
-    tooltip = "Click to toggle state",
+    tooltip = "Library defaults: btn face when off, solid btn_on with on_text when on",
   }) then
     demo_badge_active = not demo_badge_active
   end
@@ -795,6 +855,8 @@ local function draw_widgets_section()
   Theme.align(ctx)
   reaper.ImGui_Text(ctx, "Status Badges:")
   reaper.ImGui_SameLine(ctx, 0, L.md)
+  Theme.badge(ctx, "Lead Vox", { tooltip = "Default: a quiet tag (well face, outline, text label)" })
+  reaper.ImGui_SameLine(ctx, 0, L.sm)
   Theme.badge(ctx, "ACTIVE", { color = P.green, tooltip = "Online and running" })
   reaper.ImGui_SameLine(ctx, 0, L.sm)
   Theme.badge(ctx, "INFO", { color = P.blue, tooltip = "Informational status (secondary accent)" })
@@ -1030,10 +1092,10 @@ local function draw_widgets_section()
   -- Pushed style vars summary
   Theme.section_divider(ctx, "PUSHED STYLE VARS (via Theme.push)")
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-  reaper.ImGui_Text(ctx, "32 colors + 9 style vars are pushed automatically:")
+  reaper.ImGui_Text(ctx, string.format("%d colors + %d style vars are pushed automatically:", push_nc, push_nv))
   reaper.ImGui_Text(ctx, "  WindowRounding, FrameRounding, GrabRounding,")
   reaper.ImGui_Text(ctx, "  ItemSpacing, FramePadding, WindowPadding,")
-  reaper.ImGui_Text(ctx, "  CellPadding, ItemInnerSpacing, IndentSpacing")
+  reaper.ImGui_Text(ctx, "  CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize")
   reaper.ImGui_PopStyleColor(ctx, 1)
 
   vspace(L.lg)
@@ -1049,6 +1111,7 @@ local function loop()
   L = Theme.layout
 
   local nc, nv = Theme.push(ctx, P)
+  push_nc, push_nv = nc, nv
   local pushed_default = Theme.push_font(ctx, fonts.default)
 
   Theme.center_next_window(ctx, UI.win_w, UI.win_h, reaper.ImGui_Cond_FirstUseEver())
