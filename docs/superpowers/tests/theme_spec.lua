@@ -82,6 +82,23 @@ local function pushed_vars(stub)
   return out
 end
 
+--- Recorded AddRectFilled calls: true when one fills with `colour`.
+local function find_fill(fills, colour)
+  for _, f in ipairs(fills) do
+    if f.color == colour then return f end
+  end
+  return nil
+end
+
+local function has_fill(fills, colour) return find_fill(fills, colour) ~= nil end
+
+--- Sum of the counts popped by the recorded calls named `name` (a pop without a count pops one).
+local function popped(calls, name)
+  local n = 0
+  for _, c in ipairs(all(calls, name)) do n = n + (c[2] or 1) end
+  return n
+end
+
 -------------------------------------------------------------------------------
 -- Runner
 -------------------------------------------------------------------------------
@@ -290,6 +307,185 @@ test("layout: scale unchanged, rounding 2", function()
   assert(L.xs == 2 and L.sm == 4 and L.md == 8 and L.lg == 12 and L.xl == 16 and L.xxl == 24 and L.xxxl == 32)
   assert(L.rounding == 2 and L.border == 1)
   assert(L.btn_sm.h == 15 and L.btn_default.h == 21 and L.btn_lg.h == 22)
+end)
+
+
+-------------------------------------------------------------------------------
+-- Task 4: library widgets
+-------------------------------------------------------------------------------
+
+test("toggle_button: on is solid, off is a plain button", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.toggle_button("ctx", "id", "Label", true)
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_Button == P.btn_on and c.ImGui_Col_Text == P.on_text)
+  assert(c.ImGui_Col_ButtonHovered == T.lighten(P.btn_on, 0.12) and c.ImGui_Col_ButtonActive == T.darken(P.btn_on, 0.12))
+  stub.calls = {}; T.toggle_button("ctx", "id", "Label", false)
+  c = pushed_colors(stub)
+  assert(c.ImGui_Col_Button == P.btn and c.ImGui_Col_ButtonHovered == P.btn_h and c.ImGui_Col_Text == P.text)
+  assert(c.ImGui_Col_ButtonActive == P.btn_a)
+end)
+
+test("toggle_button: a script's colours win", function()
+  local T, stub = load_theme({ mode = "fancy" })
+  T.toggle_button("ctx", "id", "L", true, { active_bg = 0x112233FF, active_text = 0xEEEEEEFF })
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_Button == 0x112233FF and c.ImGui_Col_Text == 0xEEEEEEFF)
+  stub.calls = {}; T.toggle_button("ctx", "id", "L", true, { active_bg = 0xFEC13AFF })
+  c = pushed_colors(stub)
+  assert(c.ImGui_Col_Button == 0xFEC13AFF and contrast(c.ImGui_Col_Text, 0xFEC13AFF) >= 4.5, "fitted label")
+end)
+
+test("badge: default is a quiet tag; a coloured badge is solid with a readable label", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.badge("ctx", "Lead Vox")
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_Button == P.well and c.ImGui_Col_Text == P.text)
+  for _, col in ipairs({ P.green, P.red, P.yellow, P.accent, P.accent2, P.text_dim }) do
+    stub.calls = {}; T.badge("ctx", "x", { color = col })
+    c = pushed_colors(stub)
+    assert(c.ImGui_Col_Button == col, "solid fill")
+    assert(contrast(c.ImGui_Col_Text, col) >= 4.5, "label readable")
+  end
+  stub.calls = {}; T.badge("ctx", "x", { color = P.green, bg = 0x101010FF, text_color = 0xFAFAFAFF })
+  c = pushed_colors(stub); assert(c.ImGui_Col_Button == 0x101010FF and c.ImGui_Col_Text == 0xFAFAFAFF)
+end)
+
+test("badge: colour plus bg from a script keeps a readable label; interactive hover follows the fill", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  for _, pair in ipairs({ { P.green_l, P.green_d }, { P.red_l, P.red_d }, { P.accent_l, P.accent_d },
+                          { P.yellow, T.with_alpha(P.yellow, 0.22) }, { P.red, T.with_alpha(P.red, 0.2) } }) do
+    stub.calls = {}; T.badge("ctx", "x", { color = pair[1], bg = pair[2] })
+    local c = pushed_colors(stub)
+    assert(c.ImGui_Col_Button == pair[2], "bg wins")
+    assert(contrast(c.ImGui_Col_Text, composite(pair[2], P.bg)) >= 4.5, "label readable on the bg")
+  end
+  stub.calls = {}; T.badge("ctx", "x", { color = P.green, interactive = true })
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_ButtonHovered == T.lighten(P.green, 0.12) and c.ImGui_Col_ButtonActive == T.darken(P.green, 0.12))
+end)
+
+test("label_on: P.text when it reads, else the better of dark and white, fitted", function()
+  local T = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  assert(T.label_on(P.well) == P.text and T.label_on(P.btn) == P.text)
+  assert(T.label_on(P.accent) == 0x0F2B3BFF)
+  assert(T.label_on(0x2E51DEFF) == 0xFFFFFFFF)
+  assert(contrast(T.label_on(P.red), P.red) >= 4.5)
+end)
+
+test("selectable: selected row is the tint plus a 2 px accent bar", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.selectable("ctx", "Row", true)
+  local fills = all(stub.calls, "ImGui_DrawList_AddRectFilled")
+  assert(has_fill(fills, P.select), "tint")
+  local bar = find_fill(fills, P.accent); assert(bar and (bar.x2 - bar.x1) == 2, "bar")
+  assert(bar.x1 == 0 and bar.y1 == 0 and bar.y2 == 20, "bar spans the row at its left edge")
+  assert(last(stub.calls, "ImGui_DrawList_AddText").color == P.text)
+  stub.calls = {}; T.selectable("ctx", "Row", false)
+  assert(count(stub.calls, "ImGui_DrawList_AddRectFilled") == 0, "nothing at rest")
+  stub.calls = {}; T.selectable("ctx", "Row", true, nil, nil, nil, { bg_sel = 0x123456FF, text_col = 0xABCDEFFF })
+  fills = all(stub.calls, "ImGui_DrawList_AddRectFilled")
+  assert(has_fill(fills, 0x123456FF) and last(stub.calls, "ImGui_DrawList_AddText").color == 0xABCDEFFF)
+end)
+
+test("selectable: hover fill", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  stub.reaper.ImGui_IsItemHovered = function() return true end
+  T.selectable("ctx", "Row", false)
+  assert(has_fill(all(stub.calls, "ImGui_DrawList_AddRectFilled"), P.hover))
+end)
+
+test("icon_btn: transparent at rest", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.icon_btn("ctx", "##x", T.icons.close)
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_Button & 0xFF == 0 and c.ImGui_Col_ButtonHovered == P.btn_h and c.ImGui_Col_ButtonActive == P.btn_a)
+end)
+
+test("icon_btn_colored and progress_bar defaults", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.icon_btn_colored("ctx", "##y", T.icons.plus)
+  local c = pushed_colors(stub); assert(c.ImGui_Col_Button == P.btn and c.ImGui_Col_ButtonHovered == P.btn_h)
+  stub.calls = {}; T.progress_bar("ctx", 0.5)
+  local fills = all(stub.calls, "ImGui_DrawList_AddRectFilled")
+  assert(has_fill(fills, P.well) and has_fill(fills, P.accent))
+  assert(first(stub.calls, "ImGui_DrawList_AddRect").color == P.outline)
+end)
+
+test("combo: the preview is a button face", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.combo("ctx", "##c", { "A", "B" }, 1)
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_FrameBg == P.btn and c.ImGui_Col_FrameBgHovered == P.btn_h)
+end)
+
+test("section_divider, collapsing_header, tooltip, brand_icon, header colours", function()
+  local T, stub = load_theme({ mode = "fancy" }); local P = T.get_palette()
+  T.section_divider("ctx", "Section")
+  assert(pushed_colors(stub).ImGui_Col_Separator == P.sep)
+  stub.calls = {}; T.collapsing_header("ctx", "Head")
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_Header == P.btn and c.ImGui_Col_HeaderHovered == P.btn_h and c.ImGui_Col_HeaderActive == P.btn_a)
+  stub.calls = {}; T.tooltip("ctx", "Tip")
+  c = pushed_colors(stub)
+  assert(c.ImGui_Col_PopupBg == P.panel and c.ImGui_Col_Border == P.outline)
+  stub.calls = {}; T.brand_icon("ctx", 24)
+  assert(first(stub.calls, "ImGui_DrawList_AddRectFilled").color == P.well)
+  assert(first(stub.calls, "ImGui_DrawList_AddRect").color == P.outline)
+  stub.calls = {}; T.header("ctx", { title = "T", icon_fn = false })
+  local fills = all(stub.calls, "ImGui_DrawList_AddRectFilled")
+  local strip, line = find_fill(fills, P.title), find_fill(fills, P.sep)
+  assert(strip and line and line.y2 - line.y1 == 1 and line.y1 == strip.y2, "title strip with a hairline under it")
+  local fonts = T.create_fonts(nil)
+  stub.calls = {}; T.header("ctx", { title = "T", icon_fn = false, fancy_prefix = false, fonts = fonts })
+  assert(first(stub.calls, "ImGui_PushFont")[2] == fonts.default_bold, "title in the bold font")
+end)
+
+test("settings label", function()
+  assert(load_theme({}).mode_labels[1] == "Fancy" and load_theme({}).mode_labels[2] == "Match Theme")
+end)
+
+test("widgets: every push has its pop, on every path", function()
+  local function run(fn, hovered)
+    local T, stub = load_theme({ mode = "fancy" })
+    local fonts = T.create_fonts(nil)
+    local r = stub.reaper
+    for _, n in ipairs({ "ImGui_BeginCombo", "ImGui_BeginTooltip", "ImGui_IsItemHovered", "ImGui_IsPopupOpen",
+                         "ImGui_CollapsingHeader" }) do
+      r[n] = function() return hovered end
+    end
+    stub.calls = {}
+    fn(T, fonts)
+    local tag = hovered and " (hovered/open)" or " (at rest)"
+    assert(count(stub.calls, "ImGui_PushStyleColor") == popped(stub.calls, "ImGui_PopStyleColor"), "colours" .. tag)
+    assert(count(stub.calls, "ImGui_PushStyleVar") == popped(stub.calls, "ImGui_PopStyleVar"), "vars" .. tag)
+    assert(count(stub.calls, "ImGui_PushFont") == count(stub.calls, "ImGui_PopFont"), "fonts" .. tag)
+  end
+  local cases = {
+    function(T, f) T.toggle_button("ctx", "a", "A", true, { preset = "small", fonts = f, rounding = 3, tooltip = "t" }) end,
+    function(T, f) T.toggle_button("ctx", "a", "A", false, { preset = "large", fonts = f, pad_x = 2 }) end,
+    function(T, f) T.badge("ctx", "B", { preset = "small", fonts = f, rounding = 3, interactive = true, tooltip = "t" }) end,
+    function(T) T.badge("ctx", "B", { color = 0xE45E65FF }) end,
+    function(T) T.selectable("ctx", "a very long label that does not fit##s", true) end,
+    function(T) T.icon_btn("ctx", "x", T.icons.close, { tooltip = "t" }) end,
+    function(T) T.icon_btn_colored("ctx", "y", T.icons.plus, { tooltip = "t" }) end,
+    function(T, f) T.progress_bar("ctx", 0.5, { preset = "small", fonts = f, overlay = "50%", tooltip = "t" }) end,
+    function(T) T.combo("ctx", "##c", { "A", "B" }, 1, { disabled = true, tooltip = "t" }) end,
+    function(T) T.multi_combo("ctx", "##m", { "A", "B" }, { true }, { tooltip = "t" }) end,
+    function(T) T.section_divider("ctx", "S", { tooltip = "t" }) end,
+    function(T) T.collapsing_header("ctx", "H##h", { close_id = "c", close_tooltip = "t" }) end,
+    function(T) T.tooltip("ctx", "t") end,
+    function(T) T.brand_icon("ctx", 24) end,
+    function(T) T.settings_widget("ctx") end,
+    function(T, f) T.header("ctx", { title = "T", subtitle = "S", fonts = f, show_settings = true, show_close = true }) end,
+    function(T, f) T.header("ctx", { title = "T", fonts = f, show_separator = false, icon_fn = T.icons.gear }) end,
+  }
+  for i, fn in ipairs(cases) do
+    for _, hovered in ipairs({ false, true }) do
+      local ok, err = pcall(run, fn, hovered)
+      if not ok then error("case " .. i .. ": " .. tostring(err), 0) end
+    end
+  end
 end)
 
 -------------------------------------------------------------------------------

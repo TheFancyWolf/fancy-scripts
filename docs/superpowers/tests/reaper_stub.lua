@@ -72,11 +72,29 @@ local RETURNS = {
   ImGui_PopID = {},
   ImGui_Indent = {},
   ImGui_Unindent = {},
-  ImGui_PopFont = {},
   ImGui_Attach = {},
   ImGui_SetTooltip = {},
   ImGui_BeginTooltip = { false },
   ImGui_EndTooltip = {},
+  ImGui_BeginCombo = { false },
+  ImGui_EndCombo = {},
+  ImGui_SetItemDefaultFocus = {},
+  ImGui_BeginDisabled = {},
+  ImGui_EndDisabled = {},
+  ImGui_CollapsingHeader = { false },
+  ImGui_AlignTextToFramePadding = {},
+  ImGui_PushTextWrapPos = {},
+  ImGui_PopTextWrapPos = {},
+  ImGui_SetMouseCursor = {},
+  ImGui_MouseCursor_Hand = { 7 },
+  ImGui_IsPopupOpen = { false },
+  ImGui_DrawList_AddLine = {},
+  ImGui_DrawList_AddCircle = {},
+  ImGui_DrawList_AddCircleFilled = {},
+  ImGui_DrawList_AddTriangleFilled = {},
+  ImGui_DrawList_AddBezierCubic = {},
+  ImGui_DrawList_PushClipRect = {},
+  ImGui_DrawList_PopClipRect = {},
 }
 
 local ENUM_PATTERNS = { "^ImGui_Col_", "^ImGui_StyleVar_", "^ImGui_%w*Flags_", "^ImGui_Cond_" }
@@ -150,7 +168,7 @@ function M.new(opts)
 
   -- recorded calls
   for _, name in ipairs({ "ImGui_PushStyleColor", "ImGui_PopStyleColor", "ImGui_PushStyleVar",
-                          "ImGui_PopStyleVar", "ImGui_PushFont" }) do
+                          "ImGui_PopStyleVar", "ImGui_PushFont", "ImGui_PopFont" }) do
     raw[name] = function(...)
       record(name, select(2, ...))  -- drop ctx
       check_fail(name, (select(2, ...)))

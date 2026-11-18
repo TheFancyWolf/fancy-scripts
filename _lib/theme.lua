@@ -1441,6 +1441,21 @@ local function _get_palette()
   return Theme.get_palette()
 end
 
+--- Label colour for text drawn on a solid `fill`: palette.text when it reaches 4.5:1 there, otherwise whichever
+--- of the dark label 0x0F2B3BFF and white contrasts more, moved toward black or white when even that falls
+--- short (a mid-tone red reaches 4.5:1 with neither). A translucent fill is judged over palette.bg.
+--- @param fill integer  Fill colour 0xRRGGBBAA
+--- @return integer  Label colour 0xRRGGBBAA
+function Theme.label_on(fill)
+  local P = _get_palette()
+  local under = composite_over(fill, P.bg)
+  if contrast_over(P.text, under) >= 4.5 then return P.text end
+  local dark, light = 0x0F2B3BFF, 0xFFFFFFFF
+  local pick = contrast_over(dark, under) >= contrast_over(light, under) and dark or light
+  return fit_contrast(pick, { under }, 4.5)
+end
+local label_on = Theme.label_on
+
 --- True when the last item is hovered long enough to show its tooltip: ReaImGui's own tooltip delay
 --- (HoveredFlags_ForTooltip) and also while the item is disabled, so `opts.tooltip` can explain why.
 --- @param ctx userdata  ImGui context
@@ -1598,8 +1613,9 @@ function Theme.align(ctx, row_h, item_h)
   end
 end
 
---- Renders an invisible button with a DrawList vector icon overlay.
---- The icon highlights on hover. Optionally shows a tooltip.
+--- Renders a borderless button with a DrawList vector icon overlay.
+--- Transparent at rest (like the theme's transparent track buttons), palette.btn_h face on hover,
+--- palette.btn_a pressed; the icon also lightens on hover. Optionally shows a tooltip.
 ---
 --- @param ctx userdata  ImGui context
 --- @param id string  Unique ImGui ID for the button (e.g. "delete_btn")
@@ -1609,7 +1625,8 @@ end
 ---   opts.w         (number)  Button width override
 ---   opts.h         (number)  Button height override
 ---   opts.icon_size (number)  Icon size override
----   opts.color     (number)  Icon color    (default: palette.text_dim)
+---   opts.color     (number)  Icon color    (default: palette.text)
+---   opts.hover_color (number) Icon color on hover (default: icon color lightened 25%)
 ---   opts.tooltip   (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.icon_btn(ctx, id, icon_fn, opts)
@@ -1620,7 +1637,14 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local icon_sz = opts.icon_size or preset.size
   local btn_w = opts.w or (icon_sz + preset.pad * 2)
   local btn_h = opts.h or btn_w
-  local pressed = reaper.ImGui_InvisibleButton(ctx, id, btn_w, btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        with_alpha(P.btn, 0))
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  P.btn_a)
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameBorderSize(), 0)
+  local btn_label = id:find("##", 1, true) and id or ("##" .. id)   -- never draws a text label
+  local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
+  reaper.ImGui_PopStyleVar(ctx, 1)
+  reaper.ImGui_PopStyleColor(ctx, 3)
   local dl = reaper.ImGui_GetWindowDrawList(ctx)
   local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
   local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
@@ -1628,7 +1652,7 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local cy = (ry + ry2) * 0.5
   local hs = icon_sz * 0.5
   local hover = reaper.ImGui_IsItemHovered(ctx)
-  local base_col = opts.color or P.text_dim
+  local base_col = opts.color or P.text
   local draw_col = hover and (opts.hover_color or lighten(base_col, 0.25)) or base_col
   icon_fn(dl, cx, cy, hs, draw_col)
   if hover then
@@ -1640,8 +1664,8 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   return pressed
 end
 
---- Renders a colored button with a DrawList vector icon overlay.
---- Unlike icon_btn, this renders a visible button background.
+--- Renders a button with a DrawList vector icon overlay.
+--- Unlike icon_btn, this renders a visible button face (a plain button by default).
 ---
 --- @param ctx userdata  ImGui context
 --- @param id string  Unique ImGui ID (the "##" prefix is added automatically)
@@ -1652,9 +1676,9 @@ end
 ---   opts.h         (number)  Button height override
 ---   opts.icon_size (number)  Icon size override
 ---   opts.icon_color (number) Icon color    (default: palette.text)
----   opts.bg        (number)  Button bg     (default: palette.accent_d)
----   opts.bg_hover  (number)  Hover bg      (default: palette.accent_h)
----   opts.bg_active (number)  Active bg     (default: palette.accent)
+---   opts.bg        (number)  Button bg     (default: palette.btn)
+---   opts.bg_hover  (number)  Hover bg      (default: palette.btn_h)
+---   opts.bg_active (number)  Active bg     (default: palette.btn_a)
 ---   opts.tooltip   (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
@@ -1665,9 +1689,9 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   local icon_sz = opts.icon_size or preset.size
   local btn_w = opts.w or (icon_sz + preset.pad * 2)
   local btn_h = opts.h or btn_w
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        opts.bg        or P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.bg_hover  or P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.bg_active or P.accent)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        opts.bg        or P.btn)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.bg_hover  or P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.bg_active or P.btn_a)
   local pressed = reaper.ImGui_Button(ctx, "##" .. id, btn_w, btn_h)
   reaper.ImGui_PopStyleColor(ctx, 3)
   local dl = reaper.ImGui_GetWindowDrawList(ctx)
@@ -1686,7 +1710,7 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   return pressed
 end
 
---- Renders a tooltip with automatic text wrapping.
+--- Renders a tooltip with automatic text wrapping: a palette.panel popup with a palette.outline border.
 --- Respects the global Theme.get_show_tooltips() setting.
 --- Uses consistent padding from layout tokens.
 ---
@@ -1696,16 +1720,20 @@ end
 function Theme.tooltip(ctx, text, max_w)
   if not Theme.get_show_tooltips() then return end
   max_w = max_w or Theme.layout.tooltip_wrap
+  local P = _get_palette()
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PopupBg(), P.panel)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(),  P.outline)
   if reaper.ImGui_BeginTooltip(ctx) then
     reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + max_w)
     reaper.ImGui_Text(ctx, text)
     reaper.ImGui_PopTextWrapPos(ctx)
     reaper.ImGui_EndTooltip(ctx)
   end
+  reaper.ImGui_PopStyleColor(ctx, 2)
 end
 
---- Renders a labeled section divider with optional info tooltip.
---- Adds consistent spacing above and below from layout tokens.
+--- Renders a labeled section divider with optional info tooltip: label in palette.text_dim over a
+--- palette.sep hairline. Adds consistent spacing above and below from layout tokens.
 ---
 --- @param ctx userdata  ImGui context
 --- @param label string  Section title text
@@ -1745,7 +1773,7 @@ function Theme.section_divider(ctx, label, opts)
       tooltip = opts.tooltip,
     })
   end
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(), with_alpha(col, 0.60))
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(), P.sep)
   reaper.ImGui_Separator(ctx)
   reaper.ImGui_PopStyleColor(ctx, 1)
   reaper.ImGui_Spacing(ctx)
@@ -1755,6 +1783,7 @@ end
 --- Encapsulates ReaImGui's argument order and default flags to prevent
 --- argument-misalignment bugs (such as accidental close buttons).
 --- Supports optional right-aligned close/action button.
+--- The header row is a button face: palette.btn, palette.btn_h on hover, palette.btn_a pressed.
 ---
 --- @param ctx userdata  ImGui context
 --- @param label string  Section header label text
@@ -1793,7 +1822,11 @@ function Theme.collapsing_header(ctx, label, opts)
   local visible_label = label:match("^(.-)##") or label
   local id = label:match("##(.+)$") or label
 
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),        P.btn)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(), P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),  P.btn_a)
   local is_open = reaper.ImGui_CollapsingHeader(ctx, "##ch_" .. id, nil, flags)
+  reaper.ImGui_PopStyleColor(ctx, 3)
   local next_y = reaper.ImGui_GetCursorPosY(ctx)
 
   -- Precise 8px visual gap after arrow (arrow right edge is at ~18px -> text at 26px)
@@ -1884,8 +1917,8 @@ end
 ---   opts.preset       (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
 ---   opts.fonts        (table)   Font table from Theme.create_fonts() (for overlay text)
 ---   opts.fill_color   (number)  Fill color (default: palette.accent)
----   opts.bg_color     (number)  Background color (default: palette.card)
----   opts.border_color (number)  Border color (optional)
+---   opts.bg_color     (number)  Background color (default: palette.well, a recessed track)
+---   opts.border_color (number)  Border color (default: palette.outline)
 ---   opts.rounding     (number)  Corner rounding (default: Theme.layout.rounding)
 ---   opts.overlay      (string)  Centered text overlay (e.g. "+3.5 dB" or "75%")
 ---   opts.text_color   (number)  Overlay text color (default: palette.text)
@@ -1905,7 +1938,7 @@ function Theme.progress_bar(ctx, fraction, opts)
   local h = opts.h or default_h
   local rounding = opts.rounding or L.rounding
   local fill_col = opts.fill_color or opts.fg or P.accent
-  local bg_col = opts.bg_color or opts.bg or P.card
+  local bg_col = opts.bg_color or opts.bg or P.well
   local text_col = opts.text_color or P.text
   local overlay = opts.overlay or opts.text
 
@@ -1926,9 +1959,7 @@ function Theme.progress_bar(ctx, fraction, opts)
   end
 
   -- Border
-  if opts.border_color then
-    reaper.ImGui_DrawList_AddRect(dl, x, y, x + w, y + h, opts.border_color, rounding)
-  end
+  reaper.ImGui_DrawList_AddRect(dl, x, y, x + w, y + h, opts.border_color or P.outline, rounding)
 
   -- Centered text overlay
   if overlay and overlay ~= "" then
@@ -1969,14 +2000,16 @@ end
 ---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
 ---   opts.pad_x          (number)  Horizontal padding override (default: preset or FramePadding)
 ---   opts.pad_y          (number)  Vertical padding override (default: preset or FramePadding)
----   opts.active_bg      (number)  Active background (default: palette.accent_d)
----   opts.active_hover   (number)  Active hovered background (default: palette.accent_h)
----   opts.active_active  (number)  Active pressed background (default: palette.accent)
----   opts.active_text    (number)  Active text color (default: palette.accent)
----   opts.inactive_bg    (number)  Inactive background (default: palette.card)
----   opts.inactive_hover (number)  Inactive hovered background (default: palette.panel)
----   opts.inactive_active(number)  Inactive pressed background (default: palette.accent_d)
----   opts.inactive_text  (number)  Inactive text color (default: palette.text_dim)
+---   opts.active_bg      (number)  Active background (default: palette.btn_on, a solid fill)
+---   opts.active_hover   (number)  Active hovered background (default: active background lightened 12%)
+---   opts.active_active  (number)  Active pressed background (default: active background darkened 12%)
+---   opts.active_text    (number)  Active text color (default: palette.on_text; Theme.label_on(active_bg)
+---                                 when only active_bg is given)
+---   opts.inactive_bg    (number)  Inactive background (default: palette.btn, a plain button face)
+---   opts.inactive_hover (number)  Inactive hovered background (default: palette.btn_h, or inactive_bg lightened 12%)
+---   opts.inactive_active(number)  Inactive pressed background (default: palette.btn_a, or inactive_bg darkened 12%)
+---   opts.inactive_text  (number)  Inactive text color (default: palette.text; Theme.label_on(inactive_bg)
+---                                 when only inactive_bg is given)
 ---   opts.tooltip        (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.toggle_button(ctx, id, label, is_active, opts)
@@ -1993,15 +2026,18 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
 
   local bg, bg_h, bg_a, text_col
   if is_active then
-    bg       = opts.active_bg     or P.accent_d
-    bg_h     = opts.active_hover  or P.accent_h
-    bg_a     = opts.active_active or P.accent
-    text_col = opts.active_text   or P.accent_l
+    -- On: a solid fill (no tint); hover lightens it, press darkens it
+    bg       = opts.active_bg     or P.btn_on
+    bg_h     = opts.active_hover  or lighten(bg, 0.12)
+    bg_a     = opts.active_active or darken(bg, 0.12)
+    text_col = opts.active_text   or (opts.active_bg and label_on(bg) or P.on_text)
   else
-    bg       = opts.inactive_bg     or P.card
-    bg_h     = opts.inactive_hover  or P.panel
-    bg_a     = opts.inactive_active or P.accent_d
-    text_col = opts.inactive_text   or P.text_dim
+    -- Off: a plain button face
+    local custom = opts.inactive_bg
+    bg       = custom or P.btn
+    bg_h     = opts.inactive_hover  or (custom and lighten(bg, 0.12) or P.btn_h)
+    bg_a     = opts.inactive_active or (custom and darken(bg, 0.12) or P.btn_a)
+    text_col = opts.inactive_text   or (custom and label_on(bg) or P.text)
   end
 
   local pushed_vars = 0
@@ -2058,9 +2094,13 @@ Theme.badge_button = Theme.toggle_button
 --- @param opts table|nil  Optional configuration:
 ---   opts.preset         (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
 ---   opts.fonts          (table)   Font table from Theme.create_fonts() (for preset font)
----   opts.color          (number)  Semantic base color (auto-derives 70% lightened text & 33% bg)
----   opts.text_color     (number)  Explicit text color override (default: 70% lightened color or palette.accent_l)
----   opts.bg             (number)  Explicit background color override (default: 33% alpha of color)
+---   opts.color          (number)  Semantic colour: without opts.bg the badge is a solid fill of it
+---                                 (default: none, a quiet tag: palette.well face, outline, palette.text label)
+---   opts.text_color     (number)  Explicit text color override (default: Theme.label_on(fill); with both
+---                                 opts.color and opts.bg, color lightened 70% when that reads on bg)
+---   opts.bg             (number)  Explicit background color override (default: opts.color or palette.well)
+---   opts.bg_hover       (number)  Hover background when interactive (default: fill lightened 12%)
+---   opts.bg_active      (number)  Pressed background when interactive (default: fill darkened 12%)
 ---   opts.w              (number)  Badge width (default: 0 = auto from text + frame padding)
 ---   opts.h              (number)  Badge height (default: 0 = auto from font + frame padding)
 ---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
@@ -2079,11 +2119,24 @@ function Theme.badge(ctx, label, opts)
   if preset == "small" or preset == "sm" then preset = L.btn_sm end
   if preset == "large" or preset == "lg" then preset = L.btn_lg end
 
-  local base_color = opts.color or P.accent
-  local text_col   = opts.text_color or (opts.color and lighten(opts.color, 0.70) or P.accent_l)
-  local bg         = opts.bg or with_alpha(base_color, 0.20)
-  local bg_h       = opts.bg_hover or with_alpha(base_color, 0.40)
-  local bg_a       = opts.bg_active or base_color
+  -- Default: a quiet tag (well face, outline from FrameBorderSize, text label).
+  -- opts.color alone: a solid fill of that colour with a fitted dark or light label.
+  local bg       = opts.bg or opts.color or P.well
+  local text_col = opts.text_color
+  if not text_col then
+    if opts.color and opts.bg then
+      -- A script's colour + background pair: keep its tinted label where it reads on that background
+      local tinted = lighten(opts.color, 0.70)
+      local under = composite_over(bg, P.bg)
+      text_col = contrast_over(tinted, under) >= 4.5 and tinted or label_on(bg)
+    elseif opts.color or opts.bg then
+      text_col = label_on(bg)
+    else
+      text_col = P.text
+    end
+  end
+  local bg_h = opts.bg_hover or lighten(bg, 0.12)
+  local bg_a = opts.bg_active or darken(bg, 0.12)
 
   local btn_w = opts.w or 0
   local btn_h = opts.h or 0
@@ -2168,7 +2221,8 @@ local function _get_combo_item_label(item, idx, custom_fn)
 end
 
 --- Renders a selectable item with rounded highlight corners matching the design system.
---- Replaces native square-cornered Selectables.
+--- Replaces native square-cornered Selectables. A hovered row is palette.hover; a selected row is the
+--- palette.select tint plus a 2 px solid accent bar along its left edge (the 3:1 selection marker).
 --- A label wider than the item is shortened with "..." inside the item and shown in full in a tooltip;
 --- a label that fits is drawn exactly as before.
 ---
@@ -2180,9 +2234,10 @@ end
 --- @param h number|nil  Height (default: 0 = frame/row height)
 --- @param opts table|nil  Optional overrides:
 ---   opts.rounding (number) Corner rounding radius (default: Theme.layout.rounding)
----   opts.bg_hover (number) Hover color (default: palette.accent_d)
----   opts.bg_sel   (number) Selected color (default: palette.accent_h)
----   opts.text_col (number) Text color override
+---   opts.bg_hover (number) Hover color (default: palette.hover)
+---   opts.bg_sel   (number) Selected color, hovered or not (default: palette.select; a stronger tint would
+---                          take the label under 4.5:1)
+---   opts.text_col (number) Text color override (default: palette.text)
 ---   opts.pad_x    (number) Left padding for text (default: Theme.layout.sm)
 --- @return boolean clicked
 function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
@@ -2190,8 +2245,8 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
   local P = _get_palette()
   local L = Theme.layout
   local rounding = opts.rounding or L.rounding
-  local bg_hover = opts.bg_hover or P.accent_h
-  local bg_sel   = opts.bg_sel   or P.accent_d
+  local bg_hover = opts.bg_hover or P.hover
+  local bg_sel   = opts.bg_sel   or P.select
   local sel_state = is_selected == true
 
   local visible_label = label:match("^(.-)##") or label
@@ -2213,14 +2268,18 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
 
   -- 1. Draw rounded background highlight (using Theme.layout.rounding)
   if is_hovered or sel_state then
-    local bg = sel_state and (is_hovered and P.accent or bg_sel) or bg_hover
+    local bg = sel_state and bg_sel or bg_hover
     reaper.ImGui_DrawList_AddRectFilled(dl, rx1, ry1, rx2, ry2, bg, rounding)
+  end
+  -- Selection marker: a 2 px solid accent bar along the row's left edge, full row height
+  if sel_state then
+    reaper.ImGui_DrawList_AddRectFilled(dl, rx1, ry1, rx1 + 2, ry2, P.accent)
   end
 
   -- 2. Draw text on top if visible label is non-empty
   local clipped = false
   if visible_label ~= "" then
-    local text_col = opts.text_col or (sel_state and P.accent_l or P.text)
+    local text_col = opts.text_col or P.text
     local pad_x = opts.pad_x or L.sm
     local tw, th = reaper.ImGui_CalcTextSize(ctx, visible_label)
     local ty = ry1 + math.floor(((ry2 - ry1) - th) * 0.5)
@@ -2239,8 +2298,22 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
   return clicked
 end
 
+--- Opens a combo whose preview looks like a button: palette.btn face (btn_h hovered, btn_a open), outline
+--- and chevron from the style stack. The colours are popped before the list, which stays a palette.panel popup.
+--- @return boolean open  Result of ImGui_BeginCombo
+local function _begin_combo_btn(ctx, id, preview, flags)
+  local P = _get_palette()
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),        P.btn)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),  P.btn_a)
+  local open = reaper.ImGui_BeginCombo(ctx, id, preview, flags)
+  reaper.ImGui_PopStyleColor(ctx, 3)
+  return open
+end
+
 --- Renders a standardized combo box wrapping ImGui_BeginCombo.
 --- Handles label resolution, item iteration, and selection state.
+--- The preview is a button face; list rows are Theme.selectable rows (hover, select tint, accent bar).
 ---
 --- @param ctx userdata  ImGui context
 --- @param id string  Unique combo ID (e.g. "##shared_fx")
@@ -2274,7 +2347,7 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
   local new_idx = selected_idx
   local changed = false
 
-  if reaper.ImGui_BeginCombo(ctx, id, preview) then
+  if _begin_combo_btn(ctx, id, preview) then
     for i, item in ipairs(items) do
       local lbl = _get_combo_item_label(item, i, opts.get_label) .. "##item_" .. i
       local is_sel = (selected_idx == i)
@@ -2338,7 +2411,7 @@ local function _count_selected(items, selected, get_id_fn)
   return count
 end
 
---- Renders a standardized, compact multi-select combo box.
+--- Renders a standardized, compact multi-select combo box (preview and rows look like Theme.combo's).
 --- Supports full-row clicking, hover highlights, and compact density.
 --- Does not close the popup on item selection unless opts.close_on_select is true.
 ---
@@ -2396,7 +2469,7 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
   local is_now_selected = nil
   local changed = false
 
-  if reaper.ImGui_BeginCombo(ctx, id, preview) then
+  if _begin_combo_btn(ctx, id, preview) then
     local pushed_vars = 0
     if opts.compact ~= false then
       reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(), L.md, L.xs)
@@ -2496,7 +2569,7 @@ function Theme.center_next_window(ctx, w, h, cond)
 end
 
 --- Renders the Fancy Scripts brand icon (logo) using DrawList vectors.
---- Draws a rounded card with the signature bezier curve and colored dots.
+--- Draws a recessed card (palette.well, palette.outline frame) with the signature bezier curve and colored dots.
 ---
 --- @param ctx userdata  ImGui context
 --- @param size number|nil  Icon bounding box size in pixels (default: Theme.layout.row_h)
@@ -2514,8 +2587,8 @@ function Theme.brand_icon(ctx, size, target_h)
   local bx2, by2 = x + 235.0 * s, dy + 235.0 * s
   local r_bg     = 50.0 * s
   local stroke_w = math.max(1.0, 10.0 * s)
-  reaper.ImGui_DrawList_AddRectFilled(dl, bx1, by1, bx2, by2, P.card, r_bg)
-  reaper.ImGui_DrawList_AddRect(dl, bx1, by1, bx2, by2, P.sep, r_bg, 0, stroke_w)
+  reaper.ImGui_DrawList_AddRectFilled(dl, bx1, by1, bx2, by2, P.well, r_bg)
+  reaper.ImGui_DrawList_AddRect(dl, bx1, by1, bx2, by2, P.outline, r_bg, 0, stroke_w)
   local p1_x, p1_y = x + 79.0 * s, dy + 139.0 * s
   local c1_x, c1_y = x + 79.0 * s, dy + 101.0 * s
   local c2_x, c2_y = x + 161.0 * s, dy + 139.0 * s
@@ -2531,8 +2604,10 @@ end
 -- 12. SETTINGS UI WIDGET
 -------------------------------------------------------------------------------
 
-local SETTINGS_LABELS = { "Fancy Dark", "Match Theme" }
+local SETTINGS_LABELS = { "Fancy", "Match Theme" }
 local SETTINGS_VALUES = { Theme.MODE_FANCY, Theme.MODE_MATCH }
+--- Visible labels of the theme modes, in the order of the settings combo (read-only).
+Theme.mode_labels = SETTINGS_LABELS
 
 --- Calculates the reactive width required for a combo box to display its options
 --- without truncation, based on the current font metrics and ImGui frame padding.
@@ -2581,7 +2656,7 @@ function Theme.settings_widget(ctx, opts)
   local changed = false
   local combo_label = opts.label or "##theme_mode"
   reaper.ImGui_SetNextItemWidth(ctx, w)
-  if reaper.ImGui_BeginCombo(ctx, combo_label, SETTINGS_LABELS[current]) then
+  if _begin_combo_btn(ctx, combo_label, SETTINGS_LABELS[current]) then
     for i, label in ipairs(SETTINGS_LABELS) do
       local selected = (i == current)
       if Theme.selectable(ctx, label, selected) then
@@ -2626,6 +2701,8 @@ end
 --- Renders a standardized window header bar matching the Parameter Link layout pattern.
 --- Uses ReaImGui's native AlignTextToFramePadding() for pixel-perfect vertical alignment
 --- across brand icon, signature "FANCY" prefix, title, subtitle, and right controls.
+--- The row sits on a palette.title strip across the window with a 1 px palette.sep hairline under it
+--- (the hairline is left out with show_separator = false).
 ---
 --- @param ctx userdata  ImGui context
 --- @param opts table|nil  Header configuration:
@@ -2635,7 +2712,7 @@ end
 ---   opts.prefix_color   (number|nil)  Prefix text color (default: palette.yellow)
 ---   opts.subtitle       (string|nil)  Secondary subtitle text (optional)
 ---   opts.fonts          (table|nil)   Font table from Theme.create_fonts() (optional)
----   opts.font_header    (userdata|nil) Title font override (default: opts.fonts.large_bold or fonts.header)
+---   opts.font_header    (userdata|nil) Title font override (default: opts.fonts.default_bold)
 ---   opts.font_subtitle  (userdata|nil) Subtitle font override (default: opts.fonts.default)
 ---   opts.title_color    (number|nil)  Title text color (default: palette.text)
 ---   opts.subtitle_color (number|nil)  Subtitle text color (default: palette.text_dim)
@@ -2648,7 +2725,7 @@ end
 ---   opts.close_tooltip  (string|nil)  Close button tooltip (default: "Close (Esc)")
 ---   opts.right_widgets  (function|nil) Callback `function(ctx, hdr_h)` for custom controls
 ---   opts.right_width    (number|nil)  Extra width allocated for right-aligned items
----   opts.show_separator (boolean|nil) Whether to render separator line below header (default: true)
+---   opts.show_separator (boolean|nil) Whether to render the hairline below the header strip (default: true)
 ---   opts.height         (number|nil)  Row height override (default: Theme.layout.row_h)
 --- @return boolean open  Returns true if the window should stay open (false if close was clicked)
 function Theme.header(ctx, opts)
@@ -2660,6 +2737,23 @@ function Theme.header(ctx, opts)
   local close_btn_sz = L.icon_md.size + L.icon_md.pad * 2
   local frame_h = reaper.ImGui_GetFrameHeight(ctx)
   local hdr_h = opts.height or math.max(L.row_h, brand_sz, close_btn_sz, frame_h)
+
+  -- 0. Title strip behind the row, edge to edge (drawn first, so the row draws over it), and its hairline.
+  --    The strip runs from half the window padding above the row to the item spacing below it.
+  do
+    local dl = reaper.ImGui_GetWindowDrawList(ctx)
+    local _, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
+    local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
+    local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
+    local y1 = row_y - L.md
+    local y2 = row_y + hdr_h + L.sm
+    reaper.ImGui_DrawList_PushClipRect(dl, win_x, win_y, win_x + win_w, win_y + win_h, false)
+    reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y1, win_x + win_w, y2, P.title)
+    if opts.show_separator ~= false then
+      reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y2, win_x + win_w, y2 + 1, P.sep)
+    end
+    reaper.ImGui_DrawList_PopClipRect(dl)
+  end
 
   -- 1. Brand icon (centers itself in target_h and establishes the line height)
   local has_icon = (opts.icon_fn ~= false)
@@ -2702,7 +2796,7 @@ function Theme.header(ctx, opts)
 
   -- 3. Title (white text aligned to frame padding)
   if opts.title then
-    local font_title = opts.font_header or (opts.fonts and (opts.fonts.medium or opts.fonts.default_bold or opts.fonts.large))
+    local font_title = opts.font_header or (opts.fonts and (opts.fonts.default_bold or opts.fonts.medium or opts.fonts.large))
     local pushed_title = Theme.push_font(ctx, font_title)
     Theme.align(ctx)
     if opts.title_color then
@@ -2781,11 +2875,9 @@ function Theme.header(ctx, opts)
     end
   end
 
-  if opts.show_separator ~= false then
-    reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Spacing(ctx)
-  end
+  -- Clear the strip and its hairline before the content below
+  reaper.ImGui_Dummy(ctx, 0, 1)
+  reaper.ImGui_Spacing(ctx)
 
   return not close_clicked
 end
