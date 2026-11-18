@@ -194,6 +194,25 @@ test("palette: overrides win for old and new fields", function()
   assert(P.btn_on == 0xFF0000FF, "btn_on follows an overridden accent")
 end)
 
+test("palette: Match outline is bg moved away from the text, unfitted; border stays fitted", function()
+  local P = load_theme({ mode = "match", theme = REAPERTIPS }).build_palette()
+  assert(P.outline ~= P.border and lum(P.outline) < lum(P.bg), "darker than bg on a dark theme")
+  assert(contrast(P.border, P.bg) >= 3.0, "border still fitted")
+  local L = load_theme({ mode = "match", theme = LIGHT }).build_palette()
+  assert(lum(L.outline) >= lum(L.bg), "lighter than bg on a light theme")
+  local O = load_theme({ mode = "match", theme = REAPERTIPS }).build_palette({ outline = 0x123456FF })
+  assert(O.outline == 0x123456FF)
+  local C = load_theme({ mode = "fancy" }).build_palette()
+  assert(C.outline == 0x181818FF and C.border == 0x181818FF)
+end)
+
+test("palette: Match text is the stronger of the two theme text colours", function()
+  for _, fx in ipairs({ REAPERTIPS, LIGHT }) do
+    local P = load_theme({ mode = "match", theme = fx }).build_palette()
+    assert(P.text ~= P.text_dim and contrast(P.text, P.bg) > contrast(P.text_dim, P.bg))
+  end
+end)
+
 -------------------------------------------------------------------------------
 
 print(string.format("\n%d tests, %d failed", total, failures))

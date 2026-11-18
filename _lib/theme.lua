@@ -868,8 +868,12 @@ function Theme.build_palette(overrides)
     P.text_dim = overrides.text_dim or fit_contrast(F.text_dim, faces, 4.5)
     P.border   = overrides.border   or F.border
   else
-    P.text     = overrides.text     or fit_contrast(read_theme_color("col_main_text", F.text), surfaces, 4.5)
-    P.text_dim = overrides.text_dim or fit_contrast(read_theme_color("col_tcp_text", F.text_dim), faces, 4.5)
+    -- Of the theme's two text colours the one with more contrast on bg starts text, the other text_dim
+    local t1 = read_theme_color("col_main_text", F.text)
+    local t2 = read_theme_color("col_tcp_text", F.text_dim)
+    if contrast_over(t2, P.bg) > contrast_over(t1, P.bg) then t1, t2 = t2, t1 end
+    P.text     = overrides.text     or fit_contrast(t1, surfaces, 4.5)
+    P.text_dim = overrides.text_dim or fit_contrast(t2, faces, 4.5)
     P.border   = overrides.border   or fit_contrast(read_theme_color("col_main_3dhl", F.border), base_surfaces, 3.0)
   end
 
@@ -935,7 +939,8 @@ function Theme.build_palette(overrides)
   local dark_text = luminance(P.text) > 0.179          -- light text on a dark theme: "toward text" is lighter
   local function toward(c, f) return dark_text and lighten(c, f) or darken(c, f) end
   local function away(c, f) return dark_text and darken(c, f) or lighten(c, f) end
-  P.outline = overrides.outline or (fancy and F.outline or P.border)
+  -- Match Theme: bg moved 52 % away from the text colour, unfitted (the resting frame has no minimum)
+  P.outline = overrides.outline or (fancy and F.outline or away(P.bg, 0.52))
   P.btn_on  = overrides.btn_on  or (fancy and P.accent or fit_contrast(P.accent, { P.btn }, 3.0))
   -- on_text: the dark label colour on btn_on, or white / black when that cannot reach 4.5:1
   local on_text = fit_contrast(F.on_text, { P.btn_on }, 4.5)
