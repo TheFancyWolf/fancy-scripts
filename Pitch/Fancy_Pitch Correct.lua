@@ -605,6 +605,9 @@ K.PERSIST = (function()
   flag("layers", "pitch_show_trend", state, "show_trend")
   flag("layers", "pitch_show_split_points", state, "show_split_points")
 
+  -- The note tone while a note is dragged, saved when the More menu item is toggled
+  flag("tone", "pitch_note_tone", state, "note_tone")
+
   -- The Pitched Items width, saved when a drag of the divider ends
   number("sidebar", "pitch_sidebar_w", state, "sidebar_w", { K.SIDEBAR_MIN_W }, "%.0f")
   return list
@@ -1772,6 +1775,7 @@ local function clear_interaction_state()
   state.marquee = nil
   state.shift_mode = false
   state.nudge_burst = nil
+  K.tone_kill()   -- the drag that was sounding is gone
 end
 
 --- Make a session take's data the editing model (canvas, notes, key/scale). Does not touch
@@ -6418,7 +6422,7 @@ K.INFO_SECTIONS = {
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
   { title = "Icons", rows = {
-    { "… (top right)", "More: Analyze, Reset, Layers, Settings, Help" },
+    { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
     { "× (top right)", "Close the window (Esc when floating)" },
     { "▸ / ◀", "Hide / show the Pitched Items panel" },
     { "Checkbox (item row)", "Pitch envelope active / bypassed" },
@@ -6806,7 +6810,7 @@ end
 --   Correction    scope pill + Strength, then Transition / Onset Ramp / Legato Gap as badges, or one "Timing"
 --                 button that opens the three in a popup
 --   Note actions  Snap, Quantize, Split, Merge
---   Right         "…" (More: Analyze / Cancel, Reset, Layers, Settings, Help) and Close, right-aligned on row 1
+--   Right         "…" (More: Analyze / Cancel, Reset, Layers, Note Tone, Settings, Help) and Close, right-aligned on row 1
 -- The Correction and Note action units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this section
 -- places them. Every width is measured from the longest label its control can show. Which units appear, and on
 -- how many rows, is a HDR_PLANS entry chosen from the content width alone (never from the selected item or the
@@ -6828,7 +6832,7 @@ do
   -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = "Select an audio item"
   local HDR_REASON_NO_NOTES = "Analyze an item first"
-  local HDR_MORE_TIP = "More: Analyze, Reset, Layers, Settings, Help"
+  local HDR_MORE_TIP = "More: Analyze, Reset, Layers, Note Tone, Settings, Help"
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
@@ -7137,6 +7141,14 @@ do
       if reaper.ImGui_BeginMenu(ctx, "Layers") then
         hdr_draw_layers(hs)
         reaper.ImGui_EndMenu(ctx)
+      end
+      if reaper.ImGui_MenuItem(ctx, "Note Tone", nil, state.note_tone) then
+        state.note_tone = not state.note_tone
+        state.tone_failed = false
+        K.save_settings("tone")
+      end
+      if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        Theme.tooltip(ctx, "Play a tone at the note's pitch while you drag it")
       end
       if reaper.ImGui_MenuItem(ctx, "Settings") then
         show_settings_modal = true
@@ -7911,6 +7923,16 @@ local function loop_body()
   local popup_open = visible and reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
   service_nudge_burst(not visible or not open or popup_open)
 
+  -- The note tone follows a pitch drag, once per frame whatever was drawn (a hidden window or an open modal must
+  -- still let a fade-out finish)
+  local tone_pitch = nil
+  local drag = state.drag
+  if state.note_tone and drag and drag.zone == "pitch" and drag.dirty and not drag.shift_mode then
+    local note = state.notes and state.notes[drag.note_idx]
+    tone_pitch = note and note.controls and note.controls.center_pitch or nil
+  end
+  K.tone_tick(tone_pitch)
+
   Theme.pop_font(ctx, pushed_font)
   Theme.pop(ctx, nc, nv)
 
@@ -7969,6 +7991,7 @@ local function loop()
     if not ok then
       reaper.ShowConsoleMsg("Fancy Pitch Correct Error: the error window failed as well: " .. tostring(open) .. "\n")
       pcall(K.cancel_analysis)
+      pcall(K.tone_kill)
       return
     end
   else
@@ -7978,6 +8001,7 @@ local function loop()
     else
       reaper.ShowConsoleMsg("Fancy Pitch Correct Error: " .. tostring(open) .. "\n")
       pcall(K.cancel_analysis)
+      pcall(K.tone_kill)
       if state.undo_open then   -- the frame failed inside apply_envelope_to_take: close its undo block
         state.undo_open = false
         pcall(reaper.Undo_EndBlock, "Apply Pitch Correction (interrupted)", -1)
@@ -7994,6 +8018,7 @@ local function loop()
     reaper.defer(loop)
   else
     pcall(K.cancel_analysis)   -- closed while analysing: stop reading audio before the script ends
+    pcall(K.tone_kill)         -- and never leave the tone on the Monitoring FX chain
   end
 end
 
@@ -8007,6 +8032,7 @@ local function main()
   local release_toolbar = Utils.init_toolbar_toggle()
   reaper.atexit(function()
     K.release_analysis()
+    K.tone_kill()
     release_toolbar()
   end)
 
@@ -8046,6 +8072,7 @@ local function main()
   -- Startup reads (scan / load) are in sync with the project: start watching for changes from here
   note_own_write()
 
+  K.tone_kill()   -- removes a tone a crashed session left on the Monitoring FX chain
   loop()
 end
 
