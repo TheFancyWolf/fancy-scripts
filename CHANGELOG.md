@@ -4,6 +4,12 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.7.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Note tone while dragging:
+  - **Hear the pitch as you drag**: while you drag a note up or down, a sine tone sounds at the pitch the note is on and glides with it (in 1-cent steps), so you can place the note by ear. With several notes dragged together it follows the note you grabbed. It stops when you release the mouse. The lowest tone is A0 (MIDI 21): lower notes sound at A0.
+  - **Pitch drags only**: a click that only selects, Stability and Vibrato drags, Shift drags, edge trims, arrow-key nudges, Snap and Quantize stay silent.
+  - **Never part of the project**: the sound comes from REAPER's own "JS: Tone Generator", which the script puts on the Monitoring FX chain for the length of the drag and removes afterwards. It adds no track and no undo point, and there is nothing extra to install.
+  - **Note Tone** in the "…" menu, between Layers and Settings, switches it on and off (ticked = on). It is on by default and remembered between sessions. Its tooltip reads "Play a tone at the note's pitch while you drag it". The More button's tooltip and the Help row now read "More: Analyze, Reset, Layers, Note Tone, Settings, Help".
+
 - **Fancy Pitch Correct v2.6.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Fix: clicking the time ruler moves the edit cursor there (playback follows, as on REAPER's own ruler), so you can split or play from that spot. The ruler added in v2.6.0 took clicks along the top of the notes without acting on them. Double-click still shows the whole item.
 
 - **Fancy Pitch Correct v2.6.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Readable canvas, zoom on both axes, one top bar:
