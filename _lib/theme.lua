@@ -57,7 +57,7 @@
 --   icon_target={size=xl,pad=sm}->24px (WCAG 2.5.8 minimum target for frequent / destructive icon buttons)
 --   Pass via opts.preset: Theme.icon_btn(ctx, id, fn, {preset = L.icon_sm})
 --
--- FONTS -- Theme.font_sizes: small=12 default=14 medium=16 large=18 header=20
+-- FONTS -- Theme.font_sizes: small=11 default=13 medium=14 large=16 header=18  (Fira Sans, bundled in _lib/fonts/)
 --   create_fonts(ctx)          -> {default,small,medium,large,header,default_bold,medium_bold,large_bold}
 --   attach_fonts(ctx, fonts)   -> call once before first frame
 --   push_font(ctx, font, [sz]) -> bool (safe pcall, auto-resolves size from registry)
@@ -1052,35 +1052,93 @@ end
 -------------------------------------------------------------------------------
 --- Font families and size scale. Scripts must use Theme.font_sizes.* tokens
 --- and Theme.create_fonts() instead of calling ImGui_CreateFont directly.
+--- The bundled typeface is Fira Sans (SIL OFL 1.1, see fonts/OFL.txt), loaded
+--- from files in Theme.font_dir. If a file is missing or unreadable the same
+--- family is requested from the system, then plain sans-serif. Never an error.
 
-Theme.font_family      = "sans-serif"
-Theme.font_bold_family = "sans-serif Bold"
+-- Directory of this file, with a trailing separator ("" if it has none).
+local _lib_dir = (debug.getinfo(1, "S").source or ""):match("^@?(.*[/\\])") or ""
+
+Theme.font_dir             = _lib_dir .. "fonts/"
+Theme.font_files           = { regular = "FiraSans-Regular.otf", bold = "FiraSans-Bold.otf" }
+Theme.font_family          = "Fira Sans"
+Theme.font_bold_family     = "Fira Sans Bold"  -- used by ReaImGui < 0.10 only
+Theme.font_fallback_family = "sans-serif"
+--- "file", "family" or "system": where the regular weight came from.
+--- Set by Theme.create_fonts(). nil until then.
+Theme.font_source          = nil
 
 Theme.font_sizes = {
-  small   = 12,    -- labels, secondary text, table metadata
-  default = 14,    -- body text, standard UI elements
-  medium  = 16,    -- emphasized text, settings labels
-  large   = 18,    -- section headers, dialog titles
-  header  = 20,    -- primary headers, window titles
-  tooltip = 14,    -- tooltip text (kept for backward compat, = default)
+  small   = 11,    -- labels, secondary text, table metadata
+  default = 13,    -- body text, standard UI elements
+  medium  = 14,    -- emphasized text, settings labels
+  large   = 16,    -- section headers, dialog titles
+  header  = 18,    -- primary headers, window titles
+  tooltip = 13,    -- tooltip text (kept for backward compat, = default)
 }
 
 -------------------------------------------------------------------------------
 -- 9. FONT MANAGEMENT
 -------------------------------------------------------------------------------
 
+--- Creates one font, trying the font file, then the family, then sans-serif.
+--- Each attempt is pcall-protected; the first non-nil result wins.
+--- @param bold boolean  true for the bold weight
+--- @param size number  Pixel size (only used to pick the call shape on old ReaImGui)
+--- @param overrides table  create_fonts overrides (family / bold_family)
+--- @return userdata|nil font
+--- @return string source  "file", "family" or "system"
+local function _make_font(bold, size, overrides)
+  local new_api = reaper.ImGui_CreateFontFromFile ~= nil
+  local flags = 0
+  if bold and new_api and reaper.ImGui_FontFlags_Bold then
+    local okf, f = pcall(reaper.ImGui_FontFlags_Bold)
+    if okf and f then flags = f end
+  end
+
+  -- 1. bundled file (skipped when the caller names its own family)
+  if new_api and not overrides.family and not overrides.bold_family then
+    local path = Theme.font_dir .. (bold and Theme.font_files.bold or Theme.font_files.regular)
+    local fh = io.open(path, "rb")
+    if fh then
+      fh:close()
+      local ok, font = pcall(reaper.ImGui_CreateFontFromFile, path, 0, 0)
+      if ok and font then return font, "file" end
+    end
+  end
+
+  -- 2 and 3. family, then fallback family
+  local regular = overrides.family or Theme.font_family
+  local candidates = {}
+  if new_api then
+    if bold and overrides.bold_family then
+      candidates[1] = { overrides.bold_family, 0 }
+    else
+      candidates[1] = { regular, flags }
+    end
+    candidates[2] = { Theme.font_fallback_family, flags }
+  else
+    candidates[1] = { bold and (overrides.bold_family or Theme.font_bold_family) or regular, size }
+    candidates[2] = { Theme.font_fallback_family .. (bold and " Bold" or ""), size }
+  end
+  for i, c in ipairs(candidates) do
+    local ok, font = pcall(reaper.ImGui_CreateFont, c[1], c[2])
+    if ok and font then return font, (i == 1) and "family" or "system" end
+  end
+  return nil, "system"
+end
+
 --- Creates a complete set of shared fonts for a ReaImGui context.
 --- Call once at script startup, before the defer loop.
 --- Produces 8 fonts: default, small, medium, large, header (regular)
 ---                    default_bold, medium_bold, large_bold (bold)
+--- Sets Theme.font_source to where the regular weight came from.
 --- @param _ctx userdata  ImGui context (unused but kept for API consistency)
 --- @param overrides table|nil  Optional: { family="Arial", bold_family="Arial Bold", large=24, ... }
 --- @return table  Font table with keys: default, small, medium, large, header,
----                default_bold, medium_bold, large_bold
+---                default_bold, medium_bold, large_bold, tooltip
 function Theme.create_fonts(_ctx, overrides)
   overrides = overrides or {}
-  local family      = overrides.family      or Theme.font_family
-  local bold_family = overrides.bold_family or Theme.font_bold_family
   local sizes = {
     small   = overrides.small   or Theme.font_sizes.small,
     default = overrides.default or Theme.font_sizes.default,
@@ -1091,28 +1149,31 @@ function Theme.create_fonts(_ctx, overrides)
 
   local fonts = {}
   -- Regular weights
-  fonts.default = reaper.ImGui_CreateFont(family, sizes.default)
-  fonts.small   = reaper.ImGui_CreateFont(family, sizes.small)
-  fonts.medium  = reaper.ImGui_CreateFont(family, sizes.medium)
-  fonts.large   = reaper.ImGui_CreateFont(family, sizes.large)
-  fonts.header  = reaper.ImGui_CreateFont(family, sizes.header)
+  fonts.default, Theme.font_source = _make_font(false, sizes.default, overrides)
+  fonts.small   = _make_font(false, sizes.small,   overrides)
+  fonts.medium  = _make_font(false, sizes.medium,  overrides)
+  fonts.large   = _make_font(false, sizes.large,   overrides)
+  fonts.header  = _make_font(false, sizes.header,  overrides)
   -- Bold weights
-  fonts.default_bold = reaper.ImGui_CreateFont(bold_family, sizes.default)
-  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, sizes.medium)
-  fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, sizes.large)
+  fonts.default_bold = _make_font(true, sizes.default, overrides)
+  fonts.medium_bold  = _make_font(true, sizes.medium,  overrides)
+  fonts.large_bold   = _make_font(true, sizes.large,   overrides)
   -- Backward compat alias
   fonts.tooltip = fonts.default
 
   -- Store font→size mapping for push_font (ImGui_PushFont requires size arg)
   Theme._font_sizes = Theme._font_sizes or {}
-  Theme._font_sizes[fonts.default]      = sizes.default
-  Theme._font_sizes[fonts.small]        = sizes.small
-  Theme._font_sizes[fonts.medium]       = sizes.medium
-  Theme._font_sizes[fonts.large]        = sizes.large
-  Theme._font_sizes[fonts.header]       = sizes.header
-  Theme._font_sizes[fonts.default_bold] = sizes.default
-  Theme._font_sizes[fonts.medium_bold]  = sizes.medium
-  Theme._font_sizes[fonts.large_bold]   = sizes.large
+  local function register(font, size)
+    if font then Theme._font_sizes[font] = size end
+  end
+  register(fonts.default,      sizes.default)
+  register(fonts.small,        sizes.small)
+  register(fonts.medium,       sizes.medium)
+  register(fonts.large,        sizes.large)
+  register(fonts.header,       sizes.header)
+  register(fonts.default_bold, sizes.default)
+  register(fonts.medium_bold,  sizes.medium)
+  register(fonts.large_bold,   sizes.large)
 
   return fonts
 end

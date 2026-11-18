@@ -384,6 +384,17 @@ local function draw_typography_section()
   reaper.ImGui_Indent(ctx, L.md)
   vspace(L.md)
 
+  -- Font check: confirms which font loaded and that the UI symbols exist in it
+  Theme.section_divider(ctx, "FONT CHECK")
+  reaper.ImGui_Text(ctx, "Font source: " .. tostring(Theme.font_source))
+  local pushed_sym = Theme.push_font(ctx, fonts.default)
+  reaper.ImGui_Text(ctx, "\u{2713}  \u{25B8}  \u{25C0}  \u{25BE}  \u{2194}  \u{25CF}  \u{25CB}")
+  Theme.pop_font(ctx, pushed_sym)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+  reaper.ImGui_Text(ctx, "Seven symbols should show above. Boxes or gaps mean the font lacks them.")
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  vspace(L.md)
+
   local sample = "The quick brown fox jumps over the lazy dog"
   local font_list = {
     { "small",        fonts.small,        Theme.font_sizes.small,   "Labels, secondary text, metadata" },
