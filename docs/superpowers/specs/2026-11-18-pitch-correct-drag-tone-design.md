@@ -50,7 +50,7 @@ placed by ear as well as by eye. Today the script is silent until the drag is re
    `440 * 2 ^ ((note pitch - 69) / 12)`. On release it removes the effect. The Monitoring chain is global,
    not part of the project: no undo point (the dirty flag is unverified; see Builder's findings). Nothing to install, no file to generate. Costs:
    the effect is visible in the Monitoring FX window during a drag; it is heard after the master, so it is
-   not affected by track or master FX; if REAPER itself dies mid-drag the effect could be left behind (the
+   not affected by track or master FX, but it passes through the user's own Monitoring FX (see Builder's findings); if REAPER itself dies mid-drag the effect could be left behind (the
    script removes any leftover the next time it starts).
 2. **SWS preview player looping a generated sine file.** Clean, never touches any FX chain, has built-in
    fades. Costs: SWS becomes an optional requirement and a generated WAV file has to live on disk. The
@@ -89,7 +89,7 @@ My calls (correct any of them):
 ## Left to the builder
 
 - Add-per-drag versus keeping one bypassed instance while the window is open: pick whichever starts
-  without an audible delay in real REAPER. (Resolved: added per drag; see Builder's findings.)
+  without an audible delay in real REAPER. (Added per drag; only the add time, about 3 ms, was measured, not whether any delay is audible; see Builder's findings.)
 - Verify the Monitoring FX addressing (`TrackFX_AddByName` with `recFX`, index offset `0x1000000` on the
   master track) and `TrackFX_SetNamedConfigParm(..., "renamed_name", ...)` with `reaper-dev` before use. (Resolved: the real-REAPER tests a-h used both; see Builder's findings.)
 - Confirm in real REAPER that adding and removing a Monitoring FX makes no undo point and does not mark
@@ -109,4 +109,9 @@ My calls (correct any of them):
 - The effect is added per drag (about 3 ms) rather than kept bypassed on the chain.
 - Adding and removing a Monitoring FX left the project state count and the undo history unchanged in real REAPER. The "project modified" flag could not be checked, because the test project was already modified.
 - Real-REAPER tests a-h passed on 2026-11-18. These are the checks listed in Task 4 of `docs/superpowers/plans/2026-11-18-pitch-correct-drag-tone.md`: (a) the tone follows the note, (b) it stops after release, (c) the user's own Tone Generator is left alone, (d) closing mid-drag, a click only, and other zones, (e) a leftover tagged instance is removed at start, (f) the pitch range floor, (g) the Note Tone toggle, (h) a screenshot of the More menu.
+- The generator is inserted first in the Monitoring chain, so the tone obeys the user's own Monitoring FX (monitor trim, dim, correction). The cost: the user's other Monitoring FX shift one index during a drag.
+- On release the tone fades over about three frames rather than cutting at once, to avoid a click.
+- The tone only sounds while the mouse button is physically down; if the window is hidden mid-drag and the button is released, the tone stops.
+- Not yet judged by ear: whether the generator's own defaults (Wet -12 dB, Dry -6 dB) are ever heard in the instant between adding it and silencing it, and whether the three-step level ramp is smooth. If either is audible, the fallback is one silent instance kept for the session.
+- Not exercised in real REAPER: the missing-JSFX path and the top of the range (MIDI 127).
 - How the tone sounds (level, glide, any click at the start) has not been judged by ear.

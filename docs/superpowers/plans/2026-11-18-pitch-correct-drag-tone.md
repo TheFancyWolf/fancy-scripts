@@ -4,7 +4,7 @@
 
 **Goal:** While a note is pitch-dragged in Fancy Pitch Correct, a sine tone sounds at the note's pitch, switchable from the "…" (More) menu.
 
-**Architecture:** The script adds REAPER's stock `JS: Tone Generator` to the Monitoring FX chain (master track, `recFX = true`) when a pitch drag starts, sets its Base Frequency every frame, and removes it when the drag ends. One per-frame function (`K.tone_tick`) owns start, follow, fade and removal; one immediate function (`K.tone_kill`) serves every exit path.
+**Architecture:** The script adds REAPER's stock `JS: Tone Generator` to the Monitoring FX chain (master track, `recFX = true`) when a pitch drag starts, sets its Note / Octave / Fine Tune every frame, and removes it when the drag ends. One per-frame function (`K.tone_tick`) owns start, follow, fade and removal; one immediate function (`K.tone_kill`) serves every exit path.
 
 **Tech Stack:** Lua 5.4, ReaScript API, ReaImGui, `_lib/theme.lua`. No new extension.
 
@@ -26,7 +26,7 @@
 2. **The window is closed, or the target item changes, in the middle of a drag.** The tone stops and the effect is gone. (Task 4 test d.)
 3. **REAPER was killed mid-drag in an earlier session.** The leftover instance is removed when the script starts. (Task 4 test e.)
 4. **A note dragged below A0 (MIDI 21) or to MIDI 127.** The pitch is clamped to what the generator's Octave slider reaches (MIDI 21..127); no error. (Task 2 `K.tone_params`; Task 4 test f.)
-5. **The stock JSFX is missing or cannot be added.** One status message, no tone, the drag works, no retry on every frame. (Task 2; Task 4 test g.)
+5. **The stock JSFX is missing or cannot be added.** One status message, no tone, the drag works, no retry on every frame. (Task 2; not exercised in real REAPER; by code reading only.)
 
 ---
 
@@ -112,7 +112,7 @@ end
 
 ### Task 4: Real REAPER verification
 
-Follow the testing protocol. Use an analysed audio item. Read the Monitoring chain with a small console script or the bridge (count, `renamed_name`, Base Frequency, Wet Mix), not by ear.
+Follow the testing protocol. Use an analysed audio item. Read the Monitoring chain with a small console script or the bridge (count, `renamed_name`, Note / Octave / Fine Tune, Wet Mix), not by ear.
 
 - [ ] **a. Follows the note.** Hold a pitch drag on a note: one FX tagged `Fancy Pitch Correct Tone` is on the Monitoring chain; `440 * 2 ^ (Octave + Note / 12 + Fine Tune / 1200)` read from the FX is within 1 cent of the note's `center_pitch` at two different drag positions; Wet Mix reaches -18 dB.
 - [ ] **b. Stops.** After release (wait 0.5 s): no tagged FX on the chain. Undo history shows the pitch edit only; one Cmd+Z restores the note.
@@ -145,7 +145,7 @@ Follow the testing protocol. Use an analysed audio item. Read the Monitoring cha
 Run in real REAPER on 2026-11-18 (full output: the Task 1 report in the plan workspace).
 
 - `TrackFX_AddByName(master, "JS: Tone Generator", true, -1)` works (so does `"JS:synthesis/tonegenerator"`); monitoring FX are addressed as `0x1000000 + index`.
-- Adding, renaming, setting parameters and deleting leave `GetProjectStateChangeCount` and the undo history unchanged. The dirty flag did not flip either, but the project was already modified, so that one is rechecked on a clean project in Task 4.
+- Adding, renaming, setting parameters and deleting leave `GetProjectStateChangeCount` and the undo history unchanged. The dirty flag did not flip either, but the project was already modified, so that one was not rechecked on a clean project in Task 4 (the project was still modified).
 - Add takes about 2.8 ms (max 3.4), delete 0.05 ms: **add per drag**.
 - `renamed_name` sets and reads back; a never-renamed FX reads back an empty string. `TrackFX_GetFXGUID` works on monitoring indices and is stable.
 - Parameters take native units (dB, Hz) and are **quantised to the slider step**: Base Frequency 261.63 reads back 262. Hence Note / Octave / Fine Tune over a fixed 440 Hz (Task 2).
