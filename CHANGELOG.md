@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.6.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Fix: clicking the time ruler moves the edit cursor there (playback follows, as on REAPER's own ruler), so you can split or play from that spot. The ruler added in v2.6.0 took clicks along the top of the notes without acting on them. Double-click still shows the whole item.
+
 - **Fancy Pitch Correct v2.6.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Readable canvas, zoom on both axes, one top bar:
   - **Notes first**: notes are solid blocks in the accent colour (green once edited) with the item's own waveform drawn inside (REAPER's peaks for the item, scaled to its loudest sample; the analysis loudness stands in while the peaks are not built); the pitch trace and the playhead are the text colour, and the playhead has a head in the ruler. Note labels and pitch-centre spots show for the hovered and the selected notes only, on a pill beside the block.
   - **Pitch range**: the range fits the notes (at least an octave), not every analysis frame, so a stray octave error in the raw curve no longer squeezes the melody. A strip at the right edge shows the visible range within everything there is to see: drag it to scroll, drag an end to zoom, double-click to fit the notes. Alt+wheel zooms the pitch axis, Shift+wheel scrolls it.
