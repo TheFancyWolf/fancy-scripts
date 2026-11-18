@@ -573,6 +573,88 @@ test("states: a caller's own hover and pressed colours are pushed unchanged", fu
 end)
 
 -------------------------------------------------------------------------------
+-- Task 6: canvas palette
+-------------------------------------------------------------------------------
+
+-- The sorted keys of P.canvas before this plan (taken from HEAD before Task 6 edited anything)
+local CANVAS_KEYS = {
+  "anchor", "bypass_border", "bypass_title", "grid", "grid_dim", "grid_plain", "grid_plain_black", "grid_tonic",
+  "gutter_bg", "gutter_strip", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "handle", "handle_drag",
+  "handle_hover", "key_black", "key_dim_black", "key_dim_white", "key_outline", "key_plain_black", "key_text_black",
+  "key_text_dim_black", "key_text_dim_white", "key_text_plain_black", "key_text_plain_white", "key_text_tonic_black",
+  "key_text_tonic_white", "key_text_white", "key_tonic_black", "key_tonic_strip", "key_tonic_white", "key_white",
+  "marker_split", "marker_split_text", "marquee_border", "marquee_fill", "marquee_text", "note_border",
+  "note_bypassed", "note_bypassed_border", "note_edit_mark", "note_edited", "note_edited_border", "note_fill",
+  "note_label", "note_label_edited", "note_label_selected", "note_selected", "note_selected_border",
+  "note_selected_edited", "note_wave", "overview_bg", "overview_note", "pill_bg", "pill_text", "playhead", "preview",
+  "row", "row_black", "row_dim", "row_dim_black", "row_plain", "row_plain_black", "row_tint", "row_tonic",
+  "row_tonic_tint", "ruler_bg", "scrim", "spot", "trace", "trend", "vibrato", "view_border", "view_fill", "view_grip",
+  "zone_divider", "zone_drift", "zone_shift",
+}
+
+local CANVAS_PALETTES = { { mode = "fancy" }, { mode = "match", theme = REAPERTIPS }, { mode = "match", theme = LIGHT } }
+
+test("canvas: key set unchanged, both modes", function()
+  assert(#CANVAS_KEYS == 79)
+  for _, o in ipairs(CANVAS_PALETTES) do
+    local C = load_theme(o).build_palette().canvas
+    for _, k in ipairs(CANVAS_KEYS) do assert(C[k] ~= nil, k) end
+    for k in pairs(C) do assert(contains(CANVAS_KEYS, k), "new key " .. k) end
+  end
+end)
+
+test("canvas: curated values", function()
+  local P = load_theme({ mode = "fancy" }).build_palette(); local C = P.canvas
+  assert(C.row == 0x2E2E2EFF and C.row_black == 0x2B2B2BFF and C.row_tonic == 0x2E2E2EFF)
+  assert(C.row_dim == 0x282828FF and C.row_dim_black == 0x262626FF)
+  assert(C.row_plain == 0x2E2E2EFF and C.row_plain_black == 0x2A2A2AFF)
+  assert(C.grid_dim == 0x1D1D1DFF and C.grid_plain == 0x1D1D1DFF and C.grid_plain_black == 0x1D1D1DFF)
+  assert(C.gutter_bg == 0x333333FF and C.overview_bg == P.well)
+  assert(C.note_border == P.accent and C.note_edited_border == P.green and C.note_selected_border == 0xEDEDEDFF)
+  assert(C.marker_split & 0xFFFFFF00 == P.accent2 & 0xFFFFFF00, "split markers follow the secondary accent")
+end)
+
+test("canvas: contrast, all three palettes", function()
+  for _, o in ipairs(CANVAS_PALETTES) do
+    local C = load_theme(o).build_palette().canvas
+    local tag = (o.theme == LIGHT and "match light") or (o.theme and "match reapertips") or "fancy"
+    local function check(r, need, what)
+      assert(r >= need, string.format("%s: %s %.2f", tag, what, r))
+    end
+    local rows = { C.row, C.row_black, C.row_tonic, C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black }
+    for _, r in ipairs(rows) do
+      check(contrast(C.note_border, r), 3.0, "note border")
+      check(contrast(C.note_edited_border, r), 3.0, "edited note border")
+      check(contrast(C.note_selected_border, r), 3.0, "selection border")
+      check(contrast(C.note_label, composite(C.note_fill, r)), 4.5, "label on untouched note")
+      check(contrast(C.note_label_edited, composite(C.note_edited, r)), 4.5, "label on edited note")
+      check(contrast(C.note_label_selected, composite(C.note_selected, r)), 4.5, "label on selected note")
+      check(contrast(C.playhead, r), 3.0, "playhead")
+      check(contrast(C.trace, r), 3.0, "trace")
+    end
+    check(contrast(C.gutter_text, C.gutter_bg), 4.5, "gutter text")
+    check(contrast(C.gutter_text_dim, C.gutter_bg), 4.5, "gutter text dim")
+    check(contrast(C.pill_text, composite(C.pill_bg, C.row)), 4.5, "pill text")
+  end
+end)
+
+test("canvas: Match Theme keeps its derivation (the note column follows the theme's panel)", function()
+  for _, fx in ipairs({ REAPERTIPS, LIGHT }) do
+    local P = load_theme({ mode = "match", theme = fx }).build_palette()
+    assert(P.canvas.gutter_bg == P.panel, "gutter_bg is P.panel")
+    assert(P.canvas.ruler_bg == load_theme({}).with_alpha(P.panel, 0.90), "ruler_bg is P.panel at 90 %")
+  end
+end)
+
+test("canvas: curated ruler is the note column's grey; its labels read on it over every row", function()
+  local T = load_theme({ mode = "fancy" }); local P = T.build_palette(); local C = P.canvas
+  assert(C.ruler_bg == T.with_alpha(0x333333FF, 0.90))
+  for _, r in ipairs({ C.row, C.row_black, C.row_tonic, C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black }) do
+    assert(contrast(P.text_dim, composite(C.ruler_bg, r)) >= 4.5, "ruler labels (P.text_dim)")
+  end
+end)
+
+-------------------------------------------------------------------------------
 
 print(string.format("\n%d tests, %d failed", total, failures))
 os.exit(failures == 0 and 0 or 1)
