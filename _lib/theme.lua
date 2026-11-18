@@ -2742,15 +2742,18 @@ function Theme.header(ctx, opts)
   --    The strip runs from half the window padding above the row to the item spacing below it.
   do
     local dl = reaper.ImGui_GetWindowDrawList(ctx)
-    local _, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
+    local row_x, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
     local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
     local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
+    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
+    -- Right edge: the content edge plus its padding, so a vertical scrollbar stays uncovered
+    local x2 = math.min(win_x + win_w, row_x + avail_w + L.md)
     local y1 = row_y - L.md
     local y2 = row_y + hdr_h + L.sm
     reaper.ImGui_DrawList_PushClipRect(dl, win_x, win_y, win_x + win_w, win_y + win_h, false)
-    reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y1, win_x + win_w, y2, P.title)
+    reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y1, x2, y2, P.title)
     if opts.show_separator ~= false then
-      reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y2, win_x + win_w, y2 + 1, P.sep)
+      reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y2, x2, y2 + 1, P.sep)
     end
     reaper.ImGui_DrawList_PopClipRect(dl)
   end
