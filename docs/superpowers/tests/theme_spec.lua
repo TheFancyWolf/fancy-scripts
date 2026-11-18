@@ -489,6 +489,90 @@ test("widgets: every push has its pop, on every path", function()
 end)
 
 -------------------------------------------------------------------------------
+-- Task 4, fix round 1: hover / pressed states keep labels and icons readable in every palette
+-------------------------------------------------------------------------------
+
+local PALETTES = {
+  { "fancy", { mode = "fancy" } },
+  { "match reapertips", { mode = "match", theme = REAPERTIPS } },
+  { "match light", { mode = "match", theme = LIGHT } },
+}
+
+test("states: labels stay 4.5:1 on rest, hover and pressed fills, all palettes", function()
+  for _, pal in ipairs(PALETTES) do
+    local T, stub = load_theme(pal[2]); local P = T.get_palette()
+    local cases = {
+      { "toggle on", function() T.toggle_button("ctx", "id", "L", true) end },
+      { "toggle off", function() T.toggle_button("ctx", "id", "L", false) end },
+      { "toggle off, own bg", function() T.toggle_button("ctx", "id", "L", false, { inactive_bg = P.green }) end },
+      { "badge interactive", function() T.badge("ctx", "x", { interactive = true }) end },
+    }
+    for _, k in ipairs({ "green", "red", "yellow", "accent", "accent2" }) do
+      cases[#cases + 1] = { "badge " .. k, function() T.badge("ctx", "x", { color = P[k], interactive = true }) end }
+    end
+    for _, case in ipairs(cases) do
+      stub.calls = {}; case[2]()
+      local c = pushed_colors(stub)
+      local tag = pal[1] .. ", " .. case[1]
+      for _, state in ipairs({ "ImGui_Col_Button", "ImGui_Col_ButtonHovered", "ImGui_Col_ButtonActive" }) do
+        local fill = composite(c[state], P.bg)
+        local r = contrast(c.ImGui_Col_Text, fill)
+        assert(r >= 4.5, string.format("%s: %s %.2f", tag, state, r))
+      end
+      assert(c.ImGui_Col_ButtonHovered ~= c.ImGui_Col_Button, tag .. ": hover differs from rest")
+      assert(c.ImGui_Col_ButtonActive ~= c.ImGui_Col_Button, tag .. ": pressed differs from rest")
+    end
+  end
+end)
+
+test("states: icons stay 3:1 at rest, hovered and pressed, all palettes", function()
+  for _, pal in ipairs(PALETTES) do
+    for _, which in ipairs({ "text", "text_dim" }) do
+      for _, state in ipairs({ "rest", "hover", "active" }) do
+        local T, stub = load_theme(pal[2]); local P = T.get_palette()
+        local seen
+        local function icon(_, _, _, _, col) seen = col end
+        stub.reaper.ImGui_IsItemHovered = function() return state ~= "rest" end
+        stub.reaper.ImGui_IsItemActive = function() return state == "active" end
+        stub.calls = {}
+        T.icon_btn("ctx", "##i", icon, which == "text_dim" and { color = P.text_dim } or nil)
+        local c = pushed_colors(stub)
+        local face = state == "rest" and P.bg
+          or composite(state == "hover" and c.ImGui_Col_ButtonHovered or c.ImGui_Col_ButtonActive, P.bg)
+        local r = contrast(seen, face)
+        assert(r >= 3.0, string.format("%s, icon_btn %s %s: %.2f", pal[1], which, state, r))
+        if state == "hover" and which == "text" then
+          local dark_ui = contrast(P.text, 0x000000FF) > contrast(P.text, 0xFFFFFFFF)
+          assert(dark_ui == (contrast(seen, 0x000000FF) >= contrast(P.text, 0x000000FF)),
+            pal[1] .. ": hover brightening moves toward the text colour's extreme")
+        end
+        if which == "text" then
+          stub.calls = {}; seen = nil
+          T.icon_btn_colored("ctx", "##c", icon)
+          c = pushed_colors(stub)
+          local key = state == "rest" and "ImGui_Col_Button" or state == "hover" and "ImGui_Col_ButtonHovered"
+            or "ImGui_Col_ButtonActive"
+          r = contrast(seen, composite(c[key], P.bg))
+          assert(r >= 3.0, string.format("%s, icon_btn_colored %s: %.2f", pal[1], state, r))
+        end
+      end
+    end
+  end
+end)
+
+test("states: a caller's own hover and pressed colours are pushed unchanged", function()
+  local T, stub = load_theme({ mode = "match", theme = LIGHT })
+  T.toggle_button("ctx", "id", "L", true, { active_hover = 0x010203FF, active_active = 0x040506FF })
+  local c = pushed_colors(stub)
+  assert(c.ImGui_Col_ButtonHovered == 0x010203FF and c.ImGui_Col_ButtonActive == 0x040506FF)
+  stub.calls = {}; T.badge("ctx", "x", { interactive = true, bg_hover = 0x070809FF, bg_active = 0x0A0B0CFF })
+  c = pushed_colors(stub)
+  assert(c.ImGui_Col_ButtonHovered == 0x070809FF and c.ImGui_Col_ButtonActive == 0x0A0B0CFF)
+  stub.calls = {}; T.icon_btn_colored("ctx", "##c", function() end, { bg_hover = 0x0D0E0FFF })
+  assert(pushed_colors(stub).ImGui_Col_ButtonHovered == 0x0D0E0FFF)
+end)
+
+-------------------------------------------------------------------------------
 
 print(string.format("\n%d tests, %d failed", total, failures))
 os.exit(failures == 0 and 0 or 1)

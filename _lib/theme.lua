@@ -1456,6 +1456,57 @@ function Theme.label_on(fill)
 end
 local label_on = Theme.label_on
 
+--- Hover and pressed shades of `fill` that keep `label` at `need`:1 (judged over palette.bg when translucent).
+--- Hover tries the fill lightened 12 % and pressed darkened 12 %, as on a dark UI; a step that takes the label
+--- under `need` is replaced by the same step the other way, then by smaller steps (9, 6, 3 %), so both states stay
+--- visibly apart from the rest fill. Pressed also avoids the hover colour (falling back to a stronger shade of the
+--- hover direction). When nothing reaches `need`, the candidate with the best contrast is used.
+--- @param fill integer  Rest fill 0xRRGGBBAA
+--- @param label integer  Label (or icon) colour drawn on it
+--- @param need number|nil  Required contrast (default 4.5)
+--- @return integer hover, integer pressed
+local function _shade_states(fill, label, need)
+  need = need or 4.5
+  local P = _get_palette()
+  local function ratio(c) return contrast_over(label, composite_over(c, P.bg)) end
+  local function pick(first, second, avoid, extra)
+    local best, best_r
+    local list = {}
+    for _, f in ipairs({ 0.12, 0.09, 0.06, 0.03 }) do
+      list[#list + 1] = first(fill, f)
+      list[#list + 1] = second(fill, f)
+    end
+    for _, c in ipairs(extra or {}) do list[#list + 1] = c end
+    for _, c in ipairs(list) do
+      if c ~= fill and c ~= avoid then
+        local r = ratio(c)
+        if r >= need then return c end
+        if not best_r or r > best_r then best, best_r = c, r end
+      end
+    end
+    return best or first(fill, 0.12)
+  end
+  local hover = pick(lighten, darken)
+  local hover_dir = (luminance(hover) >= luminance(fill)) and lighten or darken
+  local other = hover_dir == lighten and darken or lighten
+  local pressed = pick(other, hover_dir, hover, { hover_dir(fill, 0.24), hover_dir(fill, 0.18) })
+  return hover, pressed
+end
+
+--- Icon colour for a hovered or pressed icon button: `col` moved 25 % toward the text colour's extreme
+--- (lighter on a dark UI, darker on a light one), then fitted to 3:1 on every face it is drawn on.
+--- @param col integer  Resting icon colour
+--- @param faces table  Opaque or translucent faces behind the icon (judged over palette.bg)
+--- @return integer
+local function _icon_on(col, faces)
+  local P = _get_palette()
+  local dark_ui = luminance(P.text) > luminance(P.bg)
+  local c = dark_ui and lighten(col, 0.25) or darken(col, 0.25)
+  local under = {}
+  for i, f in ipairs(faces) do under[i] = composite_over(f, P.bg) end
+  return fit_contrast(c, under, 3.0)
+end
+
 --- True when the last item is hovered long enough to show its tooltip: ReaImGui's own tooltip delay
 --- (HoveredFlags_ForTooltip) and also while the item is disabled, so `opts.tooltip` can explain why.
 --- @param ctx userdata  ImGui context
@@ -1626,7 +1677,8 @@ end
 ---   opts.h         (number)  Button height override
 ---   opts.icon_size (number)  Icon size override
 ---   opts.color     (number)  Icon color    (default: palette.text)
----   opts.hover_color (number) Icon color on hover (default: icon color lightened 25%)
+---   opts.hover_color (number) Icon color on hover (default: icon color moved 25% toward the text colour's
+---                             extreme, fitted to 3:1 on the hover and pressed faces)
 ---   opts.tooltip   (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.icon_btn(ctx, id, icon_fn, opts)
@@ -1653,7 +1705,10 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local hs = icon_sz * 0.5
   local hover = reaper.ImGui_IsItemHovered(ctx)
   local base_col = opts.color or P.text
-  local draw_col = hover and (opts.hover_color or lighten(base_col, 0.25)) or base_col
+  local draw_col = base_col
+  if hover then
+    draw_col = opts.hover_color or _icon_on(base_col, { P.btn_h, P.btn_a })
+  end
   icon_fn(dl, cx, cy, hs, draw_col)
   if hover then
     reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_Hand())   -- hovered and enabled
@@ -1675,7 +1730,7 @@ end
 ---   opts.w         (number)  Button width override
 ---   opts.h         (number)  Button height override
 ---   opts.icon_size (number)  Icon size override
----   opts.icon_color (number) Icon color    (default: palette.text)
+---   opts.icon_color (number) Icon color    (default: palette.text, fitted to 3:1 on the face of each state)
 ---   opts.bg        (number)  Button bg     (default: palette.btn)
 ---   opts.bg_hover  (number)  Hover bg      (default: palette.btn_h)
 ---   opts.bg_active (number)  Active bg     (default: palette.btn_a)
@@ -1689,9 +1744,10 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   local icon_sz = opts.icon_size or preset.size
   local btn_w = opts.w or (icon_sz + preset.pad * 2)
   local btn_h = opts.h or btn_w
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        opts.bg        or P.btn)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.bg_hover  or P.btn_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.bg_active or P.btn_a)
+  local bg, bg_h, bg_a = opts.bg or P.btn, opts.bg_hover or P.btn_h, opts.bg_active or P.btn_a
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
   local pressed = reaper.ImGui_Button(ctx, "##" .. id, btn_w, btn_h)
   reaper.ImGui_PopStyleColor(ctx, 3)
   local dl = reaper.ImGui_GetWindowDrawList(ctx)
@@ -1700,8 +1756,15 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   local cx = (rx + rx2) * 0.5
   local cy = (ry + ry2) * 0.5
   local hs = icon_sz * 0.5
-  icon_fn(dl, cx, cy, hs, opts.icon_color or P.text)
-  if reaper.ImGui_IsItemHovered(ctx) then
+  local hovered = reaper.ImGui_IsItemHovered(ctx)
+  local icon_col = opts.icon_color
+  if not icon_col then
+    -- Default icon: palette.text, fitted to 3:1 on the face it sits on in this state
+    local face = reaper.ImGui_IsItemActive(ctx) and bg_a or hovered and bg_h or bg
+    icon_col = fit_contrast(P.text, { composite_over(face, P.bg) }, 3.0)
+  end
+  icon_fn(dl, cx, cy, hs, icon_col)
+  if hovered then
     reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_Hand())   -- hovered and enabled
   end
   if opts.tooltip and _hovered_for_tooltip(ctx) then
@@ -2001,13 +2064,15 @@ end
 ---   opts.pad_x          (number)  Horizontal padding override (default: preset or FramePadding)
 ---   opts.pad_y          (number)  Vertical padding override (default: preset or FramePadding)
 ---   opts.active_bg      (number)  Active background (default: palette.btn_on, a solid fill)
----   opts.active_hover   (number)  Active hovered background (default: active background lightened 12%)
----   opts.active_active  (number)  Active pressed background (default: active background darkened 12%)
+---   opts.active_hover   (number)  Active hovered background (default: active background lightened 12%, or
+---                                 shaded the other way / less where that keeps the label at 4.5:1)
+---   opts.active_active  (number)  Active pressed background (default: active background darkened 12%, same rule)
 ---   opts.active_text    (number)  Active text color (default: palette.on_text; Theme.label_on(active_bg)
 ---                                 when only active_bg is given)
 ---   opts.inactive_bg    (number)  Inactive background (default: palette.btn, a plain button face)
----   opts.inactive_hover (number)  Inactive hovered background (default: palette.btn_h, or inactive_bg lightened 12%)
----   opts.inactive_active(number)  Inactive pressed background (default: palette.btn_a, or inactive_bg darkened 12%)
+---   opts.inactive_hover (number)  Inactive hovered background (default: palette.btn_h, or inactive_bg shaded
+---                                 as for active_hover)
+---   opts.inactive_active(number)  Inactive pressed background (default: palette.btn_a, or inactive_bg shaded)
 ---   opts.inactive_text  (number)  Inactive text color (default: palette.text; Theme.label_on(inactive_bg)
 ---                                 when only inactive_bg is given)
 ---   opts.tooltip        (string)  Hover tooltip text
@@ -2028,16 +2093,19 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
   if is_active then
     -- On: a solid fill (no tint); hover lightens it, press darkens it
     bg       = opts.active_bg     or P.btn_on
-    bg_h     = opts.active_hover  or lighten(bg, 0.12)
-    bg_a     = opts.active_active or darken(bg, 0.12)
     text_col = opts.active_text   or (opts.active_bg and label_on(bg) or P.on_text)
+    local sh, sa = _shade_states(bg, text_col)
+    bg_h     = opts.active_hover  or sh
+    bg_a     = opts.active_active or sa
   else
     -- Off: a plain button face
     local custom = opts.inactive_bg
     bg       = custom or P.btn
-    bg_h     = opts.inactive_hover  or (custom and lighten(bg, 0.12) or P.btn_h)
-    bg_a     = opts.inactive_active or (custom and darken(bg, 0.12) or P.btn_a)
     text_col = opts.inactive_text   or (custom and label_on(bg) or P.text)
+    local sh, sa
+    if custom then sh, sa = _shade_states(bg, text_col) end
+    bg_h     = opts.inactive_hover  or sh or P.btn_h
+    bg_a     = opts.inactive_active or sa or P.btn_a
   end
 
   local pushed_vars = 0
@@ -2099,8 +2167,9 @@ Theme.badge_button = Theme.toggle_button
 ---   opts.text_color     (number)  Explicit text color override (default: Theme.label_on(fill); with both
 ---                                 opts.color and opts.bg, color lightened 70% when that reads on bg)
 ---   opts.bg             (number)  Explicit background color override (default: opts.color or palette.well)
----   opts.bg_hover       (number)  Hover background when interactive (default: fill lightened 12%)
----   opts.bg_active      (number)  Pressed background when interactive (default: fill darkened 12%)
+---   opts.bg_hover       (number)  Hover background when interactive (default: fill lightened 12%, or shaded
+---                                 the other way / less where that keeps the label at 4.5:1)
+---   opts.bg_active      (number)  Pressed background when interactive (default: fill darkened 12%, same rule)
 ---   opts.w              (number)  Badge width (default: 0 = auto from text + frame padding)
 ---   opts.h              (number)  Badge height (default: 0 = auto from font + frame padding)
 ---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
@@ -2135,8 +2204,9 @@ function Theme.badge(ctx, label, opts)
       text_col = P.text
     end
   end
-  local bg_h = opts.bg_hover or lighten(bg, 0.12)
-  local bg_a = opts.bg_active or darken(bg, 0.12)
+  local sh, sa = _shade_states(bg, text_col)
+  local bg_h = opts.bg_hover or sh
+  local bg_a = opts.bg_active or sa
 
   local btn_w = opts.w or 0
   local btn_h = opts.h or 0
