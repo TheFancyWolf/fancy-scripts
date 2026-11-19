@@ -214,6 +214,9 @@ local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
 
+  -- The most a Scoop may move one onset frame, in semitones (see K.correction_build)
+  SCOOP_MAX_ST = 3.0,
+
   -- How long a status message replaces the hint on the canvas's status pill
   STATUS_SECONDS = 4.0,
 
@@ -1971,6 +1974,7 @@ end
 ---           ramps and glides)
 K.correction_build = function(notes, item_len)
   local all_points, spans, ranges = {}, {}, {}
+  local scooped = {}   -- [note index] = true: its onset frames carry a scoop correction
   local num_notes = #notes
 
   -- 1. Precalculate continuous frame shifts for every note
@@ -2002,17 +2006,27 @@ K.correction_build = function(notes, item_len)
           end
         end
 
-        -- Scoop/glide shaping: blend onset frames toward body target
+        -- Scoop: flatten the slide into the note. The onset frames are pulled toward the pitch the corrected
+        -- note settles at right after the onset: fully on the first frame at 100 %, easing out to the note's
+        -- normal correction by the end of the onset (so the onset meets the body without a step). 0 % leaves
+        -- the slide as sung. The pull of one frame is limited to K.SCOOP_MAX_ST, so a mis-detected onset frame
+        -- (an octave error) cannot write a jump of that size into the envelope.
         local scoop = (n.controls and n.controls.scoop_shape) or 0
         if scoop > 0 and is_mod and n.voiced_start_idx then
           local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
-          if onset_end > 1 and onset_end < #n.frames then
-            local body_shift = n.frame_shifts[math.min(onset_end + 1, #n.frames)]
+          local settle = n.frames[onset_end + 1]
+          if onset_end > 1 and onset_end < #n.frames and settle and settle.note then
+            local settle_pitch = settle.note + n.frame_shifts[onset_end + 1]
             for i = 1, onset_end do
-              local onset_u = i / onset_end  -- 0→1 across onset
-              local natural = n.frame_shifts[i]
-              n.frame_shifts[i] = natural + (body_shift - natural) * scoop * (1 - onset_u)
+              local sung = n.frames[i].note
+              if sung then
+                local natural = n.frame_shifts[i]
+                local pull = (settle_pitch - sung) - natural   -- what would put this frame on the settled pitch
+                pull = math.max(-K.SCOOP_MAX_ST, math.min(K.SCOOP_MAX_ST, pull))
+                n.frame_shifts[i] = natural + pull * scoop * (1 - (i - 1) / onset_end)
+              end
             end
+            scooped[idx] = true
             spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[onset_end].time, a = idx }
           end
         end
@@ -2097,7 +2111,9 @@ K.correction_build = function(notes, item_len)
     end
 
     -- B. NOTE BODY
-    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0))
+    -- A scooped onset differs from frame to frame like a Stability / Vibrato change does: its frames are written
+    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0)
+      or scooped[idx] == true)
     local body_t_start = n.start_time + trans_dur * 0.5
     local body_t_end = n.end_time - trans_dur * 0.5
 
@@ -5047,7 +5063,18 @@ local function draw_graph(draw_ctx, w, h)
       for _ in pairs(state.drag.orig_values or {}) do count = count + 1 end
       local count_suffix = count > 1 and string.format("  (%d notes)", count) or ""
       local tip
-      if state.drag.zone == "pitch" then
+      if state.drag.shift_mode then
+        -- Shift remaps the zones: the readout names the value that is changing, as the hover hint does
+        if state.drag.zone == "pitch" then
+          tip = string.format("Transition: %.0f ms%s",
+            d_note.controls.transition_ms or get_effective(d_note, "transition_ms"), count_suffix)
+        elseif state.drag.zone == "drift" then
+          tip = string.format("Onset Ramp: %.0f ms%s",
+            d_note.controls.onset_ramp_ms or get_effective(d_note, "onset_ramp_ms"), count_suffix)
+        else
+          tip = string.format("Scoop: %.0f%% corrected%s", (d_note.controls.scoop_shape or 0) * 100, count_suffix)
+        end
+      elseif state.drag.zone == "pitch" then
         local cp = d_note.controls.center_pitch
         local nearest = math.floor(cp + 0.5)
         local cents = math.floor((cp - nearest) * 100 + 0.5)
