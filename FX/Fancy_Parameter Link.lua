@@ -1522,7 +1522,8 @@ local function draw_info_modal()
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
-    if reaper.ImGui_BeginTabBar(ctx, "info_tab_bar") then
+    if reaper.ImGui_BeginTabBar(ctx, "info_tab_bar", reaper.ImGui_TabBarFlags_DrawSelectedOverline
+        and reaper.ImGui_TabBarFlags_DrawSelectedOverline() or reaper.ImGui_TabBarFlags_None()) then
       if reaper.ImGui_BeginTabItem(ctx, "Quick Start Guide") then
         reaper.ImGui_Spacing(ctx)
 

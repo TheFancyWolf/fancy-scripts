@@ -663,7 +663,8 @@ local function draw_widgets_section()
   local chg_tx, new_tx = reaper.ImGui_InputText(ctx, "##demo_raw_input", demo_raw_text)
   if chg_tx then demo_raw_text = new_tx end
   vspace(L.sm)
-  if reaper.ImGui_BeginTabBar(ctx, "##demo_raw_tabs") then
+  if reaper.ImGui_BeginTabBar(ctx, "##demo_raw_tabs", reaper.ImGui_TabBarFlags_DrawSelectedOverline
+      and reaper.ImGui_TabBarFlags_DrawSelectedOverline() or reaper.ImGui_TabBarFlags_None()) then
     if reaper.ImGui_BeginTabItem(ctx, "Tab one##demo_raw_tab1") then
       reaper.ImGui_Text(ctx, "Selected tab: tab_sel face. The other tab is tab, tab_h on hover.")
       reaper.ImGui_EndTabItem(ctx)
