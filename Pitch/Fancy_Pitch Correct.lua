@@ -404,7 +404,9 @@ local state = {
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
   raw_cache = {},           -- [guid] = raw P_EXT string last written or loaded by this script
   missing_takes = {},       -- [guid] = true when the take no longer resolves (row is kept in the sidebar)
-  stale_takes = {},         -- [guid] = true: a global default changed after the take's envelope was written and the take was not re-applied since
+  stale_takes = {},         -- [guid] = true: the take's pitch envelope is not what today's settings and its notes would write (K.envelope_check)
+  stale_env = {},           -- [guid] = { points }: the envelope a stale take really holds, for the preview curve of the open item
+  stale_queue = {},         -- guids whose envelope is still to be compared (one per frame, K.stale_check_step)
   last_seen_sel_guid = nil, -- GUID of the first selected audio item seen last frame (edge-triggered tracker)
   nudge_burst = nil,        -- pending arrow-key nudge { total_st, last_time, keys = { up, down }, guid }
 
@@ -1823,6 +1825,7 @@ local function switch_active_target(guid, take_obj)
       local found = false
       for _, g in ipairs(state.session_order) do if g == guid then found = true; break end end
       if not found then table.insert(state.session_order, guid) end
+      state.stale_queue[#state.stale_queue + 1] = guid   -- a take that just joined the session: compare its envelope
     end
   end
 
@@ -1868,6 +1871,7 @@ local function sync_with_project()
   local count = reaper.GetProjectStateChangeCount(0)
   if state.last_change_count == count then return end
   state.last_change_count = count
+  K.queue_stale_checks()   -- an undo, a redo or an edit in REAPER may have changed an envelope
 
   local i = 1
   while i <= #state.session_order do
@@ -2190,7 +2194,10 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   end
 
   -- The envelope is rewritten from the model with today's defaults and overrides: the take is current again
-  if state.target_take_guid then state.stale_takes[state.target_take_guid] = nil end
+  if state.target_take_guid then
+    state.stale_takes[state.target_take_guid] = nil
+    state.stale_env[state.target_take_guid] = nil
+  end
 
   reaper.Undo_BeginBlock()
   state.undo_open = true
@@ -2254,6 +2261,100 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   reaper.UpdateArrange()
   end_apply(take, undo_desc)
   return true
+end
+
+--- Whether the pitch envelope of the session take `guid` differs from what its note model and today's settings
+--- would write: a global default changed while another item was open, the script that wrote it computed the
+--- correction differently, or the item was changed since. It is read from the project, so it is true after a
+--- restart of the script too (a flag kept in memory was lost there, and the item then looked current).
+--- Returns stale (boolean) and, when stale, the points { time, val } the envelope holds, sorted by time.
+K.envelope_check = function(guid)
+  local data = state.session_takes[guid]
+  local take = data and resolve_take_by_guid(guid, true) or nil
+  if not take then return false end
+  local item = reaper.GetMediaItemTake_Item(take)
+  if not item then return false end
+  local notes = (guid == state.target_take_guid) and state.notes or data.notes
+  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0)
+
+  local function by_time(p, q)
+    if p.time ~= q.time then return p.time < q.time end
+    return p.val < q.val
+  end
+
+  -- What apply_envelope_to_take would write. get_effective reads the item values of the target take, so the
+  -- take stands in as the target for the length of the calculation.
+  local expected = {}
+  if notes and #notes > 0 then
+    local saved = state.target_take_guid
+    state.target_take_guid = guid
+    local ok, build = pcall(K.correction_build, notes, item_len)
+    state.target_take_guid = saved
+    if not ok then return false end   -- a model this script cannot compute is not called stale
+    for _, pt in ipairs(rdp_simplify(build.points, 0.01)) do
+      expected[#expected + 1] = { time = math.max(0.0, math.min(item_len, pt.time)), val = pt.val }
+    end
+    table.sort(expected, by_time)
+  end
+
+  -- What the item holds. The script writes Bezier points (shape 5); a point of another shape is not its own
+  -- (REAPER keeps a default point at the start of an envelope).
+  local actual, written = {}, {}
+  local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+  if env then
+    for i = 0, (reaper.CountEnvelopePointsEx(env, -1) or 0) - 1 do
+      local ok, t, v, shape = reaper.GetEnvelopePointEx(env, -1, i)
+      if ok then
+        local pt = { time = t, val = v }
+        actual[#actual + 1] = pt
+        if shape == 5 then written[#written + 1] = pt end
+      end
+    end
+  end
+  table.sort(actual, by_time)
+  table.sort(written, by_time)
+  -- That default point is Bezier when the user's default point shape is: one extra zero at the very start is not a difference
+  if #written == #expected + 1 and math.abs(written[1].time) < 0.0001 and math.abs(written[1].val) < 0.0001 then
+    table.remove(written, 1)
+  end
+
+  local same = (#written == #expected)
+  if same then
+    for i = 1, #expected do
+      if math.abs(written[i].time - expected[i].time) > 0.0002 or math.abs(written[i].val - expected[i].val) > 0.0002 then
+        same = false
+        break
+      end
+    end
+  end
+  if same then return false end
+  return true, actual
+end
+
+--- Ask for the envelope of every session take to be compared again (after the project changed, or a global
+--- default did). The work is done one take per frame by K.stale_check_step.
+K.queue_stale_checks = function()
+  local q = state.stale_queue
+  for i = #q, 1, -1 do q[i] = nil end
+  for i, guid in ipairs(state.session_order) do q[i] = guid end
+end
+
+--- Compare the envelope of one queued take (once per frame at most; nothing when the queue is empty). It waits
+--- while a gesture or an analysis is in progress: the model is then ahead of the envelope on purpose.
+K.stale_check_step = function(sctx)
+  local q = state.stale_queue
+  if #q == 0 then return end
+  if state.is_analyzing or state.drag or state.edge_drag or state.nudge_burst or state.undo_open
+      or reaper.ImGui_IsAnyItemActive(sctx) then
+    return
+  end
+  local guid = table.remove(q)
+  local stale, points = false, nil
+  if state.session_takes[guid] and not state.missing_takes[guid] then
+    stale, points = K.envelope_check(guid)
+  end
+  state.stale_takes[guid] = stale or nil
+  state.stale_env[guid] = stale and { points = points } or nil
 end
 
 --- Commit the pending arrow-key nudge (if any) as ONE named undo point.
@@ -4945,6 +5046,20 @@ local function draw_graph(draw_ctx, w, h)
   -- (K.correction_build), so a scoop, a fade or a glide shows exactly as it will sound.
   if state.show_preview and state.notes and #state.notes > 0 and state.results and #state.results > 1 then
     local build = K.correction_view(state.notes, target_item)
+    -- An outdated item holds another envelope than today's settings would write: the curve shows what it really
+    -- holds, except while a value or a note is being changed (then it previews what the release will write).
+    local held = state.target_take_guid and state.stale_takes[state.target_take_guid]
+      and state.stale_env[state.target_take_guid] or nil
+    local hint = state.setting_hint
+    local changing = state.drag or state.edge_drag or state.nudge_burst
+      or (hint.dragging and hint.frame >= (reaper.ImGui_GetFrameCount(draw_ctx) or 0) - 1)
+    if held and not changing then
+      if held.base ~= build then
+        K.held_gen = (K.held_gen or 0) - 1
+        held.base, held.ranges, held.gen = build, build.ranges, K.held_gen
+      end
+      build = held
+    end
     if #build.ranges > 0 then
       local r0, r1 = visible_range(state.results)
       local lines, line_n = K.preview_lines(state.results, r0, r1, t_to_x, build)
@@ -5813,7 +5928,7 @@ local BODY = {
   tag_missing = "Item missing",
   tag_outdated = "outdated",
   tip_missing = "The item no longer exists in this project",
-  tip_outdated = "A global default changed after this item's envelope was written. Edit or re-analyze it to refresh.",
+  tip_outdated = "This item's envelope is not what the current settings would write (a setting changed after it was written). Edit or re-analyze it to refresh.",
   -- The banner for items whose saved analysis cannot be read (see K.unreadable_guids) and its Clear button
   unreadable_fmt = "%d %s: saved analysis couldn't be read",
   unreadable_clear = "Clear",
@@ -7823,6 +7938,7 @@ do
   local BAR_REASON_NOT_ANALYZED = "Analyze an item first"
   local BAR_REASON_NOTE_OVERRIDE = "Overridden on this note. Right-click the note to change it."
   local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
+  local BAR_HINT_OUTDATED = "Outdated: this item's envelope is from other settings. Edit a note to rewrite it."
 
   -- Value badges: label format, edit range. The item override menu and the edit popup use the key.
   local BAR_BADGES = {
@@ -7893,6 +8009,7 @@ do
         end
       end
     end
+    K.queue_stale_checks()   -- the envelopes are compared next: a value put back to what an item was written with clears its mark
     return n
   end
 
@@ -7945,7 +8062,11 @@ do
     end
     if editing then
       local sel_count = bar_selection()
-      if sel_count == 0 then return BAR_HINT_SELECT_NOTE end
+      if sel_count == 0 then
+        local guid = state.target_take_guid
+        if guid and state.stale_takes[guid] then return BAR_HINT_OUTDATED end
+        return BAR_HINT_SELECT_NOTE
+      end
       if sel_count > 1 then return string.format("%d notes selected", sel_count) end
     end
     return ""
@@ -8322,6 +8443,7 @@ local function loop_body()
   -- Follow REAPER's undo / redo / project changes (one cheap count check per frame)
   sync_with_project()
   process_analysis_step()
+  K.stale_check_step(ctx)
 
   local P = Theme.get_palette()
   local L = Theme.layout
@@ -8659,6 +8781,7 @@ local function main()
 
   -- Startup reads (scan / load) are in sync with the project: start watching for changes from here
   note_own_write()
+  K.queue_stale_checks()   -- which of the stored envelopes are not what today's settings would write
 
   K.tone_kill()   -- removes a tone a crashed session left on the Monitoring FX chain
   loop()
