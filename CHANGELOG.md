@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.8.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Scrolling follows your mouse: the wheel scrolls the pitch axis (up and down), and a horizontal scroll scrolls the timeline, whether it comes from Shift + wheel, a trackpad, a tilt wheel or a mouse's own horizontal-scroll button. The two were the other way round. Cmd/Ctrl + wheel still zooms the timeline and Alt + wheel the pitch axis. The Help rows are updated.
+
 - **Fancy Pitch Correct v2.8.0 (`Pitch/Fancy_Pitch Correct.lua`)** — New look: matches the Reapertips Theme. Greys with a blue accent, flat outlined buttons, recessed slider grooves and input boxes, square-ish corners, tighter spacing and Fira Sans type. The canvas follows the same look: quiet recessed rows, blue notes (green once edited), a violet for split markers and the drift zone. Layout, controls and behaviour are unchanged. Symbols the new font lacks (check marks, arrows, dots) are drawn as small icons or plain text.
 
 - **Design system (`_lib/theme.lua`, `_lib/fonts/`)** — The curated mode takes the look of the Reapertips REAPER theme, and the mode that was called "Fancy Dark" is now called **"Fancy"** (your saved choice carries over):

@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.8.0
+-- @version 2.8.1
 -- @changelog
---   New look: matches the Reapertips Theme (greys, blue accent, flat outlined controls, Fira Sans)
+--   Wheel scrolls the pitch axis; Shift + wheel or a horizontal scroll (trackpad, tilt wheel, mouse scroll button) scrolls the timeline
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -295,7 +295,7 @@ local K = {
   -- Timeline view of the canvas: zoom, scroll and ruler (see draw_graph)
   ZOOM_STEP = 1.25,        -- one Ctrl/Cmd + wheel notch divides (up) or multiplies (down) the visible span by this
   MIN_VIEW_SPAN_S = 0.25,  -- never zoom in beyond this many seconds (an item shorter than this cannot be zoomed)
-  SCROLL_STEP = 0.1,       -- one plain wheel notch scrolls the window by this fraction of its span
+  SCROLL_STEP = 0.1,       -- one wheel notch scrolls the window by this fraction of its span
   VIEW_EPS_S = 1e-6,       -- a window this close to the whole item counts as "not zoomed"
   RULER_MINOR_DIV = 5,     -- minor ticks per major tick
   RULER_WIDEN = 1.5,       -- a label interval that does not fit grows to the next 1-2-5 step above interval * this
@@ -3515,29 +3515,35 @@ local function draw_graph(draw_ctx, w, h)
   local on_pstrip = is_canvas_hovered and mx > px + w and my <= py + h
 
   if is_canvas_hovered and not gesture and not state.view_drag then
-    -- Ctrl/Cmd + wheel zooms the timeline around the pointer, Alt + wheel zooms the pitch axis around it,
-    -- Shift + wheel scrolls the pitch axis, and the plain wheel scrolls the timeline (a no-op while the whole
-    -- item is visible). Ignored during a gesture (the mapping must not change under it) and while the script
-    -- window itself can scroll (the wheel belongs to it then).
+    -- Scrolling follows the axis the device sends: a vertical wheel scrolls the pitch axis, a horizontal one
+    -- (trackpad, tilt wheel, a mouse's own horizontal-scroll button) scrolls the timeline (a no-op while the
+    -- whole item is visible). Shift + wheel scrolls the timeline too: macOS already sends it as a horizontal
+    -- wheel, elsewhere it is turned sideways here. Ctrl/Cmd + wheel zooms the timeline around the pointer and
+    -- Alt + wheel zooms the pitch axis around it. Ignored during a gesture (the mapping must not change under
+    -- it) and while the script window itself can scroll (the wheel belongs to it then).
     local wheel_y, wheel_x = reaper.ImGui_GetMouseWheel(draw_ctx)
     wheel_y, wheel_x = wheel_y or 0, wheel_x or 0
     if (reaper.ImGui_GetScrollMaxY(draw_ctx) or 0) > 0 then wheel_y, wheel_x = 0, 0 end
     local span = vt1 - vt0
     local wheel_mods = reaper.ImGui_GetKeyMods(draw_ctx) or 0
-    local notches = wheel_y ~= 0 and wheel_y or wheel_x   -- Shift turns the wheel sideways on some systems: either axis counts
-    if wheel_y ~= 0 and (wheel_mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then
+    if wheel_x == 0 and (wheel_mods & reaper.ImGui_Mod_Shift()) ~= 0 then wheel_y, wheel_x = 0, wheel_y end
+    local notches = wheel_y ~= 0 and wheel_y or wheel_x   -- the zooms take either axis
+    if notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then
       local frac = math.max(0, math.min(1, (mx - px) / math.max(w, 1)))
-      set_view(x_to_t(px + frac * w), frac, span / K.ZOOM_STEP ^ wheel_y)
+      set_view(x_to_t(px + frac * w), frac, span / K.ZOOM_STEP ^ notches)
     elseif notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Alt()) ~= 0 then
       local frac = math.max(0, math.min(1, (py + h - my) / math.max(h, 1)))   -- 0 = bottom of the note area, 1 = top
       local anchor = min_note + frac * note_range
       local new_span = note_range / K.ZOOM_STEP ^ notches
       set_pitch_view(anchor - frac * new_span, anchor + (1 - frac) * new_span)
-    elseif notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Shift()) ~= 0 then
-      local step = notches * K.SCROLL_STEP * note_range   -- wheel up = higher notes
-      set_pitch_view(min_note + step, max_note + step)
-    elseif span < duration - K.VIEW_EPS_S and notches ~= 0 then
-      set_view(vt0 - notches * K.SCROLL_STEP * span, 0, span)   -- wheel up / left = earlier
+    else
+      if wheel_y ~= 0 then
+        local step = wheel_y * K.SCROLL_STEP * note_range   -- wheel up = higher notes
+        set_pitch_view(min_note + step, max_note + step)
+      end
+      if wheel_x ~= 0 and span < duration - K.VIEW_EPS_S then
+        set_view(vt0 - wheel_x * K.SCROLL_STEP * span, 0, span)   -- wheel left = earlier
+      end
     end
     -- Double-click on the ruler shows the whole item again
     if on_ruler and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
@@ -6366,9 +6372,9 @@ K.INFO_SECTIONS = {
     { "Drag Note Edge", "Trim note start / end boundary" },
     { "Click the time ruler", "Move the edit cursor (playback follows)" },
     { K.MOD_LABEL .. " + Wheel", "Zoom the timeline" },
-    { "Wheel", "Scroll the timeline (when zoomed)" },
+    { "Wheel", "Scroll the pitch axis" },
     { "Alt + Wheel", "Zoom the pitch axis" },
-    { "Shift + Wheel", "Scroll the pitch axis" },
+    { "Shift + Wheel or horizontal scroll", "Scroll the timeline (when zoomed)" },
     { "Z", "Zoom to the selected notes" },
     { "F", "Show the whole item, fit the pitch range" },
     { "Drag the overview strip", "Scroll; drag an end to zoom" },

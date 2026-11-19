@@ -87,9 +87,9 @@ A floating window is never narrower than plan 6 needs.
 | Input | Result |
 |---|---|
 | Cmd/Ctrl + wheel | zoom time around the pointer (unchanged) |
-| Wheel | scroll time when zoomed (unchanged) |
+| Wheel | scroll pitch (v2.8.1: follows the device's scroll axis) |
 | Alt + wheel | zoom pitch around the pointer |
-| Shift + wheel | scroll pitch |
+| Shift + wheel, or a horizontal wheel | scroll time when zoomed |
 | Z | zoom to the selected notes (time: selection + 10 % each side; pitch: selection ± 3 semitones) |
 | F | whole item, fitted pitch |
 | Double-click ruler | whole item (unchanged) |
@@ -109,7 +109,7 @@ Bottom-left of the note area. Shows, first that applies: the status message (4 s
 - More items: `Layers`, `Note Tone`, `Settings`, `Keyboard Shortcuts & Help`
 - Note Tone tooltip: `Play a tone at the note's pitch while you drag it`
 - Pill: `%d notes selected`
-- Help rows: `Alt + Wheel` → `Zoom the pitch axis`; `Shift + Wheel` → `Scroll the pitch axis`; `Z` → `Zoom to the selected notes`; `F` → `Show the whole item, fit the pitch range`; `Drag the overview strip` → `Scroll; drag an end to zoom`; `Drag the pitch strip` → `Scroll; drag an end to zoom`; "Right-click a dock value" → "Right-click a top bar value"
+- Help rows: `Wheel` → `Scroll the pitch axis`; `Alt + Wheel` → `Zoom the pitch axis`; `Shift + Wheel or horizontal scroll` → `Scroll the timeline (when zoomed)`; `Z` → `Zoom to the selected notes`; `F` → `Show the whole item, fit the pitch range`; `Drag the overview strip` → `Scroll; drag an end to zoom`; `Drag the pitch strip` → `Scroll; drag an end to zoom`; "Right-click a dock value" → "Right-click a top bar value"
 
 ## Theme mapping (`P.canvas`)
 
