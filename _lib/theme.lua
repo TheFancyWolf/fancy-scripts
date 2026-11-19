@@ -10,6 +10,8 @@
 --               accent read from the active REAPER theme; every role below is derived and contrast-fitted.
 --   Surfaces:   bg, panel, card               (window, popups / raised strips, cards / table header)
 --   Text:       text, text_dim                (primary, secondary; both fitted to 4.5:1 on the surfaces and control faces)
+--               text_dim is fitted for bg, panel, card, btn, well; on hover, pressed and tab faces use `text`
+--               (Match Theme caps the btn_h / tab / tab_h / tab_sel / hover steps so `text` keeps 4.5:1 on them)
 --   Accent:     accent      = active state    (CheckMark, TabSelectedOverline, selection bar, toggle-on face)
 --               accent_h    = hover  (40%)    (SeparatorHovered)
 --               accent_d    = dim    (20%)    (kept for scripts; the style stack no longer tints resting controls)
@@ -25,13 +27,14 @@
 --               yellow/yellow_l               (warning, caution)
 --   Structure:  border, sep, dim_bg           (border = control outline, same value as outline in Fancy; sep = neutral
 --                                              hairline, no accent tint; dim_bg = modal overlay)
---   Table:      table_row, table_row_alt      (alternating row backgrounds)
+--   Table:      table_row, table_row_alt      (alternating row backgrounds; kept for scripts, the style stack uses bg)
 --   Controls:   btn / btn_h / btn_a           resting / hovered / pressed face of buttons, combos, inactive toggles
 --               btn_on, on_text               face of an active toggle, and its label (fitted to 4.5:1)
 --               outline                       1 px frame around controls
 --               well, well_h, well_a          recessed inputs, slider grooves, checkbox boxes, progress track
 --               thumb, thumb_a                slider grab, and while dragged (slider_grab_active is kept)
---               tab, tab_h, tab_sel           tab faces (the selected tab also has an accent line on top)
+--               tab, tab_h, tab_sel           tab faces (the selected tab also has an accent line on top, drawn
+--                                             when the tab bar passes TabBarFlags_DrawSelectedOverline)
 --               hover, select                 hovered / selected row of a selectable or menu item (select = accent at 25%)
 --               scroll, scroll_h, scroll_a    scrollbar grab: 17 / 26 / 35% (white in Fancy, text colour in Match Theme)
 --               title                         title bar and docked header strip
@@ -182,6 +185,38 @@ local _cached_palette = nil
 local _cached_mode = nil
 local _cached_show_tooltips = nil
 
+-- Widget colour fits (hover / pressed shades, icon colours), kept so a widget does not search for contrast on
+-- every frame. Keyed by every colour that enters the computation (never by a palette table alone), so a palette
+-- built with overrides cannot be served another palette's entry. Cleared by set_mode and invalidate_palette,
+-- and when it grows past _FIT_CACHE_MAX entries (a script that animates colours).
+local _fit_cache, _fit_cache_n = {}, 0
+local _FIT_CACHE_MAX = 1024
+
+local function _fit_cache_clear()
+  _fit_cache, _fit_cache_n = {}, 0
+end
+
+--- Cached value for the keys (kind, a, b, c, d, e), or nil.
+local function _fit_cache_get(kind, a, b, c, d, e)
+  local t = _fit_cache[kind]
+  t = t and t[a]; t = t and t[b]; t = t and t[c]; t = t and t[d]
+  return t and t[e]
+end
+
+--- Stores `v` under the keys (kind, a, b, c, d, e) and returns it.
+local function _fit_cache_put(v, kind, a, b, c, d, e)
+  if _fit_cache_n >= _FIT_CACHE_MAX then _fit_cache_clear() end
+  local t = _fit_cache
+  for _, k in ipairs({ kind, a, b, c, d }) do
+    local n = t[k]
+    if not n then n = {}; t[k] = n end
+    t = n
+  end
+  t[e] = v
+  _fit_cache_n = _fit_cache_n + 1
+  return v
+end
+
 --- Returns the current theme mode from global ExtState (cached in memory).
 --- @return string  One of "fancy" or "match"
 function Theme.get_mode()
@@ -200,6 +235,7 @@ end
 function Theme.set_mode(mode)
   reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEY_THEME, mode, true)
   _cached_mode = mode
+  _fit_cache_clear()
   _cached_palette = Theme.build_palette()
 end
 
@@ -235,6 +271,7 @@ function Theme.invalidate_palette()
   _cached_palette = nil
   _cached_mode = nil
   _cached_show_tooltips = nil
+  _fit_cache_clear()
 end
 
 -------------------------------------------------------------------------------
@@ -824,9 +861,12 @@ function Theme.build_palette(overrides)
     P.bg     = overrides.bg     or read_theme_color("col_main_bg2",    F.bg)
     P.panel  = overrides.panel  or read_theme_color("col_tr1_bg",      F.panel)
     P.card   = overrides.card   or read_theme_color("col_tr2_bg",      F.card)
-    P.accent = overrides.accent or read_theme_color("col_cursor",      F.accent)
     P.btn    = overrides.btn    or read_theme_color("col_buttonbg",    F.btn)
     P.well   = overrides.well   or read_theme_color("col_main_editbk", F.well)
+    -- The edit cursor colour, fitted to 3:1 on the surfaces and the well (check mark, selection bar), keeping
+    -- its hue, before anything is derived from it. An overridden accent is used as given.
+    P.accent = overrides.accent or fit_contrast(read_theme_color("col_cursor", F.accent),
+      { P.bg, P.panel, P.card, P.well }, 3.0, nil, true)
   end
   P.select = overrides.select or with_alpha(P.accent, 0.25)
 
@@ -872,15 +912,16 @@ function Theme.build_palette(overrides)
   P.accent2_d = P.blue_d
   P.accent2_e = P.blue_e
 
-  -- accent_press = ButtonActive: the accent moved toward white/black only as far as P.text needs to read on it (4.5:1)
+  -- accent_press = the accent moved toward white/black only as far as P.text needs to read on it (4.5:1).
+  -- Kept for scripts; the style stack does not use it (ButtonActive is btn_a).
   P.accent_press = overrides.accent_press or fit_contrast(P.accent, { P.text }, 4.5)
 
   -- Derive accent states from the resolved primary accent color
-  -- accent_h = Hover state (40% alpha): ButtonHovered, HeaderHovered, FrameBgActive, SeparatorHovered, ScrollbarGrabHovered
+  -- accent_h = Hover state (40% alpha): SeparatorHovered in the style stack; also kept for scripts
   P.accent_h = overrides.accent_h or with_alpha(P.accent, 0.40)
-  -- accent_d = Dim/default state (20% alpha): Button, Header, FrameBgHovered, ScrollbarGrab
+  -- accent_d = Dim state (20% alpha): kept for scripts; the style stack no longer tints resting controls
   P.accent_d = overrides.accent_d or with_alpha(P.accent, 0.20)
-  -- accent_e = Extra-dim (12.5% alpha): TableBorderLight — subtle structural lines
+  -- accent_e = Extra-dim (12.5% alpha): kept for scripts (TableBorderLight is the neutral sep)
   P.accent_e = overrides.accent_e or with_alpha(P.accent, 0.125)
 
   -- High-contrast text states (lightened 70% toward white for badges, active states, and dense grids)
@@ -900,20 +941,22 @@ function Theme.build_palette(overrides)
   P.dim_bg = overrides.dim_bg or with_alpha(darken(P.bg, 0.70), 0.85)
 
   -- Derive table row colors from panel/card
-  -- table_row = Default row bg (darkened panel): TableRowBg
+  -- table_row = Default row bg (darkened panel): kept for scripts (TableRowBg is bg)
   P.table_row     = overrides.table_row     or darken(P.panel, 0.10)
-  -- table_row_alt = Alternating row bg (panel): TableRowBgAlt
+  -- table_row_alt = Alternating row bg (panel): kept for scripts (TableRowBgAlt is bg a step lighter)
   P.table_row_alt = overrides.table_row_alt or P.panel
 
-  -- slider_grab_active = Lighter accent for active slider grab: SliderGrabActive
+  -- slider_grab_active = Lighter accent: kept for scripts (SliderGrabActive is thumb_a)
   P.slider_grab_active = overrides.slider_grab_active or lighten(P.accent, 0.15)
 
   -- Control roles (see the design spec, section 2)
   local dark_text = luminance(P.text) > 0.179          -- light text on a dark theme: "toward text" is lighter
   local function toward(c, f) return dark_text and lighten(c, f) or darken(c, f) end
   local function away(c, f) return dark_text and darken(c, f) or lighten(c, f) end
-  -- Match Theme: bg moved 52 % away from the text colour, unfitted (the resting frame has no minimum)
-  P.outline = overrides.outline or (fancy and F.outline or away(P.bg, 0.52))
+  -- Match Theme: bg darkened, unfitted (the resting frame has no minimum): 52 % on a dark theme, 18 % on a light
+  -- one. Always darker than the window, so on a light theme whose well is as white as the window the frame
+  -- still shows where checkboxes, empty inputs, slider grooves and progress tracks are.
+  P.outline = overrides.outline or (fancy and F.outline or darken(P.bg, dark_text and 0.52 or 0.18))
   P.btn_on  = overrides.btn_on  or (fancy and P.accent or fit_contrast(P.accent, { P.btn }, 3.0))
   -- on_text: the dark label colour on btn_on, or white / black when that cannot reach 4.5:1
   local on_text = fit_contrast(F.on_text, { P.btn_on }, 4.5)
@@ -937,15 +980,27 @@ function Theme.build_palette(overrides)
     P.scroll_a = overrides.scroll_a or F.scroll_a
     P.title    = overrides.title    or F.title
   else
-    -- Steps of the same size as the curated ones, toward / away from the text colour
-    P.btn_h    = overrides.btn_h    or toward(P.btn, 0.13)
+    -- Steps of the same size as the curated ones, toward / away from the text colour. A step toward the text
+    -- colour lowers the label's contrast, so each is capped where P.text would fall under 4.5:1 on the face
+    -- (P.text itself is not changed). The tab faces keep their order (tab < tab_h < tab_sel) when the
+    -- selected tab's step is capped.
+    local text_need = 4.5 + FIT_MARGIN
+    local function capped(base, f)
+      local s = f
+      while s > 0 and contrast_over(P.text, toward(base, s)) < text_need do s = s - 0.005 end
+      return math.max(0, s)
+    end
+    local sel_step = capped(P.bg, 0.23)
+    local h_step   = math.min(capped(P.bg, 0.16), math.max(0, sel_step - 0.07))
+    local tab_step = math.min(0.04, math.max(0, h_step - 0.05))
+    P.btn_h    = overrides.btn_h    or toward(P.btn, capped(P.btn, 0.13))
     P.btn_a    = overrides.btn_a    or away(P.btn, 0.33)
     P.thumb    = overrides.thumb    or fit_contrast(toward(P.well, 0.75), { P.well }, 3.0)
     P.thumb_a  = overrides.thumb_a  or P.text
-    P.tab      = overrides.tab      or toward(P.bg, 0.04)
-    P.tab_h    = overrides.tab_h    or toward(P.bg, 0.16)
-    P.tab_sel  = overrides.tab_sel  or toward(P.bg, 0.23)
-    P.hover    = overrides.hover    or toward(P.bg, 0.16)
+    P.tab      = overrides.tab      or toward(P.bg, tab_step)
+    P.tab_h    = overrides.tab_h    or toward(P.bg, h_step)
+    P.tab_sel  = overrides.tab_sel  or toward(P.bg, sel_step)
+    P.hover    = overrides.hover    or toward(P.bg, capped(P.bg, 0.16))
     P.scroll   = overrides.scroll   or with_alpha(P.text, 0.17)
     P.scroll_h = overrides.scroll_h or with_alpha(P.text, 0.26)
     P.scroll_a = overrides.scroll_a or with_alpha(P.text, 0.35)
@@ -985,9 +1040,9 @@ Theme.layout = {
   -- ── Scale (unified spacing & padding) ──────────────────────────────────
   -- One scale for everything: gaps, padding, margins. Like CSS spacing tokens.
   xs   = S.xs,    -- tight: meter bars, cell padding
-  sm   = S.sm,    -- small: related items, inner spacing, frame padding Y, section gap
-  md   = S.md,    -- standard: item spacing, frame padding X, tooltips
-  lg   = S.lg,    -- large: group breaks, window padding
+  sm   = S.sm,    -- small: item spacing, related items, inner spacing, frame padding Y, section gap
+  md   = S.md,    -- standard: window padding, frame padding X, tooltips
+  lg   = S.lg,    -- large: group breaks
   xl   = S.xl,    -- extra: major sections, modal padding
   xxl  = S.xxl,   -- 2x: table row height, checkbox column
   xxxl = S.xxxl,  -- 3x: tree/hierarchy indent
@@ -1044,76 +1099,80 @@ Theme.layout = {
 -- given ReaImGui, so a pop without counts can use them, whichever context pushed.
 local pushed_nc, pushed_nv = 0, 0
 
+-- Push helpers of Theme.push, built once (not per frame): they push on _push_ctx and count into _push_nc / _push_nv.
+local _push_ctx, _push_nc, _push_nv = nil, 0, 0
+local function _push_col(name, value)
+  reaper.ImGui_PushStyleColor(_push_ctx, reaper["ImGui_Col_" .. name](), value)
+  _push_nc = _push_nc + 1
+end
+-- Tab colours: names newer than ReaImGui 0.9 are skipped when the enum does not exist.
+local function _push_col_opt(name, value)
+  if reaper["ImGui_Col_" .. name] then _push_col(name, value) end
+end
+local function _push_var(name, a, b)
+  reaper.ImGui_PushStyleVar(_push_ctx, reaper["ImGui_StyleVar_" .. name](), a, b)
+  _push_nv = _push_nv + 1
+end
+
 function Theme.push(ctx, palette)
   local P = palette or Theme.get_palette()
   local L = Theme.layout
-  local nc, nv = 0, 0
-
-  local function col(name, value)
-    reaper.ImGui_PushStyleColor(ctx, reaper["ImGui_Col_" .. name](), value)
-    nc = nc + 1
-  end
-  -- Tab colours: names newer than ReaImGui 0.9 are skipped when the enum does not exist.
-  local function col_opt(name, value)
-    if reaper["ImGui_Col_" .. name] then col(name, value) end
-  end
-  local function var(name, a, b)
-    reaper.ImGui_PushStyleVar(ctx, reaper["ImGui_StyleVar_" .. name](), a, b)
-    nv = nv + 1
-  end
+  _push_ctx, _push_nc, _push_nv = ctx, 0, 0
 
   local select_a = P.select & 0xFF
 
-  col("WindowBg",             P.bg)
-  col("TitleBg",              P.title)
-  col("TitleBgActive",        P.title)
-  col("Header",               P.select)
-  col("HeaderHovered",        P.hover)
-  col("HeaderActive",         (P.select & 0xFFFFFF00) | math.min(255, select_a * 2))
-  col("Button",               P.btn)
-  col("ButtonHovered",        P.btn_h)
-  col("ButtonActive",         P.btn_a)
-  col("FrameBg",              P.well)
-  col("FrameBgHovered",       P.well_h)
-  col("FrameBgActive",        P.well_a)
-  col("SliderGrab",           P.thumb)
-  col("SliderGrabActive",     P.thumb_a)
-  col("CheckMark",            P.accent)
-  col("PopupBg",              P.panel)
-  col("ModalWindowDimBg",     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
-  col("Separator",            P.sep)
-  col("SeparatorHovered",     P.accent_h) -- hovered / active mark a draggable splitter
-  col("SeparatorActive",      P.accent)
-  col_opt("Tab",                 P.tab)
-  col_opt("TabHovered",          P.tab_h)
-  col_opt("TabSelected",         P.tab_sel)
-  col_opt("TabSelectedOverline", P.accent)
-  col_opt("TabDimmed",           P.tab)
-  col_opt("TabDimmedSelected",   P.tab_sel)
-  col("TableHeaderBg",        P.card)
-  col("TableBorderStrong",    P.sep)
-  col("TableBorderLight",     P.sep)
-  col("TableRowBg",           P.bg)
-  col("TableRowBgAlt",        lighten(P.bg, 0.03))
-  col("ScrollbarBg",          with_alpha(P.bg, 0)) -- transparent: the surface shows through
-  col("ScrollbarGrab",        P.scroll)
-  col("ScrollbarGrabHovered", P.scroll_h)
-  col("ScrollbarGrabActive",  P.scroll_a)
-  col("Text",                 P.text)
-  col("TextDisabled",         P.text_dim)
-  col("Border",               P.outline)
+  _push_col("WindowBg",             P.bg)
+  _push_col("TitleBg",              P.title)
+  _push_col("TitleBgActive",        P.title)
+  _push_col("Header",               P.select)
+  _push_col("HeaderHovered",        P.hover)
+  _push_col("HeaderActive",         (P.select & 0xFFFFFF00) | math.min(255, select_a * 2))
+  _push_col("Button",               P.btn)
+  _push_col("ButtonHovered",        P.btn_h)
+  _push_col("ButtonActive",         P.btn_a)
+  _push_col("FrameBg",              P.well)
+  _push_col("FrameBgHovered",       P.well_h)
+  _push_col("FrameBgActive",        P.well_a)
+  _push_col("SliderGrab",           P.thumb)
+  _push_col("SliderGrabActive",     P.thumb_a)
+  _push_col("CheckMark",            P.accent)
+  _push_col("PopupBg",              P.panel)
+  _push_col("ModalWindowDimBg",     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
+  _push_col("Separator",            P.sep)
+  _push_col("SeparatorHovered",     P.accent_h) -- hovered / active mark a draggable splitter
+  _push_col("SeparatorActive",      P.accent)
+  _push_col_opt("Tab",                 P.tab)
+  _push_col_opt("TabHovered",          P.tab_h)
+  _push_col_opt("TabSelected",         P.tab_sel)
+  _push_col_opt("TabSelectedOverline", P.accent)
+  _push_col_opt("TabDimmed",           P.tab)
+  _push_col_opt("TabDimmedSelected",   P.tab_sel)
+  _push_col("TableHeaderBg",        P.card)
+  _push_col("TableBorderStrong",    P.sep)
+  _push_col("TableBorderLight",     P.sep)
+  _push_col("TableRowBg",           P.bg)
+  _push_col("TableRowBgAlt",        lighten(P.bg, 0.03))
+  _push_col("ScrollbarBg",          with_alpha(P.bg, 0)) -- transparent: the surface shows through
+  _push_col("ScrollbarGrab",        P.scroll)
+  _push_col("ScrollbarGrabHovered", P.scroll_h)
+  _push_col("ScrollbarGrabActive",  P.scroll_a)
+  _push_col("Text",                 P.text)
+  _push_col("TextDisabled",         P.text_dim)
+  _push_col("Border",               P.outline)
 
-  var("WindowRounding",   L.rounding)
-  var("FrameRounding",    L.rounding)
-  var("GrabRounding",     L.rounding)
-  var("ItemSpacing",      L.sm, L.sm)
-  var("FramePadding",     L.md, L.sm)
-  var("WindowPadding",    L.md, L.md)
-  var("CellPadding",      L.sm, L.xs)
-  var("ItemInnerSpacing", L.sm, L.sm)
-  var("IndentSpacing",    L.indent)
-  var("FrameBorderSize",  L.border)
+  _push_var("WindowRounding",   L.rounding)
+  _push_var("FrameRounding",    L.rounding)
+  _push_var("GrabRounding",     L.rounding)
+  _push_var("ItemSpacing",      L.sm, L.sm)
+  _push_var("FramePadding",     L.md, L.sm)
+  _push_var("WindowPadding",    L.md, L.md)
+  _push_var("CellPadding",      L.sm, L.xs)
+  _push_var("ItemInnerSpacing", L.sm, L.sm)
+  _push_var("IndentSpacing",    L.indent)
+  _push_var("FrameBorderSize",  L.border)
 
+  local nc, nv = _push_nc, _push_nv
+  _push_ctx = nil
   pushed_nc, pushed_nv = nc, nv
   return nc, nv
 end
@@ -1528,6 +1587,8 @@ local label_on = Theme.label_on
 local function _shade_states(fill, label, need)
   need = need or 4.5
   local P = _get_palette()
+  local hit = _fit_cache_get("shade", fill, label, need, P.bg, 0)
+  if hit then return hit[1], hit[2] end
   local function ratio(c) return contrast_over(label, composite_over(c, P.bg)) end
   local function pick(first, second, avoid, extra)
     local best, best_r
@@ -1550,21 +1611,44 @@ local function _shade_states(fill, label, need)
   local hover_dir = (luminance(hover) >= luminance(fill)) and lighten or darken
   local other = hover_dir == lighten and darken or lighten
   local pressed = pick(other, hover_dir, hover, { hover_dir(fill, 0.24), hover_dir(fill, 0.18) })
+  _fit_cache_put({ hover, pressed }, "shade", fill, label, need, P.bg, 0)
   return hover, pressed
 end
 
 --- Icon colour for a hovered or pressed icon button: `col` moved 25 % toward the text colour's extreme
---- (lighter on a dark UI, darker on a light one), then fitted to 3:1 on every face it is drawn on.
+--- (lighter on a dark UI, darker on a light one), then fitted to 3:1 on both faces it is drawn on. Cached.
 --- @param col integer  Resting icon colour
---- @param faces table  Opaque or translucent faces behind the icon (judged over palette.bg)
+--- @param face_h integer  Hovered face behind the icon (judged over palette.bg when translucent)
+--- @param face_a integer  Pressed face behind the icon
 --- @return integer
-local function _icon_on(col, faces)
+local function _icon_on(col, face_h, face_a)
   local P = _get_palette()
+  local hit = _fit_cache_get("icon", col, face_h, face_a, P.bg, P.text)
+  if hit then return hit end
   local dark_ui = luminance(P.text) > luminance(P.bg)
   local c = dark_ui and lighten(col, 0.25) or darken(col, 0.25)
-  local under = {}
-  for i, f in ipairs(faces) do under[i] = composite_over(f, P.bg) end
-  return fit_contrast(c, under, 3.0)
+  local under = { composite_over(face_h, P.bg), composite_over(face_a, P.bg) }
+  return _fit_cache_put(fit_contrast(c, under, 3.0), "icon", col, face_h, face_a, P.bg, P.text)
+end
+
+--- A caller's own hover icon colour, fitted to 3:1 on the hovered and pressed faces keeping its hue (the
+--- caller chose it for a transparent background; the face behind it is new). Cached like _icon_on.
+--- @return integer
+local function _icon_hover_fit(col, face_h, face_a)
+  local P = _get_palette()
+  local hit = _fit_cache_get("icon_hover", col, face_h, face_a, P.bg, 0)
+  if hit then return hit end
+  local under = { composite_over(face_h, P.bg), composite_over(face_a, P.bg) }
+  return _fit_cache_put(fit_contrast(col, under, 3.0, nil, true), "icon_hover", col, face_h, face_a, P.bg, 0)
+end
+
+--- Default icon colour of icon_btn_colored: palette.text fitted to 3:1 on `face` (judged over palette.bg). Cached.
+--- @return integer
+local function _icon_on_face(face)
+  local P = _get_palette()
+  local hit = _fit_cache_get("icon_face", face, P.text, P.bg, 0, 0)
+  if hit then return hit end
+  return _fit_cache_put(fit_contrast(P.text, { composite_over(face, P.bg) }, 3.0), "icon_face", face, P.text, P.bg, 0, 0)
 end
 
 --- True when the last item is hovered long enough to show its tooltip: ReaImGui's own tooltip delay
@@ -1738,7 +1822,9 @@ end
 ---   opts.icon_size (number)  Icon size override
 ---   opts.color     (number)  Icon color    (default: palette.text)
 ---   opts.hover_color (number) Icon color on hover (default: icon color moved 25% toward the text colour's
----                             extreme, fitted to 3:1 on the hover and pressed faces)
+---                             extreme, fitted to 3:1 on the hover and pressed faces). A colour given here is
+---                             also fitted to 3:1 on those faces, keeping its hue: the one place a caller's
+---                             colour is adjusted, since it was chosen for a transparent background
 ---   opts.tooltip   (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.icon_btn(ctx, id, icon_fn, opts)
@@ -1767,7 +1853,11 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local base_col = opts.color or P.text
   local draw_col = base_col
   if hover then
-    draw_col = opts.hover_color or _icon_on(base_col, { P.btn_h, P.btn_a })
+    if opts.hover_color then
+      draw_col = _icon_hover_fit(opts.hover_color, P.btn_h, P.btn_a)
+    else
+      draw_col = _icon_on(base_col, P.btn_h, P.btn_a)
+    end
   end
   icon_fn(dl, cx, cy, hs, draw_col)
   if hover then
@@ -1821,7 +1911,7 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   if not icon_col then
     -- Default icon: palette.text, fitted to 3:1 on the face it sits on in this state
     local face = reaper.ImGui_IsItemActive(ctx) and bg_a or hovered and bg_h or bg
-    icon_col = fit_contrast(P.text, { composite_over(face, P.bg) }, 3.0)
+    icon_col = _icon_on_face(face)
   end
   icon_fn(dl, cx, cy, hs, icon_col)
   if hovered then
@@ -2154,7 +2244,8 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
     -- On: a solid fill (no tint); hover lightens it, press darkens it
     bg       = opts.active_bg     or P.btn_on
     text_col = opts.active_text   or (opts.active_bg and label_on(bg) or P.on_text)
-    local sh, sa = _shade_states(bg, text_col)
+    local sh, sa
+    if not (opts.active_hover and opts.active_active) then sh, sa = _shade_states(bg, text_col) end
     bg_h     = opts.active_hover  or sh
     bg_a     = opts.active_active or sa
   else
@@ -2163,7 +2254,7 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
     bg       = custom or P.btn
     text_col = opts.inactive_text   or (custom and label_on(bg) or P.text)
     local sh, sa
-    if custom then sh, sa = _shade_states(bg, text_col) end
+    if custom and not (opts.inactive_hover and opts.inactive_active) then sh, sa = _shade_states(bg, text_col) end
     bg_h     = opts.inactive_hover  or sh or P.btn_h
     bg_a     = opts.inactive_active or sa or P.btn_a
   end
@@ -2264,9 +2355,14 @@ function Theme.badge(ctx, label, opts)
       text_col = P.text
     end
   end
-  local sh, sa = _shade_states(bg, text_col)
-  local bg_h = opts.bg_hover or sh
-  local bg_a = opts.bg_active or sa
+  -- Hover and pressed shades only for an interactive badge, and only those the caller did not give
+  local bg_h, bg_a = bg, bg
+  if opts.interactive then
+    local sh, sa
+    if not (opts.bg_hover and opts.bg_active) then sh, sa = _shade_states(bg, text_col) end
+    bg_h = opts.bg_hover or sh
+    bg_a = opts.bg_active or sa
+  end
 
   local btn_w = opts.w or 0
   local btn_h = opts.h or 0
@@ -2291,8 +2387,8 @@ function Theme.badge(ctx, label, opts)
   end
 
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.interactive and bg_h or bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.interactive and bg_a or bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
 
   local btn_label = label .. "###badge_" .. (opts.id or label)   -- ### hashes only the id: a changing label keeps the widget
@@ -2880,21 +2976,40 @@ function Theme.header(ctx, opts)
   local hdr_h = opts.height or math.max(L.row_h, brand_sz, close_btn_sz, frame_h)
 
   -- 0. Title strip behind the row, edge to edge (drawn first, so the row draws over it), and its hairline.
-  --    The strip runs from half the window padding above the row to the item spacing below it.
+  --    The strip runs from the window padding above the row to the item spacing below it (both read from the
+  --    style in effect), inside the window border: inset by WindowBorderSize on the top, left and right, so a
+  --    window without a title bar keeps its 1 px frame. Where the strip meets the window's top edge and the
+  --    window is rounded, its top corners take L.rounding.
   do
     local dl = reaper.ImGui_GetWindowDrawList(ctx)
     local row_x, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
     local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
     local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
     local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
+    local pad_x, pad_y, spacing_y, border, win_round = L.md, L.md, L.sm, 0, 0
+    if reaper.ImGui_GetStyleVar then
+      pad_x, pad_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+      local _, sy = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+      spacing_y = sy
+      if reaper.ImGui_StyleVar_WindowBorderSize then
+        border = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowBorderSize()) or 0
+      end
+      win_round = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding()) or 0
+    end
+    local x1 = win_x + border
     -- Right edge: the content edge plus its padding, so a vertical scrollbar stays uncovered
-    local x2 = math.min(win_x + win_w, row_x + avail_w + L.md)
-    local y1 = row_y - L.md
-    local y2 = row_y + hdr_h + L.sm
+    local x2 = math.min(win_x + win_w - border, row_x + avail_w + pad_x)
+    local top = win_y + border
+    local y1 = math.max(top, row_y - pad_y)
+    local y2 = row_y + hdr_h + spacing_y
     reaper.ImGui_DrawList_PushClipRect(dl, win_x, win_y, win_x + win_w, win_y + win_h, false)
-    reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y1, x2, y2, P.title)
+    if win_round > 0 and y1 <= top and reaper.ImGui_DrawFlags_RoundCornersTop then
+      reaper.ImGui_DrawList_AddRectFilled(dl, x1, y1, x2, y2, P.title, L.rounding, reaper.ImGui_DrawFlags_RoundCornersTop())
+    else
+      reaper.ImGui_DrawList_AddRectFilled(dl, x1, y1, x2, y2, P.title)
+    end
     if opts.show_separator ~= false then
-      reaper.ImGui_DrawList_AddRectFilled(dl, win_x, y2, x2, y2 + 1, P.sep)
+      reaper.ImGui_DrawList_AddRectFilled(dl, x1, y2, x2, y2 + 1, P.sep)
     end
     reaper.ImGui_DrawList_PopClipRect(dl)
   end

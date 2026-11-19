@@ -39,6 +39,7 @@ local function contains(list, value) -- luacheck: ignore 211 (used by later task
 end
 
 local REAPERTIPS, LIGHT = stub_lib.REAPERTIPS, stub_lib.LIGHT
+local WHITE, MIDGREY = stub_lib.WHITE, stub_lib.MIDGREY
 
 --- WCAG 2.x relative luminance of 0xRRGGBBAA (alpha ignored), written independently of the library.
 local function lum(c)
@@ -198,6 +199,11 @@ local function contrast_rules(P)
     assert(contrast(P.text, s) >= 4.5, "text")
     assert(contrast(P.text_dim, s) >= 4.5, "text_dim")
   end
+  -- text (not text_dim) on the hover, pressed and tab faces
+  for _, k in ipairs({ "btn_h", "btn_a", "tab", "tab_h", "tab_sel", "hover" }) do
+    local r = contrast(P.text, P[k])
+    assert(r >= 4.5, string.format("text on %s: %.2f", k, r))
+  end
   assert(contrast(P.on_text, P.btn_on) >= 4.5, "on_text on btn_on")
   assert(contrast(P.btn_on, P.btn) >= 3.0, "on vs off face")
   assert(contrast(P.thumb, P.well) >= 3.0, "thumb on well")
@@ -211,8 +217,29 @@ end
 test("palette: contrast rules, curated", function() contrast_rules(load_theme({ mode = "fancy" }).build_palette()) end)
 test("palette: contrast rules, Match Theme on Reapertips", function()
   contrast_rules(load_theme({ mode = "match", theme = REAPERTIPS }).build_palette()) end)
+test("palette: Match tab faces keep their order when the selected tab's step is capped", function()
+  for _, fx in ipairs({ REAPERTIPS, {} }) do
+    local P = load_theme({ mode = "match", theme = fx }).build_palette()
+    assert(lum(P.bg) < lum(P.tab) and lum(P.tab) < lum(P.tab_h) and lum(P.tab_h) < lum(P.tab_sel), "bg < tab < tab_h < tab_sel")
+  end
+end)
 test("palette: contrast rules, Match Theme on a light theme", function()
   contrast_rules(load_theme({ mode = "match", theme = LIGHT }).build_palette()) end)
+test("palette: contrast rules, Match Theme on a white theme; the outline stays visible on the well", function()
+  local P = load_theme({ mode = "match", theme = WHITE }).build_palette()
+  contrast_rules(P)
+  assert(P.outline ~= P.well, "outline differs from the well")
+  assert(contrast(P.outline, P.well) >= 1.2, string.format("outline on well %.2f", contrast(P.outline, P.well)))
+end)
+test("palette: Match accent is fitted to 3:1 on a mid-grey theme; an overridden accent is not", function()
+  local P = load_theme({ mode = "match", theme = MIDGREY }).build_palette()
+  for _, k in ipairs({ "bg", "panel", "card", "well" }) do
+    local r = contrast(P.accent, P[k])
+    assert(r >= 3.0, string.format("accent on %s: %.2f", k, r))
+  end
+  local O = load_theme({ mode = "match", theme = MIDGREY }).build_palette({ accent = 0x7A7A90FF })
+  assert(O.accent == 0x7A7A90FF, "overrides.accent wins unfitted")
+end)
 
 test("palette: curated mode ignores the REAPER theme", function()
   local a = load_theme({ mode = "fancy", theme = LIGHT }).build_palette()
@@ -225,12 +252,12 @@ test("palette: overrides win for old and new fields", function()
   assert(P.btn_on == 0xFF0000FF, "btn_on follows an overridden accent")
 end)
 
-test("palette: Match outline is bg moved away from the text, unfitted; border stays fitted", function()
+test("palette: Match outline is bg darkened, unfitted; border stays fitted", function()
   local P = load_theme({ mode = "match", theme = REAPERTIPS }).build_palette()
   assert(P.outline ~= P.border and lum(P.outline) < lum(P.bg), "darker than bg on a dark theme")
   assert(contrast(P.border, P.bg) >= 3.0, "border still fitted")
   local L = load_theme({ mode = "match", theme = LIGHT }).build_palette()
-  assert(lum(L.outline) >= lum(L.bg), "lighter than bg on a light theme")
+  assert(lum(L.outline) < lum(L.bg), "darker than bg on a light theme too")
   local O = load_theme({ mode = "match", theme = REAPERTIPS }).build_palette({ outline = 0x123456FF })
   assert(O.outline == 0x123456FF)
   local C = load_theme({ mode = "fancy" }).build_palette()
@@ -460,6 +487,8 @@ test("widgets: every push has its pop, on every path", function()
     assert(count(stub.calls, "ImGui_PushStyleColor") == popped(stub.calls, "ImGui_PopStyleColor"), "colours" .. tag)
     assert(count(stub.calls, "ImGui_PushStyleVar") == popped(stub.calls, "ImGui_PopStyleVar"), "vars" .. tag)
     assert(count(stub.calls, "ImGui_PushFont") == count(stub.calls, "ImGui_PopFont"), "fonts" .. tag)
+    assert(count(stub.calls, "ImGui_DrawList_PushClipRect") == count(stub.calls, "ImGui_DrawList_PopClipRect"),
+      "clip rects" .. tag)
   end
   local cases = {
     function(T, f) T.toggle_button("ctx", "a", "A", true, { preset = "small", fonts = f, rounding = 3, tooltip = "t" }) end,
@@ -558,6 +587,77 @@ test("states: icons stay 3:1 at rest, hovered and pressed, all palettes", functi
       end
     end
   end
+end)
+
+test("icon_btn: an explicit hover colour is fitted to 3:1 on the hover and pressed faces, all palettes", function()
+  for _, pal in ipairs(PALETTES) do
+    for _, state in ipairs({ "hover", "active" }) do
+      local T, stub = load_theme(pal[2]); local P = T.get_palette()
+      local seen
+      stub.reaper.ImGui_IsItemHovered = function() return true end
+      stub.reaper.ImGui_IsItemActive = function() return state == "active" end
+      T.icon_btn("ctx", "##rm", function(_, _, _, _, col) seen = col end, { color = P.text_dim, hover_color = P.red })
+      local c = pushed_colors(stub)
+      local face = composite(state == "hover" and c.ImGui_Col_ButtonHovered or c.ImGui_Col_ButtonActive, P.bg)
+      local r = contrast(seen, face)
+      assert(r >= 3.0, string.format("%s, %s: %.2f", pal[1], state, r))
+    end
+  end
+end)
+
+test("icon_btn: an id without ## still gives ImGui_Button a hidden label", function()
+  local T, stub = load_theme({ mode = "fancy" })
+  T.icon_btn("ctx", "remove", T.icons.close)
+  local b = first(stub.calls, "ImGui_Button")
+  assert(b and b[2]:sub(1, 2) == "##", "label starts with ##: " .. tostring(b and b[2]))
+end)
+
+test("cache: a second identical call pushes the same colours; a mode switch is never served stale", function()
+  local T, stub = load_theme({ mode = "fancy", theme = LIGHT })
+  local function run()
+    stub.calls = {}; T.toggle_button("ctx", "id", "L", true)
+    local a = pushed_colors(stub)
+    stub.calls = {}; T.badge("ctx", "x", { color = T.get_palette().green, interactive = true })
+    return a, pushed_colors(stub)
+  end
+  local t1, b1 = run()
+  local t2, b2 = run()
+  for _, k in ipairs({ "ImGui_Col_Button", "ImGui_Col_ButtonHovered", "ImGui_Col_ButtonActive", "ImGui_Col_Text" }) do
+    assert(t1[k] == t2[k] and b1[k] == b2[k], "same colours on the second call: " .. k)
+  end
+  T.set_mode("match")
+  local t3, b3 = run()
+  local F, fresh = load_theme({ mode = "match", theme = LIGHT }) -- a fresh library in the new mode
+  local function run_fresh()
+    fresh.calls = {}; F.toggle_button("ctx", "id", "L", true)
+    local a = pushed_colors(fresh)
+    fresh.calls = {}; F.badge("ctx", "x", { color = F.get_palette().green, interactive = true })
+    return a, pushed_colors(fresh)
+  end
+  local t4, b4 = run_fresh()
+  assert(t3.ImGui_Col_Button ~= t1.ImGui_Col_Button, "the on face follows the new palette")
+  for _, k in ipairs({ "ImGui_Col_Button", "ImGui_Col_ButtonHovered", "ImGui_Col_ButtonActive", "ImGui_Col_Text" }) do
+    assert(t3[k] == t4[k] and b3[k] == b4[k], "after set_mode, as a fresh library: " .. k)
+  end
+end)
+
+test("header: the title strip stays inside the window border and follows the real padding and spacing", function()
+  local T, stub = load_theme({ mode = "fancy", style_vars = { ImGui_StyleVar_WindowPadding = { 12, 12 },
+    ImGui_StyleVar_ItemSpacing = { 4, 6 } } })
+  local P = T.get_palette()
+  stub.reaper.ImGui_GetCursorScreenPos = function() return 12, 12 end   -- first item of a window without a title bar
+  T.header("ctx", { title = "T", icon_fn = false, height = 24 })
+  local strip = find_fill(all(stub.calls, "ImGui_DrawList_AddRectFilled"), P.title)
+  assert(strip.x1 == 1 and strip.y1 == 1, string.format("inset by the border: %s, %s", strip.x1, strip.y1))
+  assert(strip.x2 <= 399, "right edge inside the border: " .. strip.x2)
+  assert(strip.y2 == 12 + 24 + 6, "down to the item spacing under the row: " .. strip.y2)
+  assert(strip[8] == T.layout.rounding and stub.enum_name(strip[9]) == "ImGui_DrawFlags_RoundCornersTop", "rounded top corners")
+  local T2, stub2 = load_theme({ mode = "fancy", style_vars = { ImGui_StyleVar_WindowBorderSize = { 0, 0 },
+    ImGui_StyleVar_WindowRounding = { 0, 0 } } })
+  stub2.reaper.ImGui_GetCursorScreenPos = function() return 8, 8 end
+  T2.header("ctx", { title = "T", icon_fn = false })
+  local s2 = find_fill(all(stub2.calls, "ImGui_DrawList_AddRectFilled"), T2.get_palette().title)
+  assert(s2.x1 == 0 and s2.y1 == 0 and (s2[8] or 0) == 0, "no border, no rounding: edge to edge, square")
 end)
 
 test("states: a caller's own hover and pressed colours are pushed unchanged", function()

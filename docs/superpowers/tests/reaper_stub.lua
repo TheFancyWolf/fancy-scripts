@@ -22,9 +22,28 @@ M.LIGHT = {
   docker_bg = 0xD0D0D0,
 }
 
+-- A white theme: window, panels and the input well are all the same white
+M.WHITE = {
+  col_main_bg2 = 0xFFFFFF, col_tr1_bg = 0xFFFFFF, col_tr2_bg = 0xFFFFFF, col_main_editbk = 0xFFFFFF,
+  col_main_text = 0x202020, col_tcp_text = 0x404040, col_cursor = 0x1565C0, col_main_3dhl = 0xFFFFFF,
+  col_buttonbg = 0xF0F0F0, docker_bg = 0xF0F0F0,
+}
+
+-- A mid-grey theme with a grey-violet edit cursor
+M.MIDGREY = {
+  col_main_bg2 = 0x808080, col_tr1_bg = 0x858585, col_tr2_bg = 0x8A8A8A, col_main_text = 0x101010,
+  col_tcp_text = 0x202020, col_cursor = 0x7A7A90, col_main_3dhl = 0x909090, col_buttonbg = 0x8E8E8E,
+  col_main_editbk = 0x7A7A7A, docker_bg = 0x787878,
+}
+
+-- Values ImGui_GetStyleVar returns, by enum name (opts.style_vars overrides per test)
+local STYLE_VARS = {
+  ImGui_StyleVar_WindowPadding = { 8, 8 }, ImGui_StyleVar_ItemSpacing = { 4, 4 },
+  ImGui_StyleVar_WindowBorderSize = { 1, 0 }, ImGui_StyleVar_WindowRounding = { 2, 0 },
+}
+
 -- Return values for ImGui functions that widgets call. Extend as needed.
 local RETURNS = {
-  ImGui_Button = { false },
   ImGui_SmallButton = { false },
   ImGui_InvisibleButton = { false },
   ImGui_Checkbox = { false, false },
@@ -90,8 +109,6 @@ local RETURNS = {
   ImGui_IsPopupOpen = { false },
   ImGui_DrawList_AddTriangleFilled = {},
   ImGui_DrawList_AddBezierCubic = {},
-  ImGui_DrawList_PushClipRect = {},
-  ImGui_DrawList_PopClipRect = {},
 }
 
 local ENUM_PATTERNS = { "^ImGui_Col_", "^ImGui_StyleVar_", "^ImGui_%w*Flags_", "^ImGui_Cond_" }
@@ -171,7 +188,25 @@ function M.new(opts)
       check_fail(name, (select(2, ...)))
     end
   end
+  -- Buttons: recorded (label first), never clicked
+  raw.ImGui_Button = function(...)
+    record("ImGui_Button", select(2, ...))  -- drop ctx
+    check_fail("ImGui_Button", (select(2, ...)))
+    return false
+  end
+  -- Style vars read back: by enum name, opts.style_vars first
+  raw.ImGui_GetStyleVar = function(_, idx)
+    local n = stub.enum_name(idx)
+    local v = (opts.style_vars and opts.style_vars[n]) or STYLE_VARS[n] or { 0, 0 }
+    return v[1], v[2]
+  end
   -- Draw-list calls keep the draw list as arg 1; named fields for convenience.
+  for _, name in ipairs({ "ImGui_DrawList_PushClipRect", "ImGui_DrawList_PopClipRect" }) do
+    raw[name] = function(dl, ...)
+      record(name, dl, ...)
+      check_fail(name)
+    end
+  end
   raw.ImGui_DrawList_AddRectFilled = function(dl, x1, y1, x2, y2, color, ...)
     local c = record("ImGui_DrawList_AddRectFilled", dl, x1, y1, x2, y2, color, ...)
     c.x1, c.y1, c.x2, c.y2, c.color = x1, y1, x2, y2, color
