@@ -841,56 +841,6 @@ local function get_target_track_color(take, item)
   return nil
 end
 
--- get_contrasting_text_color is the only chunk-level name of the colour maths below: its helpers stay
--- private to the block, so they do not count against the chunk's 200-local limit.
-local get_contrasting_text_color
-do
-  --- sRGB channel (0-255) to linear light, the curve WCAG 2.x uses for relative luminance.
-  local function srgb_channel_to_linear(c8)
-    local c = c8 / 255
-    if c <= 0.03928 then return c / 12.92 end
-    return ((c + 0.055) / 1.055) ^ 2.4
-  end
-
-  --- WCAG relative luminance (0 = black, 1 = white) of an 0xRRGGBBAA colour (alpha ignored).
-  local function relative_luminance(rgba)
-    local r = srgb_channel_to_linear((rgba >> 24) & 0xFF)
-    local g = srgb_channel_to_linear((rgba >> 16) & 0xFF)
-    local b = srgb_channel_to_linear((rgba >> 8) & 0xFF)
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
-  end
-
-  --- WCAG contrast ratio (1 to 21) between two relative luminances.
-  local function contrast_ratio(lum_a, lum_b)
-    if lum_a < lum_b then lum_a, lum_b = lum_b, lum_a end
-    return (lum_a + 0.05) / (lum_b + 0.05)
-  end
-
-  --- Alpha-composites `fg` (0xRRGGBBAA) over the opaque colour `under`; the result is opaque.
-  local function composite_over(fg, under)
-    local a = (fg & 0xFF) / 255
-    local out = 0
-    for shift = 24, 8, -8 do
-      local f = (fg >> shift) & 0xFF
-      local u = (under >> shift) & 0xFF
-      out = out | (math.floor(f * a + u * (1 - a) + 0.5) << shift)
-    end
-    return out | 0xFF
-  end
-
-  --- Text colour for a badge filled with `badge_bg`: P.text or P.bg, whichever has the higher WCAG
-  --- contrast against the fill as it really shows (composited over the window background).
-  get_contrasting_text_color = function(badge_bg)
-    local P = Theme.get_palette()
-    if not badge_bg then return P.text end
-    local lum = relative_luminance(composite_over(badge_bg, P.bg))
-    if contrast_ratio(relative_luminance(P.text), lum) >= contrast_ratio(relative_luminance(P.bg), lum) then
-      return P.text
-    end
-    return P.bg
-  end
-end
-
 -- Ensure the Take Pitch Envelope is active on the take, creating it if needed.
 -- If force_unbypass is true (e.g. during analysis), guarantees it is active (ACT 1).
 local function ensure_take_pitch_envelope(take, item, force_unbypass)
@@ -5745,6 +5695,10 @@ local function render_pitched_items_sidebar(sidebar_ctx)
         local sel_text = fit_text(sidebar_ctx, full_name, name_w, is_active and "bold" or "regular")
         local name_col = (is_missing and dim_col) or P.text
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Text(), name_col)
+        -- The row card draws its own hover fill: the selectable adds none (an opaque P.hover would cover the
+        -- active row's blue tint in the name area)
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_HeaderHovered(), Theme.with_alpha(P.hover, 0))
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_HeaderActive(),  Theme.with_alpha(P.hover, 0))
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_ItemSpacing(), 0, 0)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_SelectableTextAlign(), 0, 0.5)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
@@ -5752,7 +5706,7 @@ local function render_pitched_items_sidebar(sidebar_ctx)
           switch_active_target(guid, take_obj)
         end
         reaper.ImGui_PopStyleVar(sidebar_ctx, 2)
-        reaper.ImGui_PopStyleColor(sidebar_ctx, 1)
+        reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
         if name_font then Theme.pop_font(sidebar_ctx, name_font) end
 
         if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
@@ -7064,7 +7018,7 @@ do
       Theme.badge(ctx, hdr_fit_text(state.target_take_name, hs.badge_w - s.pad_x), {
         id = "target",
         bg = badge_bg,
-        text_color = get_contrasting_text_color(badge_bg),
+        text_color = Theme.label_on(badge_bg),
         w = hs.badge_w,
       })
       -- The tooltip is built on hover only: it reads the item's pitch algorithm from REAPER
@@ -7085,10 +7039,16 @@ do
   end
 
   local function hdr_draw_key(hs)
-    local s = hs.s
-    -- Previews the short name ("C#") but lists the full one ("C# / Db"), so it stays a plain BeginCombo
+    local P, s = hs.P, hs.s
+    -- Previews the short name ("C#") but lists the full one ("C# / Db"), so it stays a plain BeginCombo.
+    -- Its preview takes the button face, like Scale's Theme.combo; popped before the list draws.
     reaper.ImGui_SetNextItemWidth(ctx, s.key_w)
-    if reaper.ImGui_BeginCombo(ctx, "##key_selector", SCALE_KEYS[state.key_idx].display) then
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),        P.btn)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),  P.btn_a)
+    local key_open = reaper.ImGui_BeginCombo(ctx, "##key_selector", SCALE_KEYS[state.key_idx].display)
+    reaper.ImGui_PopStyleColor(ctx, 3)
+    if key_open then
       for i, k_info in ipairs(SCALE_KEYS) do
         local is_sel = (state.key_idx == i)
         if Theme.selectable(ctx, k_info.name .. "##key_" .. i, is_sel, nil, s.key_list_w) and not is_sel then
@@ -7498,7 +7458,7 @@ do
     --- accent, an item override solid accent, each with a label that reads on it; the global default a quiet tag
     local function level_colors(level)
       if level == "note" then return Theme.label_on(P.accent2), P.accent2 end
-      if level == "item" then return P.on_text, P.accent end
+      if level == "item" then return Theme.label_on(P.accent), P.accent end
       return P.text, P.well
     end
 
