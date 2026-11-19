@@ -6,14 +6,18 @@
 -- =============================================================================
 --
 -- PALETTE -- Theme.build_palette([overrides]) / Theme.get_palette() returns table with:
---   Surfaces:   bg, panel, card               (window bg, popups, frame bg)
---   Text:       text, text_dim                (primary, secondary)
---   Accent:     accent      = active state    (ButtonActive, CheckMark, SliderGrab)
---               accent_h    = hover  (40%)    (ButtonHovered, HeaderHovered, FrameBgActive)
---               accent_d    = dim    (20%)    (Button, Header, FrameBgHovered, ScrollbarGrab)
---               accent_e    = subtle (12.5%)  (TableBorderLight)
+--   Look:       Fancy = the Reaper Tips look, fixed values (greys, blue accent). Match Theme = surfaces, text and
+--               accent read from the active REAPER theme; every role below is derived and contrast-fitted.
+--   Surfaces:   bg, panel, card               (window, popups / raised strips, cards / table header)
+--   Text:       text, text_dim                (primary, secondary; both fitted to 4.5:1 on the surfaces and control faces)
+--               text_dim is fitted for bg, panel, card, btn, well; on hover, pressed and tab faces use `text`
+--               (Match Theme caps the btn_h / tab / tab_h / tab_sel / hover steps so `text` keeps 4.5:1 on them)
+--   Accent:     accent      = active state    (CheckMark, TabSelectedOverline, selection bar, toggle-on face)
+--               accent_h    = hover  (40%)    (SeparatorHovered)
+--               accent_d    = dim    (20%)    (kept for scripts; the style stack no longer tints resting controls)
+--               accent_e    = subtle (12.5%)  (kept for scripts)
 --               accent_l    = light  (70%)    (High-contrast text on badges/active toggles)
---   Secondary:  accent2 / blue = active state (secondary accent, info, badge highlights)
+--   Secondary:  accent2 / blue = a soft violet in Fancy (secondary accent, info, badge highlights; blue* are aliases)
 --               accent2_h / blue_h = hover (40%)
 --               accent2_d / blue_d = dim   (20%)
 --               accent2_e / blue_e = subtle (12.5%)
@@ -21,31 +25,49 @@
 --   Semantic:   green/green_h/green_d/green_l (success, enabled, positive)
 --               red/red_h/red_d/red_l         (error, delete, destructive)
 --               yellow/yellow_l               (warning, caution)
---               blue/blue_h/blue_d/blue_e/blue_l (info, secondary accent)
---   Structure:  border, sep, dim_bg           (borders, separators, modal overlay; border >= 3:1 on bg/panel/card)
---   Table:      table_row, table_row_alt      (alternating row backgrounds)
---   Controls:   slider_grab_active            (slider grab while dragging)
+--   Structure:  border, sep, dim_bg           (border = control outline, same value as outline in Fancy; sep = neutral
+--                                              hairline, no accent tint; dim_bg = modal overlay)
+--   Table:      table_row, table_row_alt      (alternating row backgrounds; kept for scripts, the style stack uses bg)
+--   Controls:   btn / btn_h / btn_a           resting / hovered / pressed face of buttons, combos, inactive toggles
+--               btn_on, on_text               face of an active toggle, and its label (fitted to 4.5:1)
+--               outline                       1 px frame around controls
+--               well, well_h, well_a          recessed inputs, slider grooves, checkbox boxes, progress track
+--               thumb, thumb_a                slider grab, and while dragged (slider_grab_active is kept)
+--               tab, tab_h, tab_sel           tab faces (the selected tab also has an accent line on top, drawn
+--                                             when the tab bar passes TabBarFlags_DrawSelectedOverline)
+--               hover, select                 hovered / selected row of a selectable or menu item (select = accent at 25%)
+--               scroll, scroll_h, scroll_a    scrollbar grab: 17 / 26 / 35% (white in Fancy, text colour in Match Theme)
+--               title                         title bar and docked header strip
 --   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, handle*, trace, preview, overview_*, view_*, ... }
---               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy Dark,
+--               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy,
 --               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
+--               Theme.label_on(fill) -> a dark or light label colour that reads on fill (4.5:1)
+--
+-- CONTRAST RULE (docs/design/README.md, "Contrast")
+--   Text and labels: 4.5:1 always, in both modes.
+--   Meaningful state (toggle on, focus, slider thumb, check mark, playhead, note borders, the selection bar of library
+--   rows): 3:1 against what it sits on.
+--   The resting outline and face of a labelled control follow the theme, no minimum (outline is about 1.4:1 on bg).
+--   The select tint of rows is exempt from 3:1; library rows add a 2 px accent bar that carries it.
 --
 -- THEME MODES & PREFS -- Theme.get_mode() / .set_mode(mode) / .invalidate_palette()
---   MODE_FANCY="fancy"  Curated dark, purple accent
---   MODE_MATCH="match"  Everything from REAPER theme (including edit cursor accent)
+--   MODE_FANCY="fancy"  Curated Reaper Tips look (label "Fancy")
+--   MODE_MATCH="match"  Everything from REAPER theme (including edit cursor accent) (label "Match Theme")
+--   Theme.mode_labels   = { "Fancy", "Match Theme" } (settings combo labels, in mode order)
 --   Theme.get_show_tooltips() / .set_show_tooltips(bool) Global tooltip visibility
 --
 -- LAYOUT TOKENS -- Theme.layout.*
 --   Scale:      xs=2  sm=4  md=8  lg=12  xl=16  xxl=24  xxxl=32 (unified scale)
---   Rounding:   rounding=sm (4) (universal: windows, frames, grabs, drawlist)
+--   Rounding:   rounding=xs (2) (universal: windows, frames, grabs, drawlist)
 --   Table:      row_h=xxl (24)  chk_col_w=xxl (24)  indent=xxxl (32)
 --   Modals:     modal_sm/md/lg/xl = {w, h}
 --   Misc:       tooltip_wrap=300  section_gap=sm (4)
 --
 -- BUTTON PRESETS -- height flows from font + padding (no hardcoded heights)
---   btn_sm = {pad_x=sm, pad_y=xs, font="small", h=16}   Push FramePadding + font
---   btn_default = global FramePadding (md,sm) (h=22)    No override needed
---   btn_lg = {pad_x=lg, pad_y=sm, font="medium", h=24}  Push FramePadding + font
+--   btn_sm = {pad_x=sm, pad_y=xs, font="small", h=15}   Push FramePadding + font
+--   btn_default = global FramePadding (md,sm) (h=21)    No override needed
+--   btn_lg = {pad_x=lg, pad_y=sm, font="medium", h=22}  Push FramePadding + font
 --   Usage:
 --     PushStyleVar(ctx, FramePadding, L.btn_lg.pad_x, L.btn_lg.pad_y)
 --     push_font(ctx, fonts[L.btn_lg.font])
@@ -57,82 +79,31 @@
 --   icon_target={size=xl,pad=sm}->24px (WCAG 2.5.8 minimum target for frequent / destructive icon buttons)
 --   Pass via opts.preset: Theme.icon_btn(ctx, id, fn, {preset = L.icon_sm})
 --
--- FONTS -- Theme.font_sizes: small=12 default=14 medium=16 large=18 header=20
+-- ICONS -- Theme.icons.<name>(dl, cx, cy, half_size, color), vector shapes for the draw list:
+--   play pause close plus info tri_down tri_up tri_left tri_right slider gear check dot ring
+--
+-- FONTS -- Theme.font_sizes: small=11 default=13 medium=14 large=16 header=18  (Fira Sans, bundled in _lib/fonts/)
 --   create_fonts(ctx)          -> {default,small,medium,large,header,default_bold,medium_bold,large_bold}
 --   attach_fonts(ctx, fonts)   -> call once before first frame
 --   push_font(ctx, font, [sz]) -> bool (safe pcall, auto-resolves size from registry)
 --   pop_font(ctx, pushed)      -> conditional pop
 --   fonts.tooltip = fonts.default (backward-compat alias)
+--   Font source: _lib/fonts/FiraSans-Regular.otf and -Bold.otf (SIL OFL 1.1, fonts/OFL.txt); if a file cannot be
+--   loaded, an installed "Fira Sans", then the system sans-serif. Theme.font_source = "file" | "family" | "system".
 --
--- STYLE -- Theme.push(ctx, [palette]) -> nc=32, nv=10 / Theme.pop(ctx, nc, nv)
---   Colors: WindowBg, TitleBg*2, Header*3, Button*3, FrameBg*3, Slider*2, CheckMark,
---           Popup, ModalDim, Separator*3, Table*5, Scrollbar*3, ScrollbarGrabActive,
---           Text, TextDisabled, Border
---   Vars:   WindowRounding, FrameRounding, GrabRounding, ItemSpacing, FramePadding,
---           WindowPadding, CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize
+-- STYLE -- Theme.push(ctx, [palette]) -> nc, nv / Theme.pop(ctx, [nc], [nv])
+--   Counts are returned, not fixed: pass them to pop (no counts = those of the last push).
+--   Colors: Button*3 btn / btn_h / btn_a, FrameBg*3 well (+ a step each), SliderGrab*2 thumb / thumb_a,
+--           CheckMark accent, Header select / hover / stronger select, Tab* tab / tab_h / tab_sel (skipped on
+--           ReaImGui without them), Scrollbar* scroll (bg transparent), TitleBg*2 title, PopupBg panel,
+--           Border outline, Separator sep (hovered / active keep the accent), Table* sep / bg / card,
+--           Text, TextDisabled
+--   Vars:   Window/Frame/GrabRounding (2), ItemSpacing (4,4), FramePadding (8,4), WindowPadding (8,8),
+--           CellPadding, ItemInnerSpacing, IndentSpacing, FrameBorderSize (1)
 --
--- ICONS -- function(dl, cx, cy, half_size, color)
---   Theme.icons: play, pause, close, plus, info, tri_down, tri_up, tri_left, tri_right, slider, gear
---
--- WIDGETS
---   icon_btn(ctx, id, icon_fn, [opts])         -> bool  opts: preset,w,h,icon_size,color,tooltip (hand cursor on hover)
---   icon_btn_colored(ctx, id, icon_fn, [opts]) -> bool  opts: +bg,bg_hover,bg_active,icon_color
---   selectable(ctx, label, [sel], [flags], [w], [h], [opts])  Rounded Selectable; a label wider than the item is
---                                              shortened with "..." and shown in full in a tooltip
---   tooltip(ctx, text, [max_w])                The widgets' opts.tooltip show on HoveredFlags_ForTooltip (also when disabled)
---   section_divider(ctx, label, [opts])        opts: tooltip,color,preset,icon_size,w,h,icon_color
---   collapsing_header(ctx, label, [opts])      Safe collapsing header (opts: default_open, flags)
---   progress_bar(ctx, fraction, [opts])        Meter/progress bar (opts: preset,fonts,fill_color,bg_color,overlay)
---   toggle_button(ctx, id, label, is_act, [o]) Button-derived toggle button (opts: preset,fonts,w,h,colors)
---   badge(ctx, label, [opts])                  Button-derived status badge (opts: preset,fonts,color,bg,w,h)
---   push_button_preset(ctx, fonts, preset)     -> var_count, pushed_font (e.g. for sliders, combos)
---   pop_button_preset(ctx, var_count, pfont)   Pops styling pushed by push_button_preset
---   combo(ctx, id, items, selected_idx, [opts]) Standardized combo box (opts: w, placeholder, get_label)
---   multi_combo(ctx, id, items, sel, [opts])   Standardized multi-select combo (compact, full-row hover/click)
---   header(ctx, opts)                          Standardized window header bar (title, FANCY prefix, settings, close)
---   center_next_window(ctx, w, h)
---   brand_icon(ctx, [size], [target_h])
---   get_palette()                              Get active cached palette
---   invalidate_palette()                       Clear internal widget palette cache
---
--- ALIGNMENT
---   align(ctx, [row_h], [item_h])     PRIMARY — call before every item on a row
---                                      No args: text↔widget baseline alignment
---                                      row_h:   center item in explicit row (tables)
---                                      item_h:  custom-height item override
---                                      nil,item_h: center short item in default row
---                                                  (e.g. btn_sm next to default text)
---   vcenter(ctx, item_h, row_h)        Low-level: cursor math (use align() instead)
---   right_align(ctx, item_w, [margin]) Cursor X: right-align next item
---   hcenter(ctx, item_w)               Cursor X: center next item
---
--- SETTINGS
---   settings_widget(ctx, [opts])        Reactive theme mode combo (opts: w, label, align, margin)
---   tooltip_setting_widget(ctx, [opts]) Global show tooltips checkbox (opts: label)
---   calc_combo_width(ctx, items, [p])   Calculates reactive width from font metrics + labels
---
--- MINIMAL TEMPLATE:
---   local Theme = require("theme")
---   local ctx = reaper.ImGui_CreateContext("Script Name")
---   local fonts = Theme.create_fonts(ctx)
---   Theme.attach_fonts(ctx, fonts)
---   local function loop()
---     local P = Theme.get_palette()
---     local nc, nv = Theme.push(ctx, P)
---     local pushed = Theme.push_font(ctx, fonts.default)
---     local visible, open = reaper.ImGui_Begin(ctx, "Script Name", true)
---     if visible then reaper.ImGui_Text(ctx, "Hello"), reaper.ImGui_End(ctx) end
---     Theme.pop_font(ctx, pushed)
---     Theme.pop(ctx, nc, nv)
---     if open then reaper.defer(loop) end
---   end
---   reaper.defer(loop)
---
--- =============================================================================
--- RULES: NO hardcoded hex colors, pixel values, fonts, or icon functions.
--- Colors from build_palette(). Dims from layout.*. Fonts from create_fonts().
--- Icons from icons.*. Alignment from align() (primary) / right_align / hcenter.
--- =============================================================================
+-- WIDGETS -- toggle_button: off = btn face, on = solid btn_on with on_text. badge: quiet well tag; with opts.color a
+--   solid fill and a fitted label. combo / multi_combo: preview is a button face. icon_btn: transparent at rest.
+--   selectable: hover / select tint plus a 2 px accent bar on the left of a selected row.
 
 local Theme = {}
 
@@ -214,6 +185,38 @@ local _cached_palette = nil
 local _cached_mode = nil
 local _cached_show_tooltips = nil
 
+-- Widget colour fits (hover / pressed shades, icon colours), kept so a widget does not search for contrast on
+-- every frame. Keyed by every colour that enters the computation (never by a palette table alone), so a palette
+-- built with overrides cannot be served another palette's entry. Cleared by set_mode and invalidate_palette,
+-- and when it grows past _FIT_CACHE_MAX entries (a script that animates colours).
+local _fit_cache, _fit_cache_n = {}, 0
+local _FIT_CACHE_MAX = 1024
+
+local function _fit_cache_clear()
+  _fit_cache, _fit_cache_n = {}, 0
+end
+
+--- Cached value for the keys (kind, a, b, c, d, e), or nil.
+local function _fit_cache_get(kind, a, b, c, d, e)
+  local t = _fit_cache[kind]
+  t = t and t[a]; t = t and t[b]; t = t and t[c]; t = t and t[d]
+  return t and t[e]
+end
+
+--- Stores `v` under the keys (kind, a, b, c, d, e) and returns it.
+local function _fit_cache_put(v, kind, a, b, c, d, e)
+  if _fit_cache_n >= _FIT_CACHE_MAX then _fit_cache_clear() end
+  local t = _fit_cache
+  for _, k in ipairs({ kind, a, b, c, d }) do
+    local n = t[k]
+    if not n then n = {}; t[k] = n end
+    t = n
+  end
+  t[e] = v
+  _fit_cache_n = _fit_cache_n + 1
+  return v
+end
+
 --- Returns the current theme mode from global ExtState (cached in memory).
 --- @return string  One of "fancy" or "match"
 function Theme.get_mode()
@@ -232,6 +235,7 @@ end
 function Theme.set_mode(mode)
   reaper.SetExtState(EXTSTATE_SECTION, EXTSTATE_KEY_THEME, mode, true)
   _cached_mode = mode
+  _fit_cache_clear()
   _cached_palette = Theme.build_palette()
 end
 
@@ -267,35 +271,55 @@ function Theme.invalidate_palette()
   _cached_palette = nil
   _cached_mode = nil
   _cached_show_tooltips = nil
+  _fit_cache_clear()
 end
 
 -------------------------------------------------------------------------------
--- 3. CURATED FANCY DARK PALETTE (BASE COLORS)
+-- 3. CURATED FANCY PALETTE (BASE COLORS)
 -------------------------------------------------------------------------------
 local FANCY_PALETTE = {
   -- Base surfaces
-  bg       = 0x12121EFF,
-  panel    = 0x1C1C30FF,
-  card     = 0x22223AFF,
+  bg       = 0x323232FF,
+  panel    = 0x3E3E3EFF,
+  card     = 0x424242FF,
 
-  -- Text
-  text     = 0xFFFFFFFF,
-  text_dim = 0x8E8EADFF,
+  -- Text (text_dim starts here and is fitted to 4.5:1 on the surfaces by build_palette)
+  text     = 0xD9D9D9FF,
+  text_dim = 0xA0A0A0FF,
 
-  -- Accent (primary purple)
-  accent   = 0x8B70FAFF,
+  -- Accent (primary blue)
+  accent   = 0x46B9FEFF,
 
-  -- Accent (secondary blue)
-  accent2  = 0x4DA6FFFF,
+  -- Accent (secondary violet; the blue* fields are aliases)
+  accent2  = 0xA990F5FF,
 
   -- Semantic base colors
-  green    = 0x56E39FFF,
-  red      = 0xF45B69FF,
-  yellow   = 0xFFCC66FF,
-  blue     = 0x4DA6FFFF,
+  green    = 0x44CD8CFF,
+  red      = 0xE45E65FF,
+  yellow   = 0xFEC13AFF,
+  blue     = 0xA990F5FF,
 
   -- Structural base
-  border   = 0x737373FF,
+  border   = 0x181818FF,
+  sep      = 0x1D1D1DFF,
+
+  -- Control roles
+  btn      = 0x454545FF,  -- resting face of buttons, combos, inactive toggles
+  btn_h    = 0x585858FF,  -- hovered face
+  btn_a    = 0x2E2E2EFF,  -- pressed face
+  on_text  = 0x0F2B3BFF,  -- label on the "on" face (fitted)
+  outline  = 0x181818FF,  -- 1 px control frame
+  well     = 0x2A2A2AFF,  -- recessed inputs, slider grooves, checkbox boxes
+  thumb    = 0xC2C2C2FF,  -- slider grab
+  thumb_a  = 0xD9D9D9FF,  -- slider grab while dragged
+  tab      = 0x383838FF,
+  tab_h    = 0x4D4D4DFF,
+  tab_sel  = 0x585858FF,
+  hover    = 0x4D4D4DFF,  -- hovered selectable / menu row
+  scroll   = 0xFFFFFF2B,  -- scrollbar grab: white at 17 %
+  scroll_h = 0xFFFFFF42,  -- 26 %
+  scroll_a = 0xFFFFFF59,  -- 35 %
+  title    = 0x2D2D2DFF,  -- title bar, docked header strip
 }
 
 -------------------------------------------------------------------------------
@@ -320,7 +344,7 @@ end
 --- labels, note blocks, zone highlights, trim handles, curves and markers, marquee, playhead, pills, ruler, the
 --- overview / range strips, scrim). Built by
 --- Theme.build_palette() into P.canvas for both modes:
----   Fancy Dark   fixed values, plus the ones that are a palette colour, a shade or an alpha of it (noted per
+---   Fancy        fixed values, plus the ones that are a palette colour, a shade or an alpha of it (noted per
 ---                token). Notes are solid blocks in the accent colour (green once edited); the rows are one quiet
 ---                surface, so the notes are the first thing the eye lands on.
 ---   Match Theme  derived from P.bg / P.panel / P.text / P.accent / P.green / P.blue / P.yellow so the canvas
@@ -522,38 +546,39 @@ local function fit_fill(fill, rows, ink, min_ratio)
   return fill, false
 end
 
---- Fancy Dark canvas values. Literal tokens are the colours Pitch Correct drew with hex literals; the ones
+--- Fancy (curated) canvas values, modelled on the Reapertips MIDI editor: recessed grey rows, #1D1D1D
+--- hairlines, a #333333 note column and ruler. Literal tokens are the colours Pitch Correct drew with hex literals; the ones
 --- built from P are exactly the palette colour (or an alpha of it) the script used next to them.
 local function build_canvas_fancy(P)
   local C = {}
   -- Rows (what a note sits on). row* = in the scale, row_tonic = the key's root, row_dim* = out of the scale,
   -- row_plain* = no scale chosen (Chromatic). *_black = the row of a black piano key.
   -- The steps between them are small on purpose: the rows are a background, the notes carry the picture.
-  C.row             = 0x1C1C2AFF
-  C.row_black       = 0x1A1A27FF
-  C.row_tonic       = 0x1E1C2EFF
-  C.row_dim         = 0x161620FF
-  C.row_dim_black   = 0x14141DFF
-  C.row_plain       = 0x1C1C24FF
-  C.row_plain_black = 0x18181FFF
+  C.row             = 0x2E2E2EFF
+  C.row_black       = 0x2B2B2BFF
+  C.row_tonic       = 0x2E2E2EFF
+  C.row_dim         = 0x282828FF
+  C.row_dim_black   = 0x262626FF
+  C.row_plain       = 0x2E2E2EFF
+  C.row_plain_black = 0x2A2A2AFF
   -- Accent tints drawn over the in-scale / root rows (follow P.accent)
   C.row_tint        = with_alpha(P.accent, 0.03)
   C.row_tonic_tint  = with_alpha(P.accent, 0.10)
   -- Grid lines between rows: hairlines in the text colour, the root row's in the accent
   C.grid            = with_alpha(P.text, 0.05)
   C.grid_tonic      = with_alpha(P.accent, 0.25)
-  C.grid_dim        = 0x1E1E28FF
-  C.grid_plain      = 0x2A2A32FF
-  C.grid_plain_black = 0x24242CFF
+  C.grid_dim        = 0x1D1D1DFF
+  C.grid_plain      = 0x1D1D1DFF
+  C.grid_plain_black = 0x1D1D1DFF
   -- Note-name column (a flat strip left of the rows): labels >= 4.5:1 on gutter_bg, the root row's strip >= 3:1
-  C.gutter_bg         = P.panel
-  C.gutter_text       = with_alpha(P.text, 0.80)
+  C.gutter_bg         = 0x333333FF
+  C.gutter_text       = 0xC8C8C8FF
   C.gutter_text_dim   = P.text_dim
   C.gutter_text_tonic = P.accent_l
   C.gutter_strip      = P.accent
   -- Piano keys (fixed in both modes: a piano does not change colour with the REAPER theme)
-  C.key_white       = 0xDDDDDDFF
-  C.key_black       = 0x1E1E24FF
+  C.key_white       = 0xBABABAFF
+  C.key_black       = 0x282828FF
   C.key_plain_black = 0x1A1A1AFF
   C.key_tonic_white = 0xFFFFFFFF
   C.key_tonic_black = 0x252338FF
@@ -571,15 +596,17 @@ local function build_canvas_fancy(P)
   C.key_text_dim_white   = P.text
   C.key_text_dim_black   = P.text
   -- Note blocks: near-opaque shades of the accent (untouched) and of green (edited), dark enough for P.text to
-  -- read on them (>= 4.5:1). A selected block is a brighter shade inside a border in the text colour, so the
-  -- selection does not rest on the fill alone. note_wave is the amplitude envelope drawn inside a block.
-  C.note_fill            = with_alpha(darken(P.accent, 0.28), 0.92)
+  -- read on them (>= 4.5:1 on every row; the light blue accent needs a deeper shade than green). The border is
+  -- the note's own hue (>= 3:1 on every row). A selected block is a brighter shade inside a light border
+  -- (#EDEDED, >= 3:1 on every row), so the selection does not rest on the fill alone. note_wave is the
+  -- amplitude envelope drawn inside a block.
+  C.note_fill            = with_alpha(darken(P.accent, 0.58), 0.92)
   C.note_border          = P.accent
   C.note_edited          = with_alpha(darken(P.green, 0.50), 0.92)
   C.note_edited_border   = P.green
-  C.note_selected        = with_alpha(darken(P.accent, 0.15), 0.96)
-  C.note_selected_edited = with_alpha(darken(P.green, 0.45), 0.96)
-  C.note_selected_border = P.text
+  C.note_selected        = with_alpha(darken(P.accent, 0.48), 0.96)
+  C.note_selected_edited = with_alpha(darken(P.green, 0.48), 0.96)
+  C.note_selected_border = 0xEDEDEDFF
   C.note_bypassed        = 0x2A2A2A55
   C.note_bypassed_border = 0x555555AA
   C.note_label           = P.text
@@ -610,7 +637,7 @@ local function build_canvas_fancy(P)
   C.playhead        = P.text
   -- Overview strip (every note, small, under the rows) and range strip (beside them): the track, the notes on
   -- it, and the thumb that marks the visible window (fill, border and end grips)
-  C.overview_bg     = darken(P.bg, 0.25)
+  C.overview_bg     = P.well
   C.overview_note   = P.accent
   C.view_fill       = with_alpha(P.accent, 0.16)
   C.view_border     = P.accent
@@ -618,7 +645,7 @@ local function build_canvas_fancy(P)
   -- Overlays: pills (readouts, zone names), ruler strip, scrim
   C.pill_bg         = with_alpha(P.panel, 0.90)
   C.pill_text       = P.text
-  C.ruler_bg        = with_alpha(P.panel, 0.90)
+  C.ruler_bg        = with_alpha(0x333333FF, 0.90)   -- the note column's #333333, as the theme's MIDI ruler
   C.scrim           = with_alpha(P.bg, 0.75)
   -- BYPASSED badge on the card, over the scrim: title and border are exactly P.yellow
   C.bypass_title    = P.yellow
@@ -631,8 +658,8 @@ end
 --- palette colour named in the comment and move only as far as the contrast rule needs.
 --- Tokens not assigned below keep their build_canvas_fancy value, by design: the piano keys and their
 --- black/white labels and outline (key_white ... key_text_tonic_white), and the accent / text / blue / panel /
---- bg alphas that already follow the palette (row_tint, row_tonic_tint, grid, grid_tonic, gutter_bg, zone_drift,
---- zone_divider, marquee_fill, marquee_border, view_fill, pill_bg, ruler_bg, scrim).
+--- bg alphas that already follow the palette (row_tint, row_tonic_tint, grid, grid_tonic, zone_drift,
+--- zone_divider, marquee_fill, marquee_border, view_fill, pill_bg, scrim).
 local function build_canvas_match(P)
   local C = build_canvas_fancy(P)
   local bg = P.bg
@@ -671,6 +698,8 @@ local function build_canvas_match(P)
   C.key_text_dim_black   = fit_contrast(P.text, { C.key_dim_black }, 4.5)            -- text, >= 4.5:1 on the dimmed black key
 
   -- Note-name column: the panel colour; its labels fitted to >= 4.5:1 and the root row's strip to >= 3:1 on it
+  C.gutter_bg         = P.panel                                                      -- the curated #333333 does not follow a theme
+  C.ruler_bg          = with_alpha(P.panel, 0.90)                                    -- the time ruler: the same panel colour
   local gutter = { C.gutter_bg }
   C.gutter_text       = fit_contrast(with_alpha(P.text, 0.80), gutter, 4.5)          -- in-scale row name
   C.gutter_text_dim   = fit_contrast(P.text_dim, gutter, 4.5)                        -- out-of-scale row name
@@ -714,7 +743,7 @@ local function build_canvas_match(P)
   C.note_label_edited   = fit_contrast(P.text, edited_fills, 4.5)                     -- text on both edited fills
   C.note_edit_mark      = fit_contrast(P.text, edited_fills, 3.0)                     -- the corner square: >= 3:1 on both edited fills
 
-  -- Zone highlights: blue for the drift zone (as in Fancy Dark), yellow for the vibrato zone and while Shift is held
+  -- Zone highlights: violet (P.blue, the secondary accent) for the drift zone (as in Fancy), yellow for the vibrato zone and while Shift is held
   C.zone_shift = with_alpha(P.yellow, 0.267)
 
   -- Trim handles, fitted to >= 3:1. At rest a handle can sit on any row, fill or zone highlight; the hovered and
@@ -747,7 +776,7 @@ local function build_canvas_match(P)
   C.trace      = fit_contrast(with_alpha(P.text, 0.90), line_on, 3.0, rows, true)   -- raw pitch trace: text colour (90 % alpha)
   C.playhead   = fit_contrast(P.text, line_on, 3.0, rows, true)                  -- the playhead line: text colour
   C.preview    = fit_contrast(with_alpha(toward(P.green, 0.45), 0.90), curve_on, 3.0, rows, true)   -- corrected-pitch preview: a green toward the text colour
-  C.trend      = fit_contrast(C.trend, curve_on, 3.0, rows, true)                -- trend line: the Fancy Dark cyan (apart from marker_split's blue)
+  C.trend      = fit_contrast(C.trend, curve_on, 3.0, rows, true)                -- trend line: the Fancy cyan (apart from marker_split's violet)
   C.anchor     = C.trend                                                         -- trend anchor diamond: same as the trend
   C.spot       = fit_contrast(P.yellow, curve_on, 3.0, rows, true)               -- smart-spot circle: yellow
   -- Split markers are drawn before the wash: the line on rows and blocks, its label on rows and blocks
@@ -816,28 +845,49 @@ function Theme.build_palette(overrides)
   local mode = Theme.get_mode()
   local P = {}
   overrides = overrides or {}
+  local F = FANCY_PALETTE
+  local fancy = mode == Theme.MODE_FANCY
 
-  if mode == Theme.MODE_FANCY then
-    -- Curated Fancy Dark palette
-    P.bg       = overrides.bg       or FANCY_PALETTE.bg
-    P.panel    = overrides.panel    or FANCY_PALETTE.panel
-    P.card     = overrides.card     or FANCY_PALETTE.card
-    P.text     = overrides.text     or FANCY_PALETTE.text
-    P.text_dim = overrides.text_dim or FANCY_PALETTE.text_dim
-    P.accent   = overrides.accent   or FANCY_PALETTE.accent
-    P.border   = overrides.border   or FANCY_PALETTE.border
+  -- Surfaces, accent and the control faces the text has to read on
+  if fancy then
+    P.bg     = overrides.bg     or F.bg
+    P.panel  = overrides.panel  or F.panel
+    P.card   = overrides.card   or F.card
+    P.accent = overrides.accent or F.accent
+    P.btn    = overrides.btn    or F.btn
+    P.well   = overrides.well   or F.well
+  else
+    -- Everything from the REAPER theme (surfaces, accent from the edit cursor, control faces)
+    P.bg     = overrides.bg     or read_theme_color("col_main_bg2",    F.bg)
+    P.panel  = overrides.panel  or read_theme_color("col_tr1_bg",      F.panel)
+    P.card   = overrides.card   or read_theme_color("col_tr2_bg",      F.card)
+    P.btn    = overrides.btn    or read_theme_color("col_buttonbg",    F.btn)
+    P.well   = overrides.well   or read_theme_color("col_main_editbk", F.well)
+    -- The edit cursor colour, fitted to 3:1 on the surfaces and the well (check mark, selection bar), keeping
+    -- its hue, before anything is derived from it. An overridden accent is used as given.
+    P.accent = overrides.accent or fit_contrast(read_theme_color("col_cursor", F.accent),
+      { P.bg, P.panel, P.card, P.well }, 3.0, nil, true)
+  end
+  P.select = overrides.select or with_alpha(P.accent, 0.25)
 
-  elseif mode == Theme.MODE_MATCH then
-    -- Everything from REAPER theme (surfaces, text, borders, and accent from edit cursor)
-    P.bg       = overrides.bg       or read_theme_color("col_main_bg2",  FANCY_PALETTE.bg)
-    P.panel    = overrides.panel    or read_theme_color("col_tr1_bg",    FANCY_PALETTE.panel)
-    P.card     = overrides.card     or read_theme_color("col_tr2_bg",    FANCY_PALETTE.card)
-    P.text     = overrides.text     or read_theme_color("col_main_text", FANCY_PALETTE.text)
-    -- text_dim / border are fitted to WCAG on the three surfaces they are drawn on (text 4.5:1, border 3:1)
-    local surfaces = { P.bg, P.panel, P.card }
-    P.text_dim = overrides.text_dim or fit_contrast(read_theme_color("col_tcp_text", FANCY_PALETTE.text_dim), surfaces, 4.5)
-    P.accent   = overrides.accent   or read_theme_color("col_cursor", FANCY_PALETTE.accent)
-    P.border   = overrides.border   or fit_contrast(read_theme_color("col_main_3dhl", FANCY_PALETTE.border), surfaces, 3.0)
+  -- Text is fitted (4.5:1) on the three surfaces, the control face, the well and a selected row (the select
+  -- tint over each surface); text_dim on the surfaces and faces. A curated, un-overridden text already reaches it.
+  local base_surfaces = { P.bg, P.panel, P.card }
+  local faces = { P.bg, P.panel, P.card, P.btn, P.well }      -- text_dim: the surfaces and control faces
+  local surfaces = { P.bg, P.panel, P.card, P.btn, P.well }   -- text: those plus a selected row
+  for _, s in ipairs(base_surfaces) do surfaces[#surfaces + 1] = composite_over(P.select, s) end
+  if fancy then
+    P.text     = overrides.text     or F.text
+    P.text_dim = overrides.text_dim or fit_contrast(F.text_dim, faces, 4.5)
+    P.border   = overrides.border   or F.border
+  else
+    -- Of the theme's two text colours the one with more contrast on bg starts text, the other text_dim
+    local t1 = read_theme_color("col_main_text", F.text)
+    local t2 = read_theme_color("col_tcp_text", F.text_dim)
+    if contrast_over(t2, P.bg) > contrast_over(t1, P.bg) then t1, t2 = t2, t1 end
+    P.text     = overrides.text     or fit_contrast(t1, surfaces, 4.5)
+    P.text_dim = overrides.text_dim or fit_contrast(t2, faces, 4.5)
+    P.border   = overrides.border   or fit_contrast(read_theme_color("col_main_3dhl", F.border), base_surfaces, 3.0)
   end
 
   -- Semantic base colors & secondary accent
@@ -862,15 +912,16 @@ function Theme.build_palette(overrides)
   P.accent2_d = P.blue_d
   P.accent2_e = P.blue_e
 
-  -- accent_press = ButtonActive: the accent moved toward white/black only as far as P.text needs to read on it (4.5:1)
+  -- accent_press = the accent moved toward white/black only as far as P.text needs to read on it (4.5:1).
+  -- Kept for scripts; the style stack does not use it (ButtonActive is btn_a).
   P.accent_press = overrides.accent_press or fit_contrast(P.accent, { P.text }, 4.5)
 
   -- Derive accent states from the resolved primary accent color
-  -- accent_h = Hover state (40% alpha): ButtonHovered, HeaderHovered, FrameBgActive, SeparatorHovered, ScrollbarGrabHovered
+  -- accent_h = Hover state (40% alpha): SeparatorHovered in the style stack; also kept for scripts
   P.accent_h = overrides.accent_h or with_alpha(P.accent, 0.40)
-  -- accent_d = Dim/default state (20% alpha): Button, Header, FrameBgHovered, ScrollbarGrab
+  -- accent_d = Dim state (20% alpha): kept for scripts; the style stack no longer tints resting controls
   P.accent_d = overrides.accent_d or with_alpha(P.accent, 0.20)
-  -- accent_e = Extra-dim (12.5% alpha): TableBorderLight — subtle structural lines
+  -- accent_e = Extra-dim (12.5% alpha): kept for scripts (TableBorderLight is the neutral sep)
   P.accent_e = overrides.accent_e or with_alpha(P.accent, 0.125)
 
   -- High-contrast text states (lightened 70% toward white for badges, active states, and dense grids)
@@ -882,19 +933,79 @@ function Theme.build_palette(overrides)
   P.yellow_l  = overrides.yellow_l  or lighten(P.yellow, 0.70)
 
   -- Derive structural colors
-  -- sep = Separator lines (20% accent): Separator
-  P.sep    = overrides.sep    or with_alpha(P.accent, 0.20)
+  -- sep = hairline (Separator): a fixed grey in the curated mode, a step darker than the window in Match Theme
+  local sep_default = F.sep
+  if not fancy then sep_default = darken(P.bg, luminance(P.bg) > 0.179 and 0.12 or 0.42) end
+  P.sep    = overrides.sep    or sep_default
   -- dim_bg = Modal overlay background (85% darkened bg): ModalWindowDimBg
   P.dim_bg = overrides.dim_bg or with_alpha(darken(P.bg, 0.70), 0.85)
 
   -- Derive table row colors from panel/card
-  -- table_row = Default row bg (darkened panel): TableRowBg
+  -- table_row = Default row bg (darkened panel): kept for scripts (TableRowBg is bg)
   P.table_row     = overrides.table_row     or darken(P.panel, 0.10)
-  -- table_row_alt = Alternating row bg (panel): TableRowBgAlt
+  -- table_row_alt = Alternating row bg (panel): kept for scripts (TableRowBgAlt is bg a step lighter)
   P.table_row_alt = overrides.table_row_alt or P.panel
 
-  -- slider_grab_active = Lighter accent for active slider grab: SliderGrabActive
+  -- slider_grab_active = Lighter accent: kept for scripts (SliderGrabActive is thumb_a)
   P.slider_grab_active = overrides.slider_grab_active or lighten(P.accent, 0.15)
+
+  -- Control roles (see the design spec, section 2)
+  local dark_text = luminance(P.text) > 0.179          -- light text on a dark theme: "toward text" is lighter
+  local function toward(c, f) return dark_text and lighten(c, f) or darken(c, f) end
+  local function away(c, f) return dark_text and darken(c, f) or lighten(c, f) end
+  -- Match Theme: bg darkened, unfitted (the resting frame has no minimum): 52 % on a dark theme, 18 % on a light
+  -- one. Always darker than the window, so on a light theme whose well is as white as the window the frame
+  -- still shows where checkboxes, empty inputs, slider grooves and progress tracks are.
+  P.outline = overrides.outline or (fancy and F.outline or darken(P.bg, dark_text and 0.52 or 0.18))
+  P.btn_on  = overrides.btn_on  or (fancy and P.accent or fit_contrast(P.accent, { P.btn }, 3.0))
+  -- on_text: the dark label colour on btn_on, or white / black when that cannot reach 4.5:1
+  local on_text = fit_contrast(F.on_text, { P.btn_on }, 4.5)
+  if contrast_over(on_text, P.btn_on) < 4.5 then
+    on_text = contrast_over(0xFFFFFFFF, P.btn_on) >= contrast_over(0x000000FF, P.btn_on) and 0xFFFFFFFF or 0x000000FF
+  end
+  P.on_text = overrides.on_text or on_text
+  P.well_h  = overrides.well_h  or lighten(P.well, 0.06)
+  P.well_a  = overrides.well_a  or lighten(P.well, 0.12)
+  if fancy then
+    P.btn_h    = overrides.btn_h    or F.btn_h
+    P.btn_a    = overrides.btn_a    or F.btn_a
+    P.thumb    = overrides.thumb    or F.thumb
+    P.thumb_a  = overrides.thumb_a  or F.thumb_a
+    P.tab      = overrides.tab      or F.tab
+    P.tab_h    = overrides.tab_h    or F.tab_h
+    P.tab_sel  = overrides.tab_sel  or F.tab_sel
+    P.hover    = overrides.hover    or F.hover
+    P.scroll   = overrides.scroll   or F.scroll
+    P.scroll_h = overrides.scroll_h or F.scroll_h
+    P.scroll_a = overrides.scroll_a or F.scroll_a
+    P.title    = overrides.title    or F.title
+  else
+    -- Steps of the same size as the curated ones, toward / away from the text colour. A step toward the text
+    -- colour lowers the label's contrast, so each is capped where P.text would fall under 4.5:1 on the face
+    -- (P.text itself is not changed). The tab faces keep their order (tab < tab_h < tab_sel) when the
+    -- selected tab's step is capped.
+    local text_need = 4.5 + FIT_MARGIN
+    local function capped(base, f)
+      local s = f
+      while s > 0 and contrast_over(P.text, toward(base, s)) < text_need do s = s - 0.005 end
+      return math.max(0, s)
+    end
+    local sel_step = capped(P.bg, 0.23)
+    local h_step   = math.min(capped(P.bg, 0.16), math.max(0, sel_step - 0.07))
+    local tab_step = math.min(0.04, math.max(0, h_step - 0.05))
+    P.btn_h    = overrides.btn_h    or toward(P.btn, capped(P.btn, 0.13))
+    P.btn_a    = overrides.btn_a    or away(P.btn, 0.33)
+    P.thumb    = overrides.thumb    or fit_contrast(toward(P.well, 0.75), { P.well }, 3.0)
+    P.thumb_a  = overrides.thumb_a  or P.text
+    P.tab      = overrides.tab      or toward(P.bg, tab_step)
+    P.tab_h    = overrides.tab_h    or toward(P.bg, h_step)
+    P.tab_sel  = overrides.tab_sel  or toward(P.bg, sel_step)
+    P.hover    = overrides.hover    or toward(P.bg, capped(P.bg, 0.16))
+    P.scroll   = overrides.scroll   or with_alpha(P.text, 0.17)
+    P.scroll_h = overrides.scroll_h or with_alpha(P.text, 0.26)
+    P.scroll_a = overrides.scroll_a or with_alpha(P.text, 0.35)
+    P.title    = overrides.title    or read_theme_color("docker_bg", F.title)
+  end
 
   -- Canvas colours for custom-drawn editors (piano roll, keys, notes, curves): see section 4A
   return attach_canvas(P, mode, overrides)
@@ -929,23 +1040,23 @@ Theme.layout = {
   -- ── Scale (unified spacing & padding) ──────────────────────────────────
   -- One scale for everything: gaps, padding, margins. Like CSS spacing tokens.
   xs   = S.xs,    -- tight: meter bars, cell padding
-  sm   = S.sm,    -- small: related items, inner spacing, frame padding Y, section gap
-  md   = S.md,    -- standard: item spacing, frame padding X, tooltips
-  lg   = S.lg,    -- large: group breaks, window padding
+  sm   = S.sm,    -- small: item spacing, related items, inner spacing, frame padding Y, section gap
+  md   = S.md,    -- standard: window padding, frame padding X, tooltips
+  lg   = S.lg,    -- large: group breaks
   xl   = S.xl,    -- extra: major sections, modal padding
   xxl  = S.xxl,   -- 2x: table row height, checkbox column
   xxxl = S.xxxl,  -- 3x: tree/hierarchy indent
 
   -- ── Rounding ───────────────────────────────────────────────────────────
-  rounding     = S.sm,  -- universal corner radius (windows, frames, grabs, drawlist)
-  border       = 1,     -- hairline border width (FrameBorderSize); colour is P.border (>= 3:1)
+  rounding     = S.xs,  -- universal corner radius (windows, frames, grabs, drawlist)
+  border       = 1,     -- hairline border width (FrameBorderSize); colour is P.outline (no contrast minimum)
 
   -- ── Button size presets ─────────────────────────────────────────────────
   -- Height flows from font + padding. Default uses global FramePadding (md, sm).
   -- Pass opts.preset (or use push_button_preset) for sm/lg variants.
-  btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small",   h = 16 },
-  btn_default  = { pad_x = S.md, pad_y = S.sm, font = "default", h = 22 },
-  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 24 },
+  btn_sm       = { pad_x = S.sm, pad_y = S.xs, font = "small",   h = 15 },
+  btn_default  = { pad_x = S.md, pad_y = S.sm, font = "default", h = 21 },
+  btn_lg       = { pad_x = S.lg, pad_y = S.sm, font = "medium",  h = 22 },
 
   -- ── Icon size presets ───────────────────────────────────────────────────
   -- Button dimension = size + pad * 2. Default icon_btn uses icon_md.
@@ -982,69 +1093,99 @@ Theme.layout = {
 --- Call at the start of each frame, before ImGui_Begin.
 --- @param ctx userdata  ImGui context
 --- @param palette table|nil  Palette from build_palette() / get_palette() (builds default if nil)
---- @return integer color_count  Number of style colors pushed (32)
---- @return integer var_count  Number of style vars pushed (10)
+--- @return integer color_count  Number of style colors pushed (pass to Theme.pop)
+--- @return integer var_count  Number of style vars pushed (pass to Theme.pop)
+-- Counts of the last push on this library. Every push pushes the same number on a
+-- given ReaImGui, so a pop without counts can use them, whichever context pushed.
+local pushed_nc, pushed_nv = 0, 0
+
+-- Push helpers of Theme.push, built once (not per frame): they push on _push_ctx and count into _push_nc / _push_nv.
+local _push_ctx, _push_nc, _push_nv = nil, 0, 0
+local function _push_col(name, value)
+  reaper.ImGui_PushStyleColor(_push_ctx, reaper["ImGui_Col_" .. name](), value)
+  _push_nc = _push_nc + 1
+end
+-- Tab colours: names newer than ReaImGui 0.9 are skipped when the enum does not exist.
+local function _push_col_opt(name, value)
+  if reaper["ImGui_Col_" .. name] then _push_col(name, value) end
+end
+local function _push_var(name, a, b)
+  reaper.ImGui_PushStyleVar(_push_ctx, reaper["ImGui_StyleVar_" .. name](), a, b)
+  _push_nv = _push_nv + 1
+end
+
 function Theme.push(ctx, palette)
   local P = palette or Theme.get_palette()
   local L = Theme.layout
+  _push_ctx, _push_nc, _push_nv = ctx, 0, 0
 
-  -- Style colors (32 total)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_WindowBg(),             P.bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBg(),              P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TitleBgActive(),        P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),               P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),         P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),               P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),         P.accent_press)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),              P.card)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(),       P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),        P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrab(),           P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SliderGrabActive(),     P.slider_grab_active)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_CheckMark(),            P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PopupBg(),              P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ModalWindowDimBg(),     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(),            P.sep)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorHovered(),     P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_SeparatorActive(),      P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableHeaderBg(),        P.panel)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderStrong(),    P.sep)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableBorderLight(),     P.accent_e)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableRowBg(),           P.table_row)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TableRowBgAlt(),        P.table_row_alt)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarBg(),          P.bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrab(),        P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabHovered(), P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ScrollbarGrabActive(),  P.accent)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),                 P.text)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_TextDisabled(),         P.text_dim)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(),               P.border)
+  local select_a = P.select & 0xFF
 
-  -- Style vars (10 total — all values from layout tokens)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding(),  L.rounding)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameRounding(),   L.rounding)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_GrabRounding(),    L.rounding)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(),     L.md, L.sm)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding(),    L.md, L.sm)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding(),   L.lg, L.lg)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding(),     L.sm, L.xs)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemInnerSpacing(),L.sm, L.sm)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_IndentSpacing(),   L.indent)
-  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameBorderSize(), L.border)
+  _push_col("WindowBg",             P.bg)
+  _push_col("TitleBg",              P.title)
+  _push_col("TitleBgActive",        P.title)
+  _push_col("Header",               P.select)
+  _push_col("HeaderHovered",        P.hover)
+  _push_col("HeaderActive",         (P.select & 0xFFFFFF00) | math.min(255, select_a * 2))
+  _push_col("Button",               P.btn)
+  _push_col("ButtonHovered",        P.btn_h)
+  _push_col("ButtonActive",         P.btn_a)
+  _push_col("FrameBg",              P.well)
+  _push_col("FrameBgHovered",       P.well_h)
+  _push_col("FrameBgActive",        P.well_a)
+  _push_col("SliderGrab",           P.thumb)
+  _push_col("SliderGrabActive",     P.thumb_a)
+  _push_col("CheckMark",            P.accent)
+  _push_col("PopupBg",              P.panel)
+  _push_col("ModalWindowDimBg",     0x00000000) -- transparent: manual scrim via Theme.modal_scrim()
+  _push_col("Separator",            P.sep)
+  _push_col("SeparatorHovered",     P.accent_h) -- hovered / active mark a draggable splitter
+  _push_col("SeparatorActive",      P.accent)
+  _push_col_opt("Tab",                 P.tab)
+  _push_col_opt("TabHovered",          P.tab_h)
+  _push_col_opt("TabSelected",         P.tab_sel)
+  _push_col_opt("TabSelectedOverline", P.accent)
+  _push_col_opt("TabDimmed",           P.tab)
+  _push_col_opt("TabDimmedSelected",   P.tab_sel)
+  _push_col("TableHeaderBg",        P.card)
+  _push_col("TableBorderStrong",    P.sep)
+  _push_col("TableBorderLight",     P.sep)
+  _push_col("TableRowBg",           P.bg)
+  _push_col("TableRowBgAlt",        lighten(P.bg, 0.03))
+  _push_col("ScrollbarBg",          with_alpha(P.bg, 0)) -- transparent: the surface shows through
+  _push_col("ScrollbarGrab",        P.scroll)
+  _push_col("ScrollbarGrabHovered", P.scroll_h)
+  _push_col("ScrollbarGrabActive",  P.scroll_a)
+  _push_col("Text",                 P.text)
+  _push_col("TextDisabled",         P.text_dim)
+  _push_col("Border",               P.outline)
 
-  return 32, 10
+  _push_var("WindowRounding",   L.rounding)
+  _push_var("FrameRounding",    L.rounding)
+  _push_var("GrabRounding",     L.rounding)
+  _push_var("ItemSpacing",      L.sm, L.sm)
+  _push_var("FramePadding",     L.md, L.sm)
+  _push_var("WindowPadding",    L.md, L.md)
+  _push_var("CellPadding",      L.sm, L.xs)
+  _push_var("ItemInnerSpacing", L.sm, L.sm)
+  _push_var("IndentSpacing",    L.indent)
+  _push_var("FrameBorderSize",  L.border)
+
+  local nc, nv = _push_nc, _push_nv
+  _push_ctx = nil
+  pushed_nc, pushed_nv = nc, nv
+  return nc, nv
 end
 
---- Pops all Fancy Scripts ImGui styles from the stack.
---- Call after ImGui_End, using the counts returned by Theme.push().
+--- Pops the styles pushed by Theme.push().
+--- Call after ImGui_End, using the counts returned by Theme.push(). Without counts,
+--- the counts of the last push are used.
 --- @param ctx userdata  ImGui context
---- @param nc integer|nil  Number of colors to pop (default 32)
---- @param nv integer|nil  Number of vars to pop (default 9)
+--- @param nc integer|nil  Number of colors to pop (default: what push pushed)
+--- @param nv integer|nil  Number of vars to pop (default: what push pushed)
 function Theme.pop(ctx, nc, nv)
-  reaper.ImGui_PopStyleColor(ctx, nc or 32)
-  reaper.ImGui_PopStyleVar(ctx, nv or 10)
+  reaper.ImGui_PopStyleColor(ctx, nc or pushed_nc)
+  reaper.ImGui_PopStyleVar(ctx, nv or pushed_nv)
 end
 
 -------------------------------------------------------------------------------
@@ -1052,35 +1193,93 @@ end
 -------------------------------------------------------------------------------
 --- Font families and size scale. Scripts must use Theme.font_sizes.* tokens
 --- and Theme.create_fonts() instead of calling ImGui_CreateFont directly.
+--- The bundled typeface is Fira Sans (SIL OFL 1.1, see fonts/OFL.txt), loaded
+--- from files in Theme.font_dir. If a file is missing or unreadable the same
+--- family is requested from the system, then plain sans-serif. Never an error.
 
-Theme.font_family      = "sans-serif"
-Theme.font_bold_family = "sans-serif Bold"
+-- Directory of this file, with a trailing separator ("" if it has none).
+local _lib_dir = (debug.getinfo(1, "S").source or ""):match("^@?(.*[/\\])") or ""
+
+Theme.font_dir             = _lib_dir .. "fonts/"
+Theme.font_files           = { regular = "FiraSans-Regular.otf", bold = "FiraSans-Bold.otf" }
+Theme.font_family          = "Fira Sans"
+Theme.font_bold_family     = "Fira Sans Bold"  -- used by ReaImGui < 0.10 only
+Theme.font_fallback_family = "sans-serif"
+--- "file", "family" or "system": where the regular weight came from.
+--- Set by Theme.create_fonts(). nil until then.
+Theme.font_source          = nil
 
 Theme.font_sizes = {
-  small   = 12,    -- labels, secondary text, table metadata
-  default = 14,    -- body text, standard UI elements
-  medium  = 16,    -- emphasized text, settings labels
-  large   = 18,    -- section headers, dialog titles
-  header  = 20,    -- primary headers, window titles
-  tooltip = 14,    -- tooltip text (kept for backward compat, = default)
+  small   = 11,    -- labels, secondary text, table metadata
+  default = 13,    -- body text, standard UI elements
+  medium  = 14,    -- emphasized text, settings labels
+  large   = 16,    -- section headers, dialog titles
+  header  = 18,    -- primary headers, window titles
+  tooltip = 13,    -- tooltip text (kept for backward compat, = default)
 }
 
 -------------------------------------------------------------------------------
 -- 9. FONT MANAGEMENT
 -------------------------------------------------------------------------------
 
+--- Creates one font, trying the font file, then the family, then sans-serif.
+--- Each attempt is pcall-protected; the first non-nil result wins.
+--- @param bold boolean  true for the bold weight
+--- @param size number  Pixel size (only used to pick the call shape on old ReaImGui)
+--- @param overrides table  create_fonts overrides (family / bold_family)
+--- @return userdata|nil font
+--- @return string source  "file", "family" or "system"
+local function _make_font(bold, size, overrides)
+  local new_api = reaper.ImGui_CreateFontFromFile ~= nil
+  local flags = 0
+  if bold and new_api and reaper.ImGui_FontFlags_Bold then
+    local okf, f = pcall(reaper.ImGui_FontFlags_Bold)
+    if okf and f then flags = f end
+  end
+
+  -- 1. bundled file (skipped when the caller names its own family)
+  if new_api and not overrides.family and not overrides.bold_family then
+    local path = Theme.font_dir .. (bold and Theme.font_files.bold or Theme.font_files.regular)
+    local fh = io.open(path, "rb")
+    if fh then
+      fh:close()
+      local ok, font = pcall(reaper.ImGui_CreateFontFromFile, path, 0, 0)
+      if ok and font then return font, "file" end
+    end
+  end
+
+  -- 2 and 3. family, then fallback family
+  local regular = overrides.family or Theme.font_family
+  local candidates = {}
+  if new_api then
+    if bold and overrides.bold_family then
+      candidates[1] = { overrides.bold_family, 0 }
+    else
+      candidates[1] = { regular, flags }
+    end
+    candidates[2] = { Theme.font_fallback_family, flags }
+  else
+    candidates[1] = { bold and (overrides.bold_family or Theme.font_bold_family) or regular, size }
+    candidates[2] = { Theme.font_fallback_family .. (bold and " Bold" or ""), size }
+  end
+  for i, c in ipairs(candidates) do
+    local ok, font = pcall(reaper.ImGui_CreateFont, c[1], c[2])
+    if ok and font then return font, (i == 1) and "family" or "system" end
+  end
+  return nil, "system"
+end
+
 --- Creates a complete set of shared fonts for a ReaImGui context.
 --- Call once at script startup, before the defer loop.
 --- Produces 8 fonts: default, small, medium, large, header (regular)
 ---                    default_bold, medium_bold, large_bold (bold)
+--- Sets Theme.font_source to where the regular weight came from.
 --- @param _ctx userdata  ImGui context (unused but kept for API consistency)
 --- @param overrides table|nil  Optional: { family="Arial", bold_family="Arial Bold", large=24, ... }
 --- @return table  Font table with keys: default, small, medium, large, header,
----                default_bold, medium_bold, large_bold
+---                default_bold, medium_bold, large_bold, tooltip
 function Theme.create_fonts(_ctx, overrides)
   overrides = overrides or {}
-  local family      = overrides.family      or Theme.font_family
-  local bold_family = overrides.bold_family or Theme.font_bold_family
   local sizes = {
     small   = overrides.small   or Theme.font_sizes.small,
     default = overrides.default or Theme.font_sizes.default,
@@ -1091,28 +1290,31 @@ function Theme.create_fonts(_ctx, overrides)
 
   local fonts = {}
   -- Regular weights
-  fonts.default = reaper.ImGui_CreateFont(family, sizes.default)
-  fonts.small   = reaper.ImGui_CreateFont(family, sizes.small)
-  fonts.medium  = reaper.ImGui_CreateFont(family, sizes.medium)
-  fonts.large   = reaper.ImGui_CreateFont(family, sizes.large)
-  fonts.header  = reaper.ImGui_CreateFont(family, sizes.header)
+  fonts.default, Theme.font_source = _make_font(false, sizes.default, overrides)
+  fonts.small   = _make_font(false, sizes.small,   overrides)
+  fonts.medium  = _make_font(false, sizes.medium,  overrides)
+  fonts.large   = _make_font(false, sizes.large,   overrides)
+  fonts.header  = _make_font(false, sizes.header,  overrides)
   -- Bold weights
-  fonts.default_bold = reaper.ImGui_CreateFont(bold_family, sizes.default)
-  fonts.medium_bold  = reaper.ImGui_CreateFont(bold_family, sizes.medium)
-  fonts.large_bold   = reaper.ImGui_CreateFont(bold_family, sizes.large)
+  fonts.default_bold = _make_font(true, sizes.default, overrides)
+  fonts.medium_bold  = _make_font(true, sizes.medium,  overrides)
+  fonts.large_bold   = _make_font(true, sizes.large,   overrides)
   -- Backward compat alias
   fonts.tooltip = fonts.default
 
   -- Store font→size mapping for push_font (ImGui_PushFont requires size arg)
   Theme._font_sizes = Theme._font_sizes or {}
-  Theme._font_sizes[fonts.default]      = sizes.default
-  Theme._font_sizes[fonts.small]        = sizes.small
-  Theme._font_sizes[fonts.medium]       = sizes.medium
-  Theme._font_sizes[fonts.large]        = sizes.large
-  Theme._font_sizes[fonts.header]       = sizes.header
-  Theme._font_sizes[fonts.default_bold] = sizes.default
-  Theme._font_sizes[fonts.medium_bold]  = sizes.medium
-  Theme._font_sizes[fonts.large_bold]   = sizes.large
+  local function register(font, size)
+    if font then Theme._font_sizes[font] = size end
+  end
+  register(fonts.default,      sizes.default)
+  register(fonts.small,        sizes.small)
+  register(fonts.medium,       sizes.medium)
+  register(fonts.large,        sizes.large)
+  register(fonts.header,       sizes.header)
+  register(fonts.default_bold, sizes.default)
+  register(fonts.medium_bold,  sizes.medium)
+  register(fonts.large_bold,   sizes.large)
 
   return fonts
 end
@@ -1227,6 +1429,31 @@ function Theme.icons.info(dl, cx, cy, hs, col)
   reaper.ImGui_DrawList_AddRectFilled(dl, cx - stem_hw, stem_top, cx + stem_hw, stem_bot, col, stem_hw)
 end
 
+--- Check mark (two line segments: short stroke down, long stroke up).
+--- Use for: selected rows, "done" / "on" markers.
+function Theme.icons.check(dl, cx, cy, hs, col)
+  local th = math.max(1.5, hs * 0.3)
+  local ox, oy = math.floor(cx), math.floor(cy)
+  local x1, y1 = ox - math.floor(hs * 0.8), oy
+  local x2, y2 = ox - math.floor(hs * 0.25), oy + math.floor(hs * 0.6)
+  local x3, y3 = ox + math.floor(hs * 0.85), oy - math.floor(hs * 0.6)
+  reaper.ImGui_DrawList_AddLine(dl, x1, y1, x2, y2, col, th)
+  reaper.ImGui_DrawList_AddLine(dl, x2, y2, x3, y3, col, th)
+end
+
+--- Filled dot (filled circle).
+--- Use for: "on" / active status markers.
+function Theme.icons.dot(dl, cx, cy, hs, col)
+  reaper.ImGui_DrawList_AddCircleFilled(dl, cx, cy, hs * 0.7, col)
+end
+
+--- Ring (circle outline).
+--- Use for: "off" / inactive status markers.
+function Theme.icons.ring(dl, cx, cy, hs, col)
+  local th = math.max(1.0, hs * 0.25)
+  reaper.ImGui_DrawList_AddCircle(dl, cx, cy, hs * 0.7, col, 0, th)
+end
+
 --- ▾ Triangle down (downward-pointing).
 --- Use for: dropdown indicators, expand/collapse, sort direction.
 function Theme.icons.tri_down(dl, cx, cy, hs, col)
@@ -1331,6 +1558,97 @@ end
 -- Palette accessor for widgets: delegates to Theme.get_palette().
 local function _get_palette()
   return Theme.get_palette()
+end
+
+--- Label colour for text drawn on a solid `fill`: palette.text when it reaches 4.5:1 there, otherwise whichever
+--- of the dark label 0x0F2B3BFF and white contrasts more, moved toward black or white when even that falls
+--- short (a mid-tone red reaches 4.5:1 with neither). A translucent fill is judged over palette.bg.
+--- @param fill integer  Fill colour 0xRRGGBBAA
+--- @return integer  Label colour 0xRRGGBBAA
+function Theme.label_on(fill)
+  local P = _get_palette()
+  local under = composite_over(fill, P.bg)
+  if contrast_over(P.text, under) >= 4.5 then return P.text end
+  local dark, light = 0x0F2B3BFF, 0xFFFFFFFF
+  local pick = contrast_over(dark, under) >= contrast_over(light, under) and dark or light
+  return fit_contrast(pick, { under }, 4.5)
+end
+local label_on = Theme.label_on
+
+--- Hover and pressed shades of `fill` that keep `label` at `need`:1 (judged over palette.bg when translucent).
+--- Hover tries the fill lightened 12 % and pressed darkened 12 %, as on a dark UI; a step that takes the label
+--- under `need` is replaced by the same step the other way, then by smaller steps (9, 6, 3 %), so both states stay
+--- visibly apart from the rest fill. Pressed also avoids the hover colour (falling back to a stronger shade of the
+--- hover direction). When nothing reaches `need`, the candidate with the best contrast is used.
+--- @param fill integer  Rest fill 0xRRGGBBAA
+--- @param label integer  Label (or icon) colour drawn on it
+--- @param need number|nil  Required contrast (default 4.5)
+--- @return integer hover, integer pressed
+local function _shade_states(fill, label, need)
+  need = need or 4.5
+  local P = _get_palette()
+  local hit = _fit_cache_get("shade", fill, label, need, P.bg, 0)
+  if hit then return hit[1], hit[2] end
+  local function ratio(c) return contrast_over(label, composite_over(c, P.bg)) end
+  local function pick(first, second, avoid, extra)
+    local best, best_r
+    local list = {}
+    for _, f in ipairs({ 0.12, 0.09, 0.06, 0.03 }) do
+      list[#list + 1] = first(fill, f)
+      list[#list + 1] = second(fill, f)
+    end
+    for _, c in ipairs(extra or {}) do list[#list + 1] = c end
+    for _, c in ipairs(list) do
+      if c ~= fill and c ~= avoid then
+        local r = ratio(c)
+        if r >= need then return c end
+        if not best_r or r > best_r then best, best_r = c, r end
+      end
+    end
+    return best or first(fill, 0.12)
+  end
+  local hover = pick(lighten, darken)
+  local hover_dir = (luminance(hover) >= luminance(fill)) and lighten or darken
+  local other = hover_dir == lighten and darken or lighten
+  local pressed = pick(other, hover_dir, hover, { hover_dir(fill, 0.24), hover_dir(fill, 0.18) })
+  _fit_cache_put({ hover, pressed }, "shade", fill, label, need, P.bg, 0)
+  return hover, pressed
+end
+
+--- Icon colour for a hovered or pressed icon button: `col` moved 25 % toward the text colour's extreme
+--- (lighter on a dark UI, darker on a light one), then fitted to 3:1 on both faces it is drawn on. Cached.
+--- @param col integer  Resting icon colour
+--- @param face_h integer  Hovered face behind the icon (judged over palette.bg when translucent)
+--- @param face_a integer  Pressed face behind the icon
+--- @return integer
+local function _icon_on(col, face_h, face_a)
+  local P = _get_palette()
+  local hit = _fit_cache_get("icon", col, face_h, face_a, P.bg, P.text)
+  if hit then return hit end
+  local dark_ui = luminance(P.text) > luminance(P.bg)
+  local c = dark_ui and lighten(col, 0.25) or darken(col, 0.25)
+  local under = { composite_over(face_h, P.bg), composite_over(face_a, P.bg) }
+  return _fit_cache_put(fit_contrast(c, under, 3.0), "icon", col, face_h, face_a, P.bg, P.text)
+end
+
+--- A caller's own hover icon colour, fitted to 3:1 on the hovered and pressed faces keeping its hue (the
+--- caller chose it for a transparent background; the face behind it is new). Cached like _icon_on.
+--- @return integer
+local function _icon_hover_fit(col, face_h, face_a)
+  local P = _get_palette()
+  local hit = _fit_cache_get("icon_hover", col, face_h, face_a, P.bg, 0)
+  if hit then return hit end
+  local under = { composite_over(face_h, P.bg), composite_over(face_a, P.bg) }
+  return _fit_cache_put(fit_contrast(col, under, 3.0, nil, true), "icon_hover", col, face_h, face_a, P.bg, 0)
+end
+
+--- Default icon colour of icon_btn_colored: palette.text fitted to 3:1 on `face` (judged over palette.bg). Cached.
+--- @return integer
+local function _icon_on_face(face)
+  local P = _get_palette()
+  local hit = _fit_cache_get("icon_face", face, P.text, P.bg, 0, 0)
+  if hit then return hit end
+  return _fit_cache_put(fit_contrast(P.text, { composite_over(face, P.bg) }, 3.0), "icon_face", face, P.text, P.bg, 0, 0)
 end
 
 --- True when the last item is hovered long enough to show its tooltip: ReaImGui's own tooltip delay
@@ -1490,8 +1808,9 @@ function Theme.align(ctx, row_h, item_h)
   end
 end
 
---- Renders an invisible button with a DrawList vector icon overlay.
---- The icon highlights on hover. Optionally shows a tooltip.
+--- Renders a borderless button with a DrawList vector icon overlay.
+--- Transparent at rest (like the theme's transparent track buttons), palette.btn_h face on hover,
+--- palette.btn_a pressed; the icon also lightens on hover. Optionally shows a tooltip.
 ---
 --- @param ctx userdata  ImGui context
 --- @param id string  Unique ImGui ID for the button (e.g. "delete_btn")
@@ -1501,7 +1820,11 @@ end
 ---   opts.w         (number)  Button width override
 ---   opts.h         (number)  Button height override
 ---   opts.icon_size (number)  Icon size override
----   opts.color     (number)  Icon color    (default: palette.text_dim)
+---   opts.color     (number)  Icon color    (default: palette.text)
+---   opts.hover_color (number) Icon color on hover (default: icon color moved 25% toward the text colour's
+---                             extreme, fitted to 3:1 on the hover and pressed faces). A colour given here is
+---                             also fitted to 3:1 on those faces, keeping its hue: the one place a caller's
+---                             colour is adjusted, since it was chosen for a transparent background
 ---   opts.tooltip   (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.icon_btn(ctx, id, icon_fn, opts)
@@ -1512,7 +1835,14 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local icon_sz = opts.icon_size or preset.size
   local btn_w = opts.w or (icon_sz + preset.pad * 2)
   local btn_h = opts.h or btn_w
-  local pressed = reaper.ImGui_InvisibleButton(ctx, id, btn_w, btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        with_alpha(P.btn, 0))
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  P.btn_a)
+  reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_FrameBorderSize(), 0)
+  local btn_label = id:find("##", 1, true) and id or ("##" .. id)   -- never draws a text label
+  local pressed = reaper.ImGui_Button(ctx, btn_label, btn_w, btn_h)
+  reaper.ImGui_PopStyleVar(ctx, 1)
+  reaper.ImGui_PopStyleColor(ctx, 3)
   local dl = reaper.ImGui_GetWindowDrawList(ctx)
   local rx, ry = reaper.ImGui_GetItemRectMin(ctx)
   local rx2, ry2 = reaper.ImGui_GetItemRectMax(ctx)
@@ -1520,8 +1850,15 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   local cy = (ry + ry2) * 0.5
   local hs = icon_sz * 0.5
   local hover = reaper.ImGui_IsItemHovered(ctx)
-  local base_col = opts.color or P.text_dim
-  local draw_col = hover and (opts.hover_color or lighten(base_col, 0.25)) or base_col
+  local base_col = opts.color or P.text
+  local draw_col = base_col
+  if hover then
+    if opts.hover_color then
+      draw_col = _icon_hover_fit(opts.hover_color, P.btn_h, P.btn_a)
+    else
+      draw_col = _icon_on(base_col, P.btn_h, P.btn_a)
+    end
+  end
   icon_fn(dl, cx, cy, hs, draw_col)
   if hover then
     reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_Hand())   -- hovered and enabled
@@ -1532,8 +1869,8 @@ function Theme.icon_btn(ctx, id, icon_fn, opts)
   return pressed
 end
 
---- Renders a colored button with a DrawList vector icon overlay.
---- Unlike icon_btn, this renders a visible button background.
+--- Renders a button with a DrawList vector icon overlay.
+--- Unlike icon_btn, this renders a visible button face (a plain button by default).
 ---
 --- @param ctx userdata  ImGui context
 --- @param id string  Unique ImGui ID (the "##" prefix is added automatically)
@@ -1543,10 +1880,10 @@ end
 ---   opts.w         (number)  Button width override
 ---   opts.h         (number)  Button height override
 ---   opts.icon_size (number)  Icon size override
----   opts.icon_color (number) Icon color    (default: palette.text)
----   opts.bg        (number)  Button bg     (default: palette.accent_d)
----   opts.bg_hover  (number)  Hover bg      (default: palette.accent_h)
----   opts.bg_active (number)  Active bg     (default: palette.accent)
+---   opts.icon_color (number) Icon color    (default: palette.text, fitted to 3:1 on the face of each state)
+---   opts.bg        (number)  Button bg     (default: palette.btn)
+---   opts.bg_hover  (number)  Hover bg      (default: palette.btn_h)
+---   opts.bg_active (number)  Active bg     (default: palette.btn_a)
 ---   opts.tooltip   (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
@@ -1557,9 +1894,10 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   local icon_sz = opts.icon_size or preset.size
   local btn_w = opts.w or (icon_sz + preset.pad * 2)
   local btn_h = opts.h or btn_w
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        opts.bg        or P.accent_d)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.bg_hover  or P.accent_h)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.bg_active or P.accent)
+  local bg, bg_h, bg_a = opts.bg or P.btn, opts.bg_hover or P.btn_h, opts.bg_active or P.btn_a
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
   local pressed = reaper.ImGui_Button(ctx, "##" .. id, btn_w, btn_h)
   reaper.ImGui_PopStyleColor(ctx, 3)
   local dl = reaper.ImGui_GetWindowDrawList(ctx)
@@ -1568,8 +1906,15 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   local cx = (rx + rx2) * 0.5
   local cy = (ry + ry2) * 0.5
   local hs = icon_sz * 0.5
-  icon_fn(dl, cx, cy, hs, opts.icon_color or P.text)
-  if reaper.ImGui_IsItemHovered(ctx) then
+  local hovered = reaper.ImGui_IsItemHovered(ctx)
+  local icon_col = opts.icon_color
+  if not icon_col then
+    -- Default icon: palette.text, fitted to 3:1 on the face it sits on in this state
+    local face = reaper.ImGui_IsItemActive(ctx) and bg_a or hovered and bg_h or bg
+    icon_col = _icon_on_face(face)
+  end
+  icon_fn(dl, cx, cy, hs, icon_col)
+  if hovered then
     reaper.ImGui_SetMouseCursor(ctx, reaper.ImGui_MouseCursor_Hand())   -- hovered and enabled
   end
   if opts.tooltip and _hovered_for_tooltip(ctx) then
@@ -1578,7 +1923,7 @@ function Theme.icon_btn_colored(ctx, id, icon_fn, opts)
   return pressed
 end
 
---- Renders a tooltip with automatic text wrapping.
+--- Renders a tooltip with automatic text wrapping: a palette.panel popup with a palette.outline border.
 --- Respects the global Theme.get_show_tooltips() setting.
 --- Uses consistent padding from layout tokens.
 ---
@@ -1588,16 +1933,20 @@ end
 function Theme.tooltip(ctx, text, max_w)
   if not Theme.get_show_tooltips() then return end
   max_w = max_w or Theme.layout.tooltip_wrap
+  local P = _get_palette()
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_PopupBg(), P.panel)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(),  P.outline)
   if reaper.ImGui_BeginTooltip(ctx) then
     reaper.ImGui_PushTextWrapPos(ctx, reaper.ImGui_GetCursorPosX(ctx) + max_w)
     reaper.ImGui_Text(ctx, text)
     reaper.ImGui_PopTextWrapPos(ctx)
     reaper.ImGui_EndTooltip(ctx)
   end
+  reaper.ImGui_PopStyleColor(ctx, 2)
 end
 
---- Renders a labeled section divider with optional info tooltip.
---- Adds consistent spacing above and below from layout tokens.
+--- Renders a labeled section divider with optional info tooltip: label in palette.text_dim over a
+--- palette.sep hairline. Adds consistent spacing above and below from layout tokens.
 ---
 --- @param ctx userdata  ImGui context
 --- @param label string  Section title text
@@ -1637,7 +1986,7 @@ function Theme.section_divider(ctx, label, opts)
       tooltip = opts.tooltip,
     })
   end
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(), with_alpha(col, 0.60))
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Separator(), P.sep)
   reaper.ImGui_Separator(ctx)
   reaper.ImGui_PopStyleColor(ctx, 1)
   reaper.ImGui_Spacing(ctx)
@@ -1647,6 +1996,7 @@ end
 --- Encapsulates ReaImGui's argument order and default flags to prevent
 --- argument-misalignment bugs (such as accidental close buttons).
 --- Supports optional right-aligned close/action button.
+--- The header row is a button face: palette.btn, palette.btn_h on hover, palette.btn_a pressed.
 ---
 --- @param ctx userdata  ImGui context
 --- @param label string  Section header label text
@@ -1685,7 +2035,11 @@ function Theme.collapsing_header(ctx, label, opts)
   local visible_label = label:match("^(.-)##") or label
   local id = label:match("##(.+)$") or label
 
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Header(),        P.btn)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderHovered(), P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_HeaderActive(),  P.btn_a)
   local is_open = reaper.ImGui_CollapsingHeader(ctx, "##ch_" .. id, nil, flags)
+  reaper.ImGui_PopStyleColor(ctx, 3)
   local next_y = reaper.ImGui_GetCursorPosY(ctx)
 
   -- Precise 8px visual gap after arrow (arrow right edge is at ~18px -> text at 26px)
@@ -1776,8 +2130,8 @@ end
 ---   opts.preset       (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
 ---   opts.fonts        (table)   Font table from Theme.create_fonts() (for overlay text)
 ---   opts.fill_color   (number)  Fill color (default: palette.accent)
----   opts.bg_color     (number)  Background color (default: palette.card)
----   opts.border_color (number)  Border color (optional)
+---   opts.bg_color     (number)  Background color (default: palette.well, a recessed track)
+---   opts.border_color (number)  Border color (default: palette.outline)
 ---   opts.rounding     (number)  Corner rounding (default: Theme.layout.rounding)
 ---   opts.overlay      (string)  Centered text overlay (e.g. "+3.5 dB" or "75%")
 ---   opts.text_color   (number)  Overlay text color (default: palette.text)
@@ -1797,7 +2151,7 @@ function Theme.progress_bar(ctx, fraction, opts)
   local h = opts.h or default_h
   local rounding = opts.rounding or L.rounding
   local fill_col = opts.fill_color or opts.fg or P.accent
-  local bg_col = opts.bg_color or opts.bg or P.card
+  local bg_col = opts.bg_color or opts.bg or P.well
   local text_col = opts.text_color or P.text
   local overlay = opts.overlay or opts.text
 
@@ -1818,9 +2172,7 @@ function Theme.progress_bar(ctx, fraction, opts)
   end
 
   -- Border
-  if opts.border_color then
-    reaper.ImGui_DrawList_AddRect(dl, x, y, x + w, y + h, opts.border_color, rounding)
-  end
+  reaper.ImGui_DrawList_AddRect(dl, x, y, x + w, y + h, opts.border_color or P.outline, rounding)
 
   -- Centered text overlay
   if overlay and overlay ~= "" then
@@ -1861,14 +2213,18 @@ end
 ---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
 ---   opts.pad_x          (number)  Horizontal padding override (default: preset or FramePadding)
 ---   opts.pad_y          (number)  Vertical padding override (default: preset or FramePadding)
----   opts.active_bg      (number)  Active background (default: palette.accent_d)
----   opts.active_hover   (number)  Active hovered background (default: palette.accent_h)
----   opts.active_active  (number)  Active pressed background (default: palette.accent)
----   opts.active_text    (number)  Active text color (default: palette.accent)
----   opts.inactive_bg    (number)  Inactive background (default: palette.card)
----   opts.inactive_hover (number)  Inactive hovered background (default: palette.panel)
----   opts.inactive_active(number)  Inactive pressed background (default: palette.accent_d)
----   opts.inactive_text  (number)  Inactive text color (default: palette.text_dim)
+---   opts.active_bg      (number)  Active background (default: palette.btn_on, a solid fill)
+---   opts.active_hover   (number)  Active hovered background (default: active background lightened 12%, or
+---                                 shaded the other way / less where that keeps the label at 4.5:1)
+---   opts.active_active  (number)  Active pressed background (default: active background darkened 12%, same rule)
+---   opts.active_text    (number)  Active text color (default: palette.on_text; Theme.label_on(active_bg)
+---                                 when only active_bg is given)
+---   opts.inactive_bg    (number)  Inactive background (default: palette.btn, a plain button face)
+---   opts.inactive_hover (number)  Inactive hovered background (default: palette.btn_h, or inactive_bg shaded
+---                                 as for active_hover)
+---   opts.inactive_active(number)  Inactive pressed background (default: palette.btn_a, or inactive_bg shaded)
+---   opts.inactive_text  (number)  Inactive text color (default: palette.text; Theme.label_on(inactive_bg)
+---                                 when only inactive_bg is given)
 ---   opts.tooltip        (string)  Hover tooltip text
 --- @return boolean  true if the button was clicked
 function Theme.toggle_button(ctx, id, label, is_active, opts)
@@ -1885,15 +2241,22 @@ function Theme.toggle_button(ctx, id, label, is_active, opts)
 
   local bg, bg_h, bg_a, text_col
   if is_active then
-    bg       = opts.active_bg     or P.accent_d
-    bg_h     = opts.active_hover  or P.accent_h
-    bg_a     = opts.active_active or P.accent
-    text_col = opts.active_text   or P.accent_l
+    -- On: a solid fill (no tint); hover lightens it, press darkens it
+    bg       = opts.active_bg     or P.btn_on
+    text_col = opts.active_text   or (opts.active_bg and label_on(bg) or P.on_text)
+    local sh, sa
+    if not (opts.active_hover and opts.active_active) then sh, sa = _shade_states(bg, text_col) end
+    bg_h     = opts.active_hover  or sh
+    bg_a     = opts.active_active or sa
   else
-    bg       = opts.inactive_bg     or P.card
-    bg_h     = opts.inactive_hover  or P.panel
-    bg_a     = opts.inactive_active or P.accent_d
-    text_col = opts.inactive_text   or P.text_dim
+    -- Off: a plain button face
+    local custom = opts.inactive_bg
+    bg       = custom or P.btn
+    text_col = opts.inactive_text   or (custom and label_on(bg) or P.text)
+    local sh, sa
+    if custom and not (opts.inactive_hover and opts.inactive_active) then sh, sa = _shade_states(bg, text_col) end
+    bg_h     = opts.inactive_hover  or sh or P.btn_h
+    bg_a     = opts.inactive_active or sa or P.btn_a
   end
 
   local pushed_vars = 0
@@ -1950,9 +2313,14 @@ Theme.badge_button = Theme.toggle_button
 --- @param opts table|nil  Optional configuration:
 ---   opts.preset         (table|string) Button preset (e.g. Theme.layout.btn_sm or "small")
 ---   opts.fonts          (table)   Font table from Theme.create_fonts() (for preset font)
----   opts.color          (number)  Semantic base color (auto-derives 70% lightened text & 33% bg)
----   opts.text_color     (number)  Explicit text color override (default: 70% lightened color or palette.accent_l)
----   opts.bg             (number)  Explicit background color override (default: 33% alpha of color)
+---   opts.color          (number)  Semantic colour: without opts.bg the badge is a solid fill of it
+---                                 (default: none, a quiet tag: palette.well face, outline, palette.text label)
+---   opts.text_color     (number)  Explicit text color override (default: Theme.label_on(fill); with both
+---                                 opts.color and opts.bg, color lightened 70% when that reads on bg)
+---   opts.bg             (number)  Explicit background color override (default: opts.color or palette.well)
+---   opts.bg_hover       (number)  Hover background when interactive (default: fill lightened 12%, or shaded
+---                                 the other way / less where that keeps the label at 4.5:1)
+---   opts.bg_active      (number)  Pressed background when interactive (default: fill darkened 12%, same rule)
 ---   opts.w              (number)  Badge width (default: 0 = auto from text + frame padding)
 ---   opts.h              (number)  Badge height (default: 0 = auto from font + frame padding)
 ---   opts.rounding       (number)  Corner rounding override (default: inherits FrameRounding)
@@ -1971,11 +2339,30 @@ function Theme.badge(ctx, label, opts)
   if preset == "small" or preset == "sm" then preset = L.btn_sm end
   if preset == "large" or preset == "lg" then preset = L.btn_lg end
 
-  local base_color = opts.color or P.accent
-  local text_col   = opts.text_color or (opts.color and lighten(opts.color, 0.70) or P.accent_l)
-  local bg         = opts.bg or with_alpha(base_color, 0.20)
-  local bg_h       = opts.bg_hover or with_alpha(base_color, 0.40)
-  local bg_a       = opts.bg_active or base_color
+  -- Default: a quiet tag (well face, outline from FrameBorderSize, text label).
+  -- opts.color alone: a solid fill of that colour with a fitted dark or light label.
+  local bg       = opts.bg or opts.color or P.well
+  local text_col = opts.text_color
+  if not text_col then
+    if opts.color and opts.bg then
+      -- A script's colour + background pair: keep its tinted label where it reads on that background
+      local tinted = lighten(opts.color, 0.70)
+      local under = composite_over(bg, P.bg)
+      text_col = contrast_over(tinted, under) >= 4.5 and tinted or label_on(bg)
+    elseif opts.color or opts.bg then
+      text_col = label_on(bg)
+    else
+      text_col = P.text
+    end
+  end
+  -- Hover and pressed shades only for an interactive badge, and only those the caller did not give
+  local bg_h, bg_a = bg, bg
+  if opts.interactive then
+    local sh, sa
+    if not (opts.bg_hover and opts.bg_active) then sh, sa = _shade_states(bg, text_col) end
+    bg_h = opts.bg_hover or sh
+    bg_a = opts.bg_active or sa
+  end
 
   local btn_w = opts.w or 0
   local btn_h = opts.h or 0
@@ -2000,8 +2387,8 @@ function Theme.badge(ctx, label, opts)
   end
 
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(),        bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), opts.interactive and bg_h or bg)
-  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  opts.interactive and bg_a or bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), bg_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(),  bg_a)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(),          text_col)
 
   local btn_label = label .. "###badge_" .. (opts.id or label)   -- ### hashes only the id: a changing label keeps the widget
@@ -2060,7 +2447,8 @@ local function _get_combo_item_label(item, idx, custom_fn)
 end
 
 --- Renders a selectable item with rounded highlight corners matching the design system.
---- Replaces native square-cornered Selectables.
+--- Replaces native square-cornered Selectables. A hovered row is palette.hover; a selected row is the
+--- palette.select tint plus a 2 px solid accent bar along its left edge (the 3:1 selection marker).
 --- A label wider than the item is shortened with "..." inside the item and shown in full in a tooltip;
 --- a label that fits is drawn exactly as before.
 ---
@@ -2072,9 +2460,10 @@ end
 --- @param h number|nil  Height (default: 0 = frame/row height)
 --- @param opts table|nil  Optional overrides:
 ---   opts.rounding (number) Corner rounding radius (default: Theme.layout.rounding)
----   opts.bg_hover (number) Hover color (default: palette.accent_d)
----   opts.bg_sel   (number) Selected color (default: palette.accent_h)
----   opts.text_col (number) Text color override
+---   opts.bg_hover (number) Hover color (default: palette.hover)
+---   opts.bg_sel   (number) Selected color, hovered or not (default: palette.select; a stronger tint would
+---                          take the label under 4.5:1)
+---   opts.text_col (number) Text color override (default: palette.text)
 ---   opts.pad_x    (number) Left padding for text (default: Theme.layout.sm)
 --- @return boolean clicked
 function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
@@ -2082,8 +2471,8 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
   local P = _get_palette()
   local L = Theme.layout
   local rounding = opts.rounding or L.rounding
-  local bg_hover = opts.bg_hover or P.accent_h
-  local bg_sel   = opts.bg_sel   or P.accent_d
+  local bg_hover = opts.bg_hover or P.hover
+  local bg_sel   = opts.bg_sel   or P.select
   local sel_state = is_selected == true
 
   local visible_label = label:match("^(.-)##") or label
@@ -2105,14 +2494,18 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
 
   -- 1. Draw rounded background highlight (using Theme.layout.rounding)
   if is_hovered or sel_state then
-    local bg = sel_state and (is_hovered and P.accent or bg_sel) or bg_hover
+    local bg = sel_state and bg_sel or bg_hover
     reaper.ImGui_DrawList_AddRectFilled(dl, rx1, ry1, rx2, ry2, bg, rounding)
+  end
+  -- Selection marker: a 2 px solid accent bar along the row's left edge, full row height
+  if sel_state then
+    reaper.ImGui_DrawList_AddRectFilled(dl, rx1, ry1, rx1 + 2, ry2, P.accent)
   end
 
   -- 2. Draw text on top if visible label is non-empty
   local clipped = false
   if visible_label ~= "" then
-    local text_col = opts.text_col or (sel_state and P.accent_l or P.text)
+    local text_col = opts.text_col or P.text
     local pad_x = opts.pad_x or L.sm
     local tw, th = reaper.ImGui_CalcTextSize(ctx, visible_label)
     local ty = ry1 + math.floor(((ry2 - ry1) - th) * 0.5)
@@ -2131,8 +2524,22 @@ function Theme.selectable(ctx, label, is_selected, flags, w, h, opts)
   return clicked
 end
 
+--- Opens a combo whose preview looks like a button: palette.btn face (btn_h hovered, btn_a open), outline
+--- and chevron from the style stack. The colours are popped before the list, which stays a palette.panel popup.
+--- @return boolean open  Result of ImGui_BeginCombo
+local function _begin_combo_btn(ctx, id, preview, flags)
+  local P = _get_palette()
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),        P.btn)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),  P.btn_a)
+  local open = reaper.ImGui_BeginCombo(ctx, id, preview, flags)
+  reaper.ImGui_PopStyleColor(ctx, 3)
+  return open
+end
+
 --- Renders a standardized combo box wrapping ImGui_BeginCombo.
 --- Handles label resolution, item iteration, and selection state.
+--- The preview is a button face; list rows are Theme.selectable rows (hover, select tint, accent bar).
 ---
 --- @param ctx userdata  ImGui context
 --- @param id string  Unique combo ID (e.g. "##shared_fx")
@@ -2166,7 +2573,7 @@ function Theme.combo(ctx, id, items, selected_idx, opts)
   local new_idx = selected_idx
   local changed = false
 
-  if reaper.ImGui_BeginCombo(ctx, id, preview) then
+  if _begin_combo_btn(ctx, id, preview) then
     for i, item in ipairs(items) do
       local lbl = _get_combo_item_label(item, i, opts.get_label) .. "##item_" .. i
       local is_sel = (selected_idx == i)
@@ -2230,7 +2637,7 @@ local function _count_selected(items, selected, get_id_fn)
   return count
 end
 
---- Renders a standardized, compact multi-select combo box.
+--- Renders a standardized, compact multi-select combo box (preview and rows look like Theme.combo's).
 --- Supports full-row clicking, hover highlights, and compact density.
 --- Does not close the popup on item selection unless opts.close_on_select is true.
 ---
@@ -2249,7 +2656,7 @@ end
 ---   opts.tooltip         (string)   Hover tooltip text
 ---   opts.compact         (boolean)  Use tight vertical padding inside popup (default: true)
 ---   opts.close_on_select (boolean)  Close popup after selecting an item (default: false)
----   opts.check_mark      (string)   Prefix for selected items (default: "\xe2\x9c\x93 ")
+---   opts.check_mark      (string)   Text prefix for selected items (default: a Theme.icons.check drawn in the prefix slot)
 --- @return number|nil toggled_idx  1-based index of the toggled item, or nil if no interaction
 --- @return boolean|nil is_now_selected  New boolean selection state of the toggled item
 --- @return boolean changed  Whether a selection was modified this frame
@@ -2288,7 +2695,7 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
   local is_now_selected = nil
   local changed = false
 
-  if reaper.ImGui_BeginCombo(ctx, id, preview) then
+  if _begin_combo_btn(ctx, id, preview) then
     local pushed_vars = 0
     if opts.compact ~= false then
       reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing(), L.md, L.xs)
@@ -2298,12 +2705,14 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
 
     local sel_flags = opts.close_on_select and reaper.ImGui_SelectableFlags_None()
                       or (reaper.ImGui_SelectableFlags_NoAutoClosePopups and reaper.ImGui_SelectableFlags_NoAutoClosePopups() or reaper.ImGui_SelectableFlags_None())
-    local check_prefix = opts.check_mark or "\xe2\x9c\x93 "
+    -- Selected rows draw Theme.icons.check in the prefix slot (same reserved width as unselected rows);
+    -- a caller's own opts.check_mark text still replaces it.
+    local check_prefix = opts.check_mark
     local blank_prefix = "   "
 
     for i, item in ipairs(items) do
       local is_sel = _is_item_selected(selected, item, i, opts.get_id)
-      local prefix = is_sel and check_prefix or blank_prefix
+      local prefix = (is_sel and check_prefix) or blank_prefix
       local label_text = _get_combo_item_label(item, i, opts.get_label)
       local row_label = prefix .. label_text .. "##mitem_" .. i
 
@@ -2311,6 +2720,15 @@ function Theme.multi_combo(ctx, id, items, selected, opts)
         toggled_idx = i
         is_now_selected = not is_sel
         changed = true
+      end
+      if is_sel and not check_prefix then
+        -- Theme.selectable left the row as the last item: draw the check in its prefix slot
+        local rx1, ry1 = reaper.ImGui_GetItemRectMin(ctx)
+        local _, ry2 = reaper.ImGui_GetItemRectMax(ctx)
+        local slot_w = reaper.ImGui_CalcTextSize(ctx, blank_prefix)
+        local hs = math.max(2, math.floor((ry2 - ry1) * 0.2))
+        Theme.icons.check(reaper.ImGui_GetWindowDrawList(ctx), rx1 + L.sm + slot_w * 0.5,
+          (ry1 + ry2) * 0.5, hs, _get_palette().text)
       end
     end
 
@@ -2388,7 +2806,7 @@ function Theme.center_next_window(ctx, w, h, cond)
 end
 
 --- Renders the Fancy Scripts brand icon (logo) using DrawList vectors.
---- Draws a rounded card with the signature bezier curve and colored dots.
+--- Draws a recessed card (palette.well, palette.outline frame) with the signature bezier curve and colored dots.
 ---
 --- @param ctx userdata  ImGui context
 --- @param size number|nil  Icon bounding box size in pixels (default: Theme.layout.row_h)
@@ -2406,8 +2824,8 @@ function Theme.brand_icon(ctx, size, target_h)
   local bx2, by2 = x + 235.0 * s, dy + 235.0 * s
   local r_bg     = 50.0 * s
   local stroke_w = math.max(1.0, 10.0 * s)
-  reaper.ImGui_DrawList_AddRectFilled(dl, bx1, by1, bx2, by2, P.card, r_bg)
-  reaper.ImGui_DrawList_AddRect(dl, bx1, by1, bx2, by2, P.sep, r_bg, 0, stroke_w)
+  reaper.ImGui_DrawList_AddRectFilled(dl, bx1, by1, bx2, by2, P.well, r_bg)
+  reaper.ImGui_DrawList_AddRect(dl, bx1, by1, bx2, by2, P.outline, r_bg, 0, stroke_w)
   local p1_x, p1_y = x + 79.0 * s, dy + 139.0 * s
   local c1_x, c1_y = x + 79.0 * s, dy + 101.0 * s
   local c2_x, c2_y = x + 161.0 * s, dy + 139.0 * s
@@ -2423,8 +2841,10 @@ end
 -- 12. SETTINGS UI WIDGET
 -------------------------------------------------------------------------------
 
-local SETTINGS_LABELS = { "Fancy Dark", "Match Theme" }
+local SETTINGS_LABELS = { "Fancy", "Match Theme" }
 local SETTINGS_VALUES = { Theme.MODE_FANCY, Theme.MODE_MATCH }
+--- Visible labels of the theme modes, in the order of the settings combo (read-only).
+Theme.mode_labels = SETTINGS_LABELS
 
 --- Calculates the reactive width required for a combo box to display its options
 --- without truncation, based on the current font metrics and ImGui frame padding.
@@ -2473,7 +2893,7 @@ function Theme.settings_widget(ctx, opts)
   local changed = false
   local combo_label = opts.label or "##theme_mode"
   reaper.ImGui_SetNextItemWidth(ctx, w)
-  if reaper.ImGui_BeginCombo(ctx, combo_label, SETTINGS_LABELS[current]) then
+  if _begin_combo_btn(ctx, combo_label, SETTINGS_LABELS[current]) then
     for i, label in ipairs(SETTINGS_LABELS) do
       local selected = (i == current)
       if Theme.selectable(ctx, label, selected) then
@@ -2518,6 +2938,8 @@ end
 --- Renders a standardized window header bar matching the Parameter Link layout pattern.
 --- Uses ReaImGui's native AlignTextToFramePadding() for pixel-perfect vertical alignment
 --- across brand icon, signature "FANCY" prefix, title, subtitle, and right controls.
+--- The row sits on a palette.title strip across the window with a 1 px palette.sep hairline under it
+--- (the hairline is left out with show_separator = false).
 ---
 --- @param ctx userdata  ImGui context
 --- @param opts table|nil  Header configuration:
@@ -2527,7 +2949,7 @@ end
 ---   opts.prefix_color   (number|nil)  Prefix text color (default: palette.yellow)
 ---   opts.subtitle       (string|nil)  Secondary subtitle text (optional)
 ---   opts.fonts          (table|nil)   Font table from Theme.create_fonts() (optional)
----   opts.font_header    (userdata|nil) Title font override (default: opts.fonts.large_bold or fonts.header)
+---   opts.font_header    (userdata|nil) Title font override (default: opts.fonts.default_bold)
 ---   opts.font_subtitle  (userdata|nil) Subtitle font override (default: opts.fonts.default)
 ---   opts.title_color    (number|nil)  Title text color (default: palette.text)
 ---   opts.subtitle_color (number|nil)  Subtitle text color (default: palette.text_dim)
@@ -2540,7 +2962,7 @@ end
 ---   opts.close_tooltip  (string|nil)  Close button tooltip (default: "Close (Esc)")
 ---   opts.right_widgets  (function|nil) Callback `function(ctx, hdr_h)` for custom controls
 ---   opts.right_width    (number|nil)  Extra width allocated for right-aligned items
----   opts.show_separator (boolean|nil) Whether to render separator line below header (default: true)
+---   opts.show_separator (boolean|nil) Whether to render the hairline below the header strip (default: true)
 ---   opts.height         (number|nil)  Row height override (default: Theme.layout.row_h)
 --- @return boolean open  Returns true if the window should stay open (false if close was clicked)
 function Theme.header(ctx, opts)
@@ -2552,6 +2974,45 @@ function Theme.header(ctx, opts)
   local close_btn_sz = L.icon_md.size + L.icon_md.pad * 2
   local frame_h = reaper.ImGui_GetFrameHeight(ctx)
   local hdr_h = opts.height or math.max(L.row_h, brand_sz, close_btn_sz, frame_h)
+
+  -- 0. Title strip behind the row, edge to edge (drawn first, so the row draws over it), and its hairline.
+  --    The strip runs from the window padding above the row to the item spacing below it (both read from the
+  --    style in effect), inside the window border: inset by WindowBorderSize on the top, left and right, so a
+  --    window without a title bar keeps its 1 px frame. Where the strip meets the window's top edge and the
+  --    window is rounded, its top corners take L.rounding.
+  do
+    local dl = reaper.ImGui_GetWindowDrawList(ctx)
+    local row_x, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
+    local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
+    local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
+    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
+    local pad_x, pad_y, spacing_y, border, win_round = L.md, L.md, L.sm, 0, 0
+    if reaper.ImGui_GetStyleVar then
+      pad_x, pad_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+      local _, sy = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+      spacing_y = sy
+      if reaper.ImGui_StyleVar_WindowBorderSize then
+        border = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowBorderSize()) or 0
+      end
+      win_round = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowRounding()) or 0
+    end
+    local x1 = win_x + border
+    -- Right edge: the content edge plus its padding, so a vertical scrollbar stays uncovered
+    local x2 = math.min(win_x + win_w - border, row_x + avail_w + pad_x)
+    local top = win_y + border
+    local y1 = math.max(top, row_y - pad_y)
+    local y2 = row_y + hdr_h + spacing_y
+    reaper.ImGui_DrawList_PushClipRect(dl, win_x, win_y, win_x + win_w, win_y + win_h, false)
+    if win_round > 0 and y1 <= top and reaper.ImGui_DrawFlags_RoundCornersTop then
+      reaper.ImGui_DrawList_AddRectFilled(dl, x1, y1, x2, y2, P.title, L.rounding, reaper.ImGui_DrawFlags_RoundCornersTop())
+    else
+      reaper.ImGui_DrawList_AddRectFilled(dl, x1, y1, x2, y2, P.title)
+    end
+    if opts.show_separator ~= false then
+      reaper.ImGui_DrawList_AddRectFilled(dl, x1, y2, x2, y2 + 1, P.sep)
+    end
+    reaper.ImGui_DrawList_PopClipRect(dl)
+  end
 
   -- 1. Brand icon (centers itself in target_h and establishes the line height)
   local has_icon = (opts.icon_fn ~= false)
@@ -2594,7 +3055,7 @@ function Theme.header(ctx, opts)
 
   -- 3. Title (white text aligned to frame padding)
   if opts.title then
-    local font_title = opts.font_header or (opts.fonts and (opts.fonts.medium or opts.fonts.default_bold or opts.fonts.large))
+    local font_title = opts.font_header or (opts.fonts and (opts.fonts.default_bold or opts.fonts.medium or opts.fonts.large))
     local pushed_title = Theme.push_font(ctx, font_title)
     Theme.align(ctx)
     if opts.title_color then
@@ -2673,11 +3134,9 @@ function Theme.header(ctx, opts)
     end
   end
 
-  if opts.show_separator ~= false then
-    reaper.ImGui_Spacing(ctx)
-    reaper.ImGui_Separator(ctx)
-    reaper.ImGui_Spacing(ctx)
-  end
+  -- Clear the strip and its hairline before the content below
+  reaper.ImGui_Dummy(ctx, 0, 1)
+  reaper.ImGui_Spacing(ctx)
 
   return not close_clicked
 end

@@ -1,8 +1,8 @@
 -- @description Fancy Pan Snap
 -- @author Fancy Scripts
--- @version 1.7.1
+-- @version 1.8.0
 -- @changelog
---   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
+--   + New look from the shared design system: matches the Reapertips Theme
 -- @about
 --   Background auto-snap utility that snaps Track Pan, Track Width / Dual Pan,
 --   and Send Pans to configurable percentage increments (default 10%) on release.
@@ -14,6 +14,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -77,7 +78,7 @@ local OVERLAY_BG_ITEMS = {
 
 local OVERLAY_BORDER_ITEMS = {
   { id = "accent",  label = "Theme Accent (Cursor)" },
-  { id = "accent2", label = "Secondary Accent (Blue)" },
+  { id = "accent2", label = "Secondary Accent" },
   { id = "border",  label = "Subtle Frame (3D Border)" },
   { id = "green",   label = "Detent Green (Success)" },
   { id = "yellow",  label = "Brand Yellow" },
@@ -86,7 +87,7 @@ local OVERLAY_BORDER_ITEMS = {
 
 local OVERLAY_VAL_ITEMS = {
   { id = "accent_l",  label = "Theme Accent (Default)" },
-  { id = "accent2_l", label = "Secondary Accent (Blue)" },
+  { id = "accent2_l", label = "Secondary Accent" },
   { id = "green_l",   label = "Detent Green" },
   { id = "yellow_l",  label = "Brand Yellow" },
   { id = "text",      label = "White (High Contrast)" },
@@ -1172,7 +1173,8 @@ local function draw_info_modal()
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
-    if reaper.ImGui_BeginTabBar(ctx, "pan_snap_info_tabs") then
+    if reaper.ImGui_BeginTabBar(ctx, "pan_snap_info_tabs", reaper.ImGui_TabBarFlags_DrawSelectedOverline
+        and reaper.ImGui_TabBarFlags_DrawSelectedOverline() or reaper.ImGui_TabBarFlags_None()) then
       if reaper.ImGui_BeginTabItem(ctx, "Quick Guide") then
         reaper.ImGui_Spacing(ctx)
 

@@ -1,7 +1,9 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.4.1
+-- @version 5.4.2
 -- @changelog
+--   + New look from the shared design system: matches the Reapertips Theme
+--   + Fix: symbols the new font lacks no longer show as ?
 --   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
@@ -14,6 +16,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 --   [data] ../toolbar_icons/toolbar_fancy_parameter_link.png > toolbar_icons/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/150/toolbar_fancy_parameter_link.png > toolbar_icons/150/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/200/toolbar_fancy_parameter_link.png > toolbar_icons/200/toolbar_fancy_parameter_link.png
@@ -65,6 +68,7 @@ end
 
 -- Status message (temporary toast in header)
 local preset_status_msg  = ""
+local preset_status_ok   = false   -- true when the message reports a success (it shows green)
 local preset_status_time = 0
 
 -- Settings & Preferences
@@ -257,7 +261,7 @@ end
 
 local function make_link(d)
   return {
-    label       = d.label or (tostring(d.a_name or "?") .. " / " .. tostring(d.a_pname or "?") .. " \xe2\x86\x94 " .. tostring(d.b_name or "?") .. " / " .. tostring(d.b_pname or "?")),
+    label       = d.label or (tostring(d.a_name or "?") .. " / " .. tostring(d.a_pname or "?") .. " <-> " .. tostring(d.b_name or "?") .. " / " .. tostring(d.b_pname or "?")),
     a_guid      = d.a_guid or "",
     a_name      = d.a_name or "?",
     a_fxi       = d.a_fxi or 0,
@@ -718,15 +722,19 @@ local function apply_preset_direct(preset)
   end
   if skipped == total then
     preset_status_msg = string.format("Preset '%s': all links already exist", preset.name)
+    preset_status_ok = false
   elseif created == total then
-    preset_status_msg = string.format("Preset '%s': %d links created \xe2\x9c\x93", preset.name, created)
+    preset_status_msg = string.format("Preset '%s': %d links created", preset.name, created)
+    preset_status_ok = true
   elseif created > 0 then
     local parts = {}
     parts[#parts + 1] = string.format("%d created", created)
     if skipped > 0 then parts[#parts + 1] = string.format("%d already existed", skipped) end
     preset_status_msg = string.format("Preset '%s': %s", preset.name, table.concat(parts, ", "))
+    preset_status_ok = false
   else
     preset_status_msg = string.format("Preset '%s': no matching params found", preset.name)
+    preset_status_ok = false
   end
   preset_status_time = reaper.time_precise()
   return created > 0
@@ -1514,7 +1522,8 @@ local function draw_info_modal()
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
-    if reaper.ImGui_BeginTabBar(ctx, "info_tab_bar") then
+    if reaper.ImGui_BeginTabBar(ctx, "info_tab_bar", reaper.ImGui_TabBarFlags_DrawSelectedOverline
+        and reaper.ImGui_TabBarFlags_DrawSelectedOverline() or reaper.ImGui_TabBarFlags_None()) then
       if reaper.ImGui_BeginTabItem(ctx, "Quick Start Guide") then
         reaper.ImGui_Spacing(ctx)
 
@@ -1834,11 +1843,12 @@ local function draw_main()
       local elapsed = reaper.time_precise() - preset_status_time
       if elapsed < 4.0 then
         local alpha = math.max(0, math.min(1, 1.0 - (elapsed - 3.0)))
-        local base_col = (preset_status_msg:find("\xe2\x9c\x93") and P.green) or P.yellow
+        local base_col = (preset_status_ok and P.green) or P.yellow
         subtitle_col = (elapsed > 3.0) and Theme.with_alpha(base_col, alpha) or base_col
         subtitle_text = preset_status_msg
       else
         preset_status_msg = ""
+        preset_status_ok = false
       end
     end
 
@@ -2098,7 +2108,8 @@ local function draw_main()
             if save_preset_from_links(save_preset_name) then
               save_presets()
               Presets.sel = #Presets.list
-              preset_status_msg = string.format("Preset '%s' saved \xe2\x9c\x93", save_preset_name)
+              preset_status_msg = string.format("Preset '%s' saved", save_preset_name)
+              preset_status_ok = true
               preset_status_time = reaper.time_precise()
               save_preset_name = ""
               link_sel = {}

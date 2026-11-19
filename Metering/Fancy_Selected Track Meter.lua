@@ -1,8 +1,8 @@
 -- @description Fancy Selected Track Meter
 -- @author Fancy Scripts
--- @version 9.67.1
+-- @version 9.67.2
 -- @changelog
---   + Fixed ReaImGui double-End error when a window is collapsed, fully clipped, or in an inactive dock tab
+--   + Ships the design system's font files
 -- @about
 --   Real-time visual metering display for selected tracks.
 --   Features customizable colors, peak hold, and docking support.
@@ -12,6 +12,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK

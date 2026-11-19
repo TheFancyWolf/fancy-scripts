@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.7.1
+-- @version 2.8.0
 -- @changelog
---   # Fix: Cmd/Ctrl+Z and Cmd/Ctrl+Shift+Z undo and redo while the window is focused
+--   New look: matches the Reapertips Theme (greys, blue accent, flat outlined controls, Fira Sans)
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -11,6 +11,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
@@ -838,56 +839,6 @@ local function get_target_track_color(take, item)
   end
 
   return nil
-end
-
--- get_contrasting_text_color is the only chunk-level name of the colour maths below: its helpers stay
--- private to the block, so they do not count against the chunk's 200-local limit.
-local get_contrasting_text_color
-do
-  --- sRGB channel (0-255) to linear light, the curve WCAG 2.x uses for relative luminance.
-  local function srgb_channel_to_linear(c8)
-    local c = c8 / 255
-    if c <= 0.03928 then return c / 12.92 end
-    return ((c + 0.055) / 1.055) ^ 2.4
-  end
-
-  --- WCAG relative luminance (0 = black, 1 = white) of an 0xRRGGBBAA colour (alpha ignored).
-  local function relative_luminance(rgba)
-    local r = srgb_channel_to_linear((rgba >> 24) & 0xFF)
-    local g = srgb_channel_to_linear((rgba >> 16) & 0xFF)
-    local b = srgb_channel_to_linear((rgba >> 8) & 0xFF)
-    return 0.2126 * r + 0.7152 * g + 0.0722 * b
-  end
-
-  --- WCAG contrast ratio (1 to 21) between two relative luminances.
-  local function contrast_ratio(lum_a, lum_b)
-    if lum_a < lum_b then lum_a, lum_b = lum_b, lum_a end
-    return (lum_a + 0.05) / (lum_b + 0.05)
-  end
-
-  --- Alpha-composites `fg` (0xRRGGBBAA) over the opaque colour `under`; the result is opaque.
-  local function composite_over(fg, under)
-    local a = (fg & 0xFF) / 255
-    local out = 0
-    for shift = 24, 8, -8 do
-      local f = (fg >> shift) & 0xFF
-      local u = (under >> shift) & 0xFF
-      out = out | (math.floor(f * a + u * (1 - a) + 0.5) << shift)
-    end
-    return out | 0xFF
-  end
-
-  --- Text colour for a badge filled with `badge_bg`: P.text or P.bg, whichever has the higher WCAG
-  --- contrast against the fill as it really shows (composited over the window background).
-  get_contrasting_text_color = function(badge_bg)
-    local P = Theme.get_palette()
-    if not badge_bg then return P.text end
-    local lum = relative_luminance(composite_over(badge_bg, P.bg))
-    if contrast_ratio(relative_luminance(P.text), lum) >= contrast_ratio(relative_luminance(P.bg), lum) then
-      return P.text
-    end
-    return P.bg
-  end
 end
 
 -- Ensure the Take Pitch Envelope is active on the take, creating it if needed.
@@ -4965,8 +4916,8 @@ local function draw_graph(draw_ctx, w, h)
     local bx2 = cx + badge_w * 0.5
     local by2 = cy + badge_h * 0.5
 
-    reaper.ImGui_DrawList_AddRectFilled(draw_list, bx1, by1, bx2, by2, P.card, 6.0)
-    reaper.ImGui_DrawList_AddRect(draw_list, bx1, by1, bx2, by2, C.bypass_border, 6.0, 0, 1.5)   -- yellow, >= 3:1 on the card and the dimmed canvas
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, bx1, by1, bx2, by2, P.card, L.rounding)
+    reaper.ImGui_DrawList_AddRect(draw_list, bx1, by1, bx2, by2, C.bypass_border, L.rounding, 0, 1.5)   -- yellow, >= 3:1 on the card and the dimmed canvas
 
     local line_y = by1 + L.lg
     pushed_bp_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)
@@ -5519,11 +5470,6 @@ local BODY = {
   tag_outdated = "outdated",
   tip_missing = "The item no longer exists in this project",
   tip_outdated = "A global default changed after this item's envelope was written. Edit or re-analyze it to refresh.",
-  -- Row card tints, as alpha of P.accent: the active row's fill and border, the hover fill and border
-  active_fill_a = 0.22,
-  active_border_a = 0.9,
-  hover_fill_a = 0.10,
-  hover_border_a = 0.35,
   -- The banner for items whose saved analysis cannot be read (see K.unreadable_guids) and its Clear button
   unreadable_fmt = "%d %s: saved analysis couldn't be read",
   unreadable_clear = "Clear",
@@ -5677,7 +5623,8 @@ local function render_pitched_items_sidebar(sidebar_ctx)
         local start_x = reaper.ImGui_GetCursorPosX(sidebar_ctx)
         local start_y = reaper.ImGui_GetCursorPosY(sidebar_ctx)
 
-        -- 1. Card (inset so the border is never cut off): tint, border and, for the active row, a leading bar
+        -- 1. Card: the active row is the selection tint (P.select) with a leading accent bar, a hovered row the
+        -- hover fill (P.hover); no border, as the library's rows
         local card_x1 = rx + card_margin_x
         local card_y1 = ry + card_pad_y
         local card_x2 = rx + avail_w - card_margin_x
@@ -5686,13 +5633,14 @@ local function render_pitched_items_sidebar(sidebar_ctx)
         local dl = reaper.ImGui_GetWindowDrawList(sidebar_ctx)
         local is_row_hovered = reaper.ImGui_IsMouseHoveringRect(sidebar_ctx, card_x1, card_y1, card_x2, card_y2)
         if is_active then
-          reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.accent, BODY.active_fill_a), L.rounding)
-          reaper.ImGui_DrawList_AddRect(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.accent, BODY.active_border_a), L.rounding, 0, 1.0)
+          reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, P.select, L.rounding)
           reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1 + L.xs, card_x1 + bar_w, card_y2 - L.xs, P.accent)
         elseif is_row_hovered then
-          reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.accent, BODY.hover_fill_a), L.rounding)
-          reaper.ImGui_DrawList_AddRect(dl, card_x1, card_y1, card_x2, card_y2, Theme.with_alpha(P.accent, BODY.hover_border_a), L.rounding, 0, 1.0)
+          reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, P.hover, L.rounding)
         end
+        -- P.text_dim reads at 4.5:1 on the window, not on those fills (3.8:1 on the tint, 4.0:1 on the hover fill):
+        -- on a filled card the dim name and the state tag take P.text (the tag's words still say the state)
+        local dim_col = (is_active or is_row_hovered) and P.text or P.text_dim
 
         -- 2. Elements on one line inside the card, each centred on it
         local x_left = start_x + card_margin_x + card_pad_x
@@ -5745,8 +5693,12 @@ local function render_pitched_items_sidebar(sidebar_ctx)
         local full_name = data.name or "Item"
         local name_font = is_active and Theme.push_font(sidebar_ctx, fonts.default_bold)
         local sel_text = fit_text(sidebar_ctx, full_name, name_w, is_active and "bold" or "regular")
-        local name_col = (is_missing and P.text_dim) or P.text
+        local name_col = (is_missing and dim_col) or P.text
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_Text(), name_col)
+        -- The row card draws its own hover fill: the selectable adds none (an opaque P.hover would cover the
+        -- active row's blue tint in the name area)
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_HeaderHovered(), Theme.with_alpha(P.hover, 0))
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_HeaderActive(),  Theme.with_alpha(P.hover, 0))
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_ItemSpacing(), 0, 0)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_SelectableTextAlign(), 0, 0.5)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
@@ -5754,7 +5706,7 @@ local function render_pitched_items_sidebar(sidebar_ctx)
           switch_active_target(guid, take_obj)
         end
         reaper.ImGui_PopStyleVar(sidebar_ctx, 2)
-        reaper.ImGui_PopStyleColor(sidebar_ctx, 1)
+        reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
         if name_font then Theme.pop_font(sidebar_ctx, name_font) end
 
         if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
@@ -5774,7 +5726,7 @@ local function render_pitched_items_sidebar(sidebar_ctx)
           reaper.ImGui_SameLine(sidebar_ctx, 0, gap)
           local pushed_small = Theme.push_font(sidebar_ctx, fonts.small)
           Theme.vcenter(sidebar_ctx, tag_h, card_h, line_y)
-          reaper.ImGui_TextColored(sidebar_ctx, P.text_dim, state_tag)
+          reaper.ImGui_TextColored(sidebar_ctx, dim_col, state_tag)
           if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
             Theme.tooltip(sidebar_ctx, state_tip)
           end
@@ -6164,8 +6116,8 @@ end
 
 --- Danger styling of the Settings "Wipe" button and the confirm modal's confirm button: the label stays P.text and
 --- every state is a translucent red over the popup surface (P.panel), so the label keeps >= 4.5:1 in all of them (HC1).
---- Fancy Dark, composited: rest (P.red_d) 12.7:1, hover and pressed (P.red_h) 9.1:1 (an opaque P.red pressed would be
---- 3.21:1). Pair every K.push_danger(P) with K.pop_danger().
+--- Fancy, composited: rest (P.red_d) 6.2:1, hover and pressed (P.red_h) 4.9:1 (an opaque P.red pressed would be
+--- 2.4:1). Pair every K.push_danger(P) with K.pop_danger().
 K.push_danger = function(P)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), P.red_d)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), P.red_h)
@@ -6441,7 +6393,7 @@ K.INFO_SECTIONS = {
   { title = "Icons", rows = {
     { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
     { "× (top right)", "Close the window (Esc when floating)" },
-    { "▸ / ◀", "Hide / show the Pitched Items panel" },
+    { "> / <", "Hide / show the Pitched Items panel" },
     { "Checkbox (item row)", "Pitch envelope active / bypassed" },
     { "× (item row)", "Remove the item from Pitched Items" },
     { "* after a value", "Set for this item only" },
@@ -7062,11 +7014,11 @@ do
     local P, s = hs.P, hs.s
     if hs.has_target then
       local track_col = get_target_track_color(hs.target_take, hs.target_item)
-      local badge_bg = track_col or (hs.has_notes and P.accent_d or Theme.with_alpha(P.yellow, 0.25))
+      local badge_bg = track_col or (hs.has_notes and P.well or Theme.with_alpha(P.yellow, 0.25))   -- analysed: a quiet tag
       Theme.badge(ctx, hdr_fit_text(state.target_take_name, hs.badge_w - s.pad_x), {
         id = "target",
         bg = badge_bg,
-        text_color = get_contrasting_text_color(badge_bg),
+        text_color = Theme.label_on(badge_bg),
         w = hs.badge_w,
       })
       -- The tooltip is built on hover only: it reads the item's pitch algorithm from REAPER
@@ -7087,10 +7039,16 @@ do
   end
 
   local function hdr_draw_key(hs)
-    local s = hs.s
-    -- Previews the short name ("C#") but lists the full one ("C# / Db"), so it stays a plain BeginCombo
+    local P, s = hs.P, hs.s
+    -- Previews the short name ("C#") but lists the full one ("C# / Db"), so it stays a plain BeginCombo.
+    -- Its preview takes the button face, like Scale's Theme.combo; popped before the list draws.
     reaper.ImGui_SetNextItemWidth(ctx, s.key_w)
-    if reaper.ImGui_BeginCombo(ctx, "##key_selector", SCALE_KEYS[state.key_idx].display) then
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),        P.btn)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),  P.btn_a)
+    local key_open = reaper.ImGui_BeginCombo(ctx, "##key_selector", SCALE_KEYS[state.key_idx].display)
+    reaper.ImGui_PopStyleColor(ctx, 3)
+    if key_open then
       for i, k_info in ipairs(SCALE_KEYS) do
         local is_sel = (state.key_idx == i)
         if Theme.selectable(ctx, k_info.name .. "##key_" .. i, is_sel, nil, s.key_list_w) and not is_sel then
@@ -7304,8 +7262,13 @@ do
   local BAR_SCOPE_TAGS = { note = "Note", item = "Item", global = "Global" }
   -- Appended to a badge label when its value is overridden for the item (or the selected note)
   local BAR_OVERRIDE_MARK = "*"
-  -- The button that folds the three timing badges; %s is the override mark when one of them is overridden
-  local BAR_TIMING_FMT = "Timing%s ▾"
+  -- The button that folds the three timing badges; %s is the override mark when one of them is overridden.
+  -- A Theme.icons.tri_down (half size BAR_TIMING_ICON_HS) is drawn after the label; the gap and the icon's
+  -- width are reserved in the button's width.
+  local BAR_TIMING_FMT = "Timing%s"
+  local BAR_TIMING_ICON_HS = 4
+  local BAR_TIMING_ICON_GAP = Theme.layout.sm
+  local BAR_TIMING_ICON_W = math.ceil(BAR_TIMING_ICON_HS * 1.4)
   local BAR_TIMING_TIP = "Transition, Onset Ramp and Legato Gap"
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
@@ -7356,7 +7319,8 @@ do
       s.unit_w[spec.id] = widest + mark_w + s.pad_x
       s.timing_label_w = math.max(s.timing_label_w, bar_text_w(bctx, PARAM_LABELS[spec.key] or spec.key) + mark_w)
     end
-    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, BAR_OVERRIDE_MARK)) + s.pad_x
+    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, BAR_OVERRIDE_MARK))
+      + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W + s.pad_x
     for _, spec in ipairs(BAR_ACTIONS) do
       s.unit_w[spec.id] = bar_text_w(bctx, spec.label) + s.pad_x
     end
@@ -7490,11 +7454,12 @@ do
       return value, get_override_level(single_note, key)
     end
 
-    --- Text and background of a pill / badge by where its value comes from
+    --- Text and background of a pill / badge by where its value comes from: a note override is solid secondary
+    --- accent, an item override solid accent, each with a label that reads on it; the global default a quiet tag
     local function level_colors(level)
-      if level == "note" then return P.accent2_l, P.accent2_d end
-      if level == "item" then return P.accent_l, P.accent_d end
-      return P.text_dim, P.card
+      if level == "note" then return Theme.label_on(P.accent2), P.accent2 end
+      if level == "item" then return Theme.label_on(P.accent), P.accent end
+      return P.text, P.well
     end
 
     --- Write an edited value: to the item override when there is one, else to the global default. The global default is
@@ -7574,7 +7539,7 @@ do
       -- Scope pill: where the value comes from, which is also what an edit changes
       local fg, bg = level_colors(level)
       Theme.badge(bctx, BAR_SCOPE_TAGS[level] or BAR_SCOPE_TAGS.global, {
-        color = fg, bg = bg, id = "bar_scope", w = s.scope_w,
+        color = fg, bg = bg, text_color = fg, id = "bar_scope", w = s.scope_w,
       })
       bar_tooltip("Where " .. PARAM_LABELS.retune_speed .. " comes from.\n" .. bar_scope_tip(level, false))
 
@@ -7649,7 +7614,7 @@ do
       Theme.align(bctx)
       reaper.ImGui_BeginDisabled(bctx, disabled)
       local pressed = Theme.badge(bctx, txt, {
-        color = fg, bg = bg, interactive = true, id = "bar_" .. spec.id, w = s.unit_w[spec.id],
+        color = fg, bg = bg, text_color = fg, interactive = true, id = "bar_" .. spec.id, w = s.unit_w[spec.id],
       })
       reaper.ImGui_EndDisabled(bctx)
 
@@ -7684,8 +7649,23 @@ do
       end
 
       reaper.ImGui_BeginDisabled(bctx, inspector_reason ~= nil)
-      local pressed = reaper.ImGui_Button(bctx,
-        string.format(BAR_TIMING_FMT, overridden and BAR_OVERRIDE_MARK or "") .. "###bar_timing", s.unit_w.timing, 0)
+      -- Label and icon are centred together: the label is aligned so the icon's slot fits to its right
+      local label = string.format(BAR_TIMING_FMT, overridden and BAR_OVERRIDE_MARK or "")
+      local label_w = bar_text_w(bctx, label)
+      local slack = s.unit_w.timing - s.pad_x - label_w
+      local align_x = slack > 0 and math.max(0, math.min(1, (slack - BAR_TIMING_ICON_GAP - BAR_TIMING_ICON_W) * 0.5 / slack)) or 0.5
+      reaper.ImGui_PushStyleVar(bctx, reaper.ImGui_StyleVar_ButtonTextAlign(), align_x, 0.5)
+      local pressed = reaper.ImGui_Button(bctx, label .. "###bar_timing", s.unit_w.timing, 0)
+      reaper.ImGui_PopStyleVar(bctx)
+      do
+        local bx1, by1 = reaper.ImGui_GetItemRectMin(bctx)
+        local bx2, by2 = reaper.ImGui_GetItemRectMax(bctx)
+        local text_x = bx1 + s.pad_x * 0.5 + (bx2 - bx1 - s.pad_x - label_w) * align_x
+        local icon_col = Theme.get_palette().text
+        if inspector_reason ~= nil then icon_col = Theme.with_alpha(icon_col, 0.5) end
+        Theme.icons.tri_down(reaper.ImGui_GetWindowDrawList(bctx),
+          text_x + label_w + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W * 0.5, (by1 + by2) * 0.5, BAR_TIMING_ICON_HS, icon_col)
+      end
       reaper.ImGui_EndDisabled(bctx)
       if inspector_reason then
         bar_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())

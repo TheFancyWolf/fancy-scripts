@@ -93,7 +93,7 @@ Wide short strip (~1200×150): the summary stays one line; the Tapping section s
 | Min / max tempo | disabled with reason | n/a: each is clamped against the other (min ≤ max − 1), never disabled | EP3 |
 | Labels | overflow / long names | Labels are short fixed strings; "After the first change" wraps at narrow width | LG4 |
 | Window | missing dependency | ReaImGui missing → the house dependency message box (AGENTS.md) | HI7 |
-| All | Fancy Dark / Match Theme | Only palette tokens; checked in both modes | CL4 |
+| All | Fancy / Match Theme | Only palette tokens; checked in both modes | CL4 |
 | Summary | data honesty | Summary always reflects the saved values, including Glide ("Glides at 10 BPM/s to the average of 4 taps…") | ST4 |
 
 ## Interaction spec

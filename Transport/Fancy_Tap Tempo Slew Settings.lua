@@ -1,8 +1,8 @@
 -- @description Fancy Tap Tempo Slew Settings
 -- @author Fancy Scripts
--- @version 1.0.0
+-- @version 1.0.1
 -- @changelog
---   + Initial release
+--   + New look from the shared design system: matches the Reapertips Theme
 -- @about
 --   Settings window for Fancy Tap Tempo Slew: instant or glide, taps per
 --   change, whether the tempo updates on every tap or once per group, the
@@ -14,6 +14,7 @@
 -- @provides
 --   [main] .
 --   [nomain] ../_lib/*.lua
+--   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -364,7 +365,8 @@ local function draw_info_modal()
   Theme.modal_scrim(ctx, POPUP_INFO)
   if not reaper.ImGui_BeginPopupModal(ctx, POPUP_INFO, true, 0) then return end
   if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
-  if reaper.ImGui_BeginTabBar(ctx, "info_tabs") then
+  if reaper.ImGui_BeginTabBar(ctx, "info_tabs", reaper.ImGui_TabBarFlags_DrawSelectedOverline
+      and reaper.ImGui_TabBarFlags_DrawSelectedOverline() or reaper.ImGui_TabBarFlags_None()) then
     for _, tab in ipairs(INFO_TABS) do
       if reaper.ImGui_BeginTabItem(ctx, tab[1]) then
         for _, line in ipairs(tab[2]) do reaper.ImGui_TextWrapped(ctx, line) end
