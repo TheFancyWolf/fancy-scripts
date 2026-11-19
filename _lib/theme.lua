@@ -38,7 +38,7 @@
 --               hover, select                 hovered / selected row of a selectable or menu item (select = accent at 25%)
 --               scroll, scroll_h, scroll_a    scrollbar grab: 17 / 26 / 35% (white in Fancy, text colour in Match Theme)
 --               title                         title bar and docked header strip
---   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, handle*, trace, preview, overview_*, view_*, ... }
+--   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, span_*, handle*, trace, preview, overview_*, view_*, ... }
 --               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy,
 --               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
@@ -618,6 +618,10 @@ local function build_canvas_fancy(P)
   C.zone_drift      = with_alpha(P.blue, 0.267)
   C.zone_shift      = 0xFFAA4444
   C.zone_divider    = with_alpha(P.text, 0.20)
+  -- Setting highlights (where a timing value acts, shown while it is hovered or dragged): a wash of the Shift
+  -- zone's hue with an opaque edge; the edge is also the outline of a note a value reaches
+  C.span_fill       = 0xFFAA4428
+  C.span_edge       = 0xFFAA44FF
   C.handle          = with_alpha(P.text, 0.80)
   C.handle_hover    = P.text
   C.handle_drag     = P.yellow   -- not the accent: the blocks are accent-coloured
@@ -771,6 +775,9 @@ local function build_canvas_match(P)
   C.vibrato = with_alpha(P.yellow, 0.094)                               -- vibrato band: a faint yellow wash
   local blocks   = over_each({ C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited, C.note_bypassed }, rows)
   local shown    = concat_lists(rows, blocks)                           -- rows and note blocks (no wash): split markers and their label
+  -- Setting highlights: a yellow wash (decoration, like the vibrato band) inside a yellow edge fitted on rows and blocks
+  C.span_fill = with_alpha(P.yellow, 0.16)
+  C.span_edge = fit_contrast(P.yellow, shown, 3.0, rows, true)
   local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
   local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
   C.trace      = fit_contrast(with_alpha(P.text, 0.90), line_on, 3.0, rows, true)   -- raw pitch trace: text colour (90 % alpha)

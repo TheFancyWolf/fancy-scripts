@@ -4,6 +4,13 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.10.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Every correction setting shows on the notes:
+  - **Preview Curve is the written shape**: the green curve is now drawn from the same calculation that writes the item's pitch envelope, so it also shows the Scoop at a note's start, the fade in before a note and out after it (Onset Ramp), and the glide between two joined notes (Transition, Legato Gap). It follows Strength and the timing values live while you drag them in the top bar.
+  - **Highlights while you hover or drag a setting**: Strength outlines every edited note it reaches; Transition shades each glide; Onset Ramp shades the fade before and after each note; Legato Gap shades every gap that is joined; Scoop shades the note's onset. The same shows from the Timing popup, the note menu's sliders and a Shift+Drag on a note. A note with its own value for a setting is not lit by the top bar. If nothing in view uses the value you are dragging, the status pill says so.
+  - Untouched notes get no correction, so nothing is drawn on them. The Preview Curve entry of the Layers menu switches the curve and the highlights together. No gesture, value range or undo point changed, and the envelope that is written is the same as before.
+
+- **Design system (`_lib/theme.lua`)** — Two canvas colours for the highlights above: `canvas.span_fill` (a faint yellow wash) and `canvas.span_edge` (its edge and the note outline, at least 3:1 on every row and note fill in both theme modes).
+
 - **Fancy Pitch Correct v2.9.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Shortcuts in the right panel:
   - **Shortcuts list**: a new section under Pitched Items lists the keys and gestures that nothing on screen shows: selecting (Cmd/Ctrl+A, arrows, Shift-click, Cmd/Ctrl-click, box select, Esc), editing (arrow nudges, R, double-click to snap, the note menu, Shift-drag, trimming a note edge), the view (Z, F and the wheel chords) and Space. Keys that a button or a hover hint already names (S, Q, X, M, the note zones) are left to those; the full list stays in Keyboard Shortcuts & Help.
   - **Folding sections**: Pitched Items and Shortcuts each have a header that folds them. With both open, Pitched Items takes the height its rows need (at most half the panel) and Shortcuts scrolls in the rest; fold one and the other gets the whole panel. Both states are remembered between sessions.
