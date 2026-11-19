@@ -4,6 +4,13 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.9.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Shortcuts in the right panel:
+  - **Shortcuts list**: a new section under Pitched Items lists the keys and gestures that nothing on screen shows: selecting (Cmd/Ctrl+A, arrows, Shift-click, Cmd/Ctrl-click, box select, Esc), editing (arrow nudges, R, double-click to snap, the note menu, Shift-drag, trimming a note edge), the view (Z, F and the wheel chords) and Space. Keys that a button or a hover hint already names (S, Q, X, M, the note zones) are left to those; the full list stays in Keyboard Shortcuts & Help.
+  - **Folding sections**: Pitched Items and Shortcuts each have a header that folds them. With both open, Pitched Items takes the height its rows need (at most half the panel) and Shortcuts scrolls in the rest; fold one and the other gets the whole panel. Both states are remembered between sessions.
+  - **Default width**: a panel you have never resized opens just wide enough for every shortcut to sit on one line. The width is measured from the text in the font in use; once you drag the divider, your width is kept as before.
+  - **H** shows or hides the Shortcuts list. If the panel is hidden, H brings it back with the list open; in a window too narrow for the panel the status pill says "Widen the window to show Shortcuts".
+  - **Help**: Keyboard Shortcuts & Help lists H and the fold arrows.
+
 - **Fancy Pitch Correct v2.8.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Scrolling follows your mouse: the wheel scrolls the pitch axis (up and down), and a horizontal scroll scrolls the timeline, whether it comes from Shift + wheel, a trackpad, a tilt wheel or a mouse's own horizontal-scroll button. The two were the other way round. Cmd/Ctrl + wheel still zooms the timeline and Alt + wheel the pitch axis. The Help rows are updated.
 
 - **Fancy Pitch Correct v2.8.0 (`Pitch/Fancy_Pitch Correct.lua`)** — New look: matches the Reapertips Theme. Greys with a blue accent, flat outlined buttons, recessed slider grooves and input boxes, square-ish corners, tighter spacing and Fira Sans type. The canvas follows the same look: quiet recessed rows, blue notes (green once edited), a violet for split markers and the drift zone. Layout, controls and behaviour are unchanged. Symbols the new font lacks (check marks, arrows, dots) are drawn as small icons or plain text.
