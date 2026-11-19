@@ -139,7 +139,7 @@ Existing fields keep their names and get new values in the curated mode:
 | `accent` | `#46B9FE` | |
 | `accent2` / `blue` | `#A990F5` (a soft violet) | *my call*: the secondary accent can no longer be blue, since blue is now the primary. The theme's teal `#40BF9F` was considered and dropped: it sits 13 degrees of hue from the green and 1.13:1 from it in brightness, and the two meet on the canvas and in Parameter Link. Violet is far from blue, green, cyan and yellow. The field names `blue*` stay as aliases |
 | `green` | `#44CD8C` | |
-| `red` | `#E45E65` | |
+| `red` | `#E45E65` | a state colour, not a text colour: on these greys it is 3.7:1 |
 | `yellow` | `#FEC13A` | |
 | `border` | `#181818` | the control outline; see "Contrast" |
 | `sep` | `#1D1D1D` | hairline, no longer an accent tint |
@@ -179,7 +179,7 @@ The counts returned to callers may change; every caller already pops with the re
 | `SliderGrab` / `SliderGrabActive` | `thumb` / `thumb_a` |
 | `CheckMark` | `accent` |
 | `Header` / `HeaderHovered` / `HeaderActive` | `select` / `hover` / `select` (stronger) |
-| `Tab`, `TabHovered`, `TabSelected`, `TabSelectedOverline`, `TabDimmed*` | `tab`, `tab_h`, `tab_sel`, `accent`, and `tab` / `tab_sel` for the dimmed pair |
+| `Tab`, `TabHovered`, `TabSelected`, `TabSelectedOverline`, `TabDimmed*` | `tab`, `tab_h`, `tab_sel`, `accent`, and `tab` / `tab_sel` for the dimmed pair; the accent line needs `TabBarFlags_DrawSelectedOverline` on each tab bar; the four scripts that draw tabs pass it |
 | `ScrollbarBg` / `ScrollbarGrab*` | transparent over the surface / `scroll*` |
 | `Separator` | `sep`; hovered and active keep the accent (they mark a draggable splitter) |
 | `TitleBg*` | `title` |
@@ -265,8 +265,8 @@ No layout or behaviour changes. The sweep covers:
   - notes: untouched = a shade of the accent blue, edited = a shade of the green, each dark enough for the
     label to read. The border is the note's own hue (accent / green), at 3:1 or more on every row, exactly
     as today and as Match Theme does it; notes do not get the dark `outline` frame, which would be 1.8:1.
-    Selected = brighter fill inside a light border (`#EDEDED`), 3:1 or more. Corner radius follows
-    `L.rounding`
+    Selected = brighter fill inside a light border (`#EDEDED`), 3:1 or more. Notes and
+    the marquee stay square (a 2 px radius breaks on blocks only a few pixels tall)
   - layers that can overlap stay apart by hue as the library's comments require: notes blue, edited and
     preview green, split markers and the drift zone violet (the secondary accent), spots yellow. The trend
     line and anchor are cyan today, which is now close to the accent; the builder moves them only if they

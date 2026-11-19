@@ -539,4 +539,4 @@ grep -rn "Fancy Dark" _lib "Utility/Fancy_Design System.lua" "Pitch/Fancy_Pitch 
 
 ## Font check result
 
-(Filled in at the Task 1 stop: font source reported, which of the seven symbols showed.)
+Checked by the user in REAPER on 2026-11-18. Font source: file. All seven symbols rendered as '?', so Task 5 was required and done.

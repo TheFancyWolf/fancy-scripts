@@ -127,7 +127,7 @@ Match Theme: every new text token fitted to ≥ 4.5:1 and every boundary to ≥ 
 5. No control is drawn below the canvas. Every control the dock had is in the top bar and behaves as it did (drag, double-click reset, right-click item override, disabled reasons).
 6. At any window width the top bar picks a plan from the width alone; selecting notes or analysing never moves a control.
 7. Status messages remain visible for 4 s in every state (empty, analysing, analysed, bypassed).
-8. Every label drawn on the canvas is ≥ 4.5:1 in Fancy Dark and in Match Theme (dark and light REAPER themes).
+8. Every label drawn on the canvas is ≥ 4.5:1 in Fancy and in Match Theme (dark and light REAPER themes).
 9. `luacheck .` is clean.
 
 ## Open questions / assumptions

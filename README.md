@@ -48,5 +48,6 @@ If these scripts save you time, consider sponsoring development:
 ## 📜 License
 
 This project is licensed under the [GNU General Public License v3.0](LICENSE).
+The bundled Fira Sans fonts in `_lib/fonts/` are under the SIL Open Font License 1.1 (see [`_lib/fonts/OFL.txt`](_lib/fonts/OFL.txt)).
 
 © Fancy Wolf Audio
