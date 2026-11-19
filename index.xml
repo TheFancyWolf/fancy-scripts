@@ -374,7 +374,10 @@ Fancy Wolf Audio
 {\pard \ql \f0 \sa180 \li0 \fi0 This project is licensed under the {\field{\*\fldinst{HYPERLINK "LICENSE"}}{\fldrslt{\ul
 GNU General Public License v3.0
 }}}
-.\par}
+. The bundled Fira Sans fonts in {\f1 _lib/fonts/} are under the SIL Open Font License 1.1 (see {\field{\*\fldinst{HYPERLINK "_lib/fonts/OFL.txt"}}{\fldrslt{\ul
+{\f1 _lib/fonts/OFL.txt}
+}}}
+).\par}
 {\pard \ql \f0 \sa180 \li0 \fi0 \u169 ? Fancy Wolf Audio\par}
 }
 ]]></description>
