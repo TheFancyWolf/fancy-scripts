@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.8.1
+-- @version 2.9.0
 -- @changelog
---   Wheel scrolls the pitch axis; Shift + wheel or a horizontal scroll (trackpad, tilt wheel, mouse scroll button) scrolls the timeline
+--   Shortcuts list in the right panel (H shows or hides it); Pitched Items and Shortcuts fold from their headers
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -434,6 +434,11 @@ local state = {
   session_order = {},  -- array of guids
   sidebar_w = 200,     -- Pitched Items width: the body table's fixed column, mirrored from ImGui's live width each frame
   sidebar_open = true, -- Pitched Items drawer preference (defaults open); a window too narrow for it shows the tag instead
+  items_open = true,     -- the Pitched Items section of the panel is unfolded (header click)
+  shortcuts_open = true, -- the Shortcuts section of the panel is unfolded (header click or H)
+  sidebar_auto = false,  -- no panel width is stored: the first frame takes the width that fits the Shortcuts list
+  sidebar_fits = true,   -- the window had room for the panel beside the canvas last frame (H reads it)
+  items_content_h = nil, -- height of the Pitched Items section's content as drawn last frame (nil before the first)
   sidebar_gen = 0,     -- body table id generation: a new id makes ImGui take TableSetupColumn's width again (see draw_body_split)
   sidebar_tabled = false, -- the resizable body table was drawn last frame
   grip_hover_since = nil, -- time the mouse began resting on the divider between canvas and panel (its tooltip waits)
@@ -665,9 +670,16 @@ do
   else
     state.sidebar_open = true
   end
+  -- The two sections of the panel: anything but a stored "0" / "false" means unfolded
+  local saved_items = reaper.GetExtState("FancyScripts", "pitch_items_open")
+  state.items_open = not (saved_items == "0" or saved_items == "false")
+  local saved_shortcuts = reaper.GetExtState("FancyScripts", "pitch_shortcuts_open")
+  state.shortcuts_open = not (saved_shortcuts == "0" or saved_shortcuts == "false")
 
   -- Restore the global cascade defaults, the engine settings, the layers and the panel width
   K.load_settings()
+  -- A panel the user never resized takes its width from the Shortcuts list (see K.panel_fit_w), on the first frame
+  state.sidebar_auto = not reaper.HasExtState("FancyScripts", "pitch_sidebar_w")
 end
 
 -------------------------------------------------------------------------------
@@ -5470,6 +5482,7 @@ local BODY = {
   tag_tip = "Show Pitched Items (%d)",
   tag_tip_narrow = "Pitched Items (%d) does not fit this window. Widen the window to show it.",
   tag_narrow_status = "Widen the window to show Pitched Items",
+  shortcuts_narrow_status = "Widen the window to show Shortcuts",
   -- Row states and the checkbox column label (a row is never told apart by colour alone)
   col_on = "On",
   tag_missing = "Item missing",
@@ -5517,26 +5530,75 @@ do
   end
 end
 
-local function render_pitched_items_sidebar(sidebar_ctx)
+-- Keyboard Shortcuts & Help content: one entry per section, one { key, description } row each (draw_info_modal measures
+-- the columns from these strings). Keep a description near 52 characters so the table stays narrow; the terms follow
+-- the UI labels (Pitched Items, item, Correction Strength, Transition, Onset Ramp, Legato Gap, Scoop shape).
+-- A row that is also in the panel's Shortcuts list carries panel = { group, order in the group, short text [, short key] }:
+-- the list is built from this table (K.panel_rows), so a key is never written in two places.
+K.INFO_SECTIONS = {
+  { title = "Selection & Navigation", rows = {
+    { K.MOD_LABEL .. " + A", "Select all notes in phrase", panel = { "Select", 1, "Select all" } },
+    { "Escape", "Close dialog, deselect, close if floating", panel = { "Select", 6, "Deselect", "Esc" } },
+    { "Marquee Drag", "Box select notes (Shift=Add)", panel = { "Select", 5, "Box select", "Drag empty" } },
+    { "Shift + Click", "Range select notes", panel = { "Select", 3, "Select range" } },
+    { K.MOD_LABEL .. " + Click", "Toggle note in/out of selection", panel = { "Select", 4, "Add / remove" } },
+    { "← / →", "Select previous / next note (Shift=Extend)", panel = { "Select", 2, "Prev / next note" } },
+    { "Click empty canvas", "Deselect, move the REAPER edit cursor" },
+    { "Click a Pitched Items row", "Switch the active item" },
+    { "Select an audio item in REAPER", "Becomes the active item" },
+    { "Drag the divider", "Resize Pitched Items" },
+    { "H", "Show / hide the Shortcuts list", panel = { "General", 2, "Hide this list" } },
+  } },
+  { title = "Pitch & Note Editing", rows = {
+    { "Drag Center Zone", string.format("Move note pitch (%s = fine adjust)", K.MOD_LABEL) },
+    { "Drag Left Zone", "Adjust drift stability tracking" },
+    { "Drag Right Zone", "Scale natural vibrato depth" },
+    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 6, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
+    { "Shift + Drag Center Zone", "Adjust Transition" },
+    { "Shift + Drag Right Zone", "Adjust Scoop shape" },
+    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 7, "Trim note", "Drag edge" } },
+    { "Click the time ruler", "Move the edit cursor (playback follows)" },
+    { K.MOD_LABEL .. " + Wheel", "Zoom the timeline", panel = { "View", 3, "Zoom time" } },
+    { "Wheel", "Scroll the pitch axis" },
+    { "Alt + Wheel", "Zoom the pitch axis", panel = { "View", 5, "Zoom pitch" } },
+    { "Shift + Wheel or horizontal scroll", "Scroll the timeline (when zoomed)", panel = { "View", 4, "Scroll time", "Shift + Wheel" } },
+    { "Z", "Zoom to the selected notes", panel = { "View", 1, "Zoom to selection" } },
+    { "F", "Show the whole item, fit the pitch range", panel = { "View", 2, "Fit whole item" } },
+    { "Drag the overview strip", "Scroll; drag an end to zoom" },
+    { "Drag the pitch strip", "Scroll; drag an end to zoom" },
+    { "↑ / ↓", "Nudge pitch ±1 semitone", panel = { "Edit", 1, "±1 semitone" } },
+    { "Shift + ↑ / ↓", "Fine-tune pitch ±10 cents", panel = { "Edit", 2, "±10 cents" } },
+    { "S / Double-Click", "Snap note to nearest semitone", panel = { "Edit", 4, "Snap to semitone", "Double-click" } },
+    { "Q", "Quantize selected note(s) to scale" },
+    { "R / Backspace / Delete", "Reset note(s) to original detected pitch", panel = { "Edit", 3, "Reset pitch", "R" } },
+    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset", panel = { "Edit", 5, "Note menu", "Right-click" } },
+    { "Right-click a top bar value", "Item override and reset" },
+    { "Double-click a value", "Reset to its default" },
+    { K.MOD_LABEL .. "-click a value", "Type a number" },
+    { "Snap / Quantize / Split / Merge buttons", "Same as S / Q / X / M" },
+  } },
+  { title = "Note Topology & REAPER Transport", rows = {
+    { "X", "Split note at REAPER edit cursor" },
+    { "M", "Merge 2+ contiguous selected notes" },
+    { "Space", "Runs your REAPER action for Space (default Play/Stop)", panel = { "General", 1, "Play / stop" } },
+    { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
+  } },
+  { title = "Icons", rows = {
+    { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
+    { "× (top right)", "Close the window (Esc when floating)" },
+    { "> / <", "Hide / show the Pitched Items panel" },
+    { "▾ / ▸ (section header)", "Collapse / expand the section" },
+    { "Checkbox (item row)", "Pitch envelope active / bypassed" },
+    { "× (item row)", "Remove the item from Pitched Items" },
+    { "* after a value", "Set for this item only" },
+  } },
+}
+K.INFO_TERMS = "Reset reverts note edits · Clear discards analysis · Remove drops an item · Wipe removes all"
+
+--- The body of the Pitched Items section: the unreadable-data banner, then the item rows (or the empty text).
+K.draw_items_body = function(sidebar_ctx)
   local P = Theme.get_palette()
   local L = Theme.layout
-
-  Theme.align(sidebar_ctx)
-  reaper.ImGui_Text(sidebar_ctx, string.format("Pitched Items (%d)", #state.session_order))
-
-  reaper.ImGui_SameLine(sidebar_ctx)
-  local close_sz = L.icon_md.size + L.icon_md.pad * 2
-  Theme.right_align(sidebar_ctx, close_sz)
-  Theme.align(sidebar_ctx, nil, close_sz)
-  if Theme.icon_btn(sidebar_ctx, "##close_items_panel", Theme.icons.tri_right, {
-    preset = L.icon_md,
-    tooltip = "Hide Pitched Items panel"
-  }) then
-    state.sidebar_open = false
-    reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "0", true)
-  end
-
-  reaper.ImGui_Separator(sidebar_ctx)
 
   -- Items whose saved analysis cannot be read are not in the list: say so, with or without any row (P.text_dim, not red:
   -- the project is fine, the stored data of those items is not)
@@ -5772,6 +5834,206 @@ local function render_pitched_items_sidebar(sidebar_ctx)
   end
 end
 
+-- The panel's Shortcuts groups, in the order they are drawn
+K.PANEL_GROUPS = { "Select", "Edit", "View", "General" }
+
+--- The Shortcuts list of the panel: { { group = name, rows = { { key, text }, ... } }, ... } in K.PANEL_GROUPS order,
+--- built once from the rows of K.INFO_SECTIONS that carry a `panel` field.
+K.panel_rows = function()
+  if K.panel_rows_cache then return K.panel_rows_cache end
+  local by_group = {}
+  for _, name in ipairs(K.PANEL_GROUPS) do by_group[name] = {} end
+  for _, section in ipairs(K.INFO_SECTIONS) do
+    for _, row in ipairs(section.rows) do
+      local p = row.panel
+      if p and by_group[p[1]] then
+        local list = by_group[p[1]]
+        list[#list + 1] = { key = p[4] or row[1], text = p[3], order = p[2] }
+      end
+    end
+  end
+  local out = {}
+  for _, name in ipairs(K.PANEL_GROUPS) do
+    table.sort(by_group[name], function(a, b) return a.order < b.order end)
+    out[#out + 1] = { group = name, rows = by_group[name] }
+  end
+  K.panel_rows_cache = out
+  return out
+end
+
+--- The colour of the key text in the Shortcuts list: the accent, as in the Help modal, when it reads at 4.5:1 on the
+--- window background (HC1), else the text colour (a Match Theme accent can be too close to the background).
+K.panel_key_color = function(P)
+  local c = K.panel_key_cache
+  if c and c.accent == P.accent and c.bg == P.bg and c.text == P.text then return c.color end
+  local function luminance(rgba)
+    local function channel(v)
+      v = v / 255
+      return v <= 0.04045 and v / 12.92 or ((v + 0.055) / 1.055) ^ 2.4
+    end
+    return 0.2126 * channel((rgba >> 24) & 0xFF) + 0.7152 * channel((rgba >> 16) & 0xFF) + 0.0722 * channel((rgba >> 8) & 0xFF)
+  end
+  local la, lb = luminance(P.accent), luminance(P.bg)
+  local ratio = (math.max(la, lb) + 0.05) / (math.min(la, lb) + 0.05)
+  local color = ratio >= 4.5 and P.accent or P.text
+  K.panel_key_cache = { accent = P.accent, bg = P.bg, text = P.text, color = color }
+  return color
+end
+
+--- Fold or unfold a section of the panel ("items" or "shortcuts"); the preference is stored when it changes.
+K.set_panel_open = function(which, open)
+  local field = which == "items" and "items_open" or "shortcuts_open"
+  open = open and true or false
+  if state[field] == open then return end
+  state[field] = open
+  reaper.SetExtState("FancyScripts", which == "items" and "pitch_items_open" or "pitch_shortcuts_open", open and "1" or "0", true)
+end
+
+--- Heights of the two section bodies. avail_h = the room under the two headers. Both unfolded: Pitched Items is as tall as
+--- its content, at most half of the room, and Shortcuts takes the rest. One unfolded: it takes everything. Never negative.
+K.panel_heights = function(avail_h, items_content_h, items_open, shortcuts_open)
+  avail_h = math.max(0, math.floor(avail_h))
+  if items_open and shortcuts_open then
+    local items_h = math.max(0, math.min(math.ceil(items_content_h), avail_h // 2))
+    return items_h, avail_h - items_h
+  elseif items_open then
+    return avail_h, 0
+  elseif shortcuts_open then
+    return 0, avail_h
+  end
+  return 0, 0
+end
+
+--- H: show or hide the Shortcuts list. A hidden panel comes back with the list unfolded; a window too narrow for the
+--- panel changes nothing and says why.
+K.toggle_shortcuts = function()
+  if not state.sidebar_fits then
+    set_status(BODY.shortcuts_narrow_status)
+  elseif not state.sidebar_open then
+    state.sidebar_open = true
+    reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "1", true)
+    K.set_panel_open("shortcuts", true)
+  else
+    K.set_panel_open("shortcuts", not state.shortcuts_open)
+  end
+end
+
+--- Measure the widest key and the widest description of the Shortcuts list in the font pushed now (K.panel_key_w,
+--- K.panel_text_w); measured again only when the font size changes.
+K.panel_measure = function(measure_ctx)
+  local font_h = reaper.ImGui_GetFontSize(measure_ctx)
+  if K.panel_key_w_font == font_h then return end
+  local key_w, text_w = 0, 0
+  for _, g in ipairs(K.panel_rows()) do
+    for _, row in ipairs(g.rows) do
+      key_w = math.max(key_w, (reaper.ImGui_CalcTextSize(measure_ctx, row.key)) or 0)
+      text_w = math.max(text_w, (reaper.ImGui_CalcTextSize(measure_ctx, row.text)) or 0)
+    end
+  end
+  K.panel_key_w, K.panel_text_w, K.panel_key_w_font = key_w, text_w, font_h
+end
+
+--- The panel width at which every Shortcuts row fits on one line: the default width, taken from the text in the font in
+--- use (never a pixel constant). The parts mirror draw_body_split (the panel's inset) and K.draw_shortcuts_body (the
+--- list's indent, the key column, both columns' cell padding) plus the room of the body's scrollbar.
+K.panel_fit_w = function(measure_ctx)
+  local L = Theme.layout
+  K.panel_measure(measure_ctx)
+  local scrollbar_w = reaper.ImGui_GetStyleVar(measure_ctx, reaper.ImGui_StyleVar_ScrollbarSize()) or 0
+  return math.ceil(L.sm * 2 + L.sm * 2 + (K.panel_key_w + L.sm) + K.panel_text_w + L.xs * 4 + scrollbar_w) + 1
+end
+
+--- The body of the Shortcuts section: one heading per group, the key in a fixed column as wide as the widest key, the
+--- description wrapping in the rest. Reference text only (no hover, no click).
+K.draw_shortcuts_body = function(sidebar_ctx)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local groups = K.panel_rows()
+  local key_col = K.panel_key_color(P)
+
+  -- The widest key in the font drawn now, measured again only when the font size changes
+  K.panel_measure(sidebar_ctx)
+
+  local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
+  local table_w = math.max(1, avail_w - L.sm * 2)
+  local table_flags = reaper.ImGui_TableFlags_SizingFixedFit() | reaper.ImGui_TableFlags_NoSavedSettings()
+  reaper.ImGui_Indent(sidebar_ctx, L.sm)
+  reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_CellPadding(), L.xs, L.xs)
+  for i, g in ipairs(groups) do
+    -- Theme.section_divider brings its own air above and below: no extra gap between the groups
+    Theme.section_divider(sidebar_ctx, g.group, { color = P.yellow })
+    if reaper.ImGui_BeginTable(sidebar_ctx, "##panel_keys_" .. i, 2, table_flags, table_w, 0) then
+      reaper.ImGui_TableSetupColumn(sidebar_ctx, "##key", reaper.ImGui_TableColumnFlags_WidthFixed(), K.panel_key_w + L.sm)
+      reaper.ImGui_TableSetupColumn(sidebar_ctx, "##text", reaper.ImGui_TableColumnFlags_WidthStretch(), 1)
+      for _, row in ipairs(g.rows) do
+        reaper.ImGui_TableNextRow(sidebar_ctx)
+        reaper.ImGui_TableSetColumnIndex(sidebar_ctx, 0)
+        reaper.ImGui_TextColored(sidebar_ctx, key_col, row.key)
+        reaper.ImGui_TableSetColumnIndex(sidebar_ctx, 1)
+        reaper.ImGui_TextWrapped(sidebar_ctx, row.text)
+      end
+      reaper.ImGui_EndTable(sidebar_ctx)
+    end
+  end
+  reaper.ImGui_PopStyleVar(sidebar_ctx, 1)
+  reaper.ImGui_Unindent(sidebar_ctx, L.sm)
+  reaper.ImGui_Dummy(sidebar_ctx, 0, L.sm)
+end
+
+--- The panel: two sections, Pitched Items and Shortcuts, each a header that folds its body. Each body scrolls on its own
+--- inside the height K.panel_heights gives it; the panel itself never scrolls.
+local function render_pitched_items_sidebar(sidebar_ctx)
+  local L = Theme.layout
+  local frame_h = reaper.ImGui_GetFrameHeight(sidebar_ctx)
+  local _, spacing_y = reaper.ImGui_GetStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_ItemSpacing())
+  spacing_y = spacing_y or 0
+  local close_sz = L.icon_md.size + L.icon_md.pad * 2
+
+  -- 1. Pitched Items header: the fold arrow and the count, with the hide-panel button at its right end
+  reaper.ImGui_SetNextItemOpen(sidebar_ctx, state.items_open, reaper.ImGui_Cond_Always())
+  local items_open = Theme.collapsing_header(sidebar_ctx,
+    string.format("Pitched Items (%d)##pitch_items_hdr", #state.session_order), {
+      close_w = close_sz,
+      action_fn = function(hdr_ctx)
+        if Theme.icon_btn(hdr_ctx, "##close_items_panel", Theme.icons.tri_right, {
+          preset = L.icon_md,
+          tooltip = "Hide Pitched Items panel"
+        }) then
+          state.sidebar_open = false
+          reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "0", true)
+        end
+      end,
+    })
+  K.set_panel_open("items", items_open)
+
+  -- The room under the two headers (the Shortcuts header and the gaps around the bodies come off what is left here)
+  local _, left_h = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
+  local gaps = (state.items_open and 1 or 0) + (state.shortcuts_open and 1 or 0)
+  local avail_h = (left_h or 0) - frame_h - spacing_y * gaps
+  local items_h, shortcuts_h = K.panel_heights(avail_h, state.items_content_h or math.huge, state.items_open, state.shortcuts_open)
+
+  -- 2. Pitched Items body
+  if state.items_open and items_h >= 1 then
+    if reaper.ImGui_BeginChild(sidebar_ctx, "##pitch_items_body", 0, items_h, 0) then
+      K.draw_items_body(sidebar_ctx)
+      -- The cursor ends under the last row (the clipper counts the rows it skipped): the content's height
+      state.items_content_h = reaper.ImGui_GetCursorPosY(sidebar_ctx)
+      reaper.ImGui_EndChild(sidebar_ctx)
+    end
+  end
+
+  -- 3. Shortcuts header and body
+  reaper.ImGui_SetNextItemOpen(sidebar_ctx, state.shortcuts_open, reaper.ImGui_Cond_Always())
+  local shortcuts_open = Theme.collapsing_header(sidebar_ctx, "Shortcuts##pitch_shortcuts_hdr")
+  K.set_panel_open("shortcuts", shortcuts_open)
+  if state.shortcuts_open and shortcuts_h >= 1 then
+    if reaper.ImGui_BeginChild(sidebar_ctx, "##pitch_shortcuts_body", 0, shortcuts_h, 0) then
+      K.draw_shortcuts_body(sidebar_ctx)
+      reaper.ImGui_EndChild(sidebar_ctx)
+    end
+  end
+end
+
 --- Body, panel open: canvas | grip | Pitched Items in a resizable two-column table (canvas stretches,
 --- the panel is a fixed column). ImGui keeps a fixed column's width between frames and offers no way to
 --- set it again, so a width that has to change without a drag (the window got narrower, the panel was
@@ -5781,6 +6043,15 @@ local function draw_body_split(P, avail_w, total_h)
   local L = Theme.layout
   local left = reaper.ImGui_MouseButton_Left()
   local mouse_down = reaper.ImGui_IsMouseDown(ctx, left)
+
+  -- No stored width: the default is the width at which every Shortcuts row fits on one line. It is not saved (only a
+  -- drag of the divider is), so it follows the font; the clamps below still keep the canvas its minimum.
+  if state.sidebar_auto then
+    state.sidebar_auto = false
+    state.sidebar_w = K.panel_fit_w(ctx)
+    state.stored["pitch_sidebar_w"] = string.format("%.0f", state.sidebar_w)
+    state.sidebar_tabled = false
+  end
 
   local max_sidebar_w = math.max(BODY.min_sidebar_w, avail_w - BODY.min_graph_w - BODY.splitter_w)
   local wanted_w = math.max(BODY.min_sidebar_w, math.min(max_sidebar_w, state.sidebar_w))
@@ -5814,7 +6085,9 @@ local function draw_body_split(P, avail_w, total_h)
     state.sidebar_w = column_w
     reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.sm)
     local panel_w = math.max(column_w, BODY.min_sidebar_w) - L.sm * 2
-    if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", panel_w, total_h, 0) then
+    -- The panel never scrolls itself: each of its two sections scrolls its own body
+    local panel_flags = reaper.ImGui_WindowFlags_NoScrollbar() | reaper.ImGui_WindowFlags_NoScrollWithMouse()
+    if reaper.ImGui_BeginChild(ctx, "##pitched_items_sidebar", panel_w, total_h, 0, panel_flags) then
       render_pitched_items_sidebar(ctx)
       reaper.ImGui_EndChild(ctx)
     end
@@ -6345,67 +6618,6 @@ local function draw_settings_modal()
     reaper.ImGui_EndPopup(ctx)
   end
 end
-
--- Keyboard Shortcuts & Help content: one entry per section, one { key, description } row each (draw_info_modal measures
--- the columns from these strings). Keep a description near 52 characters so the table stays narrow; the terms follow
--- the UI labels (Pitched Items, item, Correction Strength, Transition, Onset Ramp, Legato Gap, Scoop shape).
-K.INFO_SECTIONS = {
-  { title = "Selection & Navigation", rows = {
-    { K.MOD_LABEL .. " + A", "Select all notes in phrase" },
-    { "Escape", "Close dialog, deselect, close if floating" },
-    { "Marquee Drag", "Box select notes (Shift=Add)" },
-    { "Shift + Click", "Range select notes" },
-    { K.MOD_LABEL .. " + Click", "Toggle note in/out of selection" },
-    { "← / →", "Select previous / next note (Shift=Extend)" },
-    { "Click empty canvas", "Deselect, move the REAPER edit cursor" },
-    { "Click a Pitched Items row", "Switch the active item" },
-    { "Select an audio item in REAPER", "Becomes the active item" },
-    { "Drag the divider", "Resize Pitched Items" },
-  } },
-  { title = "Pitch & Note Editing", rows = {
-    { "Drag Center Zone", string.format("Move note pitch (%s = fine adjust)", K.MOD_LABEL) },
-    { "Drag Left Zone", "Adjust drift stability tracking" },
-    { "Drag Right Zone", "Scale natural vibrato depth" },
-    { "Shift + Drag Left Zone", "Adjust Onset Ramp" },
-    { "Shift + Drag Center Zone", "Adjust Transition" },
-    { "Shift + Drag Right Zone", "Adjust Scoop shape" },
-    { "Drag Note Edge", "Trim note start / end boundary" },
-    { "Click the time ruler", "Move the edit cursor (playback follows)" },
-    { K.MOD_LABEL .. " + Wheel", "Zoom the timeline" },
-    { "Wheel", "Scroll the pitch axis" },
-    { "Alt + Wheel", "Zoom the pitch axis" },
-    { "Shift + Wheel or horizontal scroll", "Scroll the timeline (when zoomed)" },
-    { "Z", "Zoom to the selected notes" },
-    { "F", "Show the whole item, fit the pitch range" },
-    { "Drag the overview strip", "Scroll; drag an end to zoom" },
-    { "Drag the pitch strip", "Scroll; drag an end to zoom" },
-    { "↑ / ↓", "Nudge pitch ±1 semitone" },
-    { "Shift + ↑ / ↓", "Fine-tune pitch ±10 cents" },
-    { "S / Double-Click", "Snap note to nearest semitone" },
-    { "Q", "Quantize selected note(s) to scale" },
-    { "R / Backspace / Delete", "Reset note(s) to original detected pitch" },
-    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset" },
-    { "Right-click a top bar value", "Item override and reset" },
-    { "Double-click a value", "Reset to its default" },
-    { K.MOD_LABEL .. "-click a value", "Type a number" },
-    { "Snap / Quantize / Split / Merge buttons", "Same as S / Q / X / M" },
-  } },
-  { title = "Note Topology & REAPER Transport", rows = {
-    { "X", "Split note at REAPER edit cursor" },
-    { "M", "Merge 2+ contiguous selected notes" },
-    { "Space", "Runs your REAPER action for Space (default Play/Stop)" },
-    { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
-  } },
-  { title = "Icons", rows = {
-    { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
-    { "× (top right)", "Close the window (Esc when floating)" },
-    { "> / <", "Hide / show the Pitched Items panel" },
-    { "Checkbox (item row)", "Pitch envelope active / bypassed" },
-    { "× (item row)", "Remove the item from Pitched Items" },
-    { "* after a value", "Set for this item only" },
-  } },
-}
-K.INFO_TERMS = "Reset reverts note edits · Clear discards analysis · Remove drops an item · Wipe removes all"
 
 local function draw_info_modal()
   local P = Theme.get_palette()
@@ -7890,6 +8102,17 @@ local function loop_body()
     -- The panel is drawn only when the window has room for it beside a usable canvas; otherwise the
     -- tag layout takes over without touching the saved open / closed preference
     local sidebar_fits = avail_w >= BODY.min_graph_w + BODY.splitter_w + BODY.min_sidebar_w
+    state.sidebar_fits = sidebar_fits
+
+    -- H: show or hide the panel's Shortcuts list. Same guards as the window-level Esc below (no popup, no active
+    -- widget or text entry), exact modifiers and no key repeat; it works with no notes and on a bypassed item too.
+    if not popup_open_at_start
+       and not reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
+       and not reaper.ImGui_IsAnyItemActive(ctx)
+       and reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_H()) then
+      K.toggle_shortcuts()
+    end
+
     local split_drawn = false
     if total_h > 80 then
       if state.sidebar_open and sidebar_fits then
