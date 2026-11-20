@@ -1,9 +1,11 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.11.0
+-- @version 2.12.0
 -- @changelog
---   Pitch points on a note can be dragged to bend its pitch; add your own, reset or remove them from a menu; the layer is now Pitch Points in the Layers menu
---   Fixed: Split, Merge and Trim no longer shift the note's pitch; Esc during a slider drag puts the value back instead of saving it
+--   Tighten and Tolerance replace Stability and Vibrato: drag the left side of a note to steady it (slow drift first, a flat line at 100%), the right side to set how far it may stray untouched
+--   Tolerance has a default (8 cents) in the top bar, with an item override like the other values
+--   Stability and Vibrato values on earlier items are dropped (those items show as outdated); Vibrato Shading and Trend Line are gone
+--   Fixed: Esc during a note drag puts the value back instead of leaving it changed but unwritten
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -184,6 +186,7 @@ local DEFAULTS = {
   transition_ms = 35,        -- 5–60ms (smoothstep crossfade)
   onset_ramp_ms = 35,        -- 5–60ms (silence → correction fade-in)
   legato_threshold_ms = 120, -- 50–300ms (gap below = legato blend)
+  tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
 }
 -- Analysis engine (Settings > Advanced DSP): the values of the default presets, so a preset table and its default pick
 -- can never drift apart
@@ -199,6 +202,7 @@ local global_defaults = {
   transition_ms = DEFAULTS.transition_ms,
   onset_ramp_ms = DEFAULTS.onset_ramp_ms,
   legato_threshold_ms = DEFAULTS.legato_threshold_ms,
+  tolerance = DEFAULTS.tolerance,
 }
 
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
@@ -208,6 +212,8 @@ local PARAM_LABELS = {
   onset_ramp_ms = "Onset Ramp",
   legato_threshold_ms = "Legato Gap",
   scoop_shape = "Scoop Shape", -- per-note only (note context menu)
+  tighten = "Tighten",         -- per-note only (the left side of a note, note context menu)
+  tolerance = "Tolerance",
 }
 
 -- Named constants, in one table so they take a single one of the chunk's 200 locals
@@ -272,6 +278,7 @@ local K = {
     threshold = { 0.05, 0.5 },
     min_freq = { 20, 200 },
     max_freq = { 200, 2000 },
+    tolerance = { 0, 50 },   -- cents
   },
 
   -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
@@ -322,7 +329,7 @@ local K = {
   -- Canvas colours are not defined here: draw_graph and the Layers menu swatches read the same Theme palette tokens
   -- (Theme.get_palette().canvas, see section 4A of _lib/theme.lua), which follow the theme mode.
   SPOT_R = Theme.layout.sm,                          -- smart-spot circle radius
-  ANCHOR_R = Theme.layout.sm + Theme.layout.xs,      -- trend-anchor diamond half-diagonal
+  ANCHOR_R = Theme.layout.sm + Theme.layout.xs,      -- start / end point diamond half-diagonal
   EDIT_MARK = Theme.layout.sm + Theme.layout.xs,     -- side of the square that marks an edited note
   EDGE_GRAB = Theme.layout.sm * 2,                   -- note edge grab zone, per side
   EDGE_GRAB_HOVER = Theme.layout.sm * 3,             -- ... while the pointer rests on that edge
@@ -350,7 +357,6 @@ local state = {
   -- Settings > Pitch Shift Engine: the algorithm written to the item (an entry of PITCHMODE_FLAT) and whether to write it at all
   preset_pitchmode_idx = DEFAULTS.preset_pitchmode_idx,
   pitchmode_value = PITCHMODE_FLAT[DEFAULTS.preset_pitchmode_idx].value,
-  pitchmode_name = PITCHMODE_FLAT[DEFAULTS.preset_pitchmode_idx].name,
   keep_pitch_mode = DEFAULTS.keep_pitch_mode,
 
   -- Pitch detection parameters (Settings > Analysis & Detection, Advanced DSP)
@@ -373,13 +379,13 @@ local state = {
 
   -- Interaction state
   hovered_note = nil,   -- index of note block under cursor
-  hovered_zone = nil,   -- "drift" / "pitch" / "vibrato"
+  hovered_zone = nil,   -- "tighten" (left side) / "pitch" / "tolerance" (right side)
   hovered_edge = nil,   -- { note_idx, edge ("left"/"right") } for edge trimming
   selected_note = nil,  -- index of primary selected note (for single-note ops)
   selected_notes = {},  -- set { [note_idx] = true } for multi-select (merge, batch drag, quantize)
   -- Every gesture table also holds view_min / view_max: the pitch range frozen when it began (the vertical scale
   -- must not change under the cursor mid-gesture)
-  drag = nil,           -- { note_idx, anchor_idx, zone, shift_mode, start_mouse_y, last_y, pitch_st, original_value, orig_values, dirty, view_min, view_max }
+  drag = nil,           -- { note_idx, zone, shift_mode, start_mouse_y, last_y, pitch_st, acc, orig_values, raw_values, pending_single_select, dirty, view_min, view_max }
   edge_drag = nil,      -- { note_idx, edge, start_mouse_x, original_time, dirty, view_min, view_max }
   marquee = nil,        -- { start_x, start_y, cur_x, cur_y, active, has_shift, init_sel, view_min, view_max }
   -- A pitch point is named by { note_idx, frame } (its knot is looked up by frame: the knot tables are rebuilt)
@@ -397,7 +403,7 @@ local state = {
   -- The setting that is hovered or dragged (K.setting_hint): the canvas shades where it acts. key = cascade key
   -- or "scoop_shape"; notes = nil (every note the top bar value reaches) or a set of note indices; frame = the
   -- ImGui frame that reported it; said = the "nothing in view" status was posted for this drag
-  setting_hint = { frame = -1, menu_set = {} },
+  setting_hint = { frame = -1, menu_set = {}, zone_set = {} },
   view_t0 = nil,        -- visible time window of the canvas, seconds relative to the item start; nil = the whole item
   view_t1 = nil,        -- (both nil or both set; changed by the wheel in draw_graph, reset when the target changes or the model is analysed or cleared, kept through undo / redo of the same take)
   view_p0 = nil,        -- visible pitch range of the canvas, semitones (MIDI note numbers); nil = fitted to the notes
@@ -407,11 +413,9 @@ local state = {
   -- Visualization toggles
   show_note_blocks = true,
   show_raw_pitch = true,
-  show_trend = false,
   show_smart_spots = true,
   show_split_points = false,
   show_preview = true,
-  show_vibrato_regions = false,
 
   -- Target item binding (persistent GUID lock)
   target_take_guid = nil,
@@ -490,7 +494,6 @@ K.set_pitch_algorithm = function(idx)
   if not entry then return end
   state.preset_pitchmode_idx = idx
   state.pitchmode_value = entry.value
-  state.pitchmode_name = entry.name
 end
 
 --- Resolve an effective value through the Global → Item → Note cascade.
@@ -617,6 +620,7 @@ K.PERSIST = (function()
   number("cascade", "pitch_transition_ms", global_defaults, "transition_ms", { 5, 60 })
   number("cascade", "pitch_onset_ramp_ms", global_defaults, "onset_ramp_ms", { 5, 60 })
   number("cascade", "pitch_legato_thresh_ms", global_defaults, "legato_threshold_ms", { 50, 300 })
+  number("cascade", "pitch_tolerance", global_defaults, "tolerance", K.LIMITS.tolerance)
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
   choice("engine", "pitch_block_size", state, "block_size", BLOCK_SIZES)
@@ -640,8 +644,6 @@ K.PERSIST = (function()
   flag("layers", "pitch_show_raw_pitch", state, "show_raw_pitch")
   flag("layers", "pitch_show_preview", state, "show_preview")
   flag("layers", "pitch_show_smart_spots", state, "show_smart_spots")
-  flag("layers", "pitch_show_vibrato_regions", state, "show_vibrato_regions")
-  flag("layers", "pitch_show_trend", state, "show_trend")
   flag("layers", "pitch_show_split_points", state, "show_split_points")
 
   -- The note tone while a note is dragged, saved when the More menu item is toggled
@@ -1314,7 +1316,7 @@ local function start_analysis()
 end
 
 -------------------------------------------------------------------------------
--- 3. SIGNAL PROCESSING & PITCH EXTRACTION HELPERS
+-- 4. SIGNAL PROCESSING & PITCH EXTRACTION HELPERS
 -------------------------------------------------------------------------------
 
 local function gaussian_filter(arr, sigma_frames)
@@ -1323,11 +1325,15 @@ local function gaussian_filter(arr, sigma_frames)
   if n == 1 then return { arr[1] } end
   local res = {}
   local radius = math.max(1, math.ceil(sigma_frames * 2.5))
+  local weight = {}   -- [distance in frames + 1]
+  for d = 0, math.min(radius, n - 1) do
+    local dist = d / sigma_frames
+    weight[d + 1] = math.exp(-0.5 * dist * dist)
+  end
   for i = 1, n do
     local sum, w_sum = 0, 0
     for j = math.max(1, i - radius), math.min(n, i + radius) do
-      local dist = (i - j) / sigma_frames
-      local w = math.exp(-0.5 * dist * dist)
+      local w = weight[(j < i and i - j or j - i) + 1]
       sum = sum + arr[j] * w
       w_sum = w_sum + w
     end
@@ -1385,69 +1391,86 @@ local function rdp_simplify(points, epsilon)
   return dedup
 end
 
-local function compute_vibrato_weights(mod, frame_dur, total_dur)
-  local n = #mod
-  local weights = {}
-  for i = 1, n do weights[i] = 0.0 end
-  if n < 8 then return weights end
+-------------------------------------------------------------------------------
+-- PER-NOTE VALUES: a note's own settings, each in note.controls[key] (nil = not set). Its pitch
+-- (controls.center_pitch), its bypass (controls.bypassed) and its pitch points (controls.points) are handled apart.
+--   merge    what a merged note gets: "weighted" = the merged notes' average by length, "first" = the first note's
+--   edited   when the value makes its note count as edited: "positive" = above 0; "set" = stored at all (an
+--            override that equals the inherited value still counts)
+-------------------------------------------------------------------------------
+K.NOTE_CONTROLS = {
+  { key = "tighten",       merge = "weighted", edited = "positive" },   -- 0 (as sung) .. 1 (a flat line)
+  { key = "tolerance",     merge = "first",    edited = "set" },        -- cents; inherits item -> global
+  { key = "transition_ms", merge = "first",    edited = "set" },        -- inherits
+  { key = "onset_ramp_ms", merge = "first",    edited = "set" },        -- inherits
+  { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
+  { key = "scoop_shape",   merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
+}
 
-  local half_win = math.max(2, math.floor(0.12 / frame_dur)) -- ~240ms window
-  local raw_gate = {}
-  local is_active = false
+--- The values a note cut from the note with `old_ctrl` keeps (Split, Trim): all of them, and its bypass.
+K.controls_carry = function(old_ctrl)
+  local out = { bypassed = old_ctrl and old_ctrl.bypassed or false }
+  if old_ctrl then
+    for _, d in ipairs(K.NOTE_CONTROLS) do out[d.key] = old_ctrl[d.key] end
+  end
+  return out
+end
 
-  for i = 1, n do
-    local t = (i - 1) * frame_dur
-    -- Onset & offset exclusion (pitch settling and release tail are not vibrato)
-    if t < 0.10 or t > (total_dur - 0.06) then
-      raw_gate[i] = false
-      is_active = false
-    else
-      local w_start = math.max(1, i - half_win)
-      local w_end = math.min(n, i + half_win)
-      local count = w_end - w_start + 1
-      local sum_sq = 0
-      local zc = 0
-      for j = w_start, w_end do
-        sum_sq = sum_sq + mod[j] * mod[j]
-        if j > w_start and (mod[j] >= 0) ~= (mod[j-1] >= 0) then
-          zc = zc + 1
-        end
+--- The values of the note merged from `notes` (in time order); it is not bypassed.
+K.controls_merge = function(notes)
+  local out = { bypassed = false }
+  local first = notes[1] and notes[1].controls
+  local total = 0
+  for _, n in ipairs(notes) do total = total + (n.end_time - n.start_time) end
+  for _, d in ipairs(K.NOTE_CONTROLS) do
+    if d.merge == "weighted" then
+      local sum = 0
+      for _, n in ipairs(notes) do
+        sum = sum + (tonumber(n.controls and n.controls[d.key]) or 0) * (n.end_time - n.start_time)
       end
-      local rms = math.sqrt(sum_sq / count)
-      local win_time = count * frame_dur
-      local freq = win_time > 0 and (zc / (2 * win_time)) or 0
-      local is_periodic = (freq >= 3.5 and freq <= 8.5 and zc >= 2)
-
-      -- Schmitt trigger (turn on at 0.045 st / 4.5 cents, hold down to 0.028 st / 2.8 cents)
-      if not is_active then
-        if is_periodic and rms >= 0.045 then
-          is_active = true
-        end
-      else
-        if not is_periodic or rms < 0.028 then
-          is_active = false
-        end
-      end
-      raw_gate[i] = is_active
+      out[d.key] = (total > 0 and sum > 0) and (sum / total) or nil
+    elseif first then
+      out[d.key] = first[d.key]
     end
   end
+  return out
+end
 
-  -- Asymmetric envelope follower (Attack: ~100ms, Release: ~60ms)
-  local attack_coef = math.exp(-frame_dur / 0.10)
-  local release_coef = math.exp(-frame_dur / 0.06)
-  local current_env = 0.0
-
-  for i = 1, n do
-    local target = raw_gate[i] and 1.0 or 0.0
-    if target > current_env then
-      current_env = target + (current_env - target) * attack_coef
-    else
-      current_env = target + (current_env - target) * release_coef
+--- True when one of the values makes its note count as edited.
+K.controls_edited = function(ctrl)
+  for _, d in ipairs(K.NOTE_CONTROLS) do
+    local v = ctrl[d.key]
+    if d.edited == "set" then
+      if v ~= nil then return true end
+    elseif (tonumber(v) or 0) > 0 then
+      return true
     end
-    weights[i] = current_env > 0.05 and current_env or 0.0
   end
+  return false
+end
 
-  return weights
+--- Unset every value; true when one was stored.
+K.controls_clear = function(ctrl)
+  local changed = false
+  for _, d in ipairs(K.NOTE_CONTROLS) do
+    if ctrl[d.key] ~= nil then changed = true end
+    ctrl[d.key] = nil
+  end
+  return changed
+end
+
+--- Take the saved controls of a note over into `ctrl` (a new note's defaults): its pitch, its bypass, its points
+--- (checked afterwards by K.points_sanitize) and the values above, each a number; Tighten and Tolerance are held
+--- in range. Anything else that was saved is dropped (Stability and Vibrato of builds before 2.12).
+K.controls_load = function(ctrl, saved)
+  if type(saved) ~= "table" then return end
+  if type(saved.center_pitch) == "number" then ctrl.center_pitch = saved.center_pitch end
+  ctrl.bypassed = saved.bypassed == true
+  ctrl.points = saved.points
+  for _, d in ipairs(K.NOTE_CONTROLS) do ctrl[d.key] = tonumber(saved[d.key]) end
+  local lim = K.LIMITS.tolerance
+  if ctrl.tighten then ctrl.tighten = (ctrl.tighten > 0) and math.min(1, ctrl.tighten) or nil end
+  if ctrl.tolerance then ctrl.tolerance = math.max(lim[1], math.min(lim[2], ctrl.tolerance)) end
 end
 
 local function extract_note_features(note, preserve_controls)
@@ -1475,13 +1498,13 @@ local function extract_note_features(note, preserve_controls)
   filtered[#raw_pitch] = raw_pitch[#raw_pitch]
   raw_pitch = filtered
 
-  -- 2. Zero-phase Gaussian filtering for smooth pitch and low-frequency drift trend
+  -- 2. Zero-phase Gaussian filtering: the smooth pitch (what Tighten works on) and the slow trend
   --    Smooth pitch (sigma ~1.5 frames) removes micro-jitters without phase distortion
   --    Trend (sigma ~7.0 frames, ~2 Hz cutoff) isolates slow drift without vibrato ripple
   local smooth_pitch = gaussian_filter(raw_pitch, 1.5)
   local trend = gaussian_filter(raw_pitch, 7.0)
 
-  -- 3. Calculate Modulation: clean, zero-phase vibrato waveform
+  -- 3. Modulation: the fast movement around the trend (its peaks and valleys are the pitch points, step 5)
   local mod = {}
   for i = 1, #raw_pitch do
     mod[i] = smooth_pitch[i] - trend[i]
@@ -1508,7 +1531,6 @@ local function extract_note_features(note, preserve_controls)
   -- These peaks and valleys also define where saved pitch points (bends) are pinned: changing the 0.05 threshold
   -- or the filters below reshapes every stored bend and marks those items outdated.
   local smart_spots = {}
-  table.insert(smart_spots, { index = 1, time = note.frames[1].time, type = "anchor_start" })
 
   local current_sign = nil
   local extrema_idx = nil
@@ -1534,7 +1556,7 @@ local function extract_note_features(note, preserve_controls)
       -- Zero crossing! Save the previous extrema if it's prominent enough
       if math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
         local s_type = current_sign == 1 and "peak" or "valley"
-        table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
+        table.insert(smart_spots, { index = extrema_idx, type = s_type })
       end
       current_sign = sign
       extrema_idx = i
@@ -1544,33 +1566,16 @@ local function extract_note_features(note, preserve_controls)
 
   if extrema_idx and math.abs(extrema_val) > 0.05 and extrema_idx ~= 1 and extrema_idx ~= #raw_pitch then
     local s_type = current_sign == 1 and "peak" or "valley"
-    table.insert(smart_spots, { index = extrema_idx, time = note.frames[extrema_idx].time, type = s_type, mod_val = extrema_val })
+    table.insert(smart_spots, { index = extrema_idx, type = s_type })
   end
 
-  table.insert(smart_spots, { index = #raw_pitch, time = note.frames[#raw_pitch].time, type = "anchor_end" })
 
-  note.trend = trend
-  note.modulation = mod
+  note.smooth = smooth_pitch   -- the lightly smoothed pitch Tighten works on (K.tighten_line)
   note.smart_spots = smart_spots
 
-  -- 6. Vibrato detection with Schmitt trigger hysteresis & asymmetric envelope follower
-  local total_dur = note.end_time - note.start_time
-  local frame_dur = #note.frames > 1
-    and (note.frames[#note.frames].time - note.frames[1].time) / (#note.frames - 1)
-    or 0.012
-
-  note.vibrato_weight = compute_vibrato_weights(mod, frame_dur, total_dur)
-
-  -- Default controls: NO correction (green preview = raw pitch)
-  -- Cascade fields default to nil (inherit from item → global)
+  -- Default controls: NO correction (green preview = raw pitch). Every value of K.NOTE_CONTROLS starts unset.
   note.controls = {
     center_pitch = note.avg_note,
-    drift_scale = 1.0,
-    vibrato_scale = 1.0,
-    transition_ms = nil,       -- per-note override (nil = inherit)
-    onset_ramp_ms = nil,       -- per-note override (nil = inherit)
-    retune_speed = nil,        -- per-note override (nil = inherit)
-    scoop_shape = nil,         -- 0.0 (natural) to 1.0 (corrected), nil = 0
     bypassed = false,          -- per-note bypass toggle
   }
 
@@ -1899,16 +1904,81 @@ K.points_transfer = function(new_note, old_notes, pin_times)
   return dropped
 end
 
+-------------------------------------------------------------------------------
+-- TIGHTEN and TOLERANCE: the two values on the sides of a note.
+-- Tighten (controls.tighten, 0..1, nil = 0) removes the note's movement around its centre that is slower than a
+-- time window; the window shrinks as the value rises (K.TIGHTEN_WINDOW_S at 0 %, nothing left at 100 % = a flat
+-- line), so slow drift goes first, then wobble, then vibrato. Tolerance (cents; the note's own controls.tolerance,
+-- else the item's, else the global default) leaves that slow line alone where it is within Tolerance of the
+-- centre: only the part beyond it is removed.
+-------------------------------------------------------------------------------
+
+K.TIGHTEN_BODY_ST = 0.5     -- the note's body: from its first to its last frame this close to its centre
+K.TIGHTEN_WINDOW_S = 0.4    -- the time window at 0 %
+K.TIGHTEN_FADE = 0.1        -- the first tenth of the dial fades the correction in
+
+--- The per-frame pitch (semitones) Tighten takes away from `note`, or nil when it takes nothing (Tighten at 0, or
+--- a note with no body to measure). No REAPER calls. Only the body of the note is measured, so a slide into or
+--- out of the note does not bend the line; the frames before and after the body take the value at the body's edge
+--- (the slide keeps its shape and lands on the tightened note). Cached on the note: the filtered line until the
+--- note's analysis or its Tighten changes, the result until the Tolerance it uses changes too.
+K.tighten_line = function(note)
+  local ctrl, sm, frames = note.controls, note.smooth, note.frames
+  local amount = ctrl and tonumber(ctrl.tighten) or 0
+  if amount <= 0 or not sm or not frames or #frames < 3 or #sm ~= #frames then return nil end
+  amount = math.min(1, amount)
+  local nf, centre = #frames, note.avg_note
+
+  local tc = note.tighten_cache
+  if not (tc and tc.frames == frames and tc.smooth == sm and tc.avg == centre and tc.amount == amount) then
+    tc = { frames = frames, smooth = sm, avg = centre, amount = amount, line = false }
+    note.tighten_cache = tc
+    local a, b
+    for i = 1, nf do
+      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then a = i break end
+    end
+    for i = nf, 1, -1 do
+      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then b = i break end
+    end
+    local hop = (frames[nf].time - frames[1].time) / (nf - 1)
+    if a and b - a >= 2 and hop > 0 then
+      local dev = {}
+      for i = a, b do dev[#dev + 1] = sm[i] - centre end
+      local window = K.TIGHTEN_WINDOW_S * (1 - amount) ^ 2
+      local line = (window > 0) and gaussian_filter(dev, window / hop) or dev
+      local gain = smoothstep(amount / K.TIGHTEN_FADE)
+      for k = 1, #line do line[k] = line[k] * gain end
+      tc.line, tc.a, tc.b = line, a, b
+    end
+  end
+  local line = tc.line
+  if not line then return nil end
+
+  local tol = math.max(0, tonumber(get_effective(note, "tolerance")) or 0) / 100
+  if tc.tol ~= tol then
+    local a, b = tc.a, tc.b
+    local out = {}
+    for k = 1, #line do
+      local v = line[k]
+      if tol > 0 then
+        local mag = math.abs(v)
+        v = (mag > tol) and v * (1 - tol / mag) or 0
+      end
+      out[a + k - 1] = v
+    end
+    for i = 1, a - 1 do out[i] = out[a] end
+    for i = b + 1, nf do out[i] = out[b] end
+    tc.tol, tc.out = tol, out
+  end
+  return tc.out
+end
+
 local function is_note_modified(note)
   if not note or not note.controls then return false end
   local ctrl = note.controls
   if ctrl.bypassed then return true end
-  local pitch_changed = math.abs(ctrl.center_pitch - note.avg_note) > 0.001
-  local fine_changed = (ctrl.drift_scale ~= 1.0) or (ctrl.vibrato_scale ~= 1.0)
-  local has_overrides = (ctrl.retune_speed ~= nil) or (ctrl.onset_ramp_ms ~= nil)
-    or (ctrl.scoop_shape ~= nil and ctrl.scoop_shape > 0)
-    or (ctrl.transition_ms ~= nil)
-  return pitch_changed or fine_changed or has_overrides or K.points_offsets(note) ~= nil
+  return math.abs(ctrl.center_pitch - note.avg_note) > 0.001 or K.controls_edited(ctrl)
+    or K.points_offsets(note) ~= nil
 end
 
 -- Forward declaration; will be set after apply_envelope_to_take is defined
@@ -2009,14 +2079,10 @@ local function load_take_data(take, raw)
     readable = pcall(function()
       for _, note in ipairs(data.notes) do
         note.count = #note.frames
-        -- Preserve all saved controls (including cascade override fields) across re-extraction
+        -- The saved controls (including the per-note overrides) are kept across the re-extraction
         local saved_controls = note.controls
         extract_note_features(note)
-        if saved_controls then
-          for k, v in pairs(saved_controls) do
-            note.controls[k] = v
-          end
-        end
+        K.controls_load(note.controls, saved_controls)
         K.points_sanitize(note)
       end
     end)
@@ -2327,18 +2393,11 @@ K.correction_build = function(notes, item_len)
       local is_mod = is_note_modified(n)
       local retune = get_effective(n, "retune_speed")
       local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
-      local d_scale = (n.controls and n.controls.drift_scale) or 1.0
-      local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
+      -- Tighten takes the note's slower movement away: literal, like a pitch point (Strength does not scale it)
+      local tight = is_mod and K.tighten_line(n) or nil
       if n.frames then
         for i = 1, #n.frames do
-          if not is_mod then
-            n.frame_shifts[i] = 0.0
-          else
-            local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
-            local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
-            local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
-            n.frame_shifts[i] = coarse + drift_corr + vib_corr
-          end
+          n.frame_shifts[i] = tight and (coarse - (tight[i] or 0)) or coarse
         end
 
         -- Scoop: flatten the slide into the note. The onset frames are pulled toward the pitch the corrected
@@ -2454,11 +2513,10 @@ K.correction_build = function(notes, item_len)
     end
 
     -- B. NOTE BODY
-    -- A scooped onset differs from frame to frame like a Stability / Vibrato change does: its frames are written.
+    -- A tightened note and a scooped onset differ from frame to frame: their frames are written.
     -- A note with pitch points is also written frame by frame, up to each edge that is not joined to a neighbour.
     local has_points = K.points_offsets(n) ~= nil
-    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0)
-      or scooped[idx] == true or has_points)
+    local fine_changed = is_mod and (scooped[idx] == true or has_points or K.tighten_line(n) ~= nil)
     local body_t_start = n.start_time + trans_dur * 0.5
     local body_t_end = n.end_time - trans_dur * 0.5
     local start_written = false   -- section A already wrote a point at body_t_start (the end of its onset ramp)
@@ -2479,7 +2537,7 @@ K.correction_build = function(notes, item_len)
         table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
       end
     else
-      -- Fine contour: sample frames across body to counteract drift / scale vibrato
+      -- Fine contour: one point per frame across the body
       if n.frames then
         for i = 1, #n.frames do
           local t = n.frames[i].time
@@ -2801,7 +2859,7 @@ local function find_nearest_in_scale_pitch(pitch)
   return best_cand
 end
 
--- Snaps selected note(s) to the nearest valid in-scale pitch (Milestone 3: Quantize Key).
+-- Snaps selected note(s) to the nearest valid in-scale pitch.
 -- Returns how many notes moved (0 = nothing to change) and whether the change was written to the take (an undo point).
 quantize_selected_notes_to_scale = function()
   if not state.notes then return 0 end
@@ -2863,24 +2921,10 @@ reset_selected_note = function()
     if sel and sel.controls then
       local ctrl = sel.controls
       -- Only a control that actually differs from its reset value counts as a change
-      if math.abs(ctrl.center_pitch - sel.avg_note) > 0.001
-          or ctrl.drift_scale ~= 1.0
-          or ctrl.vibrato_scale ~= 1.0
-          or ctrl.transition_ms ~= nil
-          or ctrl.onset_ramp_ms ~= nil
-          or ctrl.retune_speed ~= nil
-          or ctrl.scoop_shape ~= nil
-          or ctrl.bypassed then
-        any_changed = true
-      end
+      if math.abs(ctrl.center_pitch - sel.avg_note) > 0.001 or ctrl.bypassed then any_changed = true end
+      if K.controls_clear(ctrl) then any_changed = true end
       if K.points_reset(sel) > 0 then any_changed = true end
       ctrl.center_pitch = sel.avg_note
-      ctrl.drift_scale = 1.0
-      ctrl.vibrato_scale = 1.0
-      ctrl.transition_ms = nil
-      ctrl.onset_ramp_ms = nil
-      ctrl.retune_speed = nil
-      ctrl.scoop_shape = nil
       ctrl.bypassed = false
     end
   end
@@ -2978,15 +3022,7 @@ split_note_at = function(note_idx, split_time)
     display_note = math.floor(avg_a + 0.5),
     frames = frames_a,
   }
-  extract_note_features(note_a, {
-    drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
-    vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
-    onset_ramp_ms = old_ctrl and old_ctrl.onset_ramp_ms or nil,
-    retune_speed = old_ctrl and old_ctrl.retune_speed or nil,
-    scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
-    bypassed = old_ctrl and old_ctrl.bypassed or false,
-  })
+  extract_note_features(note_a, K.controls_carry(old_ctrl))
   note_a.controls.center_pitch = note_a.avg_note + pitch_offset
   K.points_transfer(note_a, { note }, {})
 
@@ -3003,15 +3039,7 @@ split_note_at = function(note_idx, split_time)
     display_note = math.floor(avg_b + 0.5),
     frames = frames_b,
   }
-  extract_note_features(note_b, {
-    drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
-    vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
-    onset_ramp_ms = old_ctrl and old_ctrl.onset_ramp_ms or nil,
-    retune_speed = old_ctrl and old_ctrl.retune_speed or nil,
-    scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
-    bypassed = old_ctrl and old_ctrl.bypassed or false,
-  })
+  extract_note_features(note_b, K.controls_carry(old_ctrl))
   note_b.controls.center_pitch = note_b.avg_note + pitch_offset
   K.points_transfer(note_b, { note }, {})
 
@@ -3095,19 +3123,14 @@ merge_selected_notes = function()
   -- Duration-weighted pitch offset (target minus detected centre) from user tuning
   local total_dur = 0
   local weighted_offset = 0
-  local weighted_drift = 0
-  local weighted_vibrato = 0
+  local merged_from = {}
   for _, idx in ipairs(indices) do
     local n = state.notes[idx]
     local dur = n.end_time - n.start_time
     total_dur = total_dur + dur
+    merged_from[#merged_from + 1] = n
     if n.controls then
       weighted_offset = weighted_offset + (n.controls.center_pitch - n.avg_note) * dur
-      weighted_drift = weighted_drift + n.controls.drift_scale * dur
-      weighted_vibrato = weighted_vibrato + n.controls.vibrato_scale * dur
-    else
-      weighted_drift = weighted_drift + 1.0 * dur
-      weighted_vibrato = weighted_vibrato + 1.0 * dur
     end
   end
 
@@ -3125,15 +3148,7 @@ merge_selected_notes = function()
     frames = merged_frames,
   }
 
-  extract_note_features(merged, {
-    drift_scale = total_dur > 0 and (weighted_drift / total_dur) or 1.0,
-    vibrato_scale = total_dur > 0 and (weighted_vibrato / total_dur) or 1.0,
-    transition_ms = first_note.controls and first_note.controls.transition_ms or nil,
-    onset_ramp_ms = first_note.controls and first_note.controls.onset_ramp_ms or nil,
-    retune_speed = first_note.controls and first_note.controls.retune_speed or nil,
-    scoop_shape = first_note.controls and first_note.controls.scoop_shape or nil,
-    bypassed = false,
-  })
+  extract_note_features(merged, K.controls_merge(merged_from))
   -- The target follows the centre extract_note_features found (see split_note_at)
   merged.controls.center_pitch = merged.avg_note + (total_dur > 0 and (weighted_offset / total_dur) or 0)
   -- The bend of every old note carries over; a square holds each old boundary (inner end and start)
@@ -3246,15 +3261,7 @@ trim_note_edge = function(note_idx, edge, new_time)
   note.avg_note = avg_note
   note.display_note = math.floor(avg_note + 0.5)
 
-  extract_note_features(note, {
-    drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
-    vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
-    transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
-    onset_ramp_ms = old_ctrl and old_ctrl.onset_ramp_ms or nil,
-    retune_speed = old_ctrl and old_ctrl.retune_speed or nil,
-    scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
-    bypassed = old_ctrl and old_ctrl.bypassed or false,
-  })
+  extract_note_features(note, K.controls_carry(old_ctrl))
   note.controls.center_pitch = note.avg_note + pitch_offset   -- from the centre extract_note_features found
   local dropped = K.points_transfer(note, { old_note }, grew and { old_edge } or {})
 
@@ -3473,7 +3480,7 @@ local function process_analysis_step()
 end
 
 -------------------------------------------------------------------------------
--- 4. GUI
+-- 5. GUI
 -------------------------------------------------------------------------------
 
 -- Press state of every param_drag control: [id] = { ctrl = Ctrl/Cmd held at press, dragged = mouse moved,
@@ -3820,26 +3827,6 @@ K.note_entry = function(note)
   return entry
 end
 
---- The coordinates of the trend line of `note` over its frames f0 .. f1 (the ones in the visible window), as an array
---- for DrawList_AddPolyline.
-K.note_trend = function(note, f0, f1, t_to_x)
-  local dc = state.draw_cache
-  local e = K.note_entry(note)
-  if not (e.t_arr and e.t_gen == dc.gen and e.t_frames == note.frames and e.t_trend == note.trend
-      and e.t_f0 == f0 and e.t_f1 == f1) then
-    local m = dc.map
-    local arr = K.fit_array(e.t_arr, (f1 - f0 + 1) * 2)
-    local idx = 1
-    for i = f0, f1 do
-      arr[idx] = t_to_x(note.frames[i].time)
-      arr[idx + 1] = m.py + m.h - ((note.trend[i] - m.min) / m.range) * m.h
-      idx = idx + 2
-    end
-    e.t_arr, e.t_gen, e.t_frames, e.t_trend, e.t_f0, e.t_f1 = arr, dc.gen, note.frames, note.trend, f0, f1
-  end
-  return e.t_arr
-end
-
 --- Store v at sig[k]; true when that changed it.
 K.sig_set = function(sig, k, v)
   if sig[k] ~= v then
@@ -3869,23 +3856,21 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 1, n.start_time) or changed
     changed = set(sig, k + 2, n.end_time) or changed
     changed = set(sig, k + 3, n.frames) or changed
-    changed = set(sig, k + 4, n.trend) or changed
-    changed = set(sig, k + 5, n.modulation) or changed
-    changed = set(sig, k + 6, n.vibrato_weight) or changed
+    changed = set(sig, k + 4, n.smooth) or changed
+    changed = set(sig, k + 5, c and c.tighten or 0) or changed
+    changed = set(sig, k + 6, get_effective(n, "tolerance")) or changed
     changed = set(sig, k + 7, n.avg_note) or changed
     changed = set(sig, k + 8, n.voiced_start_idx) or changed
     changed = set(sig, k + 9, c and c.bypassed or false) or changed
     changed = set(sig, k + 10, c and c.center_pitch) or changed
-    changed = set(sig, k + 11, c and c.drift_scale) or changed
-    changed = set(sig, k + 12, c and c.vibrato_scale) or changed
-    changed = set(sig, k + 13, c and c.scoop_shape or 0) or changed
-    changed = set(sig, k + 14, get_effective(n, "retune_speed")) or changed
-    changed = set(sig, k + 15, get_effective(n, "transition_ms")) or changed
-    changed = set(sig, k + 16, get_effective(n, "onset_ramp_ms")) or changed
+    changed = set(sig, k + 11, c and c.scoop_shape or 0) or changed
+    changed = set(sig, k + 12, get_effective(n, "retune_speed")) or changed
+    changed = set(sig, k + 13, get_effective(n, "transition_ms")) or changed
+    changed = set(sig, k + 14, get_effective(n, "onset_ramp_ms")) or changed
     -- An override that equals the inherited value still makes the note "edited"
-    changed = set(sig, k + 17, is_note_modified(n)) or changed
-    changed = set(sig, k + 18, n.points_rev or 0) or changed
-    k = k + 18
+    changed = set(sig, k + 15, is_note_modified(n)) or changed
+    changed = set(sig, k + 16, n.points_rev or 0) or changed
+    k = k + 16
   end
   changed = set(sig, k + 1, get_effective(nil, "legato_threshold_ms")) or changed
   k = k + 1
@@ -4042,11 +4027,57 @@ K.point_add = function(note, t)
   return K.point_knot_at(note, f)
 end
 
---- The drag zone of a note block spanning sx .. ex (px) at x: "drift" (left quarter), "vibrato" (right quarter)
+-- What a drag on a zone of a note block changes: K.ZONE_CONTROLS[zone][Shift held]. No entry = the pitch drag.
+--   key      the note value (note.controls[key]); inherit = an unset value starts from the inherited one
+--   lo, hi   its range; rows = a drag as tall as that many semitone rows sweeps it, or px = units per pixel
+--   show     factor from the stored value to the shown one; read / hover = the drag readout and the hover tooltip
+--   fine     Ctrl/Cmd-drag is fine adjust (HC2); zero_nil = a value of 0 is stored as "not set"
+--   hint     the setting highlight the canvas shows while it is dragged (K.setting_hint)
+K.ZONE_CONTROLS = {
+  tighten = {
+    [false] = { key = "tighten", lo = 0, hi = 1, rows = 2, show = 100, fine = true, zero_nil = true,
+                read = "Tighten: %.0f%%", hover = "Tighten: %.0f%%", undo = "Adjust Tighten" },
+    [true]  = { key = "onset_ramp_ms", lo = 5, hi = 60, px = 0.5, inherit = true, hint = "onset_ramp_ms",
+                read = "Onset Ramp: %.0f ms", hover = "Onset Ramp: %.0fms (Shift+Drag)", undo = "Adjust Onset Ramp" },
+  },
+  pitch = {
+    [true]  = { key = "transition_ms", lo = 5, hi = 60, px = 0.5, inherit = true, hint = "transition_ms",
+                read = "Transition: %.0f ms", hover = "Transition: %.0fms (Shift+Drag)", undo = "Adjust Transition" },
+  },
+  tolerance = {
+    [false] = { key = "tolerance", lo = 0, hi = 50, rows = 1, inherit = true, fine = true, hint = "tolerance",
+                read = "Tolerance: %.0f\xC2\xA2", hover = "Tolerance: %.0f\xC2\xA2", undo = "Adjust Tolerance" },
+    [true]  = { key = "scoop_shape", lo = 0, hi = 1, rows = 2, show = 100, hint = "scoop_shape",
+                read = "Scoop: %.0f%% corrected", hover = "Scoop: %.0f%% corrected (Shift+Drag)", undo = "Adjust Scoop" },
+  },
+}
+K.TOLERANCE_IDLE = " (used once Tighten is above 0%)"   -- appended where a note's Tolerance is shown while its Tighten is 0
+
+--- The entry of K.ZONE_CONTROLS for a drag on `zone` with or without Shift, or nil (the pitch drag).
+K.zone_control = function(zone, shift)
+  local by_shift = K.ZONE_CONTROLS[zone]
+  return by_shift and by_shift[shift and true or false] or nil
+end
+
+--- The value of `note` the zone control `zc` edits: its own, else the inherited one, else 0.
+K.zone_value = function(zc, note)
+  local v = note.controls[zc.key]
+  if v == nil and zc.inherit then v = get_effective(note, zc.key) end
+  return tonumber(v) or 0
+end
+
+--- The text for the value `zc` edits on `note`: the drag readout, or the hover tooltip (hover = true).
+K.zone_text = function(zc, note, hover)
+  local text = string.format(hover and zc.hover or zc.read, K.zone_value(zc, note) * (zc.show or 1))
+  if zc.key == "tolerance" and (tonumber(note.controls.tighten) or 0) <= 0 then text = text .. K.TOLERANCE_IDLE end
+  return text
+end
+
+--- The drag zone of a note block spanning sx .. ex (px) at x: "tighten" (left quarter), "tolerance" (right quarter)
 --- or "pitch", each side zone at least 12 px.
 K.note_zone = function(x, sx, ex)
   local zone_w = math.max(12, (ex - sx) * 0.25)
-  if x < sx + zone_w then return "drift" elseif x > ex - zone_w then return "vibrato" end
+  if x < sx + zone_w then return "tighten" elseif x > ex - zone_w then return "tolerance" end
   return "pitch"
 end
 
@@ -4229,6 +4260,29 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         if bot >= y_min and top <= y_max then
           reaper.ImGui_DrawList_AddRect(draw_list, math.max(x_min, t_x(n.start_time) - pad), math.max(y_min, top - pad),
             math.min(x_max, t_x(n.end_time) + pad), math.min(y_max, bot + pad), C.span_edge)
+          drawn = drawn + 1
+        end
+      end
+    end
+    return drawn
+  end
+
+  if key == "tolerance" then
+    -- The band a tightened note may stray in untouched: centre - Tolerance .. centre + Tolerance across its block
+    for idx = 1, #notes do
+      local n = notes[idx]
+      if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
+          and (tonumber(n.controls.tighten) or 0) > 0 then
+        local cp = n.controls.center_pitch
+        local tol = (tonumber(get_effective(n, "tolerance")) or 0) / 100
+        local top = m.py + m.h - ((cp + tol - m.min) / m.range) * m.h
+        local bot = m.py + m.h - ((cp - tol - m.min) / m.range) * m.h
+        local x0, x1 = math.max(x_min, t_x(n.start_time)), math.min(x_max, t_x(n.end_time))
+        if bot >= y_min and top <= y_max and x1 > x0 then
+          top, bot = math.max(y_min, top), math.min(y_max, bot)
+          if bot - top >= 2 then reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, C.span_fill) end
+          reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x1, top, C.span_edge)
+          reaper.ImGui_DrawList_AddLine(draw_list, x0, bot, x1, bot, C.span_edge)
           drawn = drawn + 1
         end
       end
@@ -4686,8 +4740,7 @@ local function draw_graph(draw_ctx, w, h)
     end
     -- A live pitch point under the pointer (on last frame's hovered, box or selected notes) is found first. With
     -- Shift held no point is hovered and no add-square shown: a Shift press goes to the note beneath.
-    local ok_hm, hover_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-    local hover_shift = ok_hm and hover_mods and (hover_mods & reaper.ImGui_Mod_Shift()) ~= 0
+    local hover_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
     state.hovered_point = not hover_shift
       and K.point_hit(state.notes, state.hovered_note, mx, my, vt0, vt1, t_to_x, p_to_y, pt_build) or nil
     state.hovered_note = nil
@@ -4765,15 +4818,26 @@ local function draw_graph(draw_ctx, w, h)
       and not (zn.controls and zn.controls.bypassed) and not K.points_live_at(zn, t_to_x, p_to_y)) and true or false
 
     -- Mouse cursor by what a drag here does: resize arrows on a pitch point, the edges and the pitch zone, a hand
-    -- on the drift / vibrato zones
+    -- on the Tighten / Tolerance zones
     if state.hovered_point then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeNS())
     elseif state.hovered_edge then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeEW())
     elseif state.hovered_zone == "pitch" then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeNS())
-    elseif state.hovered_zone == "drift" or state.hovered_zone == "vibrato" then
+    elseif state.hovered_zone == "tighten" or state.hovered_zone == "tolerance" then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_Hand())
+    end
+    if state.hovered_zone == "tolerance" and state.hovered_note and not hover_shift and not state.hovered_point
+        and not state.hovered_edge then
+      local set = state.setting_hint.zone_set
+      for k in pairs(set) do set[k] = nil end
+      if state.selected_notes[state.hovered_note] then
+        for idx in pairs(state.selected_notes) do set[idx] = true end
+      else
+        set[state.hovered_note] = true
+      end
+      K.setting_hint(draw_ctx, "tolerance", false, set)
     end
   elseif (not is_canvas_hovered or is_bypassed or off_notes) and not gesture then
     state.hovered_note = nil
@@ -4792,11 +4856,9 @@ local function draw_graph(draw_ctx, w, h)
 
     -- Resolve modifiers for selection modes (cross-platform macOS/Win/Linux)
     -- Cmd on macOS is Mod_Ctrl (MacOSXBehaviors); the Windows key / physical Ctrl are not treated as Ctrl
-    local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
-    local ctrl_mod = reaper.ImGui_Mod_Ctrl and reaper.ImGui_Mod_Ctrl() or 0
-    local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-    local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
-    local has_cmd_or_ctrl = ok_mods and cur_mods and (cur_mods & ctrl_mod) ~= 0
+    local cur_mods = reaper.ImGui_GetKeyMods(draw_ctx) or 0
+    local has_shift = (cur_mods & reaper.ImGui_Mod_Shift()) ~= 0
+    local has_cmd_or_ctrl = (cur_mods & reaper.ImGui_Mod_Ctrl()) ~= 0
 
     local hp = state.hovered_point
     local hp_note = hp and state.notes and state.notes[hp.note_idx]
@@ -4863,7 +4925,7 @@ local function draw_graph(draw_ctx, w, h)
         view_max = max_note
       }
     elseif state.hovered_note then
-      -- Note click → update selection and prepare pitch / drift (stability) / vibrato drag
+      -- Note click → update selection and prepare the drag of the zone under the pointer (K.ZONE_CONTROLS)
       local pending_single_select = nil
       if has_shift and state.selected_note then
         -- Shift+Click: range select from primary anchor to clicked note
@@ -4897,40 +4959,29 @@ local function draw_graph(draw_ctx, w, h)
 
       state.shift_mode = has_shift and (state.hovered_note ~= nil)
 
-      local orig_values = {}
+      -- What each dragged note starts from: the value its zone changes (K.ZONE_CONTROLS), else its pitch.
+      -- raw_values keeps what the note itself stored (false = nothing: it inherited), for Esc.
+      local zone_ctl = K.zone_control(state.hovered_zone, state.shift_mode)
+      local orig_values, raw_values = {}, {}
       for idx in pairs(state.selected_notes) do
         local n = state.notes[idx]
         if n and n.controls then
-          if state.shift_mode then
-            if state.hovered_zone == "drift" then
-              orig_values[idx] = n.controls.onset_ramp_ms or get_effective(n, "onset_ramp_ms")
-            elseif state.hovered_zone == "pitch" then
-              orig_values[idx] = n.controls.transition_ms or get_effective(n, "transition_ms")
-            else
-              orig_values[idx] = n.controls.scoop_shape or 0
-            end
-          else
-            if state.hovered_zone == "pitch" then
-              orig_values[idx] = n.controls.center_pitch
-            elseif state.hovered_zone == "drift" then
-              orig_values[idx] = n.controls.drift_scale
-            else
-              orig_values[idx] = n.controls.vibrato_scale
-            end
-          end
+          orig_values[idx] = zone_ctl and K.zone_value(zone_ctl, n) or n.controls.center_pitch
+          local raw = n.controls[zone_ctl and zone_ctl.key or "center_pitch"]
+          raw_values[idx] = (raw ~= nil) and raw or false
         end
       end
 
       state.drag = {
         note_idx = state.hovered_note,
-        anchor_idx = state.hovered_note,
         zone = state.hovered_zone,
         shift_mode = state.shift_mode,
         start_mouse_y = my,
         last_y = my,      -- previous frame's pointer Y (pitch drag accumulates its movement per frame)
         pitch_st = 0,     -- semitones moved so far by a pitch drag (fine adjust scales each frame's share)
-        original_value = orig_values[state.hovered_note] or 0,
+        acc = 0,          -- value units moved so far by a zone drag (K.ZONE_CONTROLS), accumulated the same way
         orig_values = orig_values,
+        raw_values = raw_values,
         pending_single_select = pending_single_select,
         dirty = false,
         view_min = min_note,   -- the pitch range stays as it is for the whole gesture
@@ -4970,8 +5021,12 @@ local function draw_graph(draw_ctx, w, h)
       state.context_point = { note_idx = hp.note_idx, frame = hp.frame, start_st = hp_knot.st }
       reaper.ImGui_OpenPopup(draw_ctx, "##point_context_menu")
     elseif state.hovered_note and state.notes[state.hovered_note] then
-      state.selected_note = state.hovered_note
-      state.selected_notes = { [state.hovered_note] = true }
+      -- A right-click on a note that is already selected keeps the selection: Tighten and Tolerance in the menu
+      -- write to every selected note
+      if not state.selected_notes[state.hovered_note] then
+        state.selected_note = state.hovered_note
+        state.selected_notes = { [state.hovered_note] = true }
+      end
       state.context_menu_note = state.hovered_note
       state.context_menu_time = x_to_t(mx)
       -- Whether the note's points can be added to at this zoom (the menu is drawn without the canvas mapping)
@@ -4981,7 +5036,21 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  -- Process active drag (Single-note or Multi-note batch drag: Pitch, Stability, Vibrato)
+  -- HC5: Esc during a note drag puts every dragged note back to what it stored before and writes nothing
+  if state.drag and reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Escape()) then
+    local zone_ctl = K.zone_control(state.drag.zone, state.drag.shift_mode)
+    local key = zone_ctl and zone_ctl.key or "center_pitch"
+    for idx, raw in pairs(state.drag.raw_values) do
+      local n = state.notes[idx]
+      if n and n.controls then
+        if raw == false then n.controls[key] = nil else n.controls[key] = raw end
+      end
+    end
+    state.drag = nil
+    state.shift_mode = false
+  end
+
+  -- Process active drag (single-note or multi-note batch drag: pitch, or the zone's value)
   if state.drag then
     -- The cursor keeps the zone's meaning for the whole drag (pitch: vertical resize arrows, the others: a hand)
     reaper.ImGui_SetMouseCursor(draw_ctx, state.drag.zone == "pitch"
@@ -4992,70 +5061,33 @@ local function draw_graph(draw_ctx, w, h)
       state.drag.dirty = true
       state.drag.pending_single_select = nil -- drag occurred, cancel single-select collapse
 
-      if state.shift_mode then
+      local zone_ctl = K.zone_control(state.drag.zone, state.drag.shift_mode)
+      -- HC2: Cmd/Ctrl held (read every frame) = fine adjust. Each frame's pointer movement is scaled and
+      -- accumulated, so pressing or releasing the modifier mid-drag never makes the value jump.
+      local fine = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Ctrl()) ~= 0
+      if zone_ctl then
         -- The canvas shades where the dragged value acts on the dragged notes
-        K.setting_hint(draw_ctx, (state.drag.zone == "pitch" and "transition_ms")
-          or (state.drag.zone == "drift" and "onset_ramp_ms") or "scoop_shape", true, state.drag.orig_values)
-        if state.drag.zone == "pitch" then
-          local delta = delta_y * 0.5
-          for idx, orig_val in pairs(state.drag.orig_values) do
-            local n = state.notes[idx]
-            if n and n.controls then
-              n.controls.transition_ms = math.max(5, math.min(60, orig_val + delta))
-            end
-          end
-        elseif state.drag.zone == "drift" then
-          local delta = delta_y * 0.5
-          for idx, orig_val in pairs(state.drag.orig_values) do
-            local n = state.notes[idx]
-            if n and n.controls then
-              n.controls.onset_ramp_ms = math.max(5, math.min(60, orig_val + delta))
-            end
-          end
-        elseif state.drag.zone == "vibrato" then
-          local delta = delta_y / (px_per_st * 2)
-          for idx, orig_val in pairs(state.drag.orig_values) do
-            local n = state.notes[idx]
-            if n and n.controls then
-              n.controls.scoop_shape = math.max(0, math.min(1, orig_val + delta))
-            end
+        if zone_ctl.hint then K.setting_hint(draw_ctx, zone_ctl.hint, true, state.drag.orig_values) end
+        local per_px = zone_ctl.px or (zone_ctl.hi - zone_ctl.lo) / (px_per_st * zone_ctl.rows)
+        state.drag.acc = state.drag.acc
+          + (state.drag.last_y - my) * per_px * ((fine and zone_ctl.fine) and K.FINE_ADJUST_SCALE or 1)
+        state.drag.last_y = my
+        for idx, orig_val in pairs(state.drag.orig_values) do
+          local n = state.notes[idx]
+          if n and n.controls then
+            local v = math.max(zone_ctl.lo, math.min(zone_ctl.hi, orig_val + state.drag.acc))
+            n.controls[zone_ctl.key] = not (zone_ctl.zero_nil and v <= 0) and v or nil
           end
         end
       else
-        if state.drag.zone == "pitch" then
-          -- HC2: Cmd/Ctrl held (read every frame) = fine adjust. Each frame's pointer movement is scaled
-          -- and accumulated, so pressing or releasing the modifier mid-drag never makes the note jump.
-          -- Snapping to a semitone stays on the S key and on double-click.
-          local ok_mods, mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-          local fine = ok_mods and mods and (mods & reaper.ImGui_Mod_Ctrl()) ~= 0
-          state.drag.pitch_st = state.drag.pitch_st
-            + (state.drag.last_y - my) / px_per_st * (fine and K.FINE_ADJUST_SCALE or 1)
-          state.drag.last_y = my
-          local effective_delta = state.drag.pitch_st
-
-          for idx, orig_val in pairs(state.drag.orig_values) do
-            local n = state.notes[idx]
-            if n and n.controls then
-              n.controls.center_pitch = math.max(0, math.min(127, orig_val + effective_delta))   -- MIDI range
-            end
-          end
-        elseif state.drag.zone == "drift" then
-          -- Stability drag: up = more stable = less drift = lower drift_scale
-          local delta = delta_y / (px_per_st * 2)
-          for idx, orig_val in pairs(state.drag.orig_values) do
-            local n = state.notes[idx]
-            if n and n.controls then
-              n.controls.drift_scale = math.max(0, math.min(1, orig_val - delta))
-            end
-          end
-        elseif state.drag.zone == "vibrato" then
-          -- Vibrato scale drag
-          local delta = delta_y / px_per_st
-          for idx, orig_val in pairs(state.drag.orig_values) do
-            local n = state.notes[idx]
-            if n and n.controls then
-              n.controls.vibrato_scale = math.max(0, math.min(2, orig_val + delta))
-            end
+        -- The pitch drag. Snapping to a semitone stays on the S key and on double-click.
+        state.drag.pitch_st = state.drag.pitch_st
+          + (state.drag.last_y - my) / px_per_st * (fine and K.FINE_ADJUST_SCALE or 1)
+        state.drag.last_y = my
+        for idx, orig_val in pairs(state.drag.orig_values) do
+          local n = state.notes[idx]
+          if n and n.controls then
+            n.controls.center_pitch = math.max(0, math.min(127, orig_val + state.drag.pitch_st))   -- MIDI range
           end
         end
       end
@@ -5066,15 +5098,9 @@ local function draw_graph(draw_ctx, w, h)
       if state.drag.dirty then
         local count = 0
         for _ in pairs(state.drag.orig_values) do count = count + 1 end
-        -- Label follows the modifier x zone: Shift remaps the zones to Transition / Onset Ramp / Scoop
-        local action_name
-        if state.drag.shift_mode then
-          action_name = (state.drag.zone == "pitch" and "Adjust Transition" or
-                        (state.drag.zone == "drift" and "Adjust Onset Ramp" or "Adjust Scoop"))
-        else
-          action_name = (state.drag.zone == "pitch" and "Pitch Shift" or
-                        (state.drag.zone == "drift" and "Adjust Stability" or "Adjust Vibrato"))
-        end
+        -- Label follows the modifier x zone (K.ZONE_CONTROLS); the plain centre zone is the pitch drag
+        local zone_ctl = K.zone_control(state.drag.zone, state.drag.shift_mode)
+        local action_name = zone_ctl and zone_ctl.undo or "Pitch Shift"
         local undo_title = count > 1 and string.format("%s (%d notes)", action_name, count) or action_name
         apply_envelope_to_take(undo_title)
       elseif state.drag.pending_single_select then
@@ -5108,8 +5134,7 @@ local function draw_graph(draw_ctx, w, h)
         end
       end
       if pd.dirty then
-        local ok_mods, mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-        local fine = ok_mods and mods and (mods & reaper.ImGui_Mod_Ctrl()) ~= 0
+        local fine = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Ctrl()) ~= 0
         -- Accumulated unsnapped (held at the limit), so a slow fine drag is not snapped back to 0 frame by frame
         local st = math.max(-K.POINT_MAX_ST, math.min(K.POINT_MAX_ST,
           pd.st + (pd.last_y - my) / h * note_range * (fine and K.FINE_ADJUST_SCALE or 1)))
@@ -5191,7 +5216,7 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  -- Process active marquee box select (Milestone 4)
+  -- Process active marquee box select
   if state.marquee then
     local delta_x = mx - state.marquee.start_x
     local delta_y = my - state.marquee.start_y
@@ -5291,7 +5316,7 @@ local function draw_graph(draw_ctx, w, h)
     local shift_mod = reaper.ImGui_Mod_Shift()
     local repeat_flag = reaper.ImGui_InputFlags_Repeat()
 
-    -- Cmd/Ctrl + A: Select All notes (Milestone 4)
+    -- Cmd/Ctrl + A: Select All notes
     if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Mod_Ctrl() | reaper.ImGui_Key_A()) then
       state.selected_notes = {}
       for i = 1, #state.notes do
@@ -5329,7 +5354,7 @@ local function draw_graph(draw_ctx, w, h)
         K.note_action("snap")
       end
 
-      -- Q: Quantize selected note(s) to active scale (Milestone 3)
+      -- Q: Quantize selected note(s) to active scale
       if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Q()) then
         K.note_action("quantize")
       end
@@ -5417,8 +5442,7 @@ local function draw_graph(draw_ctx, w, h)
   -- Double-click: a pitch point back to 0, a point added on the add-square, else on the pitch zone: Snap to nearest
   -- semitone (single or batch). With Shift held the points are left alone, as for a press.
   if is_canvas_hovered and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
-    local ok_dm, dc_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-    local dc_shift = ok_dm and dc_mods and (dc_mods & reaper.ImGui_Mod_Shift()) ~= 0
+    local dc_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
     local hp = not dc_shift and state.hovered_point
     local hp_note = hp and state.notes and state.notes[hp.note_idx]
     local hp_knot = hp_note and K.point_knot_at(hp_note, hp.frame)
@@ -5578,16 +5602,14 @@ local function draw_graph(draw_ctx, w, h)
 
         -- Zone-colored hover highlights
         if is_hov and not state.drag and not state.point_drag and not state.hovered_point then
-          local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
-          local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-          local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
+          local has_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
 
-          if state.hovered_zone == "drift" then
+          if state.hovered_zone == "tighten" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, sx + zone_w, bot_y, has_shift and C.zone_shift or C.zone_drift)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
-          elseif state.hovered_zone == "vibrato" then
+          elseif state.hovered_zone == "tolerance" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex - zone_w, bot_y, fill)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
@@ -5611,9 +5633,9 @@ local function draw_graph(draw_ctx, w, h)
               pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
               pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
               pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
-            elseif state.hovered_zone == "drift" then
+            elseif state.hovered_zone == "tighten" then
               pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
-            elseif state.hovered_zone == "vibrato" then
+            elseif state.hovered_zone == "tolerance" then
               pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
             else
               pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
@@ -5731,7 +5753,7 @@ local function draw_graph(draw_ctx, w, h)
         -- block (drawn after the curves). The row already names the pitch of every other note. A selection larger than
         -- LABEL_MAX_SELECTED labels its primary note alone; the note a pitch drag holds reads the same in the drag readout.
         local held = state.drag and state.drag.dirty and state.drag.zone == "pitch"
-          and (state.drag.anchor_idx or state.drag.note_idx) == n_idx
+          and state.drag.note_idx == n_idx
         if not held and (is_hov or n_idx == state.selected_note or (is_selected and label_all_selected)) then
           local nearest = math.floor(cp + 0.5)
           local cents = math.floor((cp - nearest) * 100 + 0.5)
@@ -5770,7 +5792,8 @@ local function draw_graph(draw_ctx, w, h)
       local marks = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
       if hint.dragging and marks == 0 and not hint.said then
         hint.said = true
-        set_status("No edited note in view uses this value")
+        set_status(hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first"
+          or "No edited note in view uses this value")
       end
     end
     if not (live and hint.dragging) then hint.said = false end
@@ -5792,46 +5815,8 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
-  -- DRAW TREND, VIBRATO REGIONS, CORRECTED PITCH PREVIEW & PITCH POINTS
+  -- DRAW CORRECTED PITCH PREVIEW & PITCH POINTS
   ---------------------------------------------------------------------------
-  if state.notes then
-    for _, note in ipairs(state.notes) do
-      -- The frames of this note that reach the visible window (f0 > f1: none)
-      local f0, f1 = 1, 0
-      if note.frames then f0, f1 = visible_range(note.frames) end
-
-      -- Vibrato regions (amber bands where vibrato was detected)
-      if state.show_vibrato_regions and note.vibrato_weight and note.frames then
-        local in_region = false
-        local region_start_x = 0
-        for i = f0, f1 do
-          local frame = note.frames[i]
-          local is_vib = note.vibrato_weight[i] > 0.3
-          local x = t_to_x(frame.time)
-          if is_vib and not in_region then
-            region_start_x = x
-            in_region = true
-          elseif not is_vib and in_region then
-            reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              region_start_x, py, x, py + h, C.vibrato)
-            in_region = false
-          end
-        end
-        -- Close trailing region
-        if in_region then
-          local last_x = t_to_x(note.frames[f1].time)
-          reaper.ImGui_DrawList_AddRectFilled(draw_list,
-            region_start_x, py, last_x, py + h, C.vibrato)
-        end
-      end
-
-      -- Trend line (cyan)
-      if state.show_trend and note.trend and f1 > f0 then
-        reaper.ImGui_DrawList_AddPolyline(draw_list, K.note_trend(note, f0, f1, t_to_x), C.trend, 0, 1.0)
-      end
-
-    end
-  end
 
   -- Corrected pitch preview (green): the pitch trace plus the correction that is written to the item, over
   -- every edited note with its ramps and glides. It is the trajectory of the envelope itself
@@ -5882,7 +5867,7 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
-  -- DRAW MARQUEE SELECTION BOX (Milestone 4)
+  -- DRAW MARQUEE SELECTION BOX
   ---------------------------------------------------------------------------
   if state.marquee and state.marquee.active then
     local bx1 = math.max(px, math.min(state.marquee.start_x, state.marquee.cur_x))
@@ -5985,36 +5970,23 @@ local function draw_graph(draw_ctx, w, h)
       pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
     end
   elseif state.drag and state.drag.dirty then
-    local d_note = state.notes[state.drag.anchor_idx or state.drag.note_idx]
+    local d_note = state.notes[state.drag.note_idx]
     if d_note and d_note.controls then
       local count = 0
       for _ in pairs(state.drag.orig_values or {}) do count = count + 1 end
       local count_suffix = count > 1 and string.format("  (%d notes)", count) or ""
+      -- The readout names the value that is changing (K.ZONE_CONTROLS), as the hover hint does
+      local zone_ctl = K.zone_control(state.drag.zone, state.drag.shift_mode)
       local tip
-      if state.drag.shift_mode then
-        -- Shift remaps the zones: the readout names the value that is changing, as the hover hint does
-        if state.drag.zone == "pitch" then
-          tip = string.format("Transition: %.0f ms%s",
-            d_note.controls.transition_ms or get_effective(d_note, "transition_ms"), count_suffix)
-        elseif state.drag.zone == "drift" then
-          tip = string.format("Onset Ramp: %.0f ms%s",
-            d_note.controls.onset_ramp_ms or get_effective(d_note, "onset_ramp_ms"), count_suffix)
-        else
-          tip = string.format("Scoop: %.0f%% corrected%s", (d_note.controls.scoop_shape or 0) * 100, count_suffix)
-        end
-      elseif state.drag.zone == "pitch" then
+      if zone_ctl then
+        tip = K.zone_text(zone_ctl, d_note, false) .. count_suffix
+      else
         local cp = d_note.controls.center_pitch
         local nearest = math.floor(cp + 0.5)
         local cents = math.floor((cp - nearest) * 100 + 0.5)
         local sign = cents >= 0 and "+" or ""
         tip = string.format("%s %s%d\xC2\xA2%s",
           midi_to_name(nearest), sign, cents, count_suffix)
-      elseif state.drag.zone == "drift" then
-        tip = string.format("Stability: %.0f%%%s",
-          (1 - d_note.controls.drift_scale) * 100, count_suffix)
-      else
-        tip = string.format("Vibrato: %.0f%%%s",
-          d_note.controls.vibrato_scale * 100, count_suffix)
       end
       -- Beside the pointer, never outside the note area (nor over the note-name column or the ruler)
       pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
@@ -6029,31 +6001,10 @@ local function draw_graph(draw_ctx, w, h)
       and not state.point_drag and not state.hovered_point then
     local h_note = state.notes[state.hovered_note]
     if h_note and h_note.controls then
-      local tip
-      local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
-      local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
-      local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
-
-      if has_shift then
-        if state.hovered_zone == "drift" then
-          local v = h_note.controls.onset_ramp_ms or get_effective(h_note, "onset_ramp_ms")
-          tip = string.format("Onset Ramp: %.0fms (Shift+Drag)", v)
-        elseif state.hovered_zone == "vibrato" then
-          local v = h_note.controls.scoop_shape or 0
-          tip = string.format("Scoop: %.0f%% corrected (Shift+Drag)", v * 100)
-        else
-          local v = h_note.controls.transition_ms or get_effective(h_note, "transition_ms")
-          tip = string.format("Transition: %.0fms (Shift+Drag)", v)
-        end
-      else
-        if state.hovered_zone == "drift" then
-          tip = string.format("Stability: %.0f%%", (1 - h_note.controls.drift_scale) * 100)
-        elseif state.hovered_zone == "vibrato" then
-          tip = string.format("Vibrato: %.0f%%", h_note.controls.vibrato_scale * 100)
-        else
-          tip = string.format("Drag to change pitch (%s = fine)", K.MOD_LABEL)
-        end
-      end
+      local has_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
+      local zone_ctl = K.zone_control(state.hovered_zone, has_shift)
+      local tip = zone_ctl and K.zone_text(zone_ctl, h_note, true)
+        or string.format("Drag to change pitch (%s = fine)", K.MOD_LABEL)
       Theme.tooltip(draw_ctx, tip)   -- the Show Tooltips preference applies
     end
   end
@@ -6209,7 +6160,7 @@ local function draw_graph(draw_ctx, w, h)
   -- for the state the editor is in (K.status_line)
   K.canvas_status(draw_list, px + L.sm, py + h - L.sm, w - L.sm * 2, not is_bypassed)
 
-  -- Note Context Menu (Phase 4)
+  -- Note Context Menu
   local note_menu_open = reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu")
   if note_menu_open then
     -- HC5: Esc closes this menu, unless a popup opened from it (a typed-entry field) is open: that one is innermost.
@@ -6251,10 +6202,21 @@ local function draw_graph(draw_ctx, w, h)
 
       reaper.ImGui_PushItemWidth(draw_ctx, 120)
 
-      local function draw_cm_slider(label, key, min_v, max_v, fmt, scale, default)
+      -- How many notes a row with `spread` writes to: every selected note when the menu's note is one of several
+      local spread_n = 0
+      if state.selected_notes[note_idx] then
+        for idx in pairs(state.selected_notes) do
+          if state.notes[idx] and state.notes[idx].controls then spread_n = spread_n + 1 end
+        end
+      end
+
+      --- One value row. `spread`: the value is written to every selected note (see spread_n), and the row says
+      --- how many. A value outside the cascade (Tighten, Scoop Shape) has nothing to inherit and shows no level.
+      local function draw_cm_slider(label, key, min_v, max_v, fmt, scale, default, spread)
          local level = get_override_level(note, key)
          local cur_val = ctrl[key] or get_effective(note, key) or default or 0
          if scale then cur_val = cur_val * scale end
+         spread = spread and spread_n > 1
 
          -- param_drag tests the gestures right after the control (not after SameLine / TextDisabled, which would test the text)
          local name = PARAM_LABELS[key] or label
@@ -6264,34 +6226,67 @@ local function draw_graph(draw_ctx, w, h)
             local set = state.setting_hint.menu_set
             for k in pairs(set) do set[k] = nil end
             set[note_idx] = true
+            if spread then
+               for idx in pairs(state.selected_notes) do set[idx] = true end
+            end
             K.setting_hint(draw_ctx, key, K.drag_hot.active, set)
          end
          local edit = state.context_edit
          if reset then
             -- Double-click: drop the per-note override so the note inherits again (one undo point)
             if edit and edit.key == key then state.context_edit = nil end
-            if ctrl[key] ~= nil then
-               ctrl[key] = nil
+            local had = ctrl[key] ~= nil
+            ctrl[key] = nil
+            if spread then
+               for idx in pairs(state.selected_notes) do
+                  local o = state.notes[idx]
+                  if o and o ~= note and o.controls and o.controls[key] ~= nil then
+                     o.controls[key] = nil
+                     had = true
+                  end
+               end
+            end
+            if had then
                apply_envelope_to_take("Reset " .. name)
             end
          else
             if s_changed then
                -- The model is ahead of the envelope until the commit: remember the value to go back to (nil = inherit)
                if not (edit and edit.note == note and edit.key == key) then
-                  state.context_edit = { note = note, key = key, raw = ctrl[key] }
+                  edit = { note = note, key = key, raw = ctrl[key] }
+                  -- Each of the other selected notes remembers its own value for Esc
+                  if spread then
+                     edit.others = {}
+                     for idx in pairs(state.selected_notes) do
+                        local o = state.notes[idx]
+                        if o and o ~= note and o.controls then
+                           edit.others[#edit.others + 1] = { note = o, raw = o.controls[key] }
+                        end
+                     end
+                  end
+                  state.context_edit = edit
                end
                if scale then new_val = new_val / scale end
                ctrl[key] = new_val
+               for _, o in ipairs(edit.others or {}) do o.note.controls[key] = new_val end
             end
             if committed and not nm_esc then
                apply_envelope_to_take("Adjust " .. name)
                state.context_edit = nil
             end
          end
-         reaper.ImGui_SameLine(draw_ctx)
-         reaper.ImGui_TextDisabled(draw_ctx, "[" .. level .. "]")
+         if DEFAULTS[key] ~= nil then
+            reaper.ImGui_SameLine(draw_ctx)
+            reaper.ImGui_TextDisabled(draw_ctx, "[" .. level .. "]")
+         end
+         if spread then
+            reaper.ImGui_SameLine(draw_ctx)
+            reaper.ImGui_TextDisabled(draw_ctx, string.format("(%d notes)", spread_n))
+         end
       end
 
+      draw_cm_slider(PARAM_LABELS.tighten, "tighten", 0, 100, "%.0f%%", 100, nil, true)
+      draw_cm_slider(PARAM_LABELS.tolerance, "tolerance", K.LIMITS.tolerance[1], K.LIMITS.tolerance[2], "%.0f \xC2\xA2", nil, nil, true)
       draw_cm_slider("Onset Ramp", "onset_ramp_ms", 5, 60, "%.0f ms", nil)
       draw_cm_slider("Scoop Shape", "scoop_shape", 0, 100, "%.0f%%", 100)
       draw_cm_slider("Transition", "transition_ms", 5, 60, "%.0f ms", nil)
@@ -6344,6 +6339,9 @@ local function draw_graph(draw_ctx, w, h)
   local cm_edit = state.context_edit
   if not note_menu_open and cm_edit then
     if cm_edit.note.controls then cm_edit.note.controls[cm_edit.key] = cm_edit.raw end
+    for _, o in ipairs(cm_edit.others or {}) do   -- the other selected notes the value was written to
+      if o.note.controls then o.note.controls[cm_edit.key] = o.raw end
+    end
     state.context_edit = nil
   end
 
@@ -6933,13 +6931,14 @@ K.INFO_SECTIONS = {
   } },
   { title = "Pitch & Note Editing", rows = {
     { "Drag Center Zone", string.format("Move note pitch (%s = fine adjust)", K.MOD_LABEL) },
-    { "Drag Left Zone", "Adjust drift stability tracking" },
-    { "Drag Right Zone", "Scale natural vibrato depth" },
-    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 6, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
+    { "Drag Left Zone", string.format("Tighten: steady the note, slow drift first; 100%% is a flat line (%s = fine)", K.MOD_LABEL),
+      panel = { "Edit", 6, "Tighten · Tolerance", "Drag note side" } },
+    { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
+    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 7, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
     { "Shift + Drag Center Zone", "Adjust Transition" },
     { "Shift + Drag Right Zone", "Adjust Scoop shape" },
-    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 7, "Trim note", "Drag edge" } },
-    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 8, "Pitch point", "Drag dot" } },
+    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 8, "Trim note", "Drag edge" } },
+    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 9, "Pitch point", "Drag dot" } },
     { "Double-click a pitch point", "Put it back to 0" },
     { "Double-click the pitch line", "Add a pitch point" },
     { "Right-click a pitch point", "Point menu: type a value, Reset, Remove" },
@@ -7943,8 +7942,6 @@ local function draw_settings_modal()
       reaper.ImGui_Indent(ctx, L.md)
       Theme.align(ctx)
       K.layer_checkbox("Split Markers", "show_split_points")
-      Theme.align(ctx)
-      K.layer_checkbox("Trend Line", "show_trend")
       reaper.ImGui_Unindent(ctx, L.md)
     end
 
@@ -8406,8 +8403,8 @@ end
 -------------------------------------------------------------------------------
 -- Every control of the window, in one place above the canvas, in four groups read from broad to specific:
 --   Clip          brand, target badge, Key, Scale
---   Correction    scope pill + Strength, then Transition / Onset Ramp / Legato Gap as badges, or one "Timing"
---                 button that opens the three in a popup
+--   Correction    scope pill + Strength, the Tolerance badge, then Transition / Onset Ramp / Legato Gap as
+--                 badges, or one "Timing" button that opens the three in a popup
 --   Note actions  Snap, Quantize, Split, Merge
 --   Right         "…" (More: Analyze / Cancel, Reset, Layers, Note Tone, Settings, Help) and Close, right-aligned on row 1
 -- The Correction and Note action units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this section
@@ -8435,8 +8432,8 @@ do
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
-  local HDR_CORR_FULL = { "retune", "trans", "ramp", "legato" }
-  local HDR_CORR_FOLDED = { "retune", "timing" }
+  local HDR_CORR_FULL = { "retune", "tol", "trans", "ramp", "legato" }
+  local HDR_CORR_FOLDED = { "retune", "tol", "timing" }
   local HDR_ACTIONS = { "snap", "quantize", "split", "merge" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
@@ -8717,9 +8714,6 @@ do
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "The points on a note that bend its pitch: peaks and valleys, the note's start and end, and points you add")
     end
-    layer_checkbox("Vibrato Shading", "show_vibrato_regions", function(dl, x, cy)
-      reaper.ImGui_DrawList_AddRectFilled(dl, x, cy - L.sm, x + sw_w, cy + L.sm, Theme.with_alpha(LC.vibrato, 1.0))   -- the band is translucent on the canvas; the swatch is its opaque hue
-    end)
   end
 
   --- "…" (More) and its popup: Analyze / Re-Analyze and Reset (with the reason beside a disabled one), then
@@ -8894,11 +8888,16 @@ do
   local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
   local BAR_HINT_OUTDATED = "Outdated: this item's envelope is from other settings. Edit a note to rewrite it."
 
-  -- Value badges: label format, edit range. The item override menu and the edit popup use the key.
+  -- Value badges: label format, the value's format in the edit drag and the tooltip (unit), edit range. The item
+  -- override menu and the edit popup use the key. fold = one of the timing values "Timing" folds; tip = what the
+  -- value does (a line of its tooltip).
   local BAR_BADGES = {
-    { id = "trans",  key = "transition_ms",       fmt = "Transition: %.0fms", min = 5,  max = 60 },
-    { id = "ramp",   key = "onset_ramp_ms",       fmt = "Onset Ramp: %.0fms", min = 5,  max = 60 },
-    { id = "legato", key = "legato_threshold_ms", fmt = "Legato Gap: %.0fms", min = 50, max = 300 },
+    { id = "tol",    key = "tolerance",           fmt = "Tolerance: %.0f\xC2\xA2", unit = "%.0f \xC2\xA2",
+      min = K.LIMITS.tolerance[1], max = K.LIMITS.tolerance[2],
+      tip = "How far a tightened note may stray from its centre before it is pulled in." },
+    { id = "trans",  key = "transition_ms",       fmt = "Transition: %.0fms", unit = "%.0f ms", min = 5,  max = 60,  fold = true },
+    { id = "ramp",   key = "onset_ramp_ms",       fmt = "Onset Ramp: %.0fms", unit = "%.0f ms", min = 5,  max = 60,  fold = true },
+    { id = "legato", key = "legato_threshold_ms", fmt = "Legato Gap: %.0fms", unit = "%.0f ms", min = 50, max = 300, fold = true },
   }
   -- Actions: same commands as the keys
   local BAR_ACTIONS = {
@@ -8934,7 +8933,9 @@ do
       local widest = math.max(bar_text_w(bctx, string.format(spec.fmt, spec.min)),
         bar_text_w(bctx, string.format(spec.fmt, spec.max)))
       s.unit_w[spec.id] = widest + mark_w + s.pad_x
-      s.timing_label_w = math.max(s.timing_label_w, bar_text_w(bctx, PARAM_LABELS[spec.key] or spec.key) + mark_w)
+      if spec.fold then
+        s.timing_label_w = math.max(s.timing_label_w, bar_text_w(bctx, PARAM_LABELS[spec.key] or spec.key) + mark_w)
+      end
     end
     s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, BAR_OVERRIDE_MARK))
       + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W + s.pad_x
@@ -9218,7 +9219,7 @@ do
     local function edit_timing(spec, value)
       local key = spec.key
       reaper.ImGui_PushItemWidth(bctx, s.edit_w)
-      local c, v, committed, reset, cancelled = param_drag(bctx, "s_" .. key, nil, value, spec.min, spec.max, "%.0f ms")
+      local c, v, committed, reset, cancelled = param_drag(bctx, "s_" .. key, nil, value, spec.min, spec.max, spec.unit)
       local back = K.drag_revert("s_" .. key, value, cancelled)
       reaper.ImGui_PopItemWidth(bctx)
       if K.drag_hot.hovered or K.drag_hot.active then K.setting_hint(bctx, key, K.drag_hot.active) end
@@ -9265,8 +9266,8 @@ do
       elseif level == "note" then
         bar_tooltip(BAR_REASON_NOTE_OVERRIDE, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
       else
-        bar_tooltip(string.format("%s: %.0f ms\n%s\nLeft-click to edit. Right-click for item override and reset.",
-          PARAM_LABELS[key] or key, value, bar_scope_tip(level, true)))
+        bar_tooltip(string.format("%s: " .. spec.unit .. "\n%s%s\nLeft-click to edit. Right-click for item override and reset.",
+          PARAM_LABELS[key] or key, value, spec.tip and (spec.tip .. "\n") or "", bar_scope_tip(level, true)))
       end
 
       if not disabled then item_override_menu(key) end
@@ -9287,7 +9288,7 @@ do
       local overridden = false
       for _, spec in ipairs(BAR_BADGES) do
         local _, level = cascade_view(spec.key)
-        if level ~= "global" then overridden = true end
+        if spec.fold and level ~= "global" then overridden = true end
       end
 
       reaper.ImGui_BeginDisabled(bctx, inspector_reason ~= nil)
@@ -9321,6 +9322,7 @@ do
         close_popup_on_esc()
         local row_x = reaper.ImGui_GetCursorPosX(bctx) or 0
         for _, spec in ipairs(BAR_BADGES) do
+          if not spec.fold then goto next_spec end
           local key = spec.key
           local value, level = cascade_view(key)
           Theme.align(bctx)
@@ -9335,6 +9337,7 @@ do
             bar_tooltip(bar_scope_tip(level, true) .. "\nRight-click for item override and reset.")
             item_override_menu(key)
           end
+          ::next_spec::
         end
         reaper.ImGui_EndPopup(bctx)
       end
@@ -9711,7 +9714,7 @@ local function loop()
 end
 
 -------------------------------------------------------------------------------
--- 5. MAIN
+-- 6. MAIN
 -------------------------------------------------------------------------------
 local function main()
   -- The toolbar button shows the script as running and resets when it ends; closing the window or ending the script
