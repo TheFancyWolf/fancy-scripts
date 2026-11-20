@@ -1,8 +1,9 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.9.0
+-- @version 2.11.0
 -- @changelog
---   Shortcuts list in the right panel (H shows or hides it); Pitched Items and Shortcuts fold from their headers
+--   Pitch points on a note can be dragged to bend its pitch; add your own, reset or remove them from a menu; the layer is now Pitch Points in the Layers menu
+--   Fixed: Split, Merge and Trim no longer shift the note's pitch; Esc during a slider drag puts the value back instead of saving it
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -214,6 +215,9 @@ local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
 
+  -- The most a Scoop may move one onset frame, in semitones (see K.correction_build)
+  SCOOP_MAX_ST = 3.0,
+
   -- How long a status message replaces the hint on the canvas's status pill
   STATUS_SECONDS = 4.0,
 
@@ -324,6 +328,12 @@ local K = {
   EDGE_GRAB_HOVER = Theme.layout.sm * 3,             -- ... while the pointer rests on that edge
   EDGE_GRAB_MAX_FRAC = 0.25,                         -- a zone never takes more than this fraction of the block width (both edges stay usable)
   VIEW_GRIP = Theme.layout.md,                       -- grab width of each end of the overview / pitch strip thumb
+
+  -- Pitch points (see K.points_knots): handles that bend a note's pitch at one moment
+  POINT_MAX_ST = 3.0,                                -- the most one point may move the pitch, in semitones (±300 ¢)
+  POINT_MIN_GAP = 3,                                 -- a detected dot this many frames or closer to a stored point is not a point
+  POINT_GRAB = Theme.layout.sm * 2,                  -- grab distance around a drawn point, per side
+  POINT_EPS = 0.005,                                 -- an offset under half a cent counts as 0
 }
 
 local state = {
@@ -372,8 +382,22 @@ local state = {
   drag = nil,           -- { note_idx, anchor_idx, zone, shift_mode, start_mouse_y, last_y, pitch_st, original_value, orig_values, dirty, view_min, view_max }
   edge_drag = nil,      -- { note_idx, edge, start_mouse_x, original_time, dirty, view_min, view_max }
   marquee = nil,        -- { start_x, start_y, cur_x, cur_y, active, has_shift, init_sel, view_min, view_max }
+  -- A pitch point is named by { note_idx, frame } (its knot is looked up by frame: the knot tables are rebuilt)
+  point_drag = nil,     -- { note_idx, frame, start_st, st, last_y, dirty, view_min, view_max }
+  hovered_point = nil,  -- { note_idx, frame }
+  point_ghost = nil,    -- { note_idx, frame }: where a double-click on the pitch line would add a point
+  points_hover_note = nil, -- note index whose points stay shown: the pointer is in the box around its block and points
+  points_zoom_hint = false, -- the hovered note's points are too small to grab (K.points_live): the status says zoom in
   shift_mode = false,   -- true when Shift held before click (zone remap)
   context_menu_note = nil, -- index of note for right-click context menu
+  context_edit = nil,   -- { note, key, raw }: a note menu slider changed and not yet written (raw = the value before)
+  context_menu_time = nil, -- the pointer's time (item seconds) when the note menu was opened
+  context_menu_live = false, -- the note's points could be added to (K.points_live_at) when the note menu was opened
+  context_point = nil,  -- { note_idx, frame, start_st }: the point the point menu ("##point_context_menu") is on
+  -- The setting that is hovered or dragged (K.setting_hint): the canvas shades where it acts. key = cascade key
+  -- or "scoop_shape"; notes = nil (every note the top bar value reaches) or a set of note indices; frame = the
+  -- ImGui frame that reported it; said = the "nothing in view" status was posted for this drag
+  setting_hint = { frame = -1, menu_set = {} },
   view_t0 = nil,        -- visible time window of the canvas, seconds relative to the item start; nil = the whole item
   view_t1 = nil,        -- (both nil or both set; changed by the wheel in draw_graph, reset when the target changes or the model is analysed or cleared, kept through undo / redo of the same take)
   view_p0 = nil,        -- visible pitch range of the canvas, semitones (MIDI note numbers); nil = fitted to the notes
@@ -397,7 +421,9 @@ local state = {
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
   raw_cache = {},           -- [guid] = raw P_EXT string last written or loaded by this script
   missing_takes = {},       -- [guid] = true when the take no longer resolves (row is kept in the sidebar)
-  stale_takes = {},         -- [guid] = true: a global default changed after the take's envelope was written and the take was not re-applied since
+  stale_takes = {},         -- [guid] = true: the take's pitch envelope is not what today's settings and its notes would write (K.envelope_check)
+  stale_env = {},           -- [guid] = { points }: the envelope a stale take really holds, for the preview curve of the open item
+  stale_queue = {},         -- guids whose envelope is still to be compared (one per frame, K.stale_check_step)
   last_seen_sel_guid = nil, -- GUID of the first selected audio item seen last frame (edge-triggered tracker)
   nudge_burst = nil,        -- pending arrow-key nudge { total_st, last_time, keys = { up, down }, guid }
 
@@ -1211,6 +1237,12 @@ local function reset_analysis_model()
   state.selected_notes = {}
   state.drag = nil
   state.marquee = nil
+  state.point_drag = nil
+  state.context_point = nil
+  state.hovered_point = nil
+  state.point_ghost = nil
+  state.points_hover_note = nil
+  state.points_zoom_hint = false
   state.nudge_burst = nil
   K.reset_view()   -- the canvas shows the whole item again
 end
@@ -1473,6 +1505,8 @@ local function extract_note_features(note, preserve_controls)
   end
 
   -- 5. Find Smart Spots via Zero-Crossing (for visual rendering / anchor points)
+  -- These peaks and valleys also define where saved pitch points (bends) are pinned: changing the 0.05 threshold
+  -- or the filters below reshapes every stored bend and marks those items outdated.
   local smart_spots = {}
   table.insert(smart_spots, { index = 1, time = note.frames[1].time, type = "anchor_start" })
 
@@ -1567,6 +1601,304 @@ local function extract_note_features(note, preserve_controls)
   note.voiced_start_time = note.frames[note.voiced_start_idx].time
 end
 
+-------------------------------------------------------------------------------
+-- PITCH POINTS: a per-note offset curve through the note's start and end, its detected peaks and valleys and the
+-- points the user added. Stored in note.controls.points (sorted by t): { t = item seconds (a frame's time),
+-- st = semitones, added = true | nil }, only for an added point or one off 0; nil when there is none.
+-------------------------------------------------------------------------------
+
+--- The index of the frame of `frames` (sorted by time, at least one) nearest to the time t.
+K.points_frame_at = function(frames, t)
+  local lo, hi = 1, #frames
+  while lo < hi do
+    local mid = (lo + hi) // 2
+    if frames[mid].time < t then lo = mid + 1 else hi = mid end
+  end
+  if lo > 1 and math.abs(frames[lo - 1].time - t) <= math.abs(frames[lo].time - t) then return lo - 1 end
+  return lo
+end
+
+--- An offset as stored: within ±K.POINT_MAX_ST, rounded to 1e-6 st (a value the take data's JSON, %.10g, keeps
+--- exactly, so the envelope written now and the one rebuilt after a reload come from the same number), and 0
+--- under K.POINT_EPS.
+K.points_clamp = function(st)
+  st = math.max(-K.POINT_MAX_ST, math.min(K.POINT_MAX_ST, st))
+  st = math.floor(st * 1e6 + 0.5) / 1e6
+  if math.abs(st) < K.POINT_EPS then return 0 end
+  return st
+end
+
+--- Make the stored points of `note` usable (saved data may be old, edited or damaged): an entry whose t or st is
+--- not a number or whose t lies outside the note is dropped, st is clamped, t snaps to the nearest frame, of two
+--- entries on one frame the first is kept, an entry the rule does not allow (not added, at 0) is dropped; the list
+--- is sorted, and nil when empty.
+K.points_sanitize = function(note)
+  local ctrl = note.controls
+  if not ctrl then return end
+  local list, frames = ctrl.points, note.frames
+  local kept, used = {}, {}
+  if type(list) == "table" and frames and #frames > 0 then
+    for _, e in ipairs(list) do
+      if type(e) == "table" and type(e.t) == "number" and type(e.st) == "number" and e.st == e.st
+          and e.t >= note.start_time and e.t <= note.end_time then
+        local f = K.points_frame_at(frames, e.t)
+        local st = K.points_clamp(e.st)
+        local added = (e.added == true) or nil
+        if not used[f] and (added or st ~= 0) then
+          used[f] = true
+          kept[#kept + 1] = { t = frames[f].time, st = st, added = added }
+        end
+      end
+    end
+  end
+  table.sort(kept, function(a, b) return a.t < b.t end)
+  ctrl.points = (#kept > 0) and kept or nil
+  note.points_rev = (note.points_rev or 0) + 1
+end
+
+--- The knots of the note's offset curve, ordered by frame: { frame, t, st, kind, entry }. kind = "start" (frame 1),
+--- "end" (the last frame), "added", or "spot" (a detected peak / valley, or a stored entry that was not added).
+--- A detected dot closer than K.POINT_MIN_GAP frames to a stored entry is not a knot. Cached on the note with the
+--- per-frame offsets (K.points_offsets) until note.points_rev, its frames, its dots or its stored list change.
+K.points_knots = function(note)
+  local frames, spots = note.frames, note.smart_spots
+  local list = note.controls and note.controls.points
+  local rev = note.points_rev or 0
+  local pc = note.points_cache
+  if pc and pc.rev == rev and pc.frames == frames and pc.spots == spots and pc.list == list then return pc.knots end
+
+  local knots, offsets = {}, nil
+  local nf = frames and #frames or 0
+  if nf > 0 then
+    local by_frame = {}   -- [frame] = knot
+    local function kind_of(f, added)
+      if f == 1 then return "start" elseif f == nf then return "end" end
+      return added and "added" or "spot"
+    end
+    local stored = {}     -- frames that hold a stored entry
+    for _, e in ipairs(list or {}) do
+      local f = K.points_frame_at(frames, e.t)
+      if not by_frame[f] then
+        by_frame[f] = { frame = f, t = frames[f].time, st = e.st, kind = kind_of(f, e.added), entry = e }
+        stored[#stored + 1] = f
+      end
+    end
+    local function near_stored(f)
+      for _, s in ipairs(stored) do
+        if math.abs(s - f) < K.POINT_MIN_GAP then return true end
+      end
+      return false
+    end
+    for _, f in ipairs({ 1, nf }) do
+      if not by_frame[f] then by_frame[f] = { frame = f, t = frames[f].time, st = 0, kind = kind_of(f) } end
+    end
+    for _, spot in ipairs(spots or {}) do
+      local f = spot.index
+      if (spot.type == "peak" or spot.type == "valley") and f and frames[f] and not by_frame[f] and not near_stored(f) then
+        by_frame[f] = { frame = f, t = frames[f].time, st = 0, kind = "spot" }
+      end
+    end
+    for _, k in pairs(by_frame) do knots[#knots + 1] = k end
+    table.sort(knots, function(a, b) return a.frame < b.frame end)
+
+    -- Offsets: between two neighbouring knots a smoothstep from one value to the other (flat at both, no
+    -- overshoot); nil when every knot is at 0
+    for _, k in ipairs(knots) do
+      if k.st ~= 0 then offsets = {} break end
+    end
+    if offsets then
+      if #knots == 1 then offsets[1] = knots[1].st end
+      for j = 1, #knots - 1 do
+        local a, b = knots[j], knots[j + 1]
+        local span = b.frame - a.frame
+        for i = a.frame, b.frame do
+          offsets[i] = a.st + (b.st - a.st) * smoothstep((i - a.frame) / span)
+        end
+      end
+    end
+  end
+  note.points_cache = { rev = rev, frames = frames, spots = spots, list = list, knots = knots, offsets = offsets }
+  return knots
+end
+
+--- The per-frame offset (semitones) of the note's points, or nil when every point is at 0. Pure, cached.
+K.points_offsets = function(note)
+  K.points_knots(note)
+  return note.points_cache.offsets
+end
+
+--- The knot of `note` on frame `frame`, or nil.
+K.point_knot_at = function(note, frame)
+  for _, k in ipairs(K.points_knots(note)) do
+    if k.frame == frame then return k end
+  end
+  return nil
+end
+
+--- Set the offset of `knot` (a knot of `note`, or { frame, t, st = 0 } for a frame that has none) to st semitones:
+--- clamped, 0 under K.POINT_EPS; the stored entry is created, updated or removed by the entry rule. No REAPER calls:
+--- the caller writes the change (apply_envelope_to_take).
+K.point_set = function(note, knot, st)
+  local ctrl = note.controls
+  if not ctrl or not knot then return end
+  st = K.points_clamp(st)
+  local list = ctrl.points
+  local entry = knot.entry
+  if entry and list then
+    if st == 0 and not entry.added then
+      for i = #list, 1, -1 do
+        if list[i] == entry then table.remove(list, i) end
+      end
+      if #list == 0 then ctrl.points = nil end
+    else
+      entry.st = st
+    end
+  elseif st ~= 0 then
+    list = list or {}
+    local pos = #list + 1
+    for i, e in ipairs(list) do
+      if e.t > knot.t then pos = i break end
+    end
+    table.insert(list, pos, { t = knot.t, st = st })
+    ctrl.points = list
+  end
+  note.points_rev = (note.points_rev or 0) + 1
+end
+
+--- How many points the note stores (moved or added).
+K.points_count = function(note)
+  local list = note and note.controls and note.controls.points
+  return list and #list or 0
+end
+
+--- Clear the note's stored points; returns how many there were.
+K.points_reset = function(note)
+  local n = K.points_count(note)
+  if n > 0 then
+    note.controls.points = nil
+    note.points_rev = (note.points_rev or 0) + 1
+  end
+  return n
+end
+
+--- Remove the added point `knot` of `note` (a detected, start or end point stays: it has no stored entry to drop,
+--- and a moved one is put back with K.point_set). Returns true when something was removed. No REAPER calls.
+K.point_remove = function(note, knot)
+  local list = note and note.controls and note.controls.points
+  if not (list and knot and knot.kind == "added" and knot.entry) then return false end
+  for i = #list, 1, -1 do
+    if list[i] == knot.entry then table.remove(list, i) end
+  end
+  if #list == 0 then note.controls.points = nil end
+  note.points_rev = (note.points_rev or 0) + 1
+  return true
+end
+
+--- The offset (semitones) the points curve of whichever of `notes` holds the time t has at its frame nearest to t;
+--- 0 outside all of them or where that note's points are all at 0. Pure.
+K.points_curve_at = function(notes, t)
+  for _, n in ipairs(notes) do
+    if n.frames and #n.frames > 0 and t >= n.start_time and t <= n.end_time then
+      local offsets = K.points_offsets(n)
+      return offsets and (offsets[K.points_frame_at(n.frames, t)] or 0) or 0
+    end
+  end
+  return 0
+end
+
+--- Carry the bend of `old_notes` (the notes as they were before a split, merge or trim, unchanged) over to
+--- `new_note` (run after extract_note_features(new_note, ...)): (1) every stored entry of old_notes whose time lies
+--- inside new_note is copied, on new_note's nearest frame (of two closer than K.POINT_MIN_GAP frames the first in
+--- time is kept); (2) every other knot of new_note (its start, end and re-detected dots) takes the old curve's value
+--- at its time; (3) at each knot time of old_notes and each of `pin_times` inside new_note where the new curve now
+--- differs from the old one by K.POINT_EPS or more, an added entry holds the old curve's value (when no knot is within
+--- K.POINT_MIN_GAP frames). Returns how many stored entries lay outside new_note (dropped). No REAPER calls: the
+--- caller writes the change.
+K.points_transfer = function(new_note, old_notes, pin_times)
+  local frames, ctrl = new_note.frames, new_note.controls
+  if not (frames and #frames > 0 and ctrl) then return 0 end
+  local dropped = 0
+
+  -- 1. Stored entries, each normalised by its place in new_note: on its first or last frame it is that start / end
+  -- point (not added, and not stored at 0); an old start or end point that is now inside the note is added (a square)
+  local entries = {}
+  for _, old in ipairs(old_notes) do
+    local of = old.frames
+    local o_first = of and #of > 0 and of[1].time
+    local o_last = of and #of > 0 and of[#of].time
+    for _, e in ipairs((old.controls and old.controls.points) or {}) do
+      if e.t >= new_note.start_time and e.t <= new_note.end_time then
+        entries[#entries + 1] = { e = e, was_edge = (e.t == o_first or e.t == o_last) }
+      else
+        dropped = dropped + 1
+      end
+    end
+  end
+  table.sort(entries, function(a, b) return a.e.t < b.e.t end)
+  local kept, last_f, nf = {}, nil, #frames
+  for _, c in ipairs(entries) do
+    local f = K.points_frame_at(frames, c.e.t)
+    if not last_f or f - last_f >= K.POINT_MIN_GAP then
+      local st = K.points_clamp(c.e.st)
+      local added = (c.e.added == true) or nil
+      if f == 1 or f == nf then
+        added = nil
+      elseif c.was_edge then
+        added = true
+      end
+      if added or st ~= 0 then kept[#kept + 1] = { t = frames[f].time, st = st, added = added } end
+      last_f = f
+    end
+  end
+  ctrl.points = (#kept > 0) and kept or nil
+  new_note.points_rev = (new_note.points_rev or 0) + 1
+
+  -- 2. Knots without an entry follow the old curve
+  local free = {}
+  for _, k in ipairs(K.points_knots(new_note)) do
+    if not k.entry then free[#free + 1] = k.frame end
+  end
+  for _, f in ipairs(free) do
+    local k = K.point_knot_at(new_note, f)  -- an entry set just before can have taken a nearby dot
+    if k and not k.entry then K.point_set(new_note, k, K.points_curve_at(old_notes, k.t)) end
+  end
+
+  -- 3. Squares where the old curve had a knot (or an old edge was) that the new curve no longer follows: each old
+  -- knot time and pin time inside the note, in time order, where the new offset differs from the old curve by
+  -- K.POINT_EPS or more and no knot is within K.POINT_MIN_GAP frames, gets an added entry holding the old value
+  local times = {}
+  for _, old in ipairs(old_notes) do
+    for _, k in ipairs(K.points_knots(old)) do times[#times + 1] = k.t end
+  end
+  for _, pt in ipairs(pin_times or {}) do times[#times + 1] = pt end
+  table.sort(times)
+  for _, t in ipairs(times) do
+    if t >= new_note.start_time and t <= new_note.end_time then
+      local f = K.points_frame_at(frames, t)
+      local want = K.points_curve_at(old_notes, t)
+      local offs = K.points_offsets(new_note)
+      if math.abs(((offs and offs[f]) or 0) - want) >= K.POINT_EPS then
+        local clear = true
+        for _, k in ipairs(K.points_knots(new_note)) do
+          if math.abs(k.frame - f) < K.POINT_MIN_GAP then clear = false break end
+        end
+        if clear then
+          local list = ctrl.points or {}
+          local entry = { t = frames[f].time, st = K.points_clamp(want), added = true }
+          local pos = #list + 1
+          for n, e in ipairs(list) do
+            if e.t > entry.t then pos = n break end
+          end
+          table.insert(list, pos, entry)
+          ctrl.points = list
+          new_note.points_rev = new_note.points_rev + 1
+        end
+      end
+    end
+  end
+  return dropped
+end
+
 local function is_note_modified(note)
   if not note or not note.controls then return false end
   local ctrl = note.controls
@@ -1576,7 +1908,7 @@ local function is_note_modified(note)
   local has_overrides = (ctrl.retune_speed ~= nil) or (ctrl.onset_ramp_ms ~= nil)
     or (ctrl.scoop_shape ~= nil and ctrl.scoop_shape > 0)
     or (ctrl.transition_ms ~= nil)
-  return pitch_changed or fine_changed or has_overrides
+  return pitch_changed or fine_changed or has_overrides or K.points_offsets(note) ~= nil
 end
 
 -- Forward declaration; will be set after apply_envelope_to_take is defined
@@ -1685,6 +2017,7 @@ local function load_take_data(take, raw)
             note.controls[k] = v
           end
         end
+        K.points_sanitize(note)
       end
     end)
   end
@@ -1750,9 +2083,16 @@ local function clear_interaction_state()
   state.hovered_zone = nil
   state.hovered_edge = nil
   state.context_menu_note = nil
+  state.context_edit = nil
   state.drag = nil
   state.edge_drag = nil
   state.marquee = nil
+  state.point_drag = nil
+  state.context_point = nil
+  state.hovered_point = nil
+  state.point_ghost = nil
+  state.points_hover_note = nil
+  state.points_zoom_hint = false
   state.shift_mode = false
   state.nudge_burst = nil
   K.tone_kill()   -- the drag that was sounding is gone
@@ -1816,6 +2156,7 @@ local function switch_active_target(guid, take_obj)
       local found = false
       for _, g in ipairs(state.session_order) do if g == guid then found = true; break end end
       if not found then table.insert(state.session_order, guid) end
+      state.stale_queue[#state.stale_queue + 1] = guid   -- a take that just joined the session: compare its envelope
     end
   end
 
@@ -1861,6 +2202,7 @@ local function sync_with_project()
   local count = reaper.GetProjectStateChangeCount(0)
   if state.last_change_count == count then return end
   state.last_change_count = count
+  K.queue_stale_checks()   -- an undo, a redo or an edit in REAPER may have changed an envelope
 
   local i = 1
   while i <= #state.session_order do
@@ -1956,6 +2298,237 @@ local function end_apply(take, undo_desc)
   note_own_write()
 end
 
+--- The pitch correction of `notes` as a trajectory: what the take pitch envelope holds and what the canvas
+--- draws, from one calculation. Pure (no REAPER calls); it sets note.frame_shifts on every note.
+--- Returns { points, spans, ranges }:
+---   points  { time, val } in semitones, in generation order (the envelope writer simplifies and sorts them)
+---   spans   { kind, t0, t1, a, b }: where a timing value acts. "onset" / "release" (the fade before / after
+---           note a), "glide" (the blend between notes a and b; its length is note b's Transition), "gap" (the
+---           joined gap between a and b), "scoop" (the bent onset of note a). a and b are note indices.
+---   ranges  { t0, t1 }, sorted and merged: the time ranges an edited, non-bypassed note corrects (with its
+---           ramps and glides)
+K.correction_build = function(notes, item_len)
+  local all_points, spans, ranges = {}, {}, {}
+  local scooped = {}   -- [note index] = true: its onset frames carry a scoop correction
+  local num_notes = #notes
+
+  -- 1. Precalculate continuous frame shifts for every note
+  for idx = 1, num_notes do
+    local n = notes[idx]
+    n.frame_shifts = {}
+    -- Per-note bypass: zero out all shifts
+    if n.controls and n.controls.bypassed then
+      if n.frames then
+        for i = 1, #n.frames do
+          n.frame_shifts[i] = 0.0
+        end
+      end
+    else
+      local is_mod = is_note_modified(n)
+      local retune = get_effective(n, "retune_speed")
+      local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
+      local d_scale = (n.controls and n.controls.drift_scale) or 1.0
+      local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
+      if n.frames then
+        for i = 1, #n.frames do
+          if not is_mod then
+            n.frame_shifts[i] = 0.0
+          else
+            local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
+            local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
+            local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
+            n.frame_shifts[i] = coarse + drift_corr + vib_corr
+          end
+        end
+
+        -- Scoop: flatten the slide into the note. The onset frames are pulled toward the pitch the corrected
+        -- note settles at right after the onset: fully on the first frame at 100 %, easing out to the note's
+        -- normal correction by the end of the onset (so the onset meets the body without a step). 0 % leaves
+        -- the slide as sung. The pull of one frame is limited to K.SCOOP_MAX_ST, so a mis-detected onset frame
+        -- (an octave error) cannot write a jump of that size into the envelope.
+        local scoop = (n.controls and n.controls.scoop_shape) or 0
+        if scoop > 0 and is_mod and n.voiced_start_idx then
+          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
+          local settle = n.frames[onset_end + 1]
+          if onset_end > 1 and onset_end < #n.frames and settle and settle.note then
+            local settle_pitch = settle.note + n.frame_shifts[onset_end + 1]
+            for i = 1, onset_end do
+              local sung = n.frames[i].note
+              if sung then
+                local natural = n.frame_shifts[i]
+                local pull = (settle_pitch - sung) - natural   -- what would put this frame on the settled pitch
+                pull = math.max(-K.SCOOP_MAX_ST, math.min(K.SCOOP_MAX_ST, pull))
+                n.frame_shifts[i] = natural + pull * scoop * (1 - (i - 1) / onset_end)
+              end
+            end
+            scooped[idx] = true
+            spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[onset_end].time, a = idx }
+          end
+        end
+
+        -- Pitch points: the note's own offset curve, last and literal (Strength does not scale it)
+        local offsets = K.points_offsets(n)
+        if offsets then
+          for i = 1, #n.frames do
+            n.frame_shifts[i] = n.frame_shifts[i] + (offsets[i] or 0)
+          end
+        end
+      end
+    end
+  end
+
+  -- 2. Build continuous trajectory across notes and boundaries
+  local legato_thresh = get_effective(nil, "legato_threshold_ms") * 0.001
+
+  for idx = 1, num_notes do
+    local n = notes[idx]
+    local prev_n = notes[idx - 1]
+    local next_n = notes[idx + 1]
+
+    -- Bypassed notes produce zero shifts — skip trajectory generation
+    if n.controls and n.controls.bypassed then
+      goto continue_note
+    end
+
+    local is_mod = is_note_modified(n)
+    local prev_mod = is_note_modified(prev_n)
+    local next_mod = is_note_modified(next_n)
+
+    -- If this note and both its neighbors are untouched, skip entirely
+    if not is_mod and not prev_mod and not next_mod then
+      goto continue_note
+    end
+
+    local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
+    local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
+
+    local trans_dur = math.min(get_effective(n, "transition_ms") * 0.001, 0.060)
+    trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
+
+    -- The time range this note corrects (grown below by its ramps and glides)
+    local range = is_mod and { t0 = n.start_time, t1 = n.end_time } or nil
+
+    -- A. START TRANSITION
+    local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
+    if prev_gap < legato_thresh and prev_n then
+      -- Legato transition with previous note: smoothstep blend centered at boundary
+      local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
+      local t_bnd = (prev_n.end_time + n.start_time) * 0.5
+      local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
+      local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
+
+      local steps = 5
+      for s = 0, steps do
+        local u = s / steps
+        local t = t_start + u * (t_end - t_start)
+        local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
+        table.insert(all_points, { time = t, val = val })
+      end
+      if is_mod or prev_mod then
+        spans[#spans + 1] = { kind = "glide", t0 = t_start, t1 = t_end, a = idx - 1, b = idx }
+        spans[#spans + 1] = { kind = "gap", t0 = prev_n.end_time, t1 = n.start_time, a = idx - 1, b = idx }
+        -- The glide belongs to the range of whichever side is edited; the previous note's range is the last one
+        if range then range.t0 = math.min(range.t0, t_start) end
+        local last = ranges[#ranges]
+        if prev_mod and last and not (prev_n.controls and prev_n.controls.bypassed) then
+          last.t1 = math.max(last.t1, t_end)
+        end
+      end
+    else
+      -- Onset from silence / start of take: smooth ramp into pitch shift
+      if is_mod and math.abs(start_shift) > 0.001 then
+        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
+        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
+        local t_pre = math.max(0.0, n.start_time - ramp_t)
+        table.insert(all_points, { time = t_pre, val = 0.0 })
+        local steps = 4
+        for s = 1, steps do
+          local u = s / steps
+          local t = t_pre + u * (n.start_time - t_pre)
+          local val = start_shift * smoothstep(u)
+          table.insert(all_points, { time = t, val = val })
+        end
+        spans[#spans + 1] = { kind = "onset", t0 = t_pre, t1 = n.start_time, a = idx }
+        range.t0 = math.min(range.t0, t_pre)
+      end
+    end
+
+    -- B. NOTE BODY
+    -- A scooped onset differs from frame to frame like a Stability / Vibrato change does: its frames are written.
+    -- A note with pitch points is also written frame by frame, up to each edge that is not joined to a neighbour.
+    local has_points = K.points_offsets(n) ~= nil
+    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0)
+      or scooped[idx] == true or has_points)
+    local body_t_start = n.start_time + trans_dur * 0.5
+    local body_t_end = n.end_time - trans_dur * 0.5
+    local start_written = false   -- section A already wrote a point at body_t_start (the end of its onset ramp)
+    if has_points then
+      if not (prev_gap < legato_thresh and prev_n) then
+        body_t_start = n.start_time
+        start_written = math.abs(start_shift) > 0.001
+      end
+      if not (next_n and (next_n.start_time - n.end_time) < legato_thresh) then
+        body_t_end = n.end_time   -- section C's release ramp starts after n.end_time (Onset Ramp >= 5 ms)
+      end
+    end
+
+    if not fine_changed then
+      -- Coarse shift or untouched: hold shift across body
+      if is_mod then
+        table.insert(all_points, { time = math.min(item_len, body_t_start), val = start_shift })
+        table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
+      end
+    else
+      -- Fine contour: sample frames across body to counteract drift / scale vibrato
+      if n.frames then
+        for i = 1, #n.frames do
+          local t = n.frames[i].time
+          if (t > body_t_start or (t == body_t_start and not start_written)) and t <= body_t_end then
+            table.insert(all_points, { time = math.min(item_len, t), val = n.frame_shifts[i] })
+          end
+        end
+      end
+    end
+
+    -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
+    local next_gap = next_n and (next_n.start_time - n.end_time) or 999
+    if next_gap >= legato_thresh then
+      if is_mod and math.abs(end_shift) > 0.001 then
+        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
+        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
+        local steps = 4
+        for s = 1, steps do
+          local u = s / steps
+          local t = math.min(item_len, n.end_time + u * ramp_t)
+          local val = end_shift * (1.0 - smoothstep(u))
+          table.insert(all_points, { time = t, val = val })
+        end
+        local t_post = math.min(item_len, n.end_time + ramp_t + 0.001)
+        table.insert(all_points, { time = t_post, val = 0.0 })
+        spans[#spans + 1] = { kind = "release", t0 = n.end_time, t1 = math.min(item_len, n.end_time + ramp_t), a = idx }
+        range.t1 = math.max(range.t1, t_post)
+      end
+    end
+
+    if range then ranges[#ranges + 1] = range end
+
+    ::continue_note::
+  end
+
+  -- Ranges are in note order; merge the ones that touch
+  local merged = {}
+  for _, r in ipairs(ranges) do
+    local last = merged[#merged]
+    if last and r.t0 <= last.t1 then
+      last.t1 = math.max(last.t1, r.t1)
+    else
+      merged[#merged + 1] = r
+    end
+  end
+
+  return { points = all_points, spans = spans, ranges = merged }
+end
+
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
 --- keep_pitch_mode leaves the item's I_PITCHMODE untouched (used by re-analysis, which applies no correction); so does
 --- the Settings option "Keep each item's own pitch algorithm" (state.keep_pitch_mode).
@@ -1972,10 +2545,14 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   end
 
   -- The envelope is rewritten from the model with today's defaults and overrides: the take is current again
-  if state.target_take_guid then state.stale_takes[state.target_take_guid] = nil end
+  if state.target_take_guid then
+    state.stale_takes[state.target_take_guid] = nil
+    state.stale_env[state.target_take_guid] = nil
+  end
 
   reaper.Undo_BeginBlock()
   state.undo_open = true
+  K.frame_view_memo.frame = nil   -- the canvas fetches the changed correction again (K.frame_view)
 
   -- Set pitch shift mode (Elastique Soloist Monophonic by default), unless the user keeps each item's own
   if not keep_pitch_mode and not state.keep_pitch_mode and state.pitchmode_value ~= -1 then
@@ -2022,157 +2599,8 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
     return true
   end
 
-  -- 1. Precalculate continuous frame shifts for every note
-  for _, n in ipairs(state.notes) do
-    n.frame_shifts = {}
-    -- Per-note bypass: zero out all shifts
-    if n.controls and n.controls.bypassed then
-      if n.frames then
-        for i = 1, #n.frames do
-          n.frame_shifts[i] = 0.0
-        end
-      end
-    else
-      local is_mod = is_note_modified(n)
-      local retune = get_effective(n, "retune_speed")
-      local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
-      local d_scale = (n.controls and n.controls.drift_scale) or 1.0
-      local v_scale = (n.controls and n.controls.vibrato_scale) or 1.0
-      if n.frames then
-        for i = 1, #n.frames do
-          if not is_mod then
-            n.frame_shifts[i] = 0.0
-          else
-            local vw = (n.vibrato_weight and n.vibrato_weight[i]) or 0.0
-            local drift_corr = (n.trend and n.trend[i]) and ((n.trend[i] - n.avg_note) * (d_scale - 1.0)) or 0.0
-            local vib_corr = (n.modulation and n.modulation[i]) and (n.modulation[i] * (v_scale - 1.0) * vw) or 0.0
-            n.frame_shifts[i] = coarse + drift_corr + vib_corr
-          end
-        end
-
-        -- Scoop/glide shaping: blend onset frames toward body target
-        local scoop = (n.controls and n.controls.scoop_shape) or 0
-        if scoop > 0 and is_mod and n.voiced_start_idx then
-          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
-          if onset_end > 1 and onset_end < #n.frames then
-            local body_shift = n.frame_shifts[math.min(onset_end + 1, #n.frames)]
-            for i = 1, onset_end do
-              local onset_u = i / onset_end  -- 0→1 across onset
-              local natural = n.frame_shifts[i]
-              n.frame_shifts[i] = natural + (body_shift - natural) * scoop * (1 - onset_u)
-            end
-          end
-        end
-      end
-    end
-  end
-
-  -- 2. Build continuous trajectory across notes and boundaries
-  local all_points = {}
-  local num_notes = #state.notes
-  local legato_thresh = get_effective(nil, "legato_threshold_ms") * 0.001
-
-  for idx = 1, num_notes do
-    local n = state.notes[idx]
-    local prev_n = state.notes[idx - 1]
-    local next_n = state.notes[idx + 1]
-
-    -- Bypassed notes produce zero shifts — skip trajectory generation
-    if n.controls and n.controls.bypassed then
-      goto continue_note
-    end
-
-    local is_mod = is_note_modified(n)
-    local prev_mod = is_note_modified(prev_n)
-    local next_mod = is_note_modified(next_n)
-
-    -- If this note and both its neighbors are untouched, skip entirely
-    if not is_mod and not prev_mod and not next_mod then
-      goto continue_note
-    end
-
-    local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
-    local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
-
-    local trans_dur = math.min(get_effective(n, "transition_ms") * 0.001, 0.060)
-    trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
-
-    -- A. START TRANSITION
-    local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
-    if prev_gap < legato_thresh and prev_n then
-      -- Legato transition with previous note: smoothstep blend centered at boundary
-      local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
-      local t_bnd = (prev_n.end_time + n.start_time) * 0.5
-      local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
-      local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
-
-      local steps = 5
-      for s = 0, steps do
-        local u = s / steps
-        local t = t_start + u * (t_end - t_start)
-        local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
-        table.insert(all_points, { time = t, val = val })
-      end
-    else
-      -- Onset from silence / start of take: smooth ramp into pitch shift
-      if is_mod and math.abs(start_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
-        local t_pre = math.max(0.0, n.start_time - ramp_t)
-        table.insert(all_points, { time = t_pre, val = 0.0 })
-        local steps = 4
-        for s = 1, steps do
-          local u = s / steps
-          local t = t_pre + u * (n.start_time - t_pre)
-          local val = start_shift * smoothstep(u)
-          table.insert(all_points, { time = t, val = val })
-        end
-      end
-    end
-
-    -- B. NOTE BODY
-    local fine_changed = is_mod and (((n.controls.drift_scale or 1.0) ~= 1.0) or ((n.controls.vibrato_scale or 1.0) ~= 1.0))
-    local body_t_start = n.start_time + trans_dur * 0.5
-    local body_t_end = n.end_time - trans_dur * 0.5
-
-    if not fine_changed then
-      -- Coarse shift or untouched: hold shift across body
-      if is_mod then
-        table.insert(all_points, { time = math.min(item_len, body_t_start), val = start_shift })
-        table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
-      end
-    else
-      -- Fine contour: sample frames across body to counteract drift / scale vibrato
-      if n.frames then
-        for i = 1, #n.frames do
-          local t = n.frames[i].time
-          if t >= body_t_start and t <= body_t_end then
-            table.insert(all_points, { time = math.min(item_len, t), val = n.frame_shifts[i] })
-          end
-        end
-      end
-    end
-
-    -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
-    local next_gap = next_n and (next_n.start_time - n.end_time) or 999
-    if next_gap >= legato_thresh then
-      if is_mod and math.abs(end_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
-        local steps = 4
-        for s = 1, steps do
-          local u = s / steps
-          local t = math.min(item_len, n.end_time + u * ramp_t)
-          local val = end_shift * (1.0 - smoothstep(u))
-          table.insert(all_points, { time = t, val = val })
-        end
-        local t_post = math.min(item_len, n.end_time + ramp_t + 0.001)
-        table.insert(all_points, { time = t_post, val = 0.0 })
-      end
-    end
-
-    ::continue_note::
-  end
+  -- 1-2. The trajectory (frame shifts, scoop, ramps, glides): the same one the canvas draws
+  local all_points = K.correction_build(state.notes, item_len).points
 
   -- 3. Adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
   local simplified = rdp_simplify(all_points, 0.01)
@@ -2185,6 +2613,100 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   reaper.UpdateArrange()
   end_apply(take, undo_desc)
   return true
+end
+
+--- Whether the pitch envelope of the session take `guid` differs from what its note model and today's settings
+--- would write: a global default changed while another item was open, the script that wrote it computed the
+--- correction differently, or the item was changed since. It is read from the project, so it is true after a
+--- restart of the script too (a flag kept in memory was lost there, and the item then looked current).
+--- Returns stale (boolean) and, when stale, the points { time, val } the envelope holds, sorted by time.
+K.envelope_check = function(guid)
+  local data = state.session_takes[guid]
+  local take = data and resolve_take_by_guid(guid, true) or nil
+  if not take then return false end
+  local item = reaper.GetMediaItemTake_Item(take)
+  if not item then return false end
+  local notes = (guid == state.target_take_guid) and state.notes or data.notes
+  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0)
+
+  local function by_time(p, q)
+    if p.time ~= q.time then return p.time < q.time end
+    return p.val < q.val
+  end
+
+  -- What apply_envelope_to_take would write. get_effective reads the item values of the target take, so the
+  -- take stands in as the target for the length of the calculation.
+  local expected = {}
+  if notes and #notes > 0 then
+    local saved = state.target_take_guid
+    state.target_take_guid = guid
+    local ok, build = pcall(K.correction_build, notes, item_len)
+    state.target_take_guid = saved
+    if not ok then return false end   -- a model this script cannot compute is not called stale
+    for _, pt in ipairs(rdp_simplify(build.points, 0.01)) do
+      expected[#expected + 1] = { time = math.max(0.0, math.min(item_len, pt.time)), val = pt.val }
+    end
+    table.sort(expected, by_time)
+  end
+
+  -- What the item holds. The script writes Bezier points (shape 5); a point of another shape is not its own
+  -- (REAPER keeps a default point at the start of an envelope).
+  local actual, written = {}, {}
+  local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+  if env then
+    for i = 0, (reaper.CountEnvelopePointsEx(env, -1) or 0) - 1 do
+      local ok, t, v, shape = reaper.GetEnvelopePointEx(env, -1, i)
+      if ok then
+        local pt = { time = t, val = v }
+        actual[#actual + 1] = pt
+        if shape == 5 then written[#written + 1] = pt end
+      end
+    end
+  end
+  table.sort(actual, by_time)
+  table.sort(written, by_time)
+  -- That default point is Bezier when the user's default point shape is: one extra zero at the very start is not a difference
+  if #written == #expected + 1 and math.abs(written[1].time) < 0.0001 and math.abs(written[1].val) < 0.0001 then
+    table.remove(written, 1)
+  end
+
+  local same = (#written == #expected)
+  if same then
+    for i = 1, #expected do
+      if math.abs(written[i].time - expected[i].time) > 0.0002 or math.abs(written[i].val - expected[i].val) > 0.0002 then
+        same = false
+        break
+      end
+    end
+  end
+  if same then return false end
+  return true, actual
+end
+
+--- Ask for the envelope of every session take to be compared again (after the project changed, or a global
+--- default did). The work is done one take per frame by K.stale_check_step.
+K.queue_stale_checks = function()
+  local q = state.stale_queue
+  for i = #q, 1, -1 do q[i] = nil end
+  for i, guid in ipairs(state.session_order) do q[i] = guid end
+end
+
+--- Compare the envelope of one queued take (once per frame at most; nothing when the queue is empty). It waits
+--- while a gesture or an analysis is in progress: the model is then ahead of the envelope on purpose.
+K.stale_check_step = function(sctx)
+  local q = state.stale_queue
+  if #q == 0 then return end
+  if state.is_analyzing or state.drag or state.edge_drag or state.point_drag or state.nudge_burst or state.undo_open
+      or reaper.ImGui_IsAnyItemActive(sctx) then
+    return
+  end
+  local guid = table.remove(q)
+  local stale, points = false, nil
+  if state.session_takes[guid] and not state.missing_takes[guid] then
+    stale, points = K.envelope_check(guid)
+  end
+  state.stale_takes[guid] = stale or nil
+  state.stale_env[guid] = stale and { points = points } or nil
 end
 
 --- Commit the pending arrow-key nudge (if any) as ONE named undo point.
@@ -2351,6 +2873,7 @@ reset_selected_note = function()
           or ctrl.bypassed then
         any_changed = true
       end
+      if K.points_reset(sel) > 0 then any_changed = true end
       ctrl.center_pitch = sel.avg_note
       ctrl.drift_scale = 1.0
       ctrl.vibrato_scale = 1.0
@@ -2436,7 +2959,9 @@ split_note_at = function(note_idx, split_time)
   -- Validate minimum size (3 frames, ~35ms)
   if #frames_a < 3 or #frames_b < 3 then return false, too_short end
 
-  -- Preserve the user's pitch offset (semitones from original avg)
+  -- Preserve the user's pitch offset (semitones from original avg). extract_note_features replaces avg_note with its
+  -- own centre (energy-weighted, over the sustained core), so each half's target is set from that centre afterwards:
+  -- a target built on the plain frame mean would shift the half by the difference between the two.
   local old_ctrl = note.controls
   local pitch_offset = old_ctrl and (old_ctrl.center_pitch - note.avg_note) or 0
 
@@ -2454,7 +2979,6 @@ split_note_at = function(note_idx, split_time)
     frames = frames_a,
   }
   extract_note_features(note_a, {
-    center_pitch = avg_a + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
     transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
@@ -2463,6 +2987,8 @@ split_note_at = function(note_idx, split_time)
     scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
     bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
+  note_a.controls.center_pitch = note_a.avg_note + pitch_offset
+  K.points_transfer(note_a, { note }, {})
 
   -- Build note B (right half)
   local sum_b = 0
@@ -2478,7 +3004,6 @@ split_note_at = function(note_idx, split_time)
     frames = frames_b,
   }
   extract_note_features(note_b, {
-    center_pitch = avg_b + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
     transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
@@ -2487,6 +3012,8 @@ split_note_at = function(note_idx, split_time)
     scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
     bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
+  note_b.controls.center_pitch = note_b.avg_note + pitch_offset
+  K.points_transfer(note_b, { note }, {})
 
   -- Splice into notes array
   state.notes[note_idx] = note_a
@@ -2500,7 +3027,7 @@ split_note_at = function(note_idx, split_time)
 end
 
 -- Merges all contiguous selected notes into a single note.
--- Uses duration-weighted pitch averaging to preserve user tuning intent.
+-- The merged note is shifted by the duration-weighted average of the shifts the old notes had (0 when none was moved).
 -- Returns true and whether the change was written to the take (an undo point) when the notes were merged, else false
 -- and the reason in the user's words (the caller puts it in the status line).
 merge_selected_notes = function()
@@ -2565,9 +3092,9 @@ merge_selected_notes = function()
 
   if #merged_frames < 3 then return false, "Can't merge: the merged note would have too few analysis frames" end
 
-  -- Duration-weighted pitch target from user tuning
+  -- Duration-weighted pitch offset (target minus detected centre) from user tuning
   local total_dur = 0
-  local weighted_pitch = 0
+  local weighted_offset = 0
   local weighted_drift = 0
   local weighted_vibrato = 0
   for _, idx in ipairs(indices) do
@@ -2575,11 +3102,10 @@ merge_selected_notes = function()
     local dur = n.end_time - n.start_time
     total_dur = total_dur + dur
     if n.controls then
-      weighted_pitch = weighted_pitch + n.controls.center_pitch * dur
+      weighted_offset = weighted_offset + (n.controls.center_pitch - n.avg_note) * dur
       weighted_drift = weighted_drift + n.controls.drift_scale * dur
       weighted_vibrato = weighted_vibrato + n.controls.vibrato_scale * dur
     else
-      weighted_pitch = weighted_pitch + n.avg_note * dur
       weighted_drift = weighted_drift + 1.0 * dur
       weighted_vibrato = weighted_vibrato + 1.0 * dur
     end
@@ -2600,7 +3126,6 @@ merge_selected_notes = function()
   }
 
   extract_note_features(merged, {
-    center_pitch = total_dur > 0 and (weighted_pitch / total_dur) or avg_note,
     drift_scale = total_dur > 0 and (weighted_drift / total_dur) or 1.0,
     vibrato_scale = total_dur > 0 and (weighted_vibrato / total_dur) or 1.0,
     transition_ms = first_note.controls and first_note.controls.transition_ms or nil,
@@ -2609,6 +3134,17 @@ merge_selected_notes = function()
     scoop_shape = first_note.controls and first_note.controls.scoop_shape or nil,
     bypassed = false,
   })
+  -- The target follows the centre extract_note_features found (see split_note_at)
+  merged.controls.center_pitch = merged.avg_note + (total_dur > 0 and (weighted_offset / total_dur) or 0)
+  -- The bend of every old note carries over; a square holds each old boundary (inner end and start)
+  local old_notes, pin_times = {}, {}
+  for i, idx in ipairs(indices) do
+    local n = state.notes[idx]
+    old_notes[i] = n
+    if i > 1 then pin_times[#pin_times + 1] = n.start_time end
+    if i < #indices then pin_times[#pin_times + 1] = n.end_time end
+  end
+  K.points_transfer(merged, old_notes, pin_times)
 
   -- Replace in array: put merged note at first index, remove the rest
   local first_idx = indices[1]
@@ -2626,7 +3162,8 @@ end
 
 -- Trims the left or right edge of a note to a new time boundary.
 -- Filters or extends frames, preserves pitch offset, re-extracts features. A trim that would leave the note with
--- fewer than 3 frames is refused (the edge snaps back) and says so in the status line.
+-- fewer than 3 frames is refused (the edge snaps back) and says so in the status line. The note's pitch points carry
+-- over (K.points_transfer); returns how many stored points lay outside the trimmed note and were removed.
 trim_note_edge = function(note_idx, edge, new_time)
   if not state.notes or not state.notes[note_idx] then return end
   local note = state.notes[note_idx]
@@ -2695,6 +3232,12 @@ trim_note_edge = function(note_idx, edge, new_time)
   for _, f in ipairs(new_frames) do sum_note = sum_note + f.note end
   local avg_note = sum_note / #new_frames
 
+  -- The note as it was (rebuilt in place below), for its points; when it grew, a square holds the old edge
+  local old_note = { start_time = note.start_time, end_time = note.end_time, frames = note.frames,
+    smart_spots = note.smart_spots, controls = old_ctrl, points_rev = note.points_rev, points_cache = note.points_cache }
+  local old_edge = (edge == "left") and note.start_time or note.end_time
+  local grew = (edge == "left" and new_start < old_edge) or (edge == "right" and new_end > old_edge)
+
   note.start_time = new_start
   note.end_time = new_end
   note.frames = new_frames
@@ -2704,7 +3247,6 @@ trim_note_edge = function(note_idx, edge, new_time)
   note.display_note = math.floor(avg_note + 0.5)
 
   extract_note_features(note, {
-    center_pitch = avg_note + pitch_offset,
     drift_scale = old_ctrl and old_ctrl.drift_scale or 1.0,
     vibrato_scale = old_ctrl and old_ctrl.vibrato_scale or 1.0,
     transition_ms = old_ctrl and old_ctrl.transition_ms or nil,
@@ -2713,8 +3255,12 @@ trim_note_edge = function(note_idx, edge, new_time)
     scoop_shape = old_ctrl and old_ctrl.scoop_shape or nil,
     bypassed = old_ctrl and old_ctrl.bypassed or false,
   })
+  note.controls.center_pitch = note.avg_note + pitch_offset   -- from the centre extract_note_features found
+  local dropped = K.points_transfer(note, { old_note }, grew and { old_edge } or {})
 
-  apply_envelope_to_take("Trim Note Edge")
+  -- `dropped` only when the write made an undo point (the caller's status names it)
+  if not apply_envelope_to_take("Trim Note Edge") then return 0 end
+  return dropped
 end
 
 local function run_hybrid_segmentation()
@@ -2930,8 +3476,28 @@ end
 -- 4. GUI
 -------------------------------------------------------------------------------
 
--- Press state of every param_drag control: [id] = { ctrl = Ctrl/Cmd held at press, dragged = mouse moved }
+-- Press state of every param_drag control: [id] = { ctrl = Ctrl/Cmd held at press, dragged = mouse moved,
+-- raw = the caller's value when the press began (K.drag_revert) }
 local drag_state = {}
+
+-- Whether the control param_drag drew last is under the pointer / being dragged or typed into, and whether its press
+-- began this frame. esc_used: a drag was cancelled with Esc this frame, so that Esc is spent (HC5: the active edit is
+-- innermost); the window's own Esc handling reads and clears it.
+K.drag_hot = { hovered = false, active = false, activated = false, esc_used = false }
+
+--- Report that the setting `key` is hovered (dragging = false) or being changed (true) this frame, so the canvas
+--- shades where it acts. notes: nil for a top bar value (every note it reaches), or a set of note indices.
+--- A drag is not replaced by a hover reported in the same frame.
+K.setting_hint = function(hctx, key, dragging, notes)
+  local frame = reaper.ImGui_GetFrameCount(hctx) or 0
+  local h = state.setting_hint
+  if h.frame == frame and h.dragging and not dragging then return end
+  h.key, h.dragging, h.notes, h.frame = key, dragging, notes, frame
+end
+
+local function plural(n, one, many)
+  return n == 1 and one or many
+end
 
 --- Numeric part of a display format for the typed-entry field: "%.0f%%" -> "%.0f", "%.0f ms" -> "%.0f".
 local function typed_format(fmt)
@@ -2946,10 +3512,12 @@ end
 ---   label  visible text right of the control (nil / "" = none)
 ---   speed  value units per pixel (default: (hi - lo) / the item width in pixels, so a drag across the whole
 ---          control sweeps the whole range whatever its width; Ctrl/Cmd fine adjust is FINE_ADJUST_SCALE x that)
---- Returns changed, value, committed, reset:
+--- Returns changed, value, committed, reset, cancelled:
 ---   changed    the value moved (a drag frame, or a typed entry confirmed); value is clamped to [lo, hi]
 ---   committed  the edit is done: the drag was released after an edit, the typed entry was confirmed, or reset
 ---   reset      double-click: the caller restores its own default (the value returned is the input, untouched)
+---   cancelled  HC5: the drag ended while the mouse button was still held (Esc): nothing is committed, and a caller
+---              that wrote the value while it moved puts back the one from before the drag (K.drag_revert)
 --- Test the gestures right here: no other item may be submitted between this call and the caller's
 --- BeginPopupContextItem / IsItemHovered.
 local function param_drag(pctx, id, label, value, lo, hi, fmt, speed)
@@ -2969,16 +3537,27 @@ local function param_drag(pctx, id, label, value, lo, hi, fmt, speed)
   local released = reaper.ImGui_IsItemDeactivated(pctx)
   local committed = reaper.ImGui_IsItemDeactivatedAfterEdit(pctx) == true
   local reset = reaper.ImGui_IsItemHovered(pctx) and reaper.ImGui_IsMouseDoubleClicked(pctx, 0) or false
+  K.drag_hot.hovered = reaper.ImGui_IsItemHovered(pctx) == true
+  K.drag_hot.active = reaper.ImGui_IsItemActive(pctx) == true
+  K.drag_hot.activated = reaper.ImGui_IsItemActivated(pctx) == true
+  -- A mouse drag ends by itself only when the button comes up: ended with the button still held, it was cancelled
+  -- (Esc clears ImGui's active item, which it also reports as an edit released)
+  local cancelled = released and reaper.ImGui_IsMouseDown(pctx, 0) == true
+  if cancelled then
+    committed, reset = false, false
+    K.drag_hot.esc_used = true
+  end
 
   -- HC3: Ctrl/Cmd-click released without dragging opens the typed entry
   local popup = "###type_" .. id
-  if released and st.ctrl and not st.dragged and not reset then
+  if released and st.ctrl and not st.dragged and not reset and not cancelled then
     reaper.ImGui_OpenPopup(pctx, popup)
   end
   if released or reset then st.ctrl = false end
   if reaper.ImGui_BeginPopup(pctx, popup) then
     -- HC5: Esc discards the entry; an active field handles it itself (below), this covers a lost focus
     if reaper.ImGui_Shortcut(pctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(pctx) end
+    K.drag_hot.active = true   -- the typed entry is open: the value is being changed
     if reaper.ImGui_IsWindowAppearing(pctx) then
       reaper.ImGui_SetKeyboardFocusHere(pctx)
       st.text = string.format(typed_format(fmt), value)
@@ -2999,8 +3578,20 @@ local function param_drag(pctx, id, label, value, lo, hi, fmt, speed)
     reaper.ImGui_EndPopup(pctx)
   end
 
-  if reset then return false, value, true, true end
-  return rv == true, v, committed, false
+  if reset then return false, value, true, true, false end
+  if cancelled then return false, value, false, false, true end
+  return rv == true, v, committed, false, false
+end
+
+--- For a param_drag caller that writes the value while it moves. Call right after param_drag with `raw`, the caller's
+--- own value as it read it before drawing the control: it is remembered when the press begins, and returned when the
+--- drag was cancelled (Esc) so the caller can put it back; nil otherwise. `raw` must not be nil.
+K.drag_revert = function(id, raw, cancelled)
+  local st = drag_state[id]
+  if not st then return nil end
+  if K.drag_hot.activated then st.raw = raw end
+  if cancelled then return st.raw end
+  return nil
 end
 
 -------------------------------------------------------------------------------
@@ -3016,7 +3607,7 @@ end
 --   * the data: the analysis frames (state.results only ever grows by appending, a new analysis or a reload makes a
 --     new table, and no frame is changed after it is made) and, per note, the identity of its frames / trend /
 --     modulation / vibrato arrays (a split, merge, trim or re-extraction makes new ones; none is written in place)
---     plus the numbers the preview line reads (average pitch, pitch / stability / vibrato controls, retune speed)
+--     plus, for the preview, everything the correction reads (K.correction_view compares it all each frame)
 -- Edits therefore show on the very next frame, and a frame that changed nothing rebuilds nothing.
 -------------------------------------------------------------------------------
 
@@ -3249,36 +3840,439 @@ K.note_trend = function(note, f0, f1, t_to_x)
   return e.t_arr
 end
 
---- The coordinates of the corrected-pitch preview line of `note` over its frames f0 .. f1, as an array for
---- DrawList_AddPolyline. The note must have controls, a trend and a modulation.
-K.note_preview = function(note, f0, f1, t_to_x)
-  local dc = state.draw_cache
-  local e = K.note_entry(note)
-  local ctrl = note.controls
-  local retune = get_effective(note, "retune_speed")
-  if not (e.p_arr and e.p_gen == dc.gen and e.p_frames == note.frames and e.p_trend == note.trend
-      and e.p_mod == note.modulation and e.p_vw == note.vibrato_weight and e.p_avg == note.avg_note
-      and e.p_cp == ctrl.center_pitch and e.p_ds == ctrl.drift_scale and e.p_vs == ctrl.vibrato_scale
-      and e.p_ret == retune and e.p_f0 == f0 and e.p_f1 == f1) then
-    local m = dc.map
-    local coarse_shift = (ctrl.center_pitch - note.avg_note) * retune
-    local arr = K.fit_array(e.p_arr, (f1 - f0 + 1) * 2)
-    local idx = 1
-    for i = f0, f1 do
-      local frame = note.frames[i]
-      local vw = (note.vibrato_weight and note.vibrato_weight[i]) or 0.0
-      local drift_corr = (note.trend[i] - note.avg_note) * (ctrl.drift_scale - 1.0)
-      local vib_corr = note.modulation[i] * (ctrl.vibrato_scale - 1.0) * vw
-      local target = frame.note + coarse_shift + drift_corr + vib_corr
-      arr[idx] = t_to_x(frame.time)
-      arr[idx + 1] = m.py + m.h - ((target - m.min) / m.range) * m.h
-      idx = idx + 2
-    end
-    e.p_arr, e.p_gen, e.p_frames, e.p_trend, e.p_mod, e.p_vw = arr, dc.gen, note.frames, note.trend, note.modulation, note.vibrato_weight
-    e.p_avg, e.p_cp, e.p_ds, e.p_vs, e.p_ret, e.p_f0, e.p_f1 =
-      note.avg_note, ctrl.center_pitch, ctrl.drift_scale, ctrl.vibrato_scale, retune, f0, f1
+--- Store v at sig[k]; true when that changed it.
+K.sig_set = function(sig, k, v)
+  if sig[k] ~= v then
+    sig[k] = v
+    return true
   end
-  return e.p_arr
+  return false
+end
+
+--- The correction of `notes` for the canvas: K.correction_build's result with its points sorted by time, and a
+--- gen that counts the rebuilds. It is rebuilt only when something the trajectory reads changed (every note's
+--- extent, arrays and controls, the effective Strength / Transition / Onset Ramp of each and the Legato Gap),
+--- compared each frame without allocating; so a value dragged in the top bar shows on the next frame and a
+--- frame that changed nothing rebuilds nothing. `item` gives the length the points are clamped to.
+K.correction_view = function(notes, item)
+  local dc = state.draw_cache
+  local cv = dc.corr
+  if not cv then
+    cv = { sig = {}, n = 0, gen = 0 }
+    dc.corr = cv
+  end
+  local sig, set = cv.sig, K.sig_set
+  local k, changed = 1, set(cv.sig, 1, notes)
+  for i = 1, #notes do
+    local n = notes[i]
+    local c = n.controls
+    changed = set(sig, k + 1, n.start_time) or changed
+    changed = set(sig, k + 2, n.end_time) or changed
+    changed = set(sig, k + 3, n.frames) or changed
+    changed = set(sig, k + 4, n.trend) or changed
+    changed = set(sig, k + 5, n.modulation) or changed
+    changed = set(sig, k + 6, n.vibrato_weight) or changed
+    changed = set(sig, k + 7, n.avg_note) or changed
+    changed = set(sig, k + 8, n.voiced_start_idx) or changed
+    changed = set(sig, k + 9, c and c.bypassed or false) or changed
+    changed = set(sig, k + 10, c and c.center_pitch) or changed
+    changed = set(sig, k + 11, c and c.drift_scale) or changed
+    changed = set(sig, k + 12, c and c.vibrato_scale) or changed
+    changed = set(sig, k + 13, c and c.scoop_shape or 0) or changed
+    changed = set(sig, k + 14, get_effective(n, "retune_speed")) or changed
+    changed = set(sig, k + 15, get_effective(n, "transition_ms")) or changed
+    changed = set(sig, k + 16, get_effective(n, "onset_ramp_ms")) or changed
+    -- An override that equals the inherited value still makes the note "edited"
+    changed = set(sig, k + 17, is_note_modified(n)) or changed
+    changed = set(sig, k + 18, n.points_rev or 0) or changed
+    k = k + 18
+  end
+  changed = set(sig, k + 1, get_effective(nil, "legato_threshold_ms")) or changed
+  k = k + 1
+  if cv.n ~= k then
+    cv.n = k
+    changed = true
+  end
+
+  if changed or not cv.build then
+    local item_len = item and reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or nil
+    item_len = math.max(0.1, tonumber(item_len) or math.huge)
+    local build = K.correction_build(notes, item_len)
+    local pts = build.points
+    for i = 1, #pts do pts[i].seq = i end
+    table.sort(pts, function(p, q)
+      if p.time ~= q.time then return p.time < q.time end
+      return p.seq < q.seq
+    end)
+    cv.gen = cv.gen + 1
+    build.gen = cv.gen
+    cv.build = build
+  end
+  return cv.build
+end
+
+--- K.correction_view for the canvas, fetched at most once per frame (draw_graph's first caller fetches it, the
+--- others reuse it); a write (apply_envelope_to_take) or other notes / item fetch it again.
+K.frame_view_memo = { frame = nil, notes = nil, item = nil, build = nil }
+K.frame_view = function(fctx, notes, item)
+  local m = K.frame_view_memo
+  local f = reaper.ImGui_GetFrameCount(fctx) or 0
+  if m.frame ~= f or m.notes ~= notes or m.item ~= item or not m.build then
+    m.frame, m.notes, m.item, m.build = f, notes, item, K.correction_view(notes, item)
+  end
+  return m.build
+end
+
+--- True when the pitch points of note n_idx are drawn: the layer is on and the note is the hovered one (`hovered`),
+--- the one whose box holds the pointer (state.points_hover_note, see K.points_box_has), or a selected one.
+K.points_shown = function(n_idx, hovered)
+  return state.show_smart_spots and (hovered == n_idx or state.points_hover_note == n_idx
+    or state.selected_note == n_idx or state.selected_notes[n_idx] == true)
+end
+
+--- True when the note's points can be hovered, grabbed and added to: a semitone row (row_h px) is at least
+--- K.POINT_GRAB tall and its knots are on average at least K.POINT_GRAB apart across its block (block_w px).
+--- Otherwise they are drawn at half size and the note behaves as if it had none.
+K.points_live = function(note, row_h, block_w)
+  local n = #K.points_knots(note)
+  return row_h >= K.POINT_GRAB and (n < 2 or block_w / (n - 1) >= K.POINT_GRAB)
+end
+
+--- K.points_live for the note as the canvas maps it (t_to_x / pitch_to_y as in K.point_hit).
+K.points_live_at = function(note, t_to_x, pitch_to_y)
+  return K.points_live(note, pitch_to_y(0) - pitch_to_y(1), t_to_x(note.end_time) - t_to_x(note.start_time))
+end
+
+--- How far above and below a point at canvas y its grab area reaches: K.POINT_GRAB, but at most a quarter of the
+--- note's block height where y lies inside the block (the block keeps half its height for its trim handles and zones).
+K.point_reach_y = function(note, y, pitch_to_y)
+  local cp = note.controls and note.controls.center_pitch
+  if not cp then return K.POINT_GRAB end
+  local top, bot = pitch_to_y(cp + 0.5), pitch_to_y(cp - 0.5)
+  if y >= top and y <= bot then return math.min(K.POINT_GRAB, (bot - top) / 4) end
+  return K.POINT_GRAB
+end
+
+--- True when (mx, my) lies inside the box around the note's block and the aim pitches of its points in view
+--- (t0 .. t1), padded by K.POINT_GRAB: a dot above or below the block stays shown while the pointer goes to it.
+K.points_box_has = function(note, mx, my, t0, t1, t_to_x, pitch_to_y, build)
+  if not (note.controls and note.frames) then return false end
+  local g = K.POINT_GRAB
+  if mx < t_to_x(note.start_time) - g or mx > t_to_x(note.end_time) + g then return false end
+  local cp = note.controls.center_pitch
+  local y0, y1 = pitch_to_y(cp + 0.5), pitch_to_y(cp - 0.5)
+  for _, k in ipairs(K.points_knots(note)) do
+    local aim = (k.t >= t0 and k.t <= t1) and K.point_aim(note, k.frame, build) or nil
+    if aim then
+      local y = pitch_to_y(aim)
+      y0, y1 = math.min(y0, y), math.max(y1, y)
+    end
+  end
+  return my >= y0 - g and my <= y1 + g
+end
+
+--- The pitch a point aims for: the sung pitch at its frame plus the note's correction there. `build` is
+--- K.correction_view's result; without one the note's frame_shifts are stale and count as 0. On a bypassed note
+--- the sung pitch (its correction is not in effect). nil without a pitch.
+K.point_aim = function(note, frame, build)
+  local fr = note.frames and note.frames[frame]
+  if not (fr and fr.note) then return nil end
+  local bypassed = note.controls and note.controls.bypassed
+  local shift = build and note.frame_shifts and not bypassed and note.frame_shifts[frame] or 0
+  return fr.note + shift
+end
+
+--- The live pitch point (K.points_live) whose grab area holds (mx, my), nearest first: { note_idx, frame }, or nil.
+--- A grab area reaches K.POINT_GRAB sideways but never past half the gap to a neighbouring knot, and up and down
+--- as K.point_reach_y. Only the notes whose points are shown (K.points_shown, `hovered` = last frame's hovered note)
+--- and the points inside the visible window t0 .. t1; bypassed notes only when `bypassed` is true, else none.
+--- t_to_x / pitch_to_y map onto the canvas; build as in K.point_aim.
+K.point_hit = function(notes, hovered, mx, my, t0, t1, t_to_x, pitch_to_y, build, bypassed)
+  local best, best_d = nil, math.huge
+  for n_idx, note in ipairs(notes) do
+    local is_bypassed = (note.controls and note.controls.bypassed) and true or false
+    if is_bypassed == (bypassed == true) and note.frames and K.points_shown(n_idx, hovered)
+        and K.points_live_at(note, t_to_x, pitch_to_y) then
+      local knots = K.points_knots(note)
+      for j, k in ipairs(knots) do
+        local aim = (k.t >= t0 and k.t <= t1) and K.point_aim(note, k.frame, build) or nil
+        if aim then
+          local x, y = t_to_x(k.t), pitch_to_y(aim)
+          local reach_x = K.POINT_GRAB
+          if knots[j - 1] then reach_x = math.min(reach_x, (x - t_to_x(knots[j - 1].t)) / 2) end
+          if knots[j + 1] then reach_x = math.min(reach_x, (t_to_x(knots[j + 1].t) - x) / 2) end
+          local dx, dy = math.abs(x - mx), math.abs(y - my)
+          if dx <= reach_x and dy <= K.point_reach_y(note, y, pitch_to_y) and dx + dy < best_d then
+            best, best_d = { note_idx = n_idx, frame = k.frame }, dx + dy
+          end
+        end
+      end
+    end
+  end
+  return best
+end
+
+--- Where a point may be added on `note` at time t (item seconds): the frame nearest to t, or nil and a reason:
+--- "no_pitch" (that frame has no pitch) or "too_close" (fewer than K.POINT_MIN_GAP frames from a knot).
+K.point_can_add = function(note, t)
+  local frames = note.frames
+  if not (note.controls and frames and #frames > 0) then return nil, "no_pitch" end
+  local f = K.points_frame_at(frames, t)
+  if not frames[f].note then return nil, "no_pitch" end
+  for _, k in ipairs(K.points_knots(note)) do
+    if math.abs(k.frame - f) < K.POINT_MIN_GAP then return nil, "too_close" end
+  end
+  return f
+end
+
+--- Add a point at 0 to `note` at the frame nearest to t (K.point_can_add): returns its knot, or nil and the reason.
+--- No REAPER calls: the caller writes the change (apply_envelope_to_take).
+K.point_add = function(note, t)
+  local f, reason = K.point_can_add(note, t)
+  if not f then return nil, reason end
+  local ft = note.frames[f].time
+  local list = note.controls.points or {}
+  local pos = #list + 1
+  for i, e in ipairs(list) do
+    if e.t > ft then pos = i break end
+  end
+  table.insert(list, pos, { t = ft, st = 0, added = true })
+  note.controls.points = list
+  note.points_rev = (note.points_rev or 0) + 1
+  return K.point_knot_at(note, f)
+end
+
+--- The drag zone of a note block spanning sx .. ex (px) at x: "drift" (left quarter), "vibrato" (right quarter)
+--- or "pitch", each side zone at least 12 px.
+K.note_zone = function(x, sx, ex)
+  local zone_w = math.max(12, (ex - sx) * 0.25)
+  if x < sx + zone_w then return "drift" elseif x > ex - zone_w then return "vibrato" end
+  return "pitch"
+end
+
+--- Today's Ctrl/Cmd-click on note n_idx: toggle it in or out of the selection (an added note becomes the primary).
+K.toggle_note_selection = function(n_idx)
+  if state.selected_notes[n_idx] then
+    state.selected_notes[n_idx] = nil
+    if state.selected_note == n_idx then
+      state.selected_note = next(state.selected_notes)
+    end
+  else
+    state.selected_notes[n_idx] = true
+    state.selected_note = n_idx
+  end
+end
+
+--- Draw the pitch points of the notes whose points are shown (K.points_shown), each at its aim pitch (K.point_aim):
+--- a circle for a detected point, a diamond for the start and end, a square for an added one (shape, not colour
+--- alone); a moved point carries a 1 px stem from where it sits at 0, under the points. The hovered or dragged
+--- point is drawn at the diamond size with a C.handle_hover outline. The points of a note that is not live
+--- (K.points_live) are drawn at half size; a bypassed note's at the sung pitch without stems (its offsets are not in
+--- effect). The add-square (state.point_ghost) is a C.spot outline the size of a dot. Arguments as for K.point_hit;
+--- C = canvas palette.
+K.draw_points = function(draw_list, C, notes, t0, t1, t_to_x, pitch_to_y, build)
+  local pd, hp = state.point_drag, state.hovered_point
+  local hot = pd or hp   -- the point with the hover look
+  for n_idx, note in ipairs(notes) do
+    if K.points_shown(n_idx, state.hovered_note) and note.frames then
+      local knots = K.points_knots(note)
+      local live = K.points_live_at(note, t_to_x, pitch_to_y)
+      local bypassed = note.controls and note.controls.bypassed
+      for pass = 1, 2 do   -- stems first, then the points over them
+        for _, k in ipairs(knots) do
+          local aim = (k.t >= t0 and k.t <= t1) and K.point_aim(note, k.frame, build) or nil
+          if aim then
+            local x, y = t_to_x(k.t), pitch_to_y(aim)
+            local is_edge = (k.kind == "start" or k.kind == "end")
+            local col = is_edge and C.anchor or C.spot
+            if pass == 1 then
+              if k.st ~= 0 and not bypassed then
+                reaper.ImGui_DrawList_AddLine(draw_list, x, pitch_to_y(aim - k.st), x, y, col, 1.0)
+              end
+            else
+              local is_hot = live and hot ~= nil and hot.note_idx == n_idx and hot.frame == k.frame
+              local r = (is_hot or is_edge) and K.ANCHOR_R or K.SPOT_R
+              if not live then r = r / 2 end
+              if is_edge then
+                reaper.ImGui_DrawList_AddQuadFilled(draw_list, x, y - r, x + r, y, x, y + r, x - r, y, col)
+                if is_hot then reaper.ImGui_DrawList_AddQuad(draw_list, x, y - r, x + r, y, x, y + r, x - r, y, C.handle_hover, 1.5) end
+              elseif k.kind == "added" then
+                reaper.ImGui_DrawList_AddRectFilled(draw_list, x - r, y - r, x + r, y + r, col)
+                if is_hot then reaper.ImGui_DrawList_AddRect(draw_list, x - r, y - r, x + r, y + r, C.handle_hover, 0, 0, 1.5) end
+              else
+                reaper.ImGui_DrawList_AddCircleFilled(draw_list, x, y, r, col)
+                if is_hot then reaper.ImGui_DrawList_AddCircle(draw_list, x, y, r, C.handle_hover, 0, 1.5) end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+  local pg = state.point_ghost   -- only while the pointer rests: never during a gesture
+  local gesture = pd or state.drag or state.edge_drag or state.marquee or state.view_drag
+  local pg_note = pg and not gesture and notes[pg.note_idx]
+  local pg_fr = pg_note and pg_note.frames and pg_note.frames[pg.frame]
+  local pg_aim = pg_fr and pg_fr.time >= t0 and pg_fr.time <= t1 and K.point_aim(pg_note, pg.frame, build)
+  if pg_aim then
+    local x, y, r = t_to_x(pg_fr.time), pitch_to_y(pg_aim), K.SPOT_R
+    reaper.ImGui_DrawList_AddRect(draw_list, x - r, y - r, x + r, y + r, C.spot, 0, 0, 1.5)
+  end
+end
+
+--- The corrected-pitch preview: the pitch trace plus the correction, over the frames r0 .. r1 of `results` that
+--- lie in a corrected range of `build` (K.correction_view) and carry a pitch. Returns the lines (arrays for
+--- DrawList_AddPolyline, one per corrected range in view) and how many there are. The correction at a frame
+--- is read between the trajectory's points as a straight line, which is what the envelope holds there.
+K.preview_lines = function(results, r0, r1, t_to_x, build)
+  local dc = state.draw_cache
+  local pl = dc.plines
+  if not pl then
+    pl = { arrs = {}, count = 0, scratch = {} }
+    dc.plines = pl
+  end
+  if pl.gen == dc.gen and pl.bgen == build.gen and pl.results == results and pl.n == #results
+      and pl.r0 == r0 and pl.r1 == r1 then
+    return pl.arrs, pl.count
+  end
+
+  local pts, ranges = build.points, build.ranges
+  local np = #pts
+  local count = 0
+  if np > 0 and #ranges > 0 then
+    local m = dc.map
+    local scratch = pl.scratch
+    local len, run_range = 0, nil
+    local ri, pi = 1, 1
+
+    -- Close the run collected in scratch[1 .. len]: a line when it has two points or more
+    local function close_run()
+      if len >= 4 then
+        count = count + 1
+        local arr = K.fit_array(pl.arrs[count], len)
+        for j = 1, len do arr[j] = scratch[j] end
+        pl.arrs[count] = arr
+      end
+      len, run_range = 0, nil
+    end
+
+    for i = r0, r1 do
+      local fr = results[i]
+      local t = fr.time
+      while ranges[ri] and ranges[ri].t1 < t do ri = ri + 1 end
+      local rg = ranges[ri]
+      -- A frame without a pitch adds no point and ends nothing: the line bridges it, as the pitch trace does
+      if fr.note and rg and t >= rg.t0 then
+        if run_range and run_range ~= rg then close_run() end
+        run_range = rg
+        while pi < np and pts[pi + 1].time <= t do pi = pi + 1 end
+        local p0 = pts[pi]
+        local shift = p0.val
+        if t > p0.time and pi < np then
+          local p1 = pts[pi + 1]
+          local dt = p1.time - p0.time
+          if dt > 0 then shift = p0.val + (p1.val - p0.val) * (t - p0.time) / dt end
+        end
+        scratch[len + 1] = t_to_x(t)
+        scratch[len + 2] = m.py + m.h - ((fr.note + shift - m.min) / m.range) * m.h
+        len = len + 2
+      elseif fr.note and len > 0 then
+        close_run()
+      end
+    end
+    close_run()
+  end
+
+  pl.count, pl.gen, pl.bgen, pl.results, pl.n, pl.r0, pl.r1 = count, dc.gen, build.gen, results, #results, r0, r1
+  return pl.arrs, count
+end
+
+-- Which spans of K.correction_build each setting shades
+K.HINT_KINDS = {
+  transition_ms = { glide = true },
+  onset_ramp_ms = { onset = true, release = true },
+  legato_threshold_ms = { gap = true },
+  scoop_shape = { scoop = true },
+}
+
+--- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
+--- on every note Strength reaches, a span over each fade, glide, joined gap or scoop for the timing values.
+--- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
+--- `build` is K.correction_view's result, C the canvas palette. Returns how many marks were drawn.
+K.draw_setting_hint = function(draw_list, hint, build, C)
+  local m = state.draw_cache.map
+  local notes, key, set = state.notes, hint.key, hint.notes
+  if not (m.w and m.h and m.range and m.vt1 and m.vt1 > m.vt0 and m.range > 0) then return 0 end
+  local x_min, x_max, y_min, y_max = m.px, m.px + m.w, m.py, m.py + m.h
+  local pad = Theme.layout.xs
+  local drawn = 0
+
+  -- The note takes the value that is being changed. edited_only: it must also be corrected (edited, not bypassed)
+  local function reached(idx, edited_only)
+    local n = notes[idx]
+    if not (n and n.controls) then return false end
+    if set then return set[idx] ~= nil end
+    if edited_only and (n.controls.bypassed or not is_note_modified(n)) then return false end
+    return key == "legato_threshold_ms" or n.controls[key] == nil
+  end
+  local function t_x(t) return m.px + (t - m.vt0) / (m.vt1 - m.vt0) * m.w end
+  local function block_y(idx)
+    local cp = notes[idx].controls.center_pitch
+    return m.py + m.h - ((cp + 0.5 - m.min) / m.range) * m.h, m.py + m.h - ((cp - 0.5 - m.min) / m.range) * m.h
+  end
+
+  if key == "retune_speed" then
+    for idx = 1, #notes do
+      local n = notes[idx]
+      if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
+        local top, bot = block_y(idx)
+        if bot >= y_min and top <= y_max then
+          reaper.ImGui_DrawList_AddRect(draw_list, math.max(x_min, t_x(n.start_time) - pad), math.max(y_min, top - pad),
+            math.min(x_max, t_x(n.end_time) + pad), math.min(y_max, bot + pad), C.span_edge)
+          drawn = drawn + 1
+        end
+      end
+    end
+    return drawn
+  end
+
+  local kinds = K.HINT_KINDS[key]
+  if not kinds then return 0 end
+  for _, sp in ipairs(build.spans) do
+    if kinds[sp.kind] and sp.t1 >= m.vt0 and sp.t0 <= m.vt1 then
+      -- A glide is as long as the Transition of its second note; every other span belongs to its first
+      local ok
+      if sp.kind == "glide" then
+        ok = reached(sp.b, false)
+      elseif sp.kind == "gap" then
+        ok = (set == nil) or set[sp.a] ~= nil or set[sp.b] ~= nil
+      else
+        ok = reached(sp.a, true)
+      end
+      if ok and notes[sp.a] and notes[sp.a].controls and (not sp.b or (notes[sp.b] and notes[sp.b].controls)) then
+        local top, bot = block_y(sp.a)
+        if sp.b then
+          local top_b, bot_b = block_y(sp.b)
+          top, bot = math.min(top, top_b), math.max(bot, bot_b)
+        end
+        top, bot = math.max(y_min, top), math.min(y_max, bot)
+        local x0, x1 = t_x(math.min(sp.t0, sp.t1)), t_x(math.max(sp.t0, sp.t1))
+        x0, x1 = math.max(x_min, x0), math.min(x_max, x1)
+        if bot > top and x1 >= x0 then
+          if x1 - x0 < 2 then
+            local x = (x0 + x1) * 0.5
+            reaper.ImGui_DrawList_AddLine(draw_list, x, top, x, bot, C.span_edge)
+          else
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, C.span_fill)
+            reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x0, bot, C.span_edge)
+            reaper.ImGui_DrawList_AddLine(draw_list, x1, top, x1, bot, C.span_edge)
+          end
+          drawn = drawn + 1
+        end
+      end
+    end
+  end
+  return drawn
 end
 
 local function draw_graph(draw_ctx, w, h)
@@ -3440,7 +4434,7 @@ local function draw_graph(draw_ctx, w, h)
   -- A gesture keeps the pitch range it began with (view_min / view_max, stored when it starts): the range
   -- above follows every note, so a note dragged out of it would rescale the canvas under the cursor.
   -- After the release the range follows the notes again.
-  local gesture = state.drag or state.edge_drag or state.marquee
+  local gesture = state.drag or state.edge_drag or state.marquee or state.point_drag
   if gesture and gesture.view_min and gesture.view_max then
     min_note, max_note = gesture.view_min, gesture.view_max
     note_range = math.max(1, max_note - min_note)
@@ -3682,6 +4676,20 @@ local function draw_graph(draw_ctx, w, h)
   -- Hit-test: find hovered note, zone, and edge handles
   local prev_edge = state.hovered_edge   -- the edge the pointer rested on last frame keeps a larger grab zone
   if is_canvas_hovered and not off_notes and not is_bypassed and not gesture and state.notes then
+    local p_to_y = function(p) return py + h - ((p - min_note) / note_range) * h end
+    local pt_build = state.show_smart_spots and K.frame_view(draw_ctx, state.notes, target_item) or nil
+    -- The note whose points were shown by hover keeps them while the pointer stays in the box around its block
+    -- and its points (so a dot above or below the block can be reached)
+    local phn = state.points_hover_note
+    if phn and not (state.notes[phn] and K.points_box_has(state.notes[phn], mx, my, vt0, vt1, t_to_x, p_to_y, pt_build)) then
+      state.points_hover_note = nil
+    end
+    -- A live pitch point under the pointer (on last frame's hovered, box or selected notes) is found first. With
+    -- Shift held no point is hovered and no add-square shown: a Shift press goes to the note beneath.
+    local ok_hm, hover_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+    local hover_shift = ok_hm and hover_mods and (hover_mods & reaper.ImGui_Mod_Shift()) ~= 0
+    state.hovered_point = not hover_shift
+      and K.point_hit(state.notes, state.hovered_note, mx, my, vt0, vt1, t_to_x, p_to_y, pt_build) or nil
     state.hovered_note = nil
     state.hovered_zone = nil
     state.hovered_edge = nil
@@ -3718,33 +4726,63 @@ local function draw_graph(draw_ctx, w, h)
         -- Standard zone hit-test (only if no edge match)
         if mx >= px and mx >= sx and mx <= ex and my >= top_y and my <= bot_y then
           state.hovered_note = n_idx
-          local block_w = ex - sx
-          local zone_w = math.max(12, block_w * 0.25)
-          if mx < sx + zone_w then
-            state.hovered_zone = "drift"
-          elseif mx > ex - zone_w then
-            state.hovered_zone = "vibrato"
-          else
-            state.hovered_zone = "pitch"
-          end
+          state.hovered_zone = K.note_zone(mx, sx, ex)
           break
         end
       end
     end
+    if state.hovered_point then
+      state.points_hover_note = state.hovered_point.note_idx
+    elseif state.hovered_note then
+      state.points_hover_note = state.hovered_note
+    end
 
-    -- Mouse cursor by what a drag here does: resize arrows on the edges and the pitch zone, a hand on the
-    -- drift / vibrato zones
-    if state.hovered_edge then
+    -- The hollow add-square: on a live note whose points are shown, no point and no edge under the pointer, the
+    -- pointer within a point's reach of the pitch line at its nearest frame, and a point allowed there
+    state.point_ghost = nil
+    if not hover_shift and not state.hovered_point and not state.hovered_edge and state.show_smart_spots then
+      local pt_t = x_to_t(mx)
+      for n_idx, note in ipairs(state.notes) do
+        if note.frames and pt_t >= note.start_time and pt_t <= note.end_time
+            and not (note.controls and note.controls.bypassed) and K.points_shown(n_idx, state.hovered_note)
+            and K.points_live_at(note, t_to_x, p_to_y) then
+          local f = K.point_can_add(note, pt_t)
+          local aim = f and K.point_aim(note, f, pt_build)
+          if aim then
+            local y = p_to_y(aim)
+            if math.abs(y - my) <= K.point_reach_y(note, y, p_to_y) then
+              state.point_ghost = { note_idx = n_idx, frame = f }
+              break
+            end
+          end
+        end
+      end
+    end
+
+    -- The status says "zoom in" while the hovered note's points are too small to grab
+    local zn = state.points_hover_note and state.notes[state.points_hover_note]
+    state.points_zoom_hint = (state.show_smart_spots and zn and zn.frames and #zn.frames > 0
+      and not (zn.controls and zn.controls.bypassed) and not K.points_live_at(zn, t_to_x, p_to_y)) and true or false
+
+    -- Mouse cursor by what a drag here does: resize arrows on a pitch point, the edges and the pitch zone, a hand
+    -- on the drift / vibrato zones
+    if state.hovered_point then
+      reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeNS())
+    elseif state.hovered_edge then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeEW())
     elseif state.hovered_zone == "pitch" then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeNS())
     elseif state.hovered_zone == "drift" or state.hovered_zone == "vibrato" then
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_Hand())
     end
-  elseif (not is_canvas_hovered or is_bypassed or off_notes) and not state.drag and not state.edge_drag and not state.marquee then
+  elseif (not is_canvas_hovered or is_bypassed or off_notes) and not gesture then
     state.hovered_note = nil
     state.hovered_zone = nil
     state.hovered_edge = nil
+    state.hovered_point = nil
+    state.point_ghost = nil
+    state.points_hover_note = nil
+    state.points_zoom_hint = false
   end
 
   -- Click: select note (Shift/Cmd/Ctrl = multi-select), begin drag, edge drag, or marquee box select
@@ -3760,7 +4798,56 @@ local function draw_graph(draw_ctx, w, h)
     local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
     local has_cmd_or_ctrl = ok_mods and cur_mods and (cur_mods & ctrl_mod) ~= 0
 
-    if state.hovered_edge then
+    local hp = state.hovered_point
+    local hp_note = hp and state.notes and state.notes[hp.note_idx]
+    local hp_knot = hp_note and K.point_knot_at(hp_note, hp.frame)
+    local bp_select = nil   -- a bypassed note's point pressed with no note beneath: select that note, no drag
+    if not hp_knot and not has_shift and state.notes then
+      -- A press on a point of a bypassed note: say why it does not move, then handle the press as a press on the
+      -- note block beneath, or, with none beneath, as a plain click on the point's note without a drag
+      local bp = K.point_hit(state.notes, state.hovered_note, mx, my, vt0, vt1, t_to_x,
+        function(p) return py + h - ((p - min_note) / note_range) * h end,
+        state.show_smart_spots and K.frame_view(draw_ctx, state.notes, target_item) or nil, true)
+      if bp then
+        set_status("This note is bypassed, so its pitch points do nothing. Right-click the note to turn bypass off.")
+        if not state.hovered_note and not state.hovered_edge then bp_select = bp.note_idx end
+      end
+    end
+    -- A press on the add-square with no note block or edge beneath (the pitch line runs outside the block): no
+    -- marquee, so neither press of the double-click that adds the point clears the selection or moves the edit
+    -- cursor; the square's note is selected alone if it was not, so its points stay shown after the add
+    local pg = state.point_ghost
+    local pg_select = not bp_select and not hp_knot and not has_shift and pg and state.notes and state.notes[pg.note_idx]
+      and not state.hovered_note and not state.hovered_edge and pg.note_idx or nil
+    if bp_select then
+      state.selected_note = bp_select
+      state.selected_notes = { [bp_select] = true }
+    elseif pg_select then
+      if not state.selected_notes[pg_select] then
+        state.selected_note = pg_select
+        state.selected_notes = { [pg_select] = true }
+      end
+    elseif hp_knot and not has_shift then
+      -- A press on a pitch point grabs the point (not the note beneath). A plain press selects its note alone unless
+      -- it already was selected. Ctrl/Cmd = fine, and the selection is left as it is: a drag adds the note to it, a
+      -- release without a drag is today's Ctrl/Cmd-click on the note under the pointer. A Shift press is left to the note.
+      if not has_cmd_or_ctrl and not state.selected_notes[hp.note_idx] then
+        state.selected_note = hp.note_idx
+        state.selected_notes = { [hp.note_idx] = true }
+      end
+      state.point_drag = {
+        note_idx = hp.note_idx,
+        frame = hp.frame,
+        start_st = hp_knot.st,
+        st = hp_knot.st,
+        last_y = my,      -- the press until the dead zone is passed, then the previous frame's pointer Y
+        dirty = false,
+        ctrl = has_cmd_or_ctrl or nil,                         -- pressed with Ctrl/Cmd
+        under = has_cmd_or_ctrl and state.hovered_note or nil, -- the note under the pointer then
+        view_min = min_note,   -- the pitch range stays as it is for the whole gesture
+        view_max = max_note
+      }
+    elseif state.hovered_edge then
       -- Edge click → start edge drag (trimming)
       local he = state.hovered_edge
       local note = state.notes[he.note_idx]
@@ -3789,15 +4876,7 @@ local function draw_graph(draw_ctx, w, h)
         -- Primary anchor remains unchanged for range expansion
       elseif has_cmd_or_ctrl then
         -- Cmd/Ctrl+Click: toggle individual note in/out of selection
-        if state.selected_notes[state.hovered_note] then
-          state.selected_notes[state.hovered_note] = nil
-          if state.selected_note == state.hovered_note then
-            state.selected_note = next(state.selected_notes)
-          end
-        else
-          state.selected_notes[state.hovered_note] = true
-          state.selected_note = state.hovered_note
-        end
+        K.toggle_note_selection(state.hovered_note)
       else
         -- Normal click
         if state.selected_notes[state.hovered_note] then
@@ -3879,10 +4958,25 @@ local function draw_graph(draw_ctx, w, h)
 
   -- Right-click on note: open context menu
   if is_canvas_hovered and not off_notes and reaper.ImGui_IsMouseClicked(draw_ctx, 1) then
-    if state.hovered_note and state.notes[state.hovered_note] then
+    local hp = state.hovered_point
+    local hp_note = hp and state.notes[hp.note_idx]
+    local hp_knot = hp_note and K.point_knot_at(hp_note, hp.frame)
+    if hp_knot then
+      -- A live point: its own menu, ahead of the note's
+      if not state.selected_notes[hp.note_idx] then
+        state.selected_note = hp.note_idx
+        state.selected_notes = { [hp.note_idx] = true }
+      end
+      state.context_point = { note_idx = hp.note_idx, frame = hp.frame, start_st = hp_knot.st }
+      reaper.ImGui_OpenPopup(draw_ctx, "##point_context_menu")
+    elseif state.hovered_note and state.notes[state.hovered_note] then
       state.selected_note = state.hovered_note
       state.selected_notes = { [state.hovered_note] = true }
       state.context_menu_note = state.hovered_note
+      state.context_menu_time = x_to_t(mx)
+      -- Whether the note's points can be added to at this zoom (the menu is drawn without the canvas mapping)
+      state.context_menu_live = K.points_live_at(state.notes[state.hovered_note], t_to_x,
+        function(p) return py + h - ((p - min_note) / note_range) * h end)
       reaper.ImGui_OpenPopup(draw_ctx, "##note_context_menu")
     end
   end
@@ -3899,6 +4993,9 @@ local function draw_graph(draw_ctx, w, h)
       state.drag.pending_single_select = nil -- drag occurred, cancel single-select collapse
 
       if state.shift_mode then
+        -- The canvas shades where the dragged value acts on the dragged notes
+        K.setting_hint(draw_ctx, (state.drag.zone == "pitch" and "transition_ms")
+          or (state.drag.zone == "drift" and "onset_ramp_ms") or "scoop_shape", true, state.drag.orig_values)
         if state.drag.zone == "pitch" then
           local delta = delta_y * 0.5
           for idx, orig_val in pairs(state.drag.orig_values) do
@@ -3990,6 +5087,48 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- Process an active pitch point drag: vertical only, 1:1 with the pitch scale (Ctrl/Cmd = fine), written on release
+  if state.point_drag then
+    local pd = state.point_drag
+    local pd_note = state.notes and state.notes[pd.note_idx]
+    reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeNS())
+    if not (pd_note and pd_note.frames and pd_note.frames[pd.frame]) then
+      state.point_drag = nil   -- the model under it was replaced
+    elseif reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Escape()) then
+      -- HC5: Esc during the drag puts the point back and writes nothing
+      K.point_set(pd_note, K.point_knot_at(pd_note, pd.frame)
+        or { frame = pd.frame, t = pd_note.frames[pd.frame].time, st = 0 }, pd.start_st)
+      state.point_drag = nil
+    else
+      if not pd.dirty and math.abs(pd.last_y - my) > 2 then   -- dead zone: click vs. drag
+        pd.dirty = true
+        if pd.ctrl and not state.selected_notes[pd.note_idx] then   -- a Ctrl/Cmd drag adds the note to the selection
+          state.selected_notes[pd.note_idx] = true
+          state.selected_note = pd.note_idx
+        end
+      end
+      if pd.dirty then
+        local ok_mods, mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+        local fine = ok_mods and mods and (mods & reaper.ImGui_Mod_Ctrl()) ~= 0
+        -- Accumulated unsnapped (held at the limit), so a slow fine drag is not snapped back to 0 frame by frame
+        local st = math.max(-K.POINT_MAX_ST, math.min(K.POINT_MAX_ST,
+          pd.st + (pd.last_y - my) / h * note_range * (fine and K.FINE_ADJUST_SCALE or 1)))
+        pd.last_y = my
+        if st ~= pd.st then
+          pd.st = st
+          -- A frame whose knot went away (a stored point moved back to 0) is set again from 0
+          K.point_set(pd_note, K.point_knot_at(pd_note, pd.frame)
+            or { frame = pd.frame, t = pd_note.frames[pd.frame].time, st = 0 }, st)
+        end
+      end
+      if reaper.ImGui_IsMouseReleased(draw_ctx, 0) or not reaper.ImGui_IsMouseDown(draw_ctx, 0) then
+        state.point_drag = nil
+        if K.points_clamp(pd.st) ~= pd.start_st then apply_envelope_to_take("Move Pitch Point") end
+        if pd.ctrl and not pd.dirty and pd.under and state.notes[pd.under] then K.toggle_note_selection(pd.under) end
+      end
+    end
+  end
+
   -- Process active edge drag (trimming)
   if state.edge_drag then
     reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_ResizeEW())
@@ -4031,7 +5170,11 @@ local function draw_graph(draw_ctx, w, h)
         else
           ed_note.end_time = ed.original_time
         end
-        trim_note_edge(ed.note_idx, ed.edge, target_time)
+        local dropped = trim_note_edge(ed.note_idx, ed.edge, target_time)
+        if dropped and dropped > 0 then
+          set_status(string.format("Trimmed the note. %d pitch %s removed. %s+Z to undo",
+            dropped, plural(dropped, "point outside it was", "points outside it were"), K.MOD_LABEL))
+        end
       else
         -- No movement beyond dead zone — restore boundary in case of micro-drift
         local ed = state.edge_drag
@@ -4144,7 +5287,7 @@ local function draw_graph(draw_ctx, w, h)
     and reaper.ImGui_IsWindowFocused(draw_ctx, reaper.ImGui_FocusedFlags_RootAndChildWindows())
 
   -- A bypassed take is not edited at all: neither by the mouse (gated above) nor by the keys
-  if not state.drag and not state.edge_drag and shortcuts_live and not is_bypassed and state.notes and #state.notes > 0 then
+  if not state.drag and not state.edge_drag and not state.point_drag and shortcuts_live and not is_bypassed and state.notes and #state.notes > 0 then
     local shift_mod = reaper.ImGui_Mod_Shift()
     local repeat_flag = reaper.ImGui_InputFlags_Repeat()
 
@@ -4271,9 +5414,60 @@ local function draw_graph(draw_ctx, w, h)
     -- Space is forwarded to the user's own REAPER binding by forward_space_to_reaper() in loop_body (HC6).
   end
 
-  -- Double-click pitch zone: Snap to nearest semitone (single or batch)
+  -- Double-click: a pitch point back to 0, a point added on the add-square, else on the pitch zone: Snap to nearest
+  -- semitone (single or batch). With Shift held the points are left alone, as for a press.
   if is_canvas_hovered and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
-    if state.hovered_note and state.hovered_zone == "pitch" then
+    local ok_dm, dc_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
+    local dc_shift = ok_dm and dc_mods and (dc_mods & reaper.ImGui_Mod_Shift()) ~= 0
+    local hp = not dc_shift and state.hovered_point
+    local hp_note = hp and state.notes and state.notes[hp.note_idx]
+    local hp_knot = hp_note and K.point_knot_at(hp_note, hp.frame)
+    local pg = not dc_shift and state.point_ghost
+    local pg_note = pg and state.notes and state.notes[pg.note_idx]
+    local pg_fr = pg_note and pg_note.frames and pg_note.frames[pg.frame]
+    -- On a shown, live note: a double-click on the pitch line too close to a point does nothing (on the line the
+    -- double-click belongs to the points), and one on a stretch without a pitch, off the pitch zone, says why
+    -- nothing is added
+    local no_pitch, line_busy = false, false
+    if not dc_shift and not hp_knot and not pg_fr and state.notes and state.show_smart_spots then
+      local p_to_y = function(p) return py + h - ((p - min_note) / note_range) * h end
+      local pt_build = K.frame_view(draw_ctx, state.notes, target_item)
+      local pt_t = x_to_t(mx)
+      for n_idx, note in ipairs(state.notes) do
+        if note.frames and #note.frames > 0 and pt_t >= note.start_time and pt_t <= note.end_time
+            and not (note.controls and note.controls.bypassed) and K.points_shown(n_idx, state.hovered_note)
+            and K.points_live_at(note, t_to_x, p_to_y) then
+          local _, reason = K.point_can_add(note, pt_t)
+          if reason == "too_close" then
+            local aim = K.point_aim(note, K.points_frame_at(note.frames, pt_t), pt_build)
+            local y = aim and p_to_y(aim)
+            line_busy = y ~= nil and math.abs(y - my) <= K.point_reach_y(note, y, p_to_y)
+          elseif reason == "no_pitch" then
+            no_pitch = not (state.hovered_note == n_idx and state.hovered_zone == "pitch")
+              and K.points_box_has(note, mx, my, vt0, vt1, t_to_x, p_to_y, pt_build)
+          end
+          break
+        end
+      end
+    end
+    if hp_knot then
+      state.point_drag = nil   -- the press of this double-click grabbed the point: it is reset instead
+      local was = hp_knot.st
+      K.point_set(hp_note, hp_knot, 0)
+      if was ~= 0 then apply_envelope_to_take("Reset Pitch Point") end
+    elseif pg_fr then
+      local knot, reason = K.point_add(pg_note, pg_fr.time)
+      if knot then
+        apply_envelope_to_take("Add Pitch Point")
+      elseif reason == "no_pitch" then
+        set_status("No pitch detected here: a point needs a pitch to sit on.")
+      end
+      state.point_ghost = nil
+    elseif no_pitch then
+      set_status("No pitch detected here: a point needs a pitch to sit on.")
+    elseif not line_busy and state.hovered_note and state.hovered_zone == "pitch" then
+      -- (line_busy: on the line too close to a point for another one, so nothing happens; the line is not the
+      -- note's snap target)
       if not state.selected_notes[state.hovered_note] then
         state.selected_note = state.hovered_note
         state.selected_notes = { [state.hovered_note] = true }
@@ -4383,7 +5577,7 @@ local function draw_graph(draw_ctx, w, h)
         end
 
         -- Zone-colored hover highlights
-        if is_hov and not state.drag then
+        if is_hov and not state.drag and not state.point_drag and not state.hovered_point then
           local shift_mod = reaper.ImGui_Mod_Shift and reaper.ImGui_Mod_Shift() or 0
           local ok_mods, cur_mods = pcall(reaper.ImGui_GetKeyMods, draw_ctx)
           local has_shift = ok_mods and cur_mods and (cur_mods & shift_mod) ~= 0
@@ -4501,7 +5695,7 @@ local function draw_graph(draw_ctx, w, h)
           local right_handle_col = C.handle
 
           -- Brighten the hovered edge
-          if state.hovered_edge and state.hovered_edge.note_idx == n_idx then
+          if state.hovered_edge and state.hovered_edge.note_idx == n_idx and not state.hovered_point then
             if state.hovered_edge.edge == "left" then
               left_handle_col = C.handle_hover
             else
@@ -4566,6 +5760,23 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
+  -- SETTING HIGHLIGHTS: where the hovered / dragged setting acts (over the blocks, under the curves). They
+  -- belong to the Preview Curve layer and show from the frame the setting reports itself to the next one.
+  ---------------------------------------------------------------------------
+  do
+    local hint = state.setting_hint
+    local live = hint.key ~= nil and hint.frame >= (reaper.ImGui_GetFrameCount(draw_ctx) or 0) - 1
+    if live and state.show_preview and not is_bypassed and state.notes and #state.notes > 0 then
+      local marks = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
+      if hint.dragging and marks == 0 and not hint.said then
+        hint.said = true
+        set_status("No edited note in view uses this value")
+      end
+    end
+    if not (live and hint.dragging) then hint.said = false end
+  end
+
+  ---------------------------------------------------------------------------
   -- DRAW RAW PITCH CURVE (the text colour: the blocks own the accent)
   ---------------------------------------------------------------------------
   if state.show_raw_pitch then
@@ -4581,10 +5792,10 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
-  -- DRAW TREND, SMART SPOTS, VIBRATO REGIONS & CORRECTED PITCH PREVIEW
+  -- DRAW TREND, VIBRATO REGIONS, CORRECTED PITCH PREVIEW & PITCH POINTS
   ---------------------------------------------------------------------------
   if state.notes then
-    for n_idx, note in ipairs(state.notes) do
+    for _, note in ipairs(state.notes) do
       -- The frames of this note that reach the visible window (f0 > f1: none)
       local f0, f1 = 1, 0
       if note.frames then f0, f1 = visible_range(note.frames) end
@@ -4619,32 +5830,43 @@ local function draw_graph(draw_ctx, w, h)
         reaper.ImGui_DrawList_AddPolyline(draw_list, K.note_trend(note, f0, f1, t_to_x), C.trend, 0, 1.0)
       end
 
-      -- Smart spots: yellow circles (peaks / valleys) and cyan diamonds (the trend's anchors): shape, not colour alone.
-      -- Only on the hovered note and the selected ones: on every note at once they bury the notes themselves.
-      if state.show_smart_spots and note.smart_spots
-          and (state.hovered_note == n_idx or state.selected_note == n_idx or state.selected_notes[n_idx]) then
-        for _, spot in ipairs(note.smart_spots) do
-          if spot.time >= vt0 and spot.time <= vt1 then
-            local x = t_to_x(spot.time)
-            local raw_pitch = note.frames[spot.index].note
-            local y = py + h - ((raw_pitch - min_note) / note_range) * h
+    end
+  end
 
-            if spot.type == "anchor_start" or spot.type == "anchor_end" then
-              local r = K.ANCHOR_R
-              reaper.ImGui_DrawList_AddQuadFilled(draw_list, x, y - r, x + r, y, x, y + r, x - r, y, C.anchor)
-            else
-              reaper.ImGui_DrawList_AddCircleFilled(draw_list, x, y, K.SPOT_R, C.spot)
-            end
-          end
-        end
+  -- Corrected pitch preview (green): the pitch trace plus the correction that is written to the item, over
+  -- every edited note with its ramps and glides. It is the trajectory of the envelope itself
+  -- (K.correction_build), so a scoop, a fade or a glide shows exactly as it will sound.
+  if state.show_preview and state.notes and #state.notes > 0 and state.results and #state.results > 1 then
+    local build = K.frame_view(draw_ctx, state.notes, target_item)
+    -- An outdated item holds another envelope than today's settings would write: the curve shows what it really
+    -- holds, except while a value or a note is being changed (then it previews what the release will write).
+    local held = state.target_take_guid and state.stale_takes[state.target_take_guid]
+      and state.stale_env[state.target_take_guid] or nil
+    local hint = state.setting_hint
+    local cpt = state.context_point   -- the point menu's Offset being dragged or typed
+    local changing = state.drag or state.edge_drag or state.point_drag or state.nudge_burst
+      or (cpt and (cpt.active or cpt.live))
+      or (hint.dragging and hint.frame >= (reaper.ImGui_GetFrameCount(draw_ctx) or 0) - 1)
+    if held and not changing then
+      if held.base ~= build then
+        K.held_gen = (K.held_gen or 0) - 1
+        held.base, held.ranges, held.gen = build, build.ranges, K.held_gen
       end
-
-      -- Corrected pitch preview line (green) — rendered for modified notes (not bypassed)
-      if state.show_preview and f1 > f0 and is_note_modified(note) and not (note.controls.bypassed)
-          and note.controls and note.trend and note.modulation then
-        reaper.ImGui_DrawList_AddPolyline(draw_list, K.note_preview(note, f0, f1, t_to_x), C.preview, 0, 2.0)
+      build = held
+    end
+    if #build.ranges > 0 then
+      local r0, r1 = visible_range(state.results)
+      local lines, line_n = K.preview_lines(state.results, r0, r1, t_to_x, build)
+      for i = 1, line_n do
+        reaper.ImGui_DrawList_AddPolyline(draw_list, lines[i], C.preview, 0, 2.0)
       end
     end
+  end
+
+  -- Pitch points over the Preview Curve, under the pills (same rule as the hit-test: K.points_shown)
+  if state.notes and state.show_smart_spots then
+    K.draw_points(draw_list, C, state.notes, vt0, vt1, t_to_x,
+      function(p) return py + h - ((p - min_note) / note_range) * h end, K.frame_view(draw_ctx, state.notes, target_item))
   end
 
   ---------------------------------------------------------------------------
@@ -4749,14 +5971,38 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   -- DRAG READOUT (a pill on the canvas) and HOVER HINT (a tooltip)
   ---------------------------------------------------------------------------
-  if state.drag and state.drag.dirty then
+  if state.point_drag and state.point_drag.dirty then
+    -- The point's own offset in whole cents, then the pitch the note aims for there (the note readout's format)
+    local pd = state.point_drag
+    local pd_note = state.notes[pd.note_idx]
+    local knot = pd_note and K.point_knot_at(pd_note, pd.frame)
+    local aim = pd_note and K.point_aim(pd_note, pd.frame, K.frame_view(draw_ctx, state.notes, target_item))
+    if aim then
+      local nearest = math.floor(aim + 0.5)
+      local cents = math.floor((aim - nearest) * 100 + 0.5)
+      local tip = string.format("%+d\xC2\xA2 \xC2\xB7 %s %s%d\xC2\xA2", math.floor((knot and knot.st or 0) * 100 + 0.5),
+        midi_to_name(nearest), cents >= 0 and "+" or "", cents)
+      pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
+    end
+  elseif state.drag and state.drag.dirty then
     local d_note = state.notes[state.drag.anchor_idx or state.drag.note_idx]
     if d_note and d_note.controls then
       local count = 0
       for _ in pairs(state.drag.orig_values or {}) do count = count + 1 end
       local count_suffix = count > 1 and string.format("  (%d notes)", count) or ""
       local tip
-      if state.drag.zone == "pitch" then
+      if state.drag.shift_mode then
+        -- Shift remaps the zones: the readout names the value that is changing, as the hover hint does
+        if state.drag.zone == "pitch" then
+          tip = string.format("Transition: %.0f ms%s",
+            d_note.controls.transition_ms or get_effective(d_note, "transition_ms"), count_suffix)
+        elseif state.drag.zone == "drift" then
+          tip = string.format("Onset Ramp: %.0f ms%s",
+            d_note.controls.onset_ramp_ms or get_effective(d_note, "onset_ramp_ms"), count_suffix)
+        else
+          tip = string.format("Scoop: %.0f%% corrected%s", (d_note.controls.scoop_shape or 0) * 100, count_suffix)
+        end
+      elseif state.drag.zone == "pitch" then
         local cp = d_note.controls.center_pitch
         local nearest = math.floor(cp + 0.5)
         local cents = math.floor((cp - nearest) * 100 + 0.5)
@@ -4773,7 +6019,14 @@ local function draw_graph(draw_ctx, w, h)
       -- Beside the pointer, never outside the note area (nor over the note-name column or the ruler)
       pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
     end
-  elseif canvas_tip_ready and state.hovered_note and not state.drag and not state.marquee then
+  elseif canvas_tip_ready and state.hovered_point and not state.drag and not state.marquee and not state.point_drag then
+    Theme.tooltip(draw_ctx, string.format(
+      "Drag to bend the pitch here (%s = fine). Double-click: reset. Right-click: menu", K.MOD_LABEL))
+  elseif canvas_tip_ready and state.point_ghost and not state.drag and not state.marquee and not state.point_drag
+      and not state.edge_drag and not state.view_drag then
+    Theme.tooltip(draw_ctx, "Double-click to add a pitch point")
+  elseif canvas_tip_ready and state.hovered_note and not state.drag and not state.marquee
+      and not state.point_drag and not state.hovered_point then
     local h_note = state.notes[state.hovered_note]
     if h_note and h_note.controls then
       local tip
@@ -4957,11 +6210,16 @@ local function draw_graph(draw_ctx, w, h)
   K.canvas_status(draw_list, px + L.sm, py + h - L.sm, w - L.sm * 2, not is_bypassed)
 
   -- Note Context Menu (Phase 4)
-  if reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu") then
-    -- HC5: Esc closes this menu, unless a popup opened from it (a typed-entry field) is open: that one is innermost
+  local note_menu_open = reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu")
+  if note_menu_open then
+    -- HC5: Esc closes this menu, unless a popup opened from it (a typed-entry field) is open: that one is innermost.
+    -- Esc also ends a slider drag in the same frame (ImGui reports it as an edit released): that is a cancel, not a
+    -- commit
+    local nm_esc = false
     if not reaper.ImGui_IsPopupOpen(draw_ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
        and reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Escape()) then
       reaper.ImGui_CloseCurrentPopup(draw_ctx)
+      nm_esc = true
     end
     local note_idx = state.context_menu_note
     local note = state.notes[note_idx]
@@ -5001,19 +6259,33 @@ local function draw_graph(draw_ctx, w, h)
          -- param_drag tests the gestures right after the control (not after SameLine / TextDisabled, which would test the text)
          local name = PARAM_LABELS[key] or label
          local s_changed, new_val, committed, reset = param_drag(draw_ctx, "cm_" .. key, label, cur_val, min_v, max_v, fmt)
+         if K.drag_hot.hovered or K.drag_hot.active then
+            -- The canvas shades where this value acts on the menu's note
+            local set = state.setting_hint.menu_set
+            for k in pairs(set) do set[k] = nil end
+            set[note_idx] = true
+            K.setting_hint(draw_ctx, key, K.drag_hot.active, set)
+         end
+         local edit = state.context_edit
          if reset then
             -- Double-click: drop the per-note override so the note inherits again (one undo point)
+            if edit and edit.key == key then state.context_edit = nil end
             if ctrl[key] ~= nil then
                ctrl[key] = nil
                apply_envelope_to_take("Reset " .. name)
             end
          else
             if s_changed then
+               -- The model is ahead of the envelope until the commit: remember the value to go back to (nil = inherit)
+               if not (edit and edit.note == note and edit.key == key) then
+                  state.context_edit = { note = note, key = key, raw = ctrl[key] }
+               end
                if scale then new_val = new_val / scale end
                ctrl[key] = new_val
             end
-            if committed then
+            if committed and not nm_esc then
                apply_envelope_to_take("Adjust " .. name)
+               state.context_edit = nil
             end
          end
          reaper.ImGui_SameLine(draw_ctx)
@@ -5037,11 +6309,119 @@ local function draw_graph(draw_ctx, w, h)
       if reaper.ImGui_MenuItem(draw_ctx, "Split at Cursor", "X") then
         K.note_action("split", note_idx)
       end
+      -- Pitch points: add one where the menu was opened, or put the note's points back (disabled with the reason)
+      local _, add_reason = K.point_can_add(note, state.context_menu_time or note.start_time)
+      local add_why = (not state.show_smart_spots) and "layer is off"
+        or ctrl.bypassed and "note is bypassed"
+        or (not state.context_menu_live) and "zoom in first"
+        or add_reason == "no_pitch" and "no pitch here"
+        or add_reason == "too_close" and "a point is already here" or nil
+      if reaper.ImGui_MenuItem(draw_ctx, "Add Pitch Point Here", add_why, false, add_why == nil) then
+        local knot, reason = K.point_add(note, state.context_menu_time or note.start_time)
+        if knot then
+          apply_envelope_to_take("Add Pitch Point")
+        elseif reason == "no_pitch" then
+          set_status("No pitch detected here: a point needs a pitch to sit on.")
+        end
+      end
+      local n_points = K.points_count(note)
+      if reaper.ImGui_MenuItem(draw_ctx, string.format("Reset Pitch Points (%d)###reset_points", n_points),
+          n_points == 0 and "none moved or added" or nil, false, n_points > 0) then
+        local n_done = K.points_reset(note)
+        if n_done > 0 and apply_envelope_to_take("Reset Pitch Points") then
+          set_status(string.format("Reset %d pitch %s on %s. %s+Z to undo", n_done, plural(n_done, "point", "points"),
+            note_name, K.MOD_LABEL))
+        end
+      end
       if reaper.ImGui_MenuItem(draw_ctx, "Reset to Original", "R") then
         reset_selected_note()
       end
     end
     reaper.ImGui_EndPopup(draw_ctx)
+  end
+  -- The note menu closed (Esc during a slider drag) with a slider value not written: the note gets back the value it
+  -- had before the drag, with no write and no undo point (HC5: Esc reverts the active edit)
+  local cm_edit = state.context_edit
+  if not note_menu_open and cm_edit then
+    if cm_edit.note.controls then cm_edit.note.controls[cm_edit.key] = cm_edit.raw end
+    state.context_edit = nil
+  end
+
+  -- Point Context Menu: the offset of one pitch point, put it back, remove it (added points only)
+  local point_menu_open = reaper.ImGui_BeginPopup(draw_ctx, "##point_context_menu")
+  if point_menu_open then
+    -- HC5: Esc closes this menu, unless its typed-entry popup is open (that one is innermost). Esc also ends an
+    -- Offset drag in the same frame (ImGui reports it as an edit released): that is a cancel, not a commit
+    local pt_esc = false
+    if not reaper.ImGui_IsPopupOpen(draw_ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
+       and reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_Escape()) then
+      reaper.ImGui_CloseCurrentPopup(draw_ctx)
+      pt_esc = true
+    end
+    local cpt = state.context_point
+    local pt_note = cpt and state.notes and state.notes[cpt.note_idx]
+    local pt_knot = pt_note and K.point_knot_at(pt_note, cpt.frame)
+    if not pt_knot then
+      -- The point is gone (an undo, a trim, a reload, or a live Offset of 0 dropped its entry): the menu closes,
+      -- and an uncommitted Offset is put back below
+      reaper.ImGui_CloseCurrentPopup(draw_ctx)
+      point_menu_open = false
+    else
+      local pt_hint = string.format(" %s+Z to undo", K.MOD_LABEL)
+      reaper.ImGui_PushItemWidth(draw_ctx, 120)
+      local ch, val, committed, reset = param_drag(draw_ctx, "pt_offset", "Offset", pt_knot.st * 100,
+        -K.POINT_MAX_ST * 100, K.POINT_MAX_ST * 100, "%+.0f \xC2\xA2")
+      reaper.ImGui_PopItemWidth(draw_ctx)
+      cpt.active = K.drag_hot.active   -- the Offset is being dragged or typed (the Preview Curve follows it)
+      if reset then
+        if pt_knot.st ~= 0 then
+          K.point_set(pt_note, pt_knot, 0)
+          apply_envelope_to_take("Reset Pitch Point")
+        end
+        cpt.start_st, cpt.live = 0, nil
+      else
+        if ch then
+          K.point_set(pt_note, pt_knot, val / 100)
+          cpt.live, cpt.note = true, pt_note   -- the model is ahead of the envelope until the commit
+        end
+        if committed and not pt_esc then
+          local now = K.point_knot_at(pt_note, cpt.frame)
+          if not now or K.points_clamp(now.st) ~= K.points_clamp(cpt.start_st) then
+            apply_envelope_to_take("Move Pitch Point")
+          end
+          cpt.start_st, cpt.live = now and now.st or 0, nil
+        end
+      end
+
+      reaper.ImGui_Separator(draw_ctx)
+
+      local cur = K.point_knot_at(pt_note, cpt.frame) or pt_knot
+      if reaper.ImGui_MenuItem(draw_ctx, "Reset Point", cur.st == 0 and "already at 0" or nil, false, cur.st ~= 0) then
+        K.point_set(pt_note, cur, 0)
+        cpt.start_st, cpt.live = 0, nil
+        if apply_envelope_to_take("Reset Pitch Point") then set_status("Reset the pitch point." .. pt_hint) end
+      end
+      local can_remove = cur.kind == "added"
+      if reaper.ImGui_MenuItem(draw_ctx, "Remove Point", not can_remove and "detected points stay" or nil, false, can_remove) then
+        if K.point_remove(pt_note, cur) then
+          if apply_envelope_to_take("Remove Pitch Point") then set_status("Removed the pitch point." .. pt_hint) end
+          state.context_point = nil
+        end
+      end
+    end
+    reaper.ImGui_EndPopup(draw_ctx)
+  end
+  -- The point menu closed (Esc, a click away, or by itself) with its Offset not committed: the point goes back to
+  -- the value it had when the menu opened or was last committed, with no write and no undo point
+  local cpt_closed = state.context_point
+  if not point_menu_open and cpt_closed then
+    if cpt_closed.live and state.notes and state.notes[cpt_closed.note_idx] == cpt_closed.note then
+      local n = cpt_closed.note
+      local f = n.frames and n.frames[cpt_closed.frame]
+      local knot = K.point_knot_at(n, cpt_closed.frame) or (f and { frame = cpt_closed.frame, t = f.time, st = 0 })
+      if knot then K.point_set(n, knot, cpt_closed.start_st) end
+    end
+    state.context_point = nil
   end
 
   restore_canvas_layout()
@@ -5207,6 +6587,12 @@ local function remove_take_core(guid)
       state.hovered_note = nil
       state.drag = nil
       state.marquee = nil
+      state.point_drag = nil
+      state.context_point = nil
+      state.hovered_point = nil
+      state.point_ghost = nil
+      state.points_hover_note = nil
+      state.points_zoom_hint = false
       K.reset_view()
       state.start_time = nil
       state.end_time = nil
@@ -5317,10 +6703,6 @@ local function count_pitch_mode_resets(guids)
     if script_set_pitch_mode(resolve_take_by_guid(g)) then n = n + 1 end
   end
   return n
-end
-
-local function plural(n, one, many)
-  return n == 1 and one or many
 end
 
 --- Sidebar X: confirm before removing one item (names the item and every consequence).
@@ -5488,7 +6870,7 @@ local BODY = {
   tag_missing = "Item missing",
   tag_outdated = "outdated",
   tip_missing = "The item no longer exists in this project",
-  tip_outdated = "A global default changed after this item's envelope was written. Edit or re-analyze it to refresh.",
+  tip_outdated = "This item's envelope is not what the current settings would write (a setting changed after it was written). Edit or re-analyze it to refresh.",
   -- The banner for items whose saved analysis cannot be read (see K.unreadable_guids) and its Clear button
   unreadable_fmt = "%d %s: saved analysis couldn't be read",
   unreadable_clear = "Clear",
@@ -5557,6 +6939,10 @@ K.INFO_SECTIONS = {
     { "Shift + Drag Center Zone", "Adjust Transition" },
     { "Shift + Drag Right Zone", "Adjust Scoop shape" },
     { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 7, "Trim note", "Drag edge" } },
+    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 8, "Pitch point", "Drag dot" } },
+    { "Double-click a pitch point", "Put it back to 0" },
+    { "Double-click the pitch line", "Add a pitch point" },
+    { "Right-click a pitch point", "Point menu: type a value, Reset, Remove" },
     { "Click the time ruler", "Move the edit cursor (playback follows)" },
     { K.MOD_LABEL .. " + Wheel", "Zoom the timeline", panel = { "View", 3, "Zoom time" } },
     { "Wheel", "Scroll the pitch axis" },
@@ -5575,6 +6961,7 @@ K.INFO_SECTIONS = {
     { "Right-click a top bar value", "Item override and reset" },
     { "Double-click a value", "Reset to its default" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
+    { "Hover or drag a setting", "Shows on the notes where it acts" },
     { "Snap / Quantize / Split / Merge buttons", "Same as S / Q / X / M" },
   } },
   { title = "Note Topology & REAPER Transport", rows = {
@@ -6177,8 +7564,12 @@ end
 --- The value is saved once the edit is done (the drag released, a typed entry confirmed, a reset), not while it moves.
 local function settings_drag(id, key, fmt, width)
   reaper.ImGui_SetNextItemWidth(ctx, width)
-  local changed, v, committed, reset = param_drag(ctx, id, nil, state[key], K.LIMITS[key][1], K.LIMITS[key][2], fmt)
-  if reset then
+  local raw = state[key]
+  local changed, v, committed, reset, cancelled = param_drag(ctx, id, nil, raw, K.LIMITS[key][1], K.LIMITS[key][2], fmt)
+  local back = K.drag_revert(id, raw, cancelled)
+  if back ~= nil then
+    state[key] = back   -- Esc during the drag: the value from before it, nothing saved
+  elseif reset then
     state[key] = DEFAULTS[key]
   elseif changed then
     state[key] = v
@@ -6554,8 +7945,6 @@ local function draw_settings_modal()
       K.layer_checkbox("Split Markers", "show_split_points")
       Theme.align(ctx)
       K.layer_checkbox("Trend Line", "show_trend")
-      Theme.align(ctx)
-      K.layer_checkbox("Pitch Center Spots", "show_smart_spots")
       reaper.ImGui_Unindent(ctx, L.md)
     end
 
@@ -6993,7 +8382,7 @@ end
 --- window, so REAPER never sees them otherwise. Same gate as the Space forwarding, and not during a mouse
 --- gesture on the canvas. A pending arrow-key nudge is committed first, so the undo takes that nudge back.
 local function forward_undo_to_reaper()
-  if state.drag or state.edge_drag or state.marquee
+  if state.drag or state.edge_drag or state.marquee or state.point_drag
      or not reaper.ImGui_IsWindowFocused(ctx, reaper.ImGui_FocusedFlags_RootAndChildWindows())
      or reaper.ImGui_IsAnyItemActive(ctx)
      or reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId()) then
@@ -7319,6 +8708,15 @@ do
     layer_checkbox("Preview Curve", "show_preview", function(dl, x, cy)
       reaper.ImGui_DrawList_AddLine(dl, x, cy, x + sw_w, cy, LC.preview, 2.0)
     end)
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      Theme.tooltip(ctx, "The pitch after correction. Hover or drag a setting to see where it acts.")
+    end
+    layer_checkbox("Pitch Points", "show_smart_spots", function(dl, x, cy)
+      reaper.ImGui_DrawList_AddCircleFilled(dl, x + sw_w * 0.5, cy, K.SPOT_R, LC.spot)
+    end)
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      Theme.tooltip(ctx, "The points on a note that bend its pitch: peaks and valleys, the note's start and end, and points you add")
+    end
     layer_checkbox("Vibrato Shading", "show_vibrato_regions", function(dl, x, cy)
       reaper.ImGui_DrawList_AddRectFilled(dl, x, cy - L.sm, x + sw_w, cy + L.sm, Theme.with_alpha(LC.vibrato, 1.0))   -- the band is translucent on the canvas; the swatch is its opaque hue
     end)
@@ -7494,6 +8892,7 @@ do
   local BAR_REASON_NOT_ANALYZED = "Analyze an item first"
   local BAR_REASON_NOTE_OVERRIDE = "Overridden on this note. Right-click the note to change it."
   local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
+  local BAR_HINT_OUTDATED = "Outdated: this item's envelope is from other settings. Edit a note to rewrite it."
 
   -- Value badges: label format, edit range. The item override menu and the edit popup use the key.
   local BAR_BADGES = {
@@ -7564,6 +8963,7 @@ do
         end
       end
     end
+    K.queue_stale_checks()   -- the envelopes are compared next: a value put back to what an item was written with clears its mark
     return n
   end
 
@@ -7615,8 +9015,21 @@ do
       return state.selection_issue or ""
     end
     if editing then
+      if state.hovered_point then return "Drag a point to bend the pitch there" end
+      -- The zoom hint is for a pointer that rests (the hit-test that sets it does not run during a gesture), and
+      -- the Outdated hint wins over it
+      local in_gesture = state.drag or state.edge_drag or state.marquee or state.point_drag or state.view_drag
+      if state.points_zoom_hint and not in_gesture then
+        local guid = state.target_take_guid
+        if guid and state.stale_takes[guid] then return BAR_HINT_OUTDATED end
+        return "Zoom in to move pitch points"
+      end
       local sel_count = bar_selection()
-      if sel_count == 0 then return BAR_HINT_SELECT_NOTE end
+      if sel_count == 0 then
+        local guid = state.target_take_guid
+        if guid and state.stale_takes[guid] then return BAR_HINT_OUTDATED end
+        return BAR_HINT_SELECT_NOTE
+      end
       if sel_count > 1 then return string.format("%d notes selected", sel_count) end
     end
     return ""
@@ -7768,7 +9181,8 @@ do
 
       reaper.ImGui_BeginDisabled(bctx, disabled)
       reaper.ImGui_PushItemWidth(bctx, s.slider_w)
-      local rs_c, rs_v, rs_committed, rs_reset = param_drag(bctx, "rt_speed", nil, value * 100, 0, 100, "%.0f%%")
+      local rs_c, rs_v, rs_committed, rs_reset, rs_cancelled = param_drag(bctx, "rt_speed", nil, value * 100, 0, 100, "%.0f%%")
+      local rs_back = K.drag_revert("rt_speed", value, rs_cancelled)
       reaper.ImGui_PopItemWidth(bctx)
       reaper.ImGui_EndDisabled(bctx)
 
@@ -7780,9 +9194,14 @@ do
         bar_tooltip(string.format("%s: how much of the pitch correction is applied.\n%s\nDrag to change (%s-drag: fine adjust). Double-click: reset. Right-click: item override.",
           PARAM_LABELS.retune_speed, bar_scope_tip(level, false), K.MOD_LABEL))
       end
+      if not disabled and (K.drag_hot.hovered or K.drag_hot.active) then
+        K.setting_hint(bctx, "retune_speed", K.drag_hot.active)
+      end
       if not disabled then
         item_override_menu("retune_speed")
-        if rs_reset then
+        if rs_back ~= nil then
+          write_cascade_value("retune_speed", rs_back)   -- Esc during the drag: the value from before it, nothing saved or written
+        elseif rs_reset then
           reset_cascade_param("retune_speed")
         else
           if rs_c then write_cascade_value("retune_speed", rs_v / 100) end
@@ -7799,9 +9218,13 @@ do
     local function edit_timing(spec, value)
       local key = spec.key
       reaper.ImGui_PushItemWidth(bctx, s.edit_w)
-      local c, v, committed, reset = param_drag(bctx, "s_" .. key, nil, value, spec.min, spec.max, "%.0f ms")
+      local c, v, committed, reset, cancelled = param_drag(bctx, "s_" .. key, nil, value, spec.min, spec.max, "%.0f ms")
+      local back = K.drag_revert("s_" .. key, value, cancelled)
       reaper.ImGui_PopItemWidth(bctx)
-      if reset then
+      if K.drag_hot.hovered or K.drag_hot.active then K.setting_hint(bctx, key, K.drag_hot.active) end
+      if back ~= nil then
+        write_cascade_value(key, back)   -- Esc during the drag: the value from before it, nothing saved or written
+      elseif reset then
         reset_cascade_param(key)
       else
         if c then write_cascade_value(key, v) end
@@ -7835,6 +9258,7 @@ do
         color = fg, bg = bg, text_color = fg, interactive = true, id = "bar_" .. spec.id, w = s.unit_w[spec.id],
       })
       reaper.ImGui_EndDisabled(bctx)
+      if not disabled and reaper.ImGui_IsItemHovered(bctx) then K.setting_hint(bctx, key, false) end
 
       if inspector_reason then
         bar_tooltip(inspector_reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
@@ -7988,6 +9412,7 @@ local function loop_body()
   -- Follow REAPER's undo / redo / project changes (one cheap count check per frame)
   sync_with_project()
   process_analysis_step()
+  K.stale_check_step(ctx)
 
   local P = Theme.get_palette()
   local L = Theme.layout
@@ -8070,6 +9495,12 @@ local function loop_body()
             state.hovered_note = nil
             state.drag = nil
             state.marquee = nil
+            state.point_drag = nil
+            state.context_point = nil
+            state.hovered_point = nil
+            state.point_ghost = nil
+            state.points_hover_note = nil
+            state.points_zoom_hint = false
             K.reset_view()
             state.start_time = 0
             state.item_len = reaper.GetMediaItemInfo_Value(cur_sel_item, "D_LENGTH")
@@ -8147,7 +9578,10 @@ local function loop_body()
     -- HC5: Esc, innermost first, only through Shortcut(). Modals own Esc while open (handled inside each
     -- BeginPopupModal); an active edit consumes it itself. What is left: the note selection, then the
     -- window, which closes on Esc only when it is floating.
+    local esc_used = K.drag_hot.esc_used   -- this frame's Esc cancelled a slider drag: it is spent
+    K.drag_hot.esc_used = false
     if not popup_open_at_start
+       and not esc_used
        and not reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
        and not reaper.ImGui_IsAnyItemActive(ctx)
        and reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then
@@ -8325,6 +9759,7 @@ local function main()
 
   -- Startup reads (scan / load) are in sync with the project: start watching for changes from here
   note_own_write()
+  K.queue_stale_checks()   -- which of the stored envelopes are not what today's settings would write
 
   K.tone_kill()   -- removes a tone a crashed session left on the Monitoring FX chain
   loop()
