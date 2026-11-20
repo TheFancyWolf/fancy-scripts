@@ -4,6 +4,17 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.11.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Pitch points you can drag:
+  - **Drag a pitch point**: the dots and diamonds on the hovered and selected notes are now pitch points. Drag one up or down to bend the pitch at that moment; the bend eases to nothing at the point on either side. Cmd/Ctrl-drag adjusts finely, a point holds up to ±300 cents, and Esc during a drag puts it back. A note with moved points shows as edited, and the Preview Curve follows the bend.
+  - **Add your own**: double-click the pitch line to add a point (drawn as a square); double-click a point to put it back to 0.
+  - **Two menus**: right-click a point for a menu with a typed Offset, Reset Point and Remove Point. The note menu has "Add Pitch Point Here" and "Reset Pitch Points (N)".
+  - **Reset, Split, Merge and Trim**: "Reset to Original" also clears a note's points. Split, Merge and Trim keep the bend you made; Trim drops the points left outside the note and says how many.
+  - **Crowded notes**: when a note is too crowded, or its row too short, its points are drawn small and cannot be grabbed until you zoom in.
+  - **New name and place**: the layer that was "Pitch Center Spots" in Settings → Diagnostics is now "Pitch Points" in the Layers menu. Help lists the new gestures and the Shortcuts list has a row for them.
+  - Items without points are written exactly as before.
+  - **Fixed: Split, Merge and Trim moved the note's pitch**: a note you split, merged or trimmed was shifted as a whole, often by 20 to 50 cents, and an untouched note came out marked as edited. The new note now keeps exactly the shift it had before (none for an untouched note), and trimming an edge back and forth no longer adds up. Notes already split, merged or trimmed keep the pitch they were written with.
+  - **Fixed: Esc during a slider drag saved the value**: pressing Esc while dragging a value saved it. This was so for the sliders in a note's right-click menu (Onset Ramp, Scoop Shape, Transition, Correction Strength), for Correction Strength and the timing values in the top bar, and for the sliders in Settings. Esc now puts the value back to what it was before the drag, with nothing written or saved; a menu or popup the slider sits in still closes. The same Esc no longer also clears the note selection.
+
 - **Fancy Pitch Correct v2.10.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Every correction setting shows on the notes:
   - **Preview Curve is the written shape**: the green curve is now drawn from the same calculation that writes the item's pitch envelope, so it also shows the Scoop at a note's start, the fade in before a note and out after it (Onset Ramp), and the glide between two joined notes (Transition, Legato Gap). It follows Strength and the timing values live while you drag them in the top bar.
   - **Highlights while you hover or drag a setting**: Strength outlines every edited note it reaches; Transition shades each glide; Onset Ramp shades the fade before and after each note; Legato Gap shades every gap that is joined; Scoop shades the note's onset. The same shows from the Timing popup, the note menu's sliders and a Shift+Drag on a note. A note with its own value for a setting is not lit by the top bar. If nothing in view uses the value you are dragging, the status pill says so.
