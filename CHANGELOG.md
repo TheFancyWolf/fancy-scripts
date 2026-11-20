@@ -4,6 +4,15 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.12.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Tighten and Tolerance replace Stability and Vibrato:
+  - **Tighten** (drag the left side of a note up): one dial that takes the note's wandering away, slowest movement first. Around 50 % removes drift and sag and leaves vibrato as sung; around 70 % also halves the vibrato; 100 % is a flat line. The slide into a note and the fall out of it keep their shape. Cmd/Ctrl-drag adjusts finely.
+  - **Tolerance** (drag the right side of a note up): how far a tightened note may stray from its centre before anything is pulled in, 0 to 50 cents. It only acts on notes with Tighten above 0 %; the readout says so while it is not in use. While you hover or drag it, a band on the note shows the range.
+  - **Tolerance default in the top bar**: a `Tolerance: 8¢` badge next to Strength, with the same chain as the other values: the global default, an override for one item (right-click), or a note's own value.
+  - **Note menu**: Tighten and Tolerance are the first two value rows. With several notes selected, a right-click on one of them keeps the selection and the two rows write to all of them (the row says how many). Scoop Shape no longer shows a level it does not have.
+  - **Removed**: Stability, Vibrato, the Vibrato Shading layer and the Trend Line diagnostic. Stability and Vibrato values stored on earlier items are dropped, not converted: such an item shows as outdated and is rewritten without them on its next edit.
+  - **Fixed: Esc during a note drag**: pressing Esc while dragging a note (its pitch or one of its side values) left the value changed on screen but not written to the item. It now puts the value back.
+  - Under the hood: the per-note values and the drag zones are each described in one table; vibrato detection and about 190 lines that served the old controls are gone; a tightened note's line is computed once per change, not on every redraw of the correction.
+
 - **Fancy Pitch Correct v2.11.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Pitch points you can drag:
   - **Drag a pitch point**: the dots and diamonds on the hovered and selected notes are now pitch points. Drag one up or down to bend the pitch at that moment; the bend eases to nothing at the point on either side. Cmd/Ctrl-drag adjusts finely, a point holds up to ±300 cents, and Esc during a drag puts it back. A note with moved points shows as edited, and the Preview Curve follows the bend.
   - **Add your own**: double-click the pitch line to add a point (drawn as a square); double-click a point to put it back to 0.
