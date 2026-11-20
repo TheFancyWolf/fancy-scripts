@@ -4,6 +4,15 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.13.0 (`Pitch/Fancy_Pitch Correct.lua`)** — The top bar follows your selection:
+  - **One bar for defaults and notes**: with no note selected, the values in the top bar are the defaults (the pill reads `Defaults`). Select one or more notes and the same controls show and change those notes (`3 notes`). A note with its own value no longer greys the bar out.
+  - **Change many notes at once**: with several notes selected, a drag moves them all by the same amount and keeps the differences between them; mixed values show as a range such as `20–60%`. Cmd/Ctrl-click a value and type a number to make them all equal. Double-click puts them back to what they inherit.
+  - **Tighten, Strength and Tolerance always visible**, each with a bar under it that shows where the value sits between its lowest and highest setting. A `*` marks a value that is not the default.
+  - **Timing row**: the `Timing` button opens a row with Transition, Onset Ramp, Scoop Shape and Legato Gap, and it stays open until you close it. It replaces the three badges and their popups: every value now drags directly.
+  - **Tooltips say what a value does**: each one explains the effect on the sound first, then what a drag changes right now, then the gestures.
+  - **Note menu**: every value row (not only Tighten and Tolerance) writes to all selected notes when you right-click one of them.
+  - The "…" button's tooltip now begins "Menu".
+
 - **Fancy Pitch Correct v2.12.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Tighten and Tolerance replace Stability and Vibrato:
   - **Tighten** (drag the left side of a note up): one dial that takes the note's wandering away, slowest movement first. Around 50 % removes drift and sag and leaves vibrato as sung; around 70 % also halves the vibrato; 100 % is a flat line. The slide into a note and the fall out of it keep their shape. Cmd/Ctrl-drag adjusts finely.
   - **Tolerance** (drag the right side of a note up): how far a tightened note may stray from its centre before anything is pulled in, 0 to 50 cents. It only acts on notes with Tighten above 0 %; the readout says so while it is not in use. While you hover or drag it, a band on the note shows the range.
