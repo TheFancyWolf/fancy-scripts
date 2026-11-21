@@ -231,6 +231,44 @@ test("segment_short_note", function()
   eq(#segment({ { dur = 0.12, note = 60 }, { dur = 0.4, note = 62 } }, HOP, 0.5), 2, "notes")
 end)
 
+local function body_note(n, low_first, tighten)
+  local fr, sm = {}, {}
+  for i = 1, n do
+    fr[i] = { time = (i - 1) * 0.01 }
+    sm[i] = 60 + ((i <= low_first) and -2 or 0)
+  end
+  return { frames = fr, smooth = sm, avg_note = 60, controls = { tighten = tighten } }
+end
+
+test("note_body_flat", function()
+  local a, b = S.K.note_body(body_note(20, 0, 0.5))
+  eq(a, 1, "a"); eq(b, 20, "b")
+end)
+
+test("note_body_skips_low_start", function()
+  local a, b = S.K.note_body(body_note(20, 5, 0.5))
+  eq(a, 6, "a"); eq(b, 20, "b")
+end)
+
+test("note_body_too_short", function()
+  eq(S.K.note_body(body_note(2, 0, 0.5)), nil, "2 frames")
+end)
+
+test("note_body_without_tighten", function()
+  local a, b = S.K.note_body(body_note(20, 0, nil))
+  eq(a, 1, "a"); eq(b, 20, "b")
+end)
+
+test("tighten_unchanged", function()
+  local n = body_note(100, 5, 0.5)
+  for i = 6, 100 do n.smooth[i] = 60 + 0.3 * math.sin(i * 0.7) + 0.002 * i end
+  n.controls.tolerance = 1
+  local out = S.K.tighten_line(n)
+  -- literals recorded from K.tighten_line before the note_body refactor
+  near(out[1], 0, 1e-9, "first"); near(out[50], 0.090541679572182426, 1e-9, "middle")
+  near(out[100], 0.16270590047208416, 1e-9, "last")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

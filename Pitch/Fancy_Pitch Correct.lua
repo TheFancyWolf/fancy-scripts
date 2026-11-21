@@ -1939,6 +1939,30 @@ K.TIGHTEN_BODY_ST = 0.5     -- the note's body: from its first to its last frame
 K.TIGHTEN_WINDOW_S = 0.4    -- the time window at 0 %
 K.TIGHTEN_FADE = 0.1        -- the first tenth of the dial fades the correction in
 
+--- The body of `note`: the frame indices `a, b` from its first to its last frame whose smoothed pitch is within
+--- K.TIGHTEN_BODY_ST of the note's centre, or nil when the note has fewer than 3 frames, no `smooth` line, or fewer
+--- than 3 frames from `a` to `b`. No REAPER calls. Cached on the note, keyed on its frames, smooth line and centre
+--- (not on Tighten), so Tighten, joins and Slide In share one body.
+K.note_body = function(note)
+  local sm, frames, centre = note.smooth, note.frames, note.avg_note
+  if not sm or not frames or not centre or #frames < 3 or #sm ~= #frames then return nil end
+  local bc = note.body_cache
+  if not (bc and bc.frames == frames and bc.smooth == sm and bc.avg == centre) then
+    local nf = #frames
+    local a, b
+    for i = 1, nf do
+      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then a = i break end
+    end
+    for i = nf, 1, -1 do
+      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then b = i break end
+    end
+    if not (a and b - a >= 2) then a, b = nil, nil end
+    bc = { frames = frames, smooth = sm, avg = centre, a = a, b = b }
+    note.body_cache = bc
+  end
+  return bc.a, bc.b
+end
+
 --- The per-frame pitch (semitones) Tighten takes away from `note`, or nil when it takes nothing (Tighten at 0, or
 --- a note with no body to measure). No REAPER calls. Only the body of the note is measured, so a slide into or
 --- out of the note does not bend the line; the frames before and after the body take the value at the body's edge
@@ -1955,15 +1979,9 @@ K.tighten_line = function(note)
   if not (tc and tc.frames == frames and tc.smooth == sm and tc.avg == centre and tc.amount == amount) then
     tc = { frames = frames, smooth = sm, avg = centre, amount = amount, line = false }
     note.tighten_cache = tc
-    local a, b
-    for i = 1, nf do
-      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then a = i break end
-    end
-    for i = nf, 1, -1 do
-      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then b = i break end
-    end
+    local a, b = K.note_body(note)
     local hop = (frames[nf].time - frames[1].time) / (nf - 1)
-    if a and b - a >= 2 and hop > 0 then
+    if a and hop > 0 then
       local dev = {}
       for i = a, b do dev[#dev + 1] = sm[i] - centre end
       local window = K.TIGHTEN_WINDOW_S * (1 - amount) ^ 2
