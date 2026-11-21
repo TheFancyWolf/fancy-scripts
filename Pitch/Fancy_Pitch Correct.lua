@@ -1,11 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.13.0
+-- @version 2.14.0
 -- @changelog
---   The top bar follows your selection: with no note selected its values are the defaults, with notes selected they are those notes' values, and a drag changes all of them together
---   Tighten, Strength and Tolerance are always in the bar, each with a bar showing where the value sits in its range; the Timing button opens a row with Transition, Onset Ramp, Scoop Shape and Legato Gap
---   Every value drags directly (no popups); tooltips say what each value does to the sound
---   Note menu: every value row now writes to all selected notes
+--   Side panel: a panel button in the top bar shows and hides it (lit while it shows); the panel has its own darker surface, and hidden it leaves the whole width to the canvas
+--   Timing row: now a secondary bar on a recessed band, its values under the Timing button
+--   Pitch trace: dimmed over a note block and barely visible everywhere else, so the preview curve stands out; the preview is opaque and more saturated
+--   Top bar values: the fill under a value uses the accent colour
+--   Ruler labels keep room between them when zoomed in; the idle hint on the canvas no longer covers a note
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -310,6 +311,7 @@ local K = {
   VIEW_EPS_S = 1e-6,       -- a window this close to the whole item counts as "not zoomed"
   RULER_MINOR_DIV = 5,     -- minor ticks per major tick
   RULER_WIDEN = 1.5,       -- a label interval that does not fit grows to the next 1-2-5 step above interval * this
+  RULER_LABEL_ROOM = 2,    -- a label interval is at least this many times as wide as its widest label
   RULER_MAX_TRIES = 8,     -- widenings tried before the ruler gives up on making every label fit
 
   -- Pitch view of the canvas (see draw_graph): the range is fitted to the notes unless the user chose one
@@ -465,7 +467,7 @@ local state = {
   session_takes = {},  -- [guid] = take_data table
   session_order = {},  -- array of guids
   sidebar_w = 200,     -- Pitched Items width: the body table's fixed column, mirrored from ImGui's live width each frame
-  sidebar_open = true, -- Pitched Items drawer preference (defaults open); a window too narrow for it shows the tag instead
+  sidebar_open = true, -- side panel preference (defaults open); a window too narrow for it shows the canvas alone
   items_open = true,     -- the Pitched Items section of the panel is unfolded (header click)
   shortcuts_open = true, -- the Shortcuts section of the panel is unfolded (header click or H)
   sidebar_auto = false,  -- no panel width is stored: the first frame takes the width that fits the Shortcuts list
@@ -3825,6 +3827,84 @@ K.raw_trace = function(results, r0, r1, t_to_x)
   return nil
 end
 
+--- The parts of the raw pitch trace that fall in a note's time span, as runs for DrawList_AddPolyline: arrs[1 .. count]
+--- with owner[i] = the note of run i. A run starts one point before its note and ends one point after it, so that,
+--- clipped to the note's block, the line reaches both edges. `notes` is in time order; notes_gen changes whenever a
+--- note's extent does.
+K.raw_trace_runs = function(results, r0, r1, t_to_x, notes, notes_gen)
+  local dc = state.draw_cache
+  local rr = dc.rruns
+  if not rr then
+    rr = { arrs = {}, owner = {}, count = 0, scratch = {} }
+    dc.rruns = rr
+  end
+  if rr.gen == dc.gen and rr.ngen == notes_gen and rr.notes == notes and rr.results == results
+      and rr.n == #results and rr.r0 == r0 and rr.r1 == r1 then
+    return rr.arrs, rr.owner, rr.count
+  end
+
+  local m = dc.map
+  local scratch = rr.scratch
+  local count, len, cur, ni = 0, 0, nil, 1
+  local last_x, last_y = nil, nil
+  local function close_run()
+    if cur and len >= 4 then
+      count = count + 1
+      local arr = K.fit_array(rr.arrs[count], len)
+      for j = 1, len do arr[j] = scratch[j] end
+      rr.arrs[count] = arr
+      rr.owner[count] = cur
+    end
+    len = 0
+  end
+  for i = r0, r1 do
+    local fr = results[i]
+    if fr.note then
+      local t = fr.time
+      while notes[ni] and notes[ni].end_time < t do ni = ni + 1 end
+      local nt = notes[ni]
+      local owner = (nt ~= nil and t >= nt.start_time) and nt or nil
+      local x, y = t_to_x(t), m.py + m.h - ((fr.note - m.min) / m.range) * m.h
+      if owner ~= cur then
+        if cur then
+          scratch[len + 1], scratch[len + 2] = x, y   -- one point past the note
+          len = len + 2
+        end
+        close_run()
+        cur = owner
+        if owner and last_x then
+          scratch[1], scratch[2] = last_x, last_y   -- one point before the note
+          len = 2
+        end
+      end
+      if cur then
+        scratch[len + 1], scratch[len + 2] = x, y
+        len = len + 2
+      end
+      last_x, last_y = x, y
+    end
+  end
+  close_run()
+  for k = count + 1, #rr.owner do rr.owner[k] = nil end   -- no note is kept alive by a run that is gone
+
+  rr.count, rr.gen, rr.ngen, rr.notes, rr.results, rr.n, rr.r0, rr.r1 = count, dc.gen, notes_gen, notes, results, #results, r0, r1
+  return rr.arrs, rr.owner, count
+end
+
+--- Whether a note block overlaps the screen rectangle (x1, y1) .. (x2, y2). The other arguments are the canvas
+--- mapping of this frame: time to x, and the note area's top, height, lowest pitch and pitch range.
+K.note_under = function(notes, t_to_x, py, h, min_note, note_range, x1, y1, x2, y2)
+  if not notes then return false end
+  for _, note in ipairs(notes) do
+    local cp = note.controls and note.controls.center_pitch
+    if cp and t_to_x(note.end_time) > x1 and t_to_x(note.start_time) < x2 then
+      local top = py + h - ((cp + 0.5 - min_note) / note_range) * h
+      if top < y2 and top + h / note_range > y1 then return true end
+    end
+  end
+  return false
+end
+
 --- The per-note cache entry (created on first use; entries go when their note does).
 K.note_entry = function(note)
   local notes = state.draw_cache.notes
@@ -5818,8 +5898,25 @@ local function draw_graph(draw_ctx, w, h)
     while r0 > 1 and not state.results[r0].note do r0 = r0 - 1 end
     while r1 < #state.results and not state.results[r1].note do r1 = r1 + 1 end
     local polyline = K.raw_trace(state.results, r0, r1, t_to_x)   -- cached, see K.raw_trace
+    local has_notes = state.notes and #state.notes > 0
     if polyline then
-      reaper.ImGui_DrawList_AddPolyline(draw_list, polyline, C.trace, 0, 1.5)
+      -- With notes the trace is a reference layer: barely visible everywhere, and dimmed only over a note's block
+      reaper.ImGui_DrawList_AddPolyline(draw_list, polyline, has_notes and C.trace_far or C.trace, 0, 1.5)
+    end
+    if polyline and has_notes then
+      local view = K.frame_view(draw_ctx, state.notes, target_item)
+      local runs, owner, run_n = K.raw_trace_runs(state.results, r0, r1, t_to_x, state.notes, view.gen)   -- cached
+      for i = 1, run_n do
+        local note = owner[i]
+        local cp = note.controls and note.controls.center_pitch
+        if cp then
+          reaper.ImGui_DrawList_PushClipRect(draw_list,
+            t_to_x(note.start_time), py + h - ((cp + 0.5 - min_note) / note_range) * h,
+            t_to_x(note.end_time), py + h - ((cp - 0.5 - min_note) / note_range) * h, true)
+          reaper.ImGui_DrawList_AddPolyline(draw_list, runs[i], C.trace_note, 0, 1.5)
+          reaper.ImGui_DrawList_PopClipRect(draw_list)
+        end
+      end
     end
   end
 
@@ -5924,14 +6021,14 @@ local function draw_graph(draw_ctx, w, h)
       return string.format("%d", whole) .. fraction .. "s"
     end
 
-    -- The major step: the smallest one whose labels fit side by side (starting from one digit per step)
+    -- The major step: the smallest one whose labels fit with room between them (starting from one digit per step)
     local digit_w = reaper.ImGui_CalcTextSize(draw_ctx, "0") or 0
     local interval = nice_step(span * math.max(digit_w, 1) / math.max(w, 1))
     local decimals = 0
     for attempt = 1, K.RULER_MAX_TRIES do
       decimals = interval >= 1 and 0 or math.ceil(-math.log(interval, 10) - K.VIEW_EPS_S)
       local widest = reaper.ImGui_CalcTextSize(draw_ctx, time_label(vt1 - item_t0, decimals)) or 0
-      if interval / span * w >= widest + L.md or attempt == K.RULER_MAX_TRIES then break end
+      if interval / span * w >= widest * K.RULER_LABEL_ROOM or attempt == K.RULER_MAX_TRIES then break end
       interval = nice_step(interval * K.RULER_WIDEN)
     end
 
@@ -6167,7 +6264,9 @@ local function draw_graph(draw_ctx, w, h)
 
   -- Status pill, bottom-left of the note area (over the scrim too): a status message while it lasts, else the hint
   -- for the state the editor is in (K.status_line)
-  K.canvas_status(draw_list, px + L.sm, py + h - L.sm, w - L.sm * 2, not is_bypassed)
+  K.canvas_status(draw_list, px + L.sm, py + h - L.sm, w - L.sm * 2, not is_bypassed, function(x1, y1, x2, y2)
+    return K.note_under(state.notes, t_to_x, py, h, min_note, note_range, x1, y1, x2, y2)
+  end)
 
   -- Note Context Menu
   local note_menu_open = reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu")
@@ -6868,9 +6967,10 @@ local BODY = {
   -- The grip is not an item, so it gets no ForTooltip delay of its own: its tooltip waits this long instead
   grip_tip_delay_s = 0.5,
   grip_tip = "Drag to resize Pitched Items",
-  tag_tip = "Show Pitched Items (%d)",
-  tag_tip_narrow = "Pitched Items (%d) does not fit this window. Widen the window to show it.",
-  tag_narrow_status = "Widen the window to show Pitched Items",
+  panel_tip_show = "Show the side panel: Pitched Items (%d) and Shortcuts",
+  panel_tip_hide = "Hide the side panel",
+  panel_tip_narrow = "The side panel does not fit this window. Widen the window to show it.",
+  panel_narrow_status = "Widen the window to show the side panel",
   shortcuts_narrow_status = "Widen the window to show Shortcuts",
   -- Row states and the checkbox column label (a row is never told apart by colour alone)
   col_on = "On",
@@ -7116,7 +7216,12 @@ K.draw_items_body = function(sidebar_ctx)
         local is_enabled = (not is_missing) and not is_take_pitch_bypassed(take_obj)
         Theme.vcenter(sidebar_ctx, frame_h, card_h, line_y)
         if is_missing then reaper.ImGui_BeginDisabled(sidebar_ctx) end
+        -- The panel's surface is the recessed one, so the box takes the button face to keep its boundary visible
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBg(), P.btn)
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
+        reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBgActive(), P.btn_a)
         local cb_changed, new_en = reaper.ImGui_Checkbox(sidebar_ctx, "##bp", is_enabled)
+        reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
         if is_missing then reaper.ImGui_EndDisabled(sidebar_ctx) end
         local cb_w = reaper.ImGui_GetItemRectSize(sidebar_ctx)
         if cb_changed and not is_missing then
@@ -7258,10 +7363,10 @@ K.panel_rows = function()
 end
 
 --- The colour of the key text in the Shortcuts list: the accent, as in the Help modal, when it reads at 4.5:1 on the
---- window background (HC1), else the text colour (a Match Theme accent can be too close to the background).
+--- panel's surface (HC1), else the text colour (a Match Theme accent can be too close to the background).
 K.panel_key_color = function(P)
   local c = K.panel_key_cache
-  if c and c.accent == P.accent and c.bg == P.bg and c.text == P.text then return c.color end
+  if c and c.accent == P.accent and c.inset == P.inset and c.text == P.text then return c.color end
   local function luminance(rgba)
     local function channel(v)
       v = v / 255
@@ -7269,10 +7374,10 @@ K.panel_key_color = function(P)
     end
     return 0.2126 * channel((rgba >> 24) & 0xFF) + 0.7152 * channel((rgba >> 16) & 0xFF) + 0.0722 * channel((rgba >> 8) & 0xFF)
   end
-  local la, lb = luminance(P.accent), luminance(P.bg)
+  local la, lb = luminance(P.accent), luminance(P.inset)
   local ratio = (math.max(la, lb) + 0.05) / (math.min(la, lb) + 0.05)
   local color = ratio >= 4.5 and P.accent or P.text
-  K.panel_key_cache = { accent = P.accent, bg = P.bg, text = P.text, color = color }
+  K.panel_key_cache = { accent = P.accent, inset = P.inset, text = P.text, color = color }
   return color
 end
 
@@ -7298,6 +7403,17 @@ K.panel_heights = function(avail_h, items_content_h, items_open, shortcuts_open)
     return 0, avail_h
   end
   return 0, 0
+end
+
+--- The top bar's panel button: show or hide the side panel (the preference is stored). A window too narrow for the
+--- panel records the wish to see it and says why nothing changed.
+K.toggle_sidebar = function()
+  local open = not (state.sidebar_open and state.sidebar_fits)
+  if open ~= state.sidebar_open then
+    state.sidebar_open = open
+    reaper.SetExtState("FancyScripts", "pitch_sidebar_open", open and "1" or "0", true)
+  end
+  if open and not state.sidebar_fits then set_status(BODY.panel_narrow_status) end
 end
 
 --- H: show or hide the Shortcuts list. A hidden panel comes back with the list unfolded; a window too narrow for the
@@ -7379,27 +7495,14 @@ end
 --- The panel: two sections, Pitched Items and Shortcuts, each a header that folds its body. Each body scrolls on its own
 --- inside the height K.panel_heights gives it; the panel itself never scrolls.
 local function render_pitched_items_sidebar(sidebar_ctx)
-  local L = Theme.layout
   local frame_h = reaper.ImGui_GetFrameHeight(sidebar_ctx)
   local _, spacing_y = reaper.ImGui_GetStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_ItemSpacing())
   spacing_y = spacing_y or 0
-  local close_sz = L.icon_md.size + L.icon_md.pad * 2
 
-  -- 1. Pitched Items header: the fold arrow and the count, with the hide-panel button at its right end
+  -- 1. Pitched Items header: the fold arrow and the count (the panel itself is shown and hidden from the top bar)
   reaper.ImGui_SetNextItemOpen(sidebar_ctx, state.items_open, reaper.ImGui_Cond_Always())
   local items_open = Theme.collapsing_header(sidebar_ctx,
-    string.format("Pitched Items (%d)##pitch_items_hdr", #state.session_order), {
-      close_w = close_sz,
-      action_fn = function(hdr_ctx)
-        if Theme.icon_btn(hdr_ctx, "##close_items_panel", Theme.icons.tri_right, {
-          preset = L.icon_md,
-          tooltip = "Hide Pitched Items panel"
-        }) then
-          state.sidebar_open = false
-          reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "0", true)
-        end
-      end,
-    })
+    string.format("Pitched Items (%d)##pitch_items_hdr", #state.session_order))
   K.set_panel_open("items", items_open)
 
   -- The room under the two headers (the Shortcuts header and the gaps around the bodies come off what is left here)
@@ -7479,6 +7582,9 @@ local function draw_body_split(P, avail_w, total_h)
     local grip_x, grip_y = reaper.ImGui_GetCursorScreenPos(ctx)
     local column_w = reaper.ImGui_GetContentRegionAvail(ctx)
     state.sidebar_w = column_w
+    -- The panel has its own recessed surface (the Timing tray's), so it reads as a panel beside the canvas
+    reaper.ImGui_DrawList_AddRectFilled(reaper.ImGui_GetWindowDrawList(ctx),
+      grip_x, grip_y, grip_x + column_w, grip_y + total_h, P.inset)
     reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.sm)
     local panel_w = math.max(column_w, BODY.min_sidebar_w) - L.sm * 2
     -- The panel never scrolls itself: each of its two sections scrolls its own body
@@ -7516,35 +7622,6 @@ local function draw_body_split(P, avail_w, total_h)
   reaper.ImGui_PopStyleColor(ctx, 2)
   reaper.ImGui_PopStyleVar(ctx, 1)
   return drawn
-end
-
---- Body, panel closed (by preference or because the window is too narrow): the canvas and a strip on the
---- right whose button, centred in the strip, opens the panel again when it fits.
-local function draw_body_tag(P, avail_w, total_h, fits)
-  local L = Theme.layout
-  local tag_w = L.icon_md.size + L.icon_md.pad * 2
-  draw_graph(ctx, avail_w - tag_w, total_h)
-
-  reaper.ImGui_SameLine(ctx, 0, 0)
-
-  local tag_dl = reaper.ImGui_GetWindowDrawList(ctx)
-  local tx, ty = reaper.ImGui_GetCursorScreenPos(ctx)
-  reaper.ImGui_DrawList_AddRectFilled(tag_dl, tx, ty, tx + tag_w, ty + total_h, P.card)
-
-  -- The button is the whole strip: its icon is centred in it and the click target is as tall as the body
-  if Theme.icon_btn(ctx, "##open_items_tag", Theme.icons.tri_left, {
-    icon_size = L.icon_md.size,
-    w = tag_w,
-    h = total_h,
-    tooltip = string.format(fits and BODY.tag_tip or BODY.tag_tip_narrow, #state.session_order)
-  }) then
-    -- Record the wish to see the panel; a window too narrow for it keeps showing this tag
-    if not state.sidebar_open then
-      state.sidebar_open = true
-      reaper.SetExtState("FancyScripts", "pitch_sidebar_open", "1", true)
-    end
-    if not fits then set_status(BODY.tag_narrow_status) end
-  end
 end
 
 --- 1-based index of the list item closest to value (ties pick the lower one).
@@ -8510,8 +8587,8 @@ do
     s.more_w = math.max(hdr_text_w(HDR_ELLIPSIS), hdr_text_w(HDR_PROGRESS_LONGEST)) + s.pad_x
     s.no_target_w = hdr_text_w(HDR_NO_TARGET_TEXT) + s.pad_x  -- the badge never plans narrower than this
     s.badge_min_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
-    -- More, Close: the real gap between them (see hdr_draw_right)
-    s.right_w = s.more_w + L.lg + s.close_sz
+    -- More, Panel, Close: the real gaps between them (see hdr_draw_right)
+    s.right_w = s.more_w + L.sm + s.close_sz + L.lg + s.close_sz
     -- The Values, Timing row and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
     s.bar = K.bar_measure(ctx)
     return s
@@ -8811,6 +8888,21 @@ do
 
     hdr_draw_more(hs)
 
+    -- The side panel's switch: lit while the panel shows, dim while the window has no room for it
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
+    Theme.align(ctx, nil, s.close_sz)
+    local panel_shown = state.sidebar_open and state.sidebar_fits
+    if Theme.icon_btn(ctx, "##hdr_panel", Theme.icons.panel_right, {
+      preset = L.icon_target,
+      icon_size = L.icon_md.size,
+      w = s.close_sz, h = s.close_sz,
+      color = panel_shown and hs.P.accent or (state.sidebar_fits and hs.P.text or hs.P.text_dim),
+      tooltip = panel_shown and BODY.panel_tip_hide
+        or (state.sidebar_fits and string.format(BODY.panel_tip_show, #state.session_order) or BODY.panel_tip_narrow),
+    }) then
+      K.toggle_sidebar()
+    end
+
     -- The destructive Close sits a group gap away. An icon shorter than the frame is centred on the row's
     -- framed widgets.
     reaper.ImGui_SameLine(ctx, 0, L.lg)
@@ -8887,9 +8979,31 @@ do
     s.rows_now = #plan.rows
     if state.timing_open then
       local per_row = hdr_timing_per_row(s, avail_w)
-      s.rows_now = s.rows_now + math.ceil(#HDR_TIMING / per_row)
+      local timing_rows = math.ceil(#HDR_TIMING / per_row)
+      s.rows_now = s.rows_now + timing_rows
+      -- The row is a secondary bar: a recessed band across the whole window (the side panel's surface) with its
+      -- values, when they fit on one line, starting under the button that opened it (never past the bar's end)
+      local row_x, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
+      local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+      local indent = 0
+      if timing_rows == 1 then
+        local tray_w = hdr_row_w(HDR_TIMING, s, 0)
+        indent = math.max(0, math.min((K.timing_btn_x or row_x) - row_x, avail_w - tray_w))
+      end
+      local win_x = reaper.ImGui_GetWindowPos(ctx)
+      local win_w = reaper.ImGui_GetWindowSize(ctx)
+      reaper.ImGui_DrawList_PushClipRect(draw_list, win_x, row_y - L.xs, win_x + win_w, row_y + 1e4, false)
+      reaper.ImGui_DrawList_AddRectFilled(draw_list,
+        win_x, row_y - L.xs,
+        win_x + win_w, row_y + timing_rows * s.frame_h + timing_rows * (spacing_y or 0),   -- down to the body: no gap
+        P.inset)
+      reaper.ImGui_DrawList_PopClipRect(draw_list)
       for i, id in ipairs(HDR_TIMING) do
-        if (i - 1) % per_row ~= 0 then reaper.ImGui_SameLine(ctx, 0, L.sm) end
+        if (i - 1) % per_row ~= 0 then
+          reaper.ImGui_SameLine(ctx, 0, L.sm)
+        elseif indent > 0 then
+          reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + indent)
+        end
         draw_unit(id)
       end
     end
@@ -9146,9 +9260,9 @@ do
       if sel_count == 0 then
         local guid = state.target_take_guid
         if guid and state.stale_takes[guid] then return BAR_HINT_OUTDATED end
-        return BAR_HINT_SELECT_NOTE
+        return BAR_HINT_SELECT_NOTE, true
       end
-      if sel_count > 1 then return string.format("%d notes selected", sel_count) end
+      if sel_count > 1 then return string.format("%d notes selected", sel_count), true end
     end
     return ""
   end
@@ -9156,8 +9270,10 @@ do
   --- Draw the status line on a pill whose bottom-left corner is (x, bottom_y), at most max_w wide (the text is
   --- shortened with an ellipsis). The canvas calls it on every path it leaves by, so a status message shows in
   --- every state. C.pill_text is >= 4.5:1 on the pill over every canvas surface.
-  K.canvas_status = function(draw_list, x, bottom_y, max_w, editing)
-    local text = K.status_line(editing)
+  --- An idle hint (the second value of K.status_line) gives way to the notes: it is not drawn while covered(x1, y1,
+  --- x2, y2) says a note block lies under the pill. A message always shows.
+  K.canvas_status = function(draw_list, x, bottom_y, max_w, editing, covered)
+    local text, idle = K.status_line(editing)
     if text == "" then return end
     local L = Theme.layout
     local C = Theme.get_palette().canvas
@@ -9167,6 +9283,7 @@ do
     local text_w, text_h = reaper.ImGui_CalcTextSize(ctx, text)
     if (text_w or 0) > room then return end   -- not even the ellipsis fits
     local top_y = bottom_y - text_h - L.xs * 2
+    if idle and covered and covered(x, top_y, x + text_w + L.sm * 2, bottom_y) then return end
     reaper.ImGui_DrawList_AddRectFilled(draw_list, x, top_y, x + text_w + L.sm * 2, bottom_y, C.pill_bg, L.rounding)
     reaper.ImGui_DrawList_AddText(draw_list, x + L.sm, top_y + L.xs, C.pill_text, text)
   end
@@ -9384,7 +9501,7 @@ do
       -- The fill says where the value comes from as well (the mark and the tooltip say it without colour)
       local span = spec.hi - spec.lo
       K.bar_value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
-        (view.level == "note") and P.accent2 or (view.level == "item") and P.accent or P.text_dim)
+        (view.level == "note") and P.accent2 or P.accent)
 
       local scope = BAR_SCOPE_DEFAULT
       if view.target == "notes" then
@@ -9532,6 +9649,7 @@ do
       do
         local bx1, by1 = reaper.ImGui_GetItemRectMin(bctx)
         local bx2, by2 = reaper.ImGui_GetItemRectMax(bctx)
+        K.timing_btn_x = bx1   -- the Timing row starts under its button (see draw_header)
         local text_x = bx1 + s.pad_x * 0.5 + (bx2 - bx1 - s.pad_x - label_w) * align_x
         local icon = state.timing_open and Theme.icons.tri_down or Theme.icons.tri_right
         icon(reaper.ImGui_GetWindowDrawList(bctx),
@@ -9735,7 +9853,7 @@ local function loop_body()
     local total_h = math.max(60, body_h)
 
     -- The panel is drawn only when the window has room for it beside a usable canvas; otherwise the
-    -- tag layout takes over without touching the saved open / closed preference
+    -- canvas takes the whole body without touching the saved open / closed preference
     local sidebar_fits = avail_w >= BODY.min_graph_w + BODY.splitter_w + BODY.min_sidebar_w
     state.sidebar_fits = sidebar_fits
 
@@ -9753,7 +9871,7 @@ local function loop_body()
       if state.sidebar_open and sidebar_fits then
         split_drawn = draw_body_split(P, avail_w, total_h)
       else
-        draw_body_tag(P, avail_w, total_h, sidebar_fits)
+        draw_graph(ctx, avail_w, total_h)   -- panel hidden, or no room for it: the canvas takes the whole body
       end
     elseif body_h >= (reaper.ImGui_GetTextLineHeight(ctx) or 0) then
       -- Too short for the canvas: say why in the space the body would have had (a window with less room than
