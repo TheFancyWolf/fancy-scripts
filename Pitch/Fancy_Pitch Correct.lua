@@ -1,8 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.15.0
+-- @version 2.16.0
 -- @changelog
---   New shortcuts: B bypasses the selected notes (press again to turn bypass off); W moves the edit cursor to the start of the item, like REAPER's Go to start of project. Both are in the side panel's Shortcuts list
+--   Joins between notes are now automatic: the correction blends across the slide you actually sang, with a short fixed fade into and out of silence. Transition, Onset Ramp, Legato Gap and the Timing button are gone
+--   Scoop Shape is now Slide In: it flattens the slide into a note up to where the note really settles, and at 100% removes the slide completely. Shift + drag on a note adjusts it; it is also in the top bar and the note menu
+--   New Separation value in the top bar (0-100%, default 50%): how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up. Changing it re-splits the item at once as one undo step; notes whose start and end did not move keep their edits, and it asks first if an edited note would lose them
+--   Better note splitting: notes joined by a slide and repeated notes on the same pitch now come out as separate notes; vibrato and short pitch-detection dropouts no longer cut a held note
+--   Items analysed with an earlier version need Re-Analyze; stored Transition, Onset Ramp, Legato Gap and Scoop values are not carried over
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -180,10 +184,8 @@ local DEFAULTS = {
   keep_pitch_mode = false,   -- Settings: leave each item's own pitch algorithm alone
   -- Cascade parameters (Global -> Item -> Note)
   retune_speed = 1.0,        -- 0.0–1.0 (correction strength)
-  transition_ms = 35,        -- 5–60ms (smoothstep crossfade)
-  onset_ramp_ms = 35,        -- 5–60ms (silence → correction fade-in)
-  legato_threshold_ms = 120, -- 50–300ms (gap below = legato blend)
   tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
+  separation = 0.5,          -- 0–1 how readily the analysis splits notes (see K.separation_params)
 }
 -- Analysis engine (Settings > Advanced DSP): the values of the default presets, so a preset table and its default pick
 -- can never drift apart
@@ -196,19 +198,13 @@ DEFAULTS.hop_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].hop   -- how many
 -- Global cascade defaults (project-wide, persisted in ExtState)
 local global_defaults = {
   retune_speed = DEFAULTS.retune_speed,
-  transition_ms = DEFAULTS.transition_ms,
-  onset_ramp_ms = DEFAULTS.onset_ramp_ms,
-  legato_threshold_ms = DEFAULTS.legato_threshold_ms,
   tolerance = DEFAULTS.tolerance,
 }
 
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
 local PARAM_LABELS = {
   retune_speed = "Correction Strength",
-  transition_ms = "Transition",
-  onset_ramp_ms = "Onset Ramp",
-  legato_threshold_ms = "Legato Gap",
-  scoop_shape = "Scoop Shape", -- per-note only (the top bar's Timing row, note context menu)
+  slide_in = "Slide In", -- per-note only (the top bar, Shift + drag on a note, note context menu)
   tighten = "Tighten",         -- per-note only (the top bar, the left side of a note, note context menu)
   tolerance = "Tolerance",
 }
@@ -218,7 +214,7 @@ local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
 
-  -- The most a Scoop may move one onset frame, in semitones (see K.correction_build)
+  -- The most Slide In may move one slide frame, in semitones (see K.correction_build)
   SCOOP_MAX_ST = 3.0,
 
   -- How long a status message replaces the hint on the canvas's status pill
@@ -276,6 +272,7 @@ local K = {
     min_freq = { 20, 200 },
     max_freq = { 200, 2000 },
     tolerance = { 0, 50 },   -- cents
+    separation = { 0, 1 },
   },
 
   -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
@@ -363,7 +360,8 @@ local state = {
   min_freq = DEFAULTS.min_freq,
   max_freq = DEFAULTS.max_freq,
   hop_size = DEFAULTS.hop_size, -- How many samples to advance per block
-  analysis_params = nil,        -- the five values above, frozen by start_analysis for the running analysis
+  separation = DEFAULTS.separation, -- how readily notes are split (K.segment)
+  analysis_params = nil,        -- the five detection values above (not separation), frozen by start_analysis
 
   -- Analysis state
   accessor = nil,
@@ -395,13 +393,12 @@ local state = {
   shift_mode = false,   -- true when Shift held before click (zone remap)
   context_menu_note = nil, -- index of note for right-click context menu
   bar_edit = nil,       -- { id, notes, acc, raws, starts }: a top bar value is being dragged on the selected notes (see draw_value)
-  timing_open = false,  -- the top bar's Timing row is shown (persisted)
   context_edit = nil,   -- { note, key, raw }: a note menu slider changed and not yet written (raw = the value before)
   context_menu_time = nil, -- the pointer's time (item seconds) when the note menu was opened
   context_menu_live = false, -- the note's points could be added to (K.points_live_at) when the note menu was opened
   context_point = nil,  -- { note_idx, frame, start_st }: the point the point menu ("##point_context_menu") is on
   -- The setting that is hovered or dragged (K.setting_hint): the canvas shades where it acts. key = cascade key
-  -- or "scoop_shape"; notes = nil (every note the top bar value reaches) or a set of note indices; frame = the
+  -- or "slide_in"; notes = nil (every note the top bar value reaches) or a set of note indices; frame = the
   -- ImGui frame that reported it; said = the "nothing in view" status was posted for this drag
   setting_hint = { frame = -1, menu_set = {}, zone_set = {} },
   view_t0 = nil,        -- visible time window of the canvas, seconds relative to the item start; nil = the whole item
@@ -497,14 +494,11 @@ K.set_pitch_algorithm = function(idx)
 end
 
 --- Resolve an effective value through the Global → Item → Note cascade.
---- For per-note cascadable keys: retune_speed, transition_ms, onset_ramp_ms.
---- For per-item only keys: legato_threshold_ms.
+--- For the cascadable keys: retune_speed, tolerance.
 local function get_effective(note, key)
-  -- 1. Per-note override (not applicable for legato_threshold_ms)
-  if key ~= "legato_threshold_ms" then
-    if note and note.controls and note.controls[key] ~= nil then
-      return note.controls[key]
-    end
+  -- 1. Per-note override
+  if note and note.controls and note.controls[key] ~= nil then
+    return note.controls[key]
   end
   -- 2. Per-item override
   if state.target_take_guid then
@@ -519,9 +513,7 @@ end
 
 --- Returns the override level for display: "note", "item", or "global"
 local function get_override_level(note, key)
-  if key ~= "legato_threshold_ms" then
-    if note and note.controls and note.controls[key] ~= nil then return "note" end
-  end
+  if note and note.controls and note.controls[key] ~= nil then return "note" end
   if state.target_take_guid then
     local take_data = state.session_takes[state.target_take_guid]
     if take_data and take_data.overrides and take_data.overrides[key] ~= nil then return "item" end
@@ -536,8 +528,9 @@ local function set_status(msg)
 end
 
 --- Ask the user to confirm a destructive action. draw_confirm_modal() shows the modal.
---- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function }
---- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once.
+--- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function, on_cancel = function | nil }
+--- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once, or on_cancel once when
+--- the modal closes without confirming.
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
   state.confirm = {
@@ -546,6 +539,7 @@ local function request_confirm(req)
     body_lines = req.body_lines or {},
     confirm_label = req.confirm_label or "Confirm",
     on_confirm = req.on_confirm,
+    on_cancel = req.on_cancel,
     open_pending = true,  -- OpenPopup once, on the next draw_confirm_modal() call
     opened = false,
   }
@@ -617,13 +611,7 @@ K.PERSIST = (function()
 
   -- Global cascade defaults (project-wide), saved when a drag or a typed entry is committed or reset
   number("cascade", "pitch_retune_speed", global_defaults, "retune_speed", { 0, 1 })
-  number("cascade", "pitch_transition_ms", global_defaults, "transition_ms", { 5, 60 })
-  number("cascade", "pitch_onset_ramp_ms", global_defaults, "onset_ramp_ms", { 5, 60 })
-  number("cascade", "pitch_legato_thresh_ms", global_defaults, "legato_threshold_ms", { 50, 300 })
   number("cascade", "pitch_tolerance", global_defaults, "tolerance", K.LIMITS.tolerance)
-
-  -- Top bar: whether the Timing row is open, saved when it is toggled
-  flag("bar", "pitch_timing_open", state, "timing_open")
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
   choice("engine", "pitch_block_size", state, "block_size", BLOCK_SIZES)
@@ -631,6 +619,7 @@ K.PERSIST = (function()
   number("engine", "pitch_threshold", state, "threshold", K.LIMITS.threshold)
   number("engine", "pitch_min_freq", state, "min_freq", K.LIMITS.min_freq)
   number("engine", "pitch_max_freq", state, "max_freq", K.LIMITS.max_freq)
+  number("engine", "pitch_separation", state, "separation", K.LIMITS.separation)
   flag("engine", "pitch_keep_pitch_mode", state, "keep_pitch_mode")
   add("engine", "pitch_algorithm", function() return string.format("%.14g", state.pitchmode_value) end, function(raw)
     local value = finite(raw)
@@ -977,6 +966,28 @@ local function midi_to_name(midi)
   return NOTE_NAMES[note_idx] .. octave
 end
 
+K.LEVEL_WINDOW_S = 0.010   -- the shortest short-level window
+K.LEVEL_PERIODS = 2        -- a voiced frame's window spans at least this many periods of its pitch
+
+--- The short-level window (seconds) for a frame of pitch `freq` Hz (nil or 0: unvoiced): LEVEL_WINDOW_S, or
+--- LEVEL_PERIODS periods if that is longer. A window shorter than a period swings with where it lands in the period.
+K.level_window_s = function(freq)
+  if freq and freq > 0 then return math.max(K.LEVEL_WINDOW_S, K.LEVEL_PERIODS / freq) end
+  return K.LEVEL_WINDOW_S
+end
+
+--- RMS of the samples in a `window_s` window (default LEVEL_WINDOW_S) centred on the block (the whole block if it is
+--- shorter). A whole-block RMS smears a quick dip in loudness; this follows it. `s` is a plain Lua array.
+K.short_level = function(s, b_size, sample_rate, window_s)
+  local n = math.min(b_size, math.max(1, math.floor((window_s or K.LEVEL_WINDOW_S) * sample_rate + 0.5)))
+  local first = math.floor((b_size - n) / 2) + 1
+  local sum = 0
+  for i = first, first + n - 1 do
+    sum = sum + s[i] * s[i]
+  end
+  return math.sqrt(sum / n)
+end
+
 -- Process a single block of audio using the YIN algorithm
 local function yin_process_block(samples, sample_rate, params)
   local b_size = params.calc_block_size or params.block_size
@@ -1050,7 +1061,7 @@ local function yin_process_block(samples, sample_rate, params)
     end
     -- If even the global minimum is high, it's likely unvoiced
     if min_val > params.threshold * 2 then
-      return rms, nil
+      return rms, nil, K.short_level(s, b_size, sample_rate)
     end
   end
 
@@ -1069,7 +1080,9 @@ local function yin_process_block(samples, sample_rate, params)
     end
   end
 
-  return rms, sample_rate / better_tau
+  local freq = sample_rate / better_tau
+  -- The short level spans two periods of the pitch found (10 ms at least): it does not swing within a period
+  return rms, freq, K.short_level(s, b_size, sample_rate, K.level_window_s(freq))
 end
 
 -------------------------------------------------------------------------------
@@ -1404,10 +1417,8 @@ end
 K.NOTE_CONTROLS = {
   { key = "tighten",       merge = "weighted", edited = "positive" },   -- 0 (as sung) .. 1 (a flat line)
   { key = "tolerance",     merge = "first",    edited = "set" },        -- cents; inherits item -> global
-  { key = "transition_ms", merge = "first",    edited = "set" },        -- inherits
-  { key = "onset_ramp_ms", merge = "first",    edited = "set" },        -- inherits
   { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
-  { key = "scoop_shape",   merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
+  { key = "slide_in",      merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
 }
 
 --- The values a note cut from the note with `old_ctrl` keeps (Split, Trim): all of them, and its bypass.
@@ -1588,25 +1599,6 @@ local function extract_note_features(note, preserve_controls)
       note.controls[k] = v
     end
   end
-
-  -- 7. ONSET ANALYSIS — scoop magnitude and voiced start detection
-  local scoop_frames = math.min(10, math.floor(#raw_pitch * 0.3))
-  local scoop_sum = 0
-  for i = 1, scoop_frames do
-    scoop_sum = scoop_sum + math.abs(raw_pitch[i] - note.avg_note)
-  end
-  note.scoop_magnitude = scoop_frames > 0 and (scoop_sum / scoop_frames) or 0
-
-  -- Find first frame with stable voicing (3+ consecutive voiced frames)
-  note.voiced_start_idx = 1
-  for i = 1, math.min(#note.frames, 15) do
-    if i + 2 <= #note.frames
-      and note.frames[i].note and note.frames[i+1].note and note.frames[i+2].note then
-      note.voiced_start_idx = i
-      break
-    end
-  end
-  note.voiced_start_time = note.frames[note.voiced_start_idx].time
 end
 
 -------------------------------------------------------------------------------
@@ -1920,6 +1912,30 @@ K.TIGHTEN_BODY_ST = 0.5     -- the note's body: from its first to its last frame
 K.TIGHTEN_WINDOW_S = 0.4    -- the time window at 0 %
 K.TIGHTEN_FADE = 0.1        -- the first tenth of the dial fades the correction in
 
+--- The body of `note`: the frame indices `a, b` from its first to its last frame whose smoothed pitch is within
+--- K.TIGHTEN_BODY_ST of the note's centre, or nil when the note has fewer than 3 frames, no `smooth` line, or fewer
+--- than 3 frames from `a` to `b`. No REAPER calls. Cached on the note, keyed on its frames, smooth line and centre
+--- (not on Tighten), so Tighten, joins and Slide In share one body.
+K.note_body = function(note)
+  local sm, frames, centre = note.smooth, note.frames, note.avg_note
+  if not sm or not frames or not centre or #frames < 3 or #sm ~= #frames then return nil end
+  local bc = note.body_cache
+  if not (bc and bc.frames == frames and bc.smooth == sm and bc.avg == centre) then
+    local nf = #frames
+    local a, b
+    for i = 1, nf do
+      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then a = i break end
+    end
+    for i = nf, 1, -1 do
+      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then b = i break end
+    end
+    if not (a and b - a >= 2) then a, b = nil, nil end
+    bc = { frames = frames, smooth = sm, avg = centre, a = a, b = b }
+    note.body_cache = bc
+  end
+  return bc.a, bc.b
+end
+
 --- The per-frame pitch (semitones) Tighten takes away from `note`, or nil when it takes nothing (Tighten at 0, or
 --- a note with no body to measure). No REAPER calls. Only the body of the note is measured, so a slide into or
 --- out of the note does not bend the line; the frames before and after the body take the value at the body's edge
@@ -1936,15 +1952,9 @@ K.tighten_line = function(note)
   if not (tc and tc.frames == frames and tc.smooth == sm and tc.avg == centre and tc.amount == amount) then
     tc = { frames = frames, smooth = sm, avg = centre, amount = amount, line = false }
     note.tighten_cache = tc
-    local a, b
-    for i = 1, nf do
-      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then a = i break end
-    end
-    for i = nf, 1, -1 do
-      if math.abs(sm[i] - centre) <= K.TIGHTEN_BODY_ST then b = i break end
-    end
+    local a, b = K.note_body(note)
     local hop = (frames[nf].time - frames[1].time) / (nf - 1)
-    if a and b - a >= 2 and hop > 0 then
+    if a and hop > 0 then
       local dev = {}
       for i = a, b do dev[#dev + 1] = sm[i] - centre end
       local window = K.TIGHTEN_WINDOW_S * (1 - amount) ^ 2
@@ -2020,9 +2030,6 @@ local function save_take_data(take, data)
         avg_note = note.avg_note,
         display_note = note.display_note,
         controls = note.controls,
-        scoop_magnitude = note.scoop_magnitude,
-        voiced_start_idx = note.voiced_start_idx,
-        voiced_start_time = note.voiced_start_time,
         frames = note.frames
       })
     end
@@ -2143,9 +2150,9 @@ local function toggle_take_pitch_bypass(take)
 end
 
 --- Drop every in-flight gesture and selection, and show the whole item again (used when the model under
---- them is replaced).
-local function clear_interaction_state()
-  K.reset_view()
+--- them is replaced). keep_view: the canvas stays where it is (a re-split of the same item).
+local function clear_interaction_state(keep_view)
+  if not keep_view then K.reset_view() end
   state.selected_note = nil
   state.selected_notes = {}
   state.hovered_note = nil
@@ -2368,18 +2375,23 @@ local function end_apply(take, undo_desc)
   note_own_write()
 end
 
+-- Joins and fades between notes (seconds). Two neighbours closer than 2 * FADE_S are joined: the blend runs from
+-- the first note's body end to the second note's body start, at least MIN_S, at most MAX_S and MAX_PART of either
+-- note. Every other edge of an edited note fades over FADE_S, or a quarter of the note when that is shorter.
+K.JOIN = { FADE_S = 0.030, MIN_S = 0.010, MAX_S = 0.120, MAX_PART = 0.4 }
+
 --- The pitch correction of `notes` as a trajectory: what the take pitch envelope holds and what the canvas
 --- draws, from one calculation. Pure (no REAPER calls); it sets note.frame_shifts on every note.
 --- Returns { points, spans, ranges }:
 ---   points  { time, val } in semitones, in generation order (the envelope writer simplifies and sorts them)
----   spans   { kind, t0, t1, a, b }: where a timing value acts. "onset" / "release" (the fade before / after
----           note a), "glide" (the blend between notes a and b; its length is note b's Transition), "gap" (the
----           joined gap between a and b), "scoop" (the bent onset of note a). a and b are note indices.
+---   spans   { kind, t0, t1, a, b }: "onset" / "release" (the fade before / after note a), "glide" (the join of
+---           notes a and b, across the slide between their bodies), "scoop" (the slide of note a that Slide In
+---           flattens). a and b are note indices.
 ---   ranges  { t0, t1 }, sorted and merged: the time ranges an edited, non-bypassed note corrects (with its
----           ramps and glides)
+---           fades and joins)
+--- No timing setting: joins and fades follow K.JOIN.
 K.correction_build = function(notes, item_len)
   local all_points, spans, ranges = {}, {}, {}
-  local scooped = {}   -- [note index] = true: its onset frames carry a scoop correction
   local num_notes = #notes
 
   -- 1. Precalculate continuous frame shifts for every note
@@ -2404,28 +2416,27 @@ K.correction_build = function(notes, item_len)
           n.frame_shifts[i] = tight and (coarse - (tight[i] or 0)) or coarse
         end
 
-        -- Scoop: flatten the slide into the note. The onset frames are pulled toward the pitch the corrected
-        -- note settles at right after the onset: fully on the first frame at 100 %, easing out to the note's
-        -- normal correction by the end of the onset (so the onset meets the body without a step). 0 % leaves
-        -- the slide as sung. The pull of one frame is limited to K.SCOOP_MAX_ST, so a mis-detected onset frame
-        -- (an octave error) cannot write a jump of that size into the envelope.
-        local scoop = (n.controls and n.controls.scoop_shape) or 0
-        if scoop > 0 and is_mod and n.voiced_start_idx then
-          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
-          local settle = n.frames[onset_end + 1]
-          if onset_end > 1 and onset_end < #n.frames and settle and settle.note then
-            local settle_pitch = settle.note + n.frame_shifts[onset_end + 1]
-            for i = 1, onset_end do
+        -- Slide In: flatten the slide into the note. The slide is the frames before the note's body (K.note_body).
+        -- Each is pulled toward the pitch the corrected note has at its body start: fully at 100 %, not at all at
+        -- 0 % (the slide as sung). No taper, so the slide meets the body without a step. The pull of one frame is
+        -- limited to K.SCOOP_MAX_ST, so a mis-detected frame (an octave error) cannot write a jump of that size
+        -- into the envelope. A note that starts on pitch has no slide.
+        local slide_in = (n.controls and n.controls.slide_in) or 0
+        if slide_in > 0 and is_mod then
+          local a = K.note_body(n)
+          local settle = a and a > 1 and n.frames[a] and n.frames[a].note
+          if settle then
+            local settle_pitch = settle + n.frame_shifts[a]
+            for i = 1, a - 1 do
               local sung = n.frames[i].note
               if sung then
                 local natural = n.frame_shifts[i]
                 local pull = (settle_pitch - sung) - natural   -- what would put this frame on the settled pitch
                 pull = math.max(-K.SCOOP_MAX_ST, math.min(K.SCOOP_MAX_ST, pull))
-                n.frame_shifts[i] = natural + pull * scoop * (1 - (i - 1) / onset_end)
+                n.frame_shifts[i] = natural + pull * slide_in
               end
             end
-            scooped[idx] = true
-            spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[onset_end].time, a = idx }
+            spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[a - 1].time, a = idx }
           end
         end
 
@@ -2440,141 +2451,160 @@ K.correction_build = function(notes, item_len)
     end
   end
 
-  -- 2. Build continuous trajectory across notes and boundaries
-  local legato_thresh = get_effective(nil, "legato_threshold_ms") * 0.001
+  -- 2. The trajectory across notes. Two neighbours closer than two fades are joined (K.JOIN): the correction
+  -- blends across the slide the singer sang between their bodies. Every other edge of an edited note fades.
+  local J = K.JOIN
+  local function emit(t, val)
+    all_points[#all_points + 1] = { time = math.max(0.0, math.min(item_len, t)), val = val }
+  end
+  -- Corrected (edited and not bypassed): such a note writes its own points and takes part in its joins
+  local function active(n)
+    return n ~= nil and not (n.controls and n.controls.bypassed) and is_note_modified(n)
+  end
+  -- The note's shift at time t: its frame shifts joined by straight lines, the first / last one before / after them
+  local function shift_at(n, t)
+    local fr, sh = n.frames, n.frame_shifts
+    local nf = fr and #fr or 0
+    if nf == 0 or not sh then return 0.0 end
+    if t <= fr[1].time then return sh[1] or 0.0 end
+    if t >= fr[nf].time then return sh[nf] or 0.0 end
+    local lo, hi = 1, nf
+    while hi - lo > 1 do
+      local mid = math.floor((lo + hi) / 2)
+      if fr[mid].time <= t then lo = mid else hi = mid end
+    end
+    local t0, t1 = fr[lo].time, fr[hi].time
+    local v0, v1 = sh[lo] or 0.0, sh[hi] or 0.0
+    return (t1 > t0) and v0 + (v1 - v0) * (t - t0) / (t1 - t0) or v1
+  end
+  -- The times of the first and last frame of the note's body; a note without a body is all body
+  local function body_times(n)
+    local fr = n.frames
+    if not fr or #fr == 0 then return n.start_time, n.end_time end
+    local a, b = K.note_body(n)
+    return fr[a or 1].time, fr[b or #fr].time
+  end
+
+  -- joins[i]: the blend { t0, t1 } between notes i and i + 1, from the first note's body end to the second note's
+  -- body start; at least MIN_S (grown evenly), at most MAX_S and MAX_PART of either note on its side (cut from the
+  -- far ends, so the part nearest the boundary stays)
+  local joins = {}
+  for i = 1, num_notes - 1 do
+    local na, nb = notes[i], notes[i + 1]
+    if nb.start_time - na.end_time < 2 * J.FADE_S and (active(na) or active(nb)) then
+      local _, a_end = body_times(na)
+      local b_start = body_times(nb)
+      local s0, s1 = a_end, math.max(a_end, b_start)
+      if s1 - s0 < J.MIN_S then
+        local c = (s0 + s1) * 0.5
+        s0, s1 = c - J.MIN_S * 0.5, c + J.MIN_S * 0.5
+      end
+      local bnd = (na.end_time + nb.start_time) * 0.5
+      local left, right = math.max(0, bnd - s0), math.max(0, s1 - bnd)
+      if left + right > J.MAX_S then
+        local half = J.MAX_S * 0.5
+        if left < half then right = J.MAX_S - left
+        elseif right < half then left = J.MAX_S - right
+        else left, right = half, half end
+      end
+      s0 = math.max(0.0, bnd - left, na.end_time - J.MAX_PART * (na.end_time - na.start_time))
+      s1 = math.min(item_len, bnd + right, nb.start_time + J.MAX_PART * (nb.end_time - nb.start_time))
+      joins[i] = { t0 = s0, t1 = math.max(s0, s1) }
+    end
+  end
+
+  -- The blend of join j from note na into note nb (index b_idx): the first note's shift held at the span start,
+  -- crossfaded (smoothstep) into the second note's own shift, one point per frame of either note
+  local function emit_join(na, nb, b_idx, j)
+    local hold = shift_at(na, j.t0)
+    local len = j.t1 - j.t0
+    local function put(t)
+      local u = (len > 0) and (t - j.t0) / len or 1
+      local own = shift_at(nb, t)
+      emit(t, (u >= 1) and own or hold + (own - hold) * smoothstep(u))
+    end
+    put(j.t0)
+    local fa, fb = na.frames or {}, nb.frames or {}
+    local pa, pb = 1, 1
+    while true do
+      while fa[pa] and fa[pa].time <= j.t0 do pa = pa + 1 end
+      while fb[pb] and fb[pb].time <= j.t0 do pb = pb + 1 end
+      local ta = fa[pa] and fa[pa].time or math.huge
+      local tb = fb[pb] and fb[pb].time or math.huge
+      local t = math.min(ta, tb)
+      if t >= j.t1 then break end
+      put(t)
+      if ta == t then pa = pa + 1 end
+      if tb == t then pb = pb + 1 end
+    end
+    put(j.t1)
+    spans[#spans + 1] = { kind = "glide", t0 = j.t0, t1 = j.t1, a = b_idx - 1, b = b_idx }
+  end
 
   for idx = 1, num_notes do
     local n = notes[idx]
-    local prev_n = notes[idx - 1]
-    local next_n = notes[idx + 1]
+    local jp, jn = joins[idx - 1], joins[idx]
 
-    -- Bypassed notes produce zero shifts — skip trajectory generation
-    if n.controls and n.controls.bypassed then
-      goto continue_note
-    end
+    -- A. The join from the previous note (written by whichever of the two is edited)
+    if jp then emit_join(notes[idx - 1], n, idx, jp) end
 
-    local is_mod = is_note_modified(n)
-    local prev_mod = is_note_modified(prev_n)
-    local next_mod = is_note_modified(next_n)
+    if active(n) then
+      local fade = math.min(J.FADE_S, (n.end_time - n.start_time) * 0.25)
+      local start_shift, end_shift = shift_at(n, n.start_time), shift_at(n, n.end_time)
+      -- The time range this note corrects, with its joins and fades
+      local range = { t0 = jp and jp.t0 or n.start_time, t1 = jn and jn.t1 or n.end_time }
+      -- The body runs from the end of the join before (or the note start) to the start of the join after (or the
+      -- note end); an edge a join or fade already wrote is not written again
+      local body_t0 = jp and jp.t1 or n.start_time
+      local body_t1 = jn and jn.t0 or n.end_time
+      local t0_written = jp ~= nil
 
-    -- If this note and both its neighbors are untouched, skip entirely
-    if not is_mod and not prev_mod and not next_mod then
-      goto continue_note
-    end
-
-    local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
-    local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
-
-    local trans_dur = math.min(get_effective(n, "transition_ms") * 0.001, 0.060)
-    trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
-
-    -- The time range this note corrects (grown below by its ramps and glides)
-    local range = is_mod and { t0 = n.start_time, t1 = n.end_time } or nil
-
-    -- A. START TRANSITION
-    local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
-    if prev_gap < legato_thresh and prev_n then
-      -- Legato transition with previous note: smoothstep blend centered at boundary
-      local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
-      local t_bnd = (prev_n.end_time + n.start_time) * 0.5
-      local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
-      local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
-
-      local steps = 5
-      for s = 0, steps do
-        local u = s / steps
-        local t = t_start + u * (t_end - t_start)
-        local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
-        table.insert(all_points, { time = t, val = val })
-      end
-      if is_mod or prev_mod then
-        spans[#spans + 1] = { kind = "glide", t0 = t_start, t1 = t_end, a = idx - 1, b = idx }
-        spans[#spans + 1] = { kind = "gap", t0 = prev_n.end_time, t1 = n.start_time, a = idx - 1, b = idx }
-        -- The glide belongs to the range of whichever side is edited; the previous note's range is the last one
-        if range then range.t0 = math.min(range.t0, t_start) end
-        local last = ranges[#ranges]
-        if prev_mod and last and not (prev_n.controls and prev_n.controls.bypassed) then
-          last.t1 = math.max(last.t1, t_end)
-        end
-      end
-    else
-      -- Onset from silence / start of take: smooth ramp into pitch shift
-      if is_mod and math.abs(start_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
-        local t_pre = math.max(0.0, n.start_time - ramp_t)
-        table.insert(all_points, { time = t_pre, val = 0.0 })
+      -- B. Onset from silence: smooth ramp into the note's shift
+      if not jp and math.abs(start_shift) > 0.001 then
+        local t_pre = math.max(0.0, n.start_time - fade)
         local steps = 4
-        for s = 1, steps do
+        for s = 0, steps do
           local u = s / steps
-          local t = t_pre + u * (n.start_time - t_pre)
-          local val = start_shift * smoothstep(u)
-          table.insert(all_points, { time = t, val = val })
+          emit(t_pre + u * (n.start_time - t_pre), start_shift * smoothstep(u))
         end
         spans[#spans + 1] = { kind = "onset", t0 = t_pre, t1 = n.start_time, a = idx }
         range.t0 = math.min(range.t0, t_pre)
+        t0_written = true
       end
-    end
 
-    -- B. NOTE BODY
-    -- A tightened note and a scooped onset differ from frame to frame: their frames are written.
-    -- A note with pitch points is also written frame by frame, up to each edge that is not joined to a neighbour.
-    local has_points = K.points_offsets(n) ~= nil
-    local fine_changed = is_mod and (scooped[idx] == true or has_points or K.tighten_line(n) ~= nil)
-    local body_t_start = n.start_time + trans_dur * 0.5
-    local body_t_end = n.end_time - trans_dur * 0.5
-    local start_written = false   -- section A already wrote a point at body_t_start (the end of its onset ramp)
-    if has_points then
-      if not (prev_gap < legato_thresh and prev_n) then
-        body_t_start = n.start_time
-        start_written = math.abs(start_shift) > 0.001
-      end
-      if not (next_n and (next_n.start_time - n.end_time) < legato_thresh) then
-        body_t_end = n.end_time   -- section C's release ramp starts after n.end_time (Onset Ramp >= 5 ms)
-      end
-    end
-
-    if not fine_changed then
-      -- Coarse shift or untouched: hold shift across body
-      if is_mod then
-        table.insert(all_points, { time = math.min(item_len, body_t_start), val = start_shift })
-        table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
-      end
-    else
-      -- Fine contour: one point per frame across the body
-      if n.frames then
-        for i = 1, #n.frames do
-          local t = n.frames[i].time
-          if (t > body_t_start or (t == body_t_start and not start_written)) and t <= body_t_end then
-            table.insert(all_points, { time = math.min(item_len, t), val = n.frame_shifts[i] })
-          end
+      -- C. The body: one point per frame when its shifts vary, its two ends when they are constant
+      if not t0_written then emit(body_t0, shift_at(n, body_t0)) end
+      local sh, fr = n.frame_shifts, n.frames
+      local varies = false
+      if fr and sh and sh[1] then
+        for i = 2, #fr do
+          if math.abs((sh[i] or 0) - sh[1]) > 1e-9 then varies = true break end
         end
       end
-    end
+      if varies then
+        for i = 1, #fr do
+          local t = fr[i].time
+          if t > body_t0 and t < body_t1 then emit(t, sh[i]) end
+        end
+      end
 
-    -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
-    local next_gap = next_n and (next_n.start_time - n.end_time) or 999
-    if next_gap >= legato_thresh then
-      if is_mod and math.abs(end_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
+      -- D. Release into silence: smooth ramp out of the note's shift
+      if not jn and math.abs(end_shift) > 0.001 then
         local steps = 4
-        for s = 1, steps do
+        for s = 0, steps do
           local u = s / steps
-          local t = math.min(item_len, n.end_time + u * ramp_t)
-          local val = end_shift * (1.0 - smoothstep(u))
-          table.insert(all_points, { time = t, val = val })
+          emit(n.end_time + u * fade, end_shift * (1.0 - smoothstep(u)))
         end
-        local t_post = math.min(item_len, n.end_time + ramp_t + 0.001)
-        table.insert(all_points, { time = t_post, val = 0.0 })
-        spans[#spans + 1] = { kind = "release", t0 = n.end_time, t1 = math.min(item_len, n.end_time + ramp_t), a = idx }
+        local t_post = math.min(item_len, n.end_time + fade + 0.001)
+        emit(t_post, 0.0)
+        spans[#spans + 1] = { kind = "release", t0 = n.end_time, t1 = math.min(item_len, n.end_time + fade), a = idx }
         range.t1 = math.max(range.t1, t_post)
+      elseif not jn then
+        emit(body_t1, shift_at(n, body_t1))
       end
+
+      ranges[#ranges + 1] = range
     end
-
-    if range then ranges[#ranges + 1] = range end
-
-    ::continue_note::
   end
 
   -- Ranges are in note order; merge the ones that touch
@@ -3274,105 +3304,424 @@ trim_note_edge = function(note_idx, edge, new_time)
   return dropped
 end
 
+-- Note splitting: the fixed constants of K.segment (the ones Separation scales come from K.separation_params)
+K.SEG = {
+  BRIDGE_S = 0.025,      -- a shorter unvoiced stretch with matching pitch on both sides does not end the note
+  SILENCE_DB = 40,       -- a frame this far below the 95th-percentile level of the voiced frames is silent
+  DIP_REACH_S = 0.150,   -- how far each way a level dip looks for the peaks it must lie below
+  MEDIAN_S = 0.015,      -- pitch median filter window (at least 3 frames)
+  CYCLE_S = 0.18,        -- about one vibrato cycle: the window of the cycle median the note's centre is taken from
+  -- The Separation columns 0 / 0.5 / 1 (fewer notes -> more notes); K.separation_params is linear between them
+  SEPARATION = {
+    { pitch_st = 1.5, hold_s = 0.140, dip_db = 12, min_note_s = 0.100 },
+    { pitch_st = 0.8, hold_s = 0.090, dip_db = 6, min_note_s = 0.070 },
+    { pitch_st = 0.4, hold_s = 0.050, dip_db = 3, min_note_s = 0.040 },
+  },
+}
+
+--- The splitting thresholds at Separation `sep` (0..1): pitch_st (a departure from the note's centre beyond this...),
+--- hold_s (...that lasts this long starts a new note), dip_db (a level dip this deep splits) and min_note_s (a shorter
+--- piece is merged into a neighbour).
+K.separation_params = function(sep)
+  sep = math.max(0, math.min(1, sep or DEFAULTS.separation))
+  local cols = K.SEG.SEPARATION
+  local a, b, u
+  if sep <= 0.5 then a, b, u = cols[1], cols[2], sep / 0.5
+  else a, b, u = cols[2], cols[3], (sep - 0.5) / 0.5 end
+  local p = {}
+  for key, v in pairs(a) do p[key] = v * (1 - u) + b[key] * u end   -- exact at the columns
+  return p
+end
+
+--- The frame spacing of `results` (time-ordered frames, at least two): the median step between frames.
+K.frame_step = function(results)
+  local steps = {}
+  for i = 2, #results do steps[i - 1] = results[i].time - results[i - 1].time end
+  table.sort(steps)
+  local m = #steps
+  if m % 2 == 1 then return steps[(m + 1) / 2] end
+  return (steps[m / 2] + steps[m / 2 + 1]) * 0.5
+end
+
+--- Splits analysed frames (`results`: time-ordered { time, note | nil, rms, lvl }) into notes at Separation `sep`.
+--- Returns notes { start_time, end_time, frames, sum_note, count } (frames: the original result frames, voiced only)
+--- and split_points { time, reason } (one per note, reason "Onset" / "Pitch change" / "Level dip"). Every time constant
+--- is converted with the frames' own spacing. `results` is not modified.
+K.segment = function(results, sep)
+  local P, SEG = K.separation_params(sep), K.SEG
+  local notes, split_points = {}, {}
+  local n = #results
+  if n < 2 then return notes, split_points end
+
+  local function median(list)   -- sorts `list`
+    table.sort(list)
+    local m = #list
+    if m % 2 == 1 then return list[(m + 1) / 2] end
+    return (list[m / 2] + list[m / 2 + 1]) * 0.5
+  end
+  -- Binary heaps: h[1] is the entry for which less(h[1], x) holds against every other x
+  local function hpush(h, e, less)
+    local c = #h + 1
+    h[c] = e
+    while c > 1 do
+      local up = c // 2
+      if not less(e, h[up]) then break end
+      h[c], h[up] = h[up], e
+      c = up
+    end
+  end
+  local function hpop(h, less)
+    local top, c = h[1], #h
+    h[1] = h[c]
+    h[c] = nil
+    c = c - 1
+    local i = 1
+    while true do
+      local l, best = 2 * i, i
+      if l <= c and less(h[l], h[best]) then best = l end
+      if l + 1 <= c and less(h[l + 1], h[best]) then best = l + 1 end
+      if best == i then break end
+      h[i], h[best] = h[best], h[i]
+      i = best
+    end
+    return top
+  end
+  local function lt(x, y) return x < y end
+  local function gt(x, y) return x > y end
+
+  local hop = K.frame_step(results)
+  if not (hop > 0) then return notes, split_points end
+  local half_w = math.max(1, math.floor(SEG.MEDIAN_S / hop / 2 + 0.5))   -- median window 2*half_w + 1 frames
+
+  -- 1. Levels in dB; a frame is voiced when it has a pitch and is not silent relative to the item's loud level
+  local db, loud = {}, {}
+  for i, f in ipairs(results) do
+    db[i] = 20 * math.log(math.max(f.lvl or f.rms or 0, 1e-10), 10)
+    if f.note then loud[#loud + 1] = db[i] end
+  end
+  if #loud == 0 then return notes, split_points end
+  table.sort(loud)
+  local floor_db = loud[math.max(1, math.ceil(0.95 * #loud))] - SEG.SILENCE_DB
+  local voiced = {}
+  for i, f in ipairs(results) do voiced[i] = f.note ~= nil and db[i] >= floor_db end
+
+  -- 2. Runs of voiced frames; a short unvoiced stretch with matching pitch on both sides is bridged
+  local function side_pitch(list, from, to)
+    local vals = {}
+    for k = from, to do vals[#vals + 1] = results[list[k]].note end
+    return median(vals)
+  end
+  local runs, run = {}, nil   -- run: { idx = voiced result indices }
+  for i = 1, n do
+    if voiced[i] then
+      if run then
+        local last = run.idx[#run.idx]
+        if i > last + 1 then
+          local gap_s = results[i].time - results[last].time - hop
+          local after = {}
+          for j = i, n do
+            if voiced[j] then after[#after + 1] = j end
+            if #after > half_w then break end
+          end
+          local bridged = gap_s < SEG.BRIDGE_S and math.abs(
+            side_pitch(run.idx, math.max(1, #run.idx - half_w), #run.idx) - side_pitch(after, 1, #after)) <= P.pitch_st
+          if not bridged then run = nil end
+        end
+      end
+      if not run then
+        run = { idx = {} }
+        runs[#runs + 1] = run
+      end
+      run.idx[#run.idx + 1] = i
+    end
+  end
+
+  local segs = {}   -- { first, last (result indices), reason, run, voiced = result indices, pitch }
+  for r, rn in ipairs(runs) do
+    local idx, m = rn.idx, #rn.idx
+    local first, last = idx[1], idx[m]
+
+    -- 3. Median-filtered pitch of the run's voiced frames (working data; the frames keep their own pitch)
+    local pf = {}
+    for k = 1, m do
+      local win = {}
+      for q = math.max(1, k - half_w), math.min(m, k + half_w) do win[#win + 1] = results[idx[q]].note end
+      pf[k] = median(win)
+    end
+
+    -- Cycle median: the median of pf over about one vibrato cycle (an unbiased centre for vibrato). The window is
+    -- centred, shifted at the run's edges to stay full length; win_lo[k] is where it starts
+    local cyc_w = math.min(m, 2 * math.max(1, math.floor(SEG.CYCLE_S / hop / 2 + 0.5)) + 1)
+    local cyc_half = (cyc_w - 1) // 2
+    local cyc, win_lo = {}, {}
+    do
+      local sorted, lo, hi = {}, 1, 0
+      local function find(v)   -- the first position in `sorted` whose value is >= v
+        local a, b = 1, #sorted
+        while a <= b do
+          local mid = (a + b) // 2
+          if sorted[mid] < v then a = mid + 1 else b = mid - 1 end
+        end
+        return a
+      end
+      for k = 1, m do
+        local want_lo = math.max(1, math.min(k - cyc_half, m - cyc_w + 1))
+        local want_hi = want_lo + cyc_w - 1
+        while hi < want_hi do hi = hi + 1; table.insert(sorted, find(pf[hi]), pf[hi]) end
+        while lo < want_lo do table.remove(sorted, find(pf[lo])); lo = lo + 1 end
+        local nc = #sorted
+        cyc[k] = nc % 2 == 1 and sorted[(nc + 1) // 2] or (sorted[nc // 2] + sorted[nc // 2 + 1]) * 0.5
+        win_lo[k] = want_lo
+      end
+    end
+
+    -- 4. Pitch change: pf stays more than pitch_st from the note's centre, on one side, for hold_s, and has settled
+    -- there (the cycle median in the middle of that stretch is more than pitch_st / 2 from the centre). The centre is
+    -- the median of the note's cycle-median values so far (kept sorted), frozen while a departure lasts. A cycle-median
+    -- window never reaches back before the note's start: near the start it is the note's first cycle
+    local boundary = { [first] = "Onset" }
+    local s, k = 1, 1
+    -- The note's cycle-median values so far: the lower half in a max-heap (one more when odd), the upper half in a
+    -- min-heap, so the median is at their tops
+    local body_lo, body_hi, d, dir, head = {}, {}, nil, nil, nil
+    local function note_cyc(q)
+      if win_lo[q] >= s then return cyc[q] end
+      if not head then
+        local vals = {}
+        for x = s, math.min(m, s + cyc_w - 1) do vals[#vals + 1] = pf[x] end
+        head = median(vals)
+      end
+      return head
+    end
+    local function to_body(q)
+      local v = note_cyc(q)
+      if body_lo[1] and v > body_lo[1] then hpush(body_hi, v, lt) else hpush(body_lo, v, gt) end
+      if #body_lo > #body_hi + 1 then hpush(body_hi, hpop(body_lo, gt), lt)
+      elseif #body_hi > #body_lo then hpush(body_lo, hpop(body_hi, lt), gt) end
+    end
+    while k <= m do
+      local split = false
+      if #body_lo > 0 then
+        local centre = #body_lo > #body_hi and body_lo[1] or (body_lo[1] + body_hi[1]) * 0.5
+        local off = pf[k] - centre
+        local away = math.abs(off) > P.pitch_st
+        if d and not (away and (off > 0) == dir) then   -- came back (vibrato, a stray frame): part of the note
+          for q = d, k - 1 do to_body(q) end
+          d = nil
+        end
+        if away and not d then d, dir = k, off > 0 end
+        if d and results[idx[k]].time - results[idx[d]].time >= P.hold_s
+          and math.abs(note_cyc((d + k) // 2) - centre) > P.pitch_st / 2 then
+          -- The new note starts where the pitch crossed halfway from the centre to the pitch it settled on
+          local held = {}
+          for q = d, k do held[#held + 1] = pf[q] end
+          local settled = median(held)
+          local half, sign = (centre + settled) * 0.5, settled - centre
+          local function past(q) return (pf[q] - half) * sign >= 0 end
+          local j = d
+          if past(j) then
+            while j - 1 > s and past(j - 1) do j = j - 1 end
+          else
+            while j < k and not past(j) do j = j + 1 end
+          end
+          boundary[idx[j]] = "Pitch change"
+          s, k, body_lo, body_hi, d, head = j, j, {}, {}, nil, nil
+          split = true
+        end
+      end
+      if not split then
+        if not d then to_body(k) end
+        k = k + 1
+      end
+    end
+
+    -- 5. Level dip: a frame dip_db below the highest level within DIP_REACH_S on each side (bridged frames count).
+    -- Each stretch of such frames splits once, at its lowest frame (the middle one of equal lowest frames)
+    local function side_max(step)   -- per frame, the highest level within reach before (step 1) or after (step -1) it
+      local out, dq, h, tl = {}, {}, 1, 0
+      local from, to = first, last
+      if step < 0 then from, to = last, first end
+      for i = from, to, step do
+        if i ~= from then
+          local q = i - step
+          while tl >= h and db[dq[tl]] <= db[q] do tl = tl - 1 end
+          tl = tl + 1
+          dq[tl] = q
+        end
+        while tl >= h and math.abs(results[i].time - results[dq[h]].time) > SEG.DIP_REACH_S do h = h + 1 end
+        if tl >= h then out[i] = db[dq[h]] end
+      end
+      return out
+    end
+    local left, right = side_max(1), side_max(-1)
+    local i = first
+    while i <= last do
+      local function dip(q)
+        return left[q] and right[q] and db[q] <= left[q] - P.dip_db and db[q] <= right[q] - P.dip_db
+      end
+      if dip(i) then
+        local j = i
+        while j + 1 <= last and dip(j + 1) do j = j + 1 end
+        local low = math.huge
+        for q = i, j do low = math.min(low, db[q]) end
+        local ties = {}
+        for q = i, j do if db[q] <= low + 1e-9 then ties[#ties + 1] = q end end
+        local at = ties[(#ties + 1) // 2]
+        if not boundary[at] then boundary[at] = "Level dip" end
+        i = j + 1
+      else
+        i = i + 1
+      end
+    end
+
+    -- Segments of this run, from its boundaries
+    local starts = {}
+    for at in pairs(boundary) do starts[#starts + 1] = at end
+    table.sort(starts)
+    local q = 1   -- idx and starts are both in order: one walk hands each voiced frame to its segment
+    for b, at in ipairs(starts) do
+      local seg = { first = at, last = (starts[b + 1] or last + 1) - 1, reason = boundary[at], run = r, voiced = {} }
+      while q <= m and idx[q] < seg.first do q = q + 1 end
+      while q <= m and idx[q] <= seg.last do
+        seg.voiced[#seg.voiced + 1] = idx[q]
+        q = q + 1
+      end
+      segs[#segs + 1] = seg
+    end
+    rn.pf = {}   -- filtered pitch by result index, for the merge below
+    for q = 1, m do rn.pf[idx[q]] = pf[q] end
+  end
+
+  -- 6. A segment shorter than min_note_s joins the touching neighbour closer in pitch, or is dropped without one.
+  -- The shortest goes first (the earliest of equally short ones). The segments are a linked list and the short ones
+  -- sit in a heap keyed by (duration, order), so a merge only looks at its neighbours
+  local function touching(a, b) return a and b and a.run == b.run end
+  local function seg_dur(seg)
+    local nxt = seg.nxt
+    if #seg.voiced == 0 then return 0 end
+    local stop = touching(seg, nxt) and #nxt.voiced > 0 and results[nxt.voiced[1]].time
+      or results[seg.voiced[#seg.voiced]].time + hop
+    return stop - results[seg.voiced[1]].time
+  end
+  local function pitch_of(seg)   -- the median of seg.sorted (its voiced frames' filtered pitch, in order)
+    local v, c = seg.sorted, #seg.sorted
+    if c == 0 then return nil end
+    if c % 2 == 1 then return v[(c + 1) // 2] end
+    return (v[c // 2] + v[c // 2 + 1]) * 0.5
+  end
+  local heap = {}
+  local function before(x, y) return x.dur < y.dur or (x.dur == y.dur and x.seg.ord < y.seg.ord) end
+  local function push(seg)   -- (re)queue seg when it is short; an older entry for it goes stale with seg.ver
+    seg.ver = (seg.ver or 0) + 1
+    local dur = seg_dur(seg)
+    if dur < P.min_note_s then hpush(heap, { dur = dur, seg = seg, ver = seg.ver }, before) end
+  end
+  for x, seg in ipairs(segs) do
+    seg.ord, seg.prv, seg.nxt = x, segs[x - 1], segs[x + 1]
+    seg.sorted = {}
+    for q, i in ipairs(seg.voiced) do seg.sorted[q] = runs[seg.run].pf[i] end
+    table.sort(seg.sorted)
+    seg.pitch = pitch_of(seg)
+  end
+  for _, seg in ipairs(segs) do push(seg) end
+  local head = segs[1]
+  while #heap > 0 do
+    local e = hpop(heap, before)
+    local seg = e.seg
+    if not seg.gone and e.ver == seg.ver then
+      local prev, nxt = seg.prv, seg.nxt
+      if not touching(prev, seg) then prev = nil end
+      if not touching(seg, nxt) then nxt = nil end
+      local into = prev or nxt
+      if prev and nxt and seg.pitch and nxt.pitch
+        and (not prev.pitch or math.abs(nxt.pitch - seg.pitch) < math.abs(prev.pitch - seg.pitch)) then
+        into = nxt
+      end
+      if into and into == prev then
+        prev.last = seg.last
+        for _, i in ipairs(seg.voiced) do prev.voiced[#prev.voiced + 1] = i end
+      elseif into then   -- the next segment now starts where this one did, for the same reason
+        nxt.first, nxt.reason = seg.first, seg.reason
+        for _, i in ipairs(nxt.voiced) do seg.voiced[#seg.voiced + 1] = i end
+        nxt.voiced = seg.voiced
+      end
+      if into then
+        local sorted = into.sorted
+        for _, v in ipairs(seg.sorted) do   -- insert after equal values: the same multiset as a fresh sort
+          local lo, hi = 1, #sorted
+          while lo <= hi do
+            local mid = (lo + hi) // 2
+            if sorted[mid] <= v then lo = mid + 1 else hi = mid - 1 end
+          end
+          table.insert(sorted, lo, v)
+        end
+        into.pitch = pitch_of(into)
+      end
+      -- Unlink seg; the durations that can change are those of the segments now on either side of the gap
+      seg.gone = true
+      if seg.prv then seg.prv.nxt = seg.nxt else head = seg.nxt end
+      if seg.nxt then seg.nxt.prv = seg.prv end
+      if seg.prv then push(seg.prv) end
+      if seg.nxt then push(seg.nxt) end
+    end
+  end
+  segs = {}
+  local cur = head
+  while cur do
+    segs[#segs + 1] = cur
+    cur = cur.nxt
+  end
+
+  -- Notes: start at the first voiced frame; end where the touching next note starts, else at the last voiced frame
+  for x, seg in ipairs(segs) do
+    local fr, sum = {}, 0
+    for q, i in ipairs(seg.voiced) do
+      fr[q] = results[i]
+      sum = sum + results[i].note
+    end
+    local nxt = segs[x + 1]
+    local note = {
+      start_time = fr[1].time,
+      end_time = touching(seg, nxt) and results[nxt.voiced[1]].time or fr[#fr].time,
+      frames = fr, sum_note = sum, count = #fr,
+    }
+    notes[#notes + 1] = note
+    split_points[#split_points + 1] = { time = note.start_time, reason = seg.reason }
+  end
+  return notes, split_points
+end
+
+--- Re-split: which new notes are old notes whose start and end did not move. pairs[new_index] = old_note when both
+--- edges differ by at most tol_s (seconds; the caller passes one frame); each old note pairs at most once. lost =
+--- how many old notes for which is_modified(old) is true are in no pair (their edits are dropped). Both lists are in
+--- time order. Pure: no REAPER calls.
+K.resplit_match = function(old_notes, new_notes, tol_s, is_modified)
+  local tol = tol_s + 1e-9   -- frame times are sums of the hop: one frame apart may differ by a rounding error
+  local pairs_, used, j = {}, {}, 1
+  for i, nn in ipairs(new_notes) do
+    -- Old notes that end before this note can start (within tol) cannot pair with it or with any later note
+    while old_notes[j] and old_notes[j].end_time < nn.start_time - tol do j = j + 1 end
+    local k = j
+    while old_notes[k] and old_notes[k].start_time <= nn.start_time + tol do
+      local o = old_notes[k]
+      if not used[k] and math.abs(o.start_time - nn.start_time) <= tol and math.abs(o.end_time - nn.end_time) <= tol then
+        pairs_[i], used[k] = o, true
+        break
+      end
+      k = k + 1
+    end
+  end
+  local lost = 0
+  for k, o in ipairs(old_notes) do
+    if not used[k] and is_modified(o) then lost = lost + 1 end
+  end
+  return pairs_, lost
+end
+
 local function run_hybrid_segmentation()
-  state.notes = {}
-  state.split_points = {} -- For debugging display
+  state.notes, state.split_points = K.segment(state.results or {}, state.separation)
 
-  if #state.results == 0 then return end
-
-  -- Configuration
-  local min_note_dur = 0.08 -- 80ms
-  local debounce_dur = 0.08 -- 80ms
-  local pitch_jump_threshold = 0.75 -- Semitones
-  local rms_noise_floor = 0.005 -- Absolute RMS threshold for silence
-
-  -- Calculate derivatives (applying a simple median filter logic by looking at 3 frames would be better, but we keep it simple for now)
-  for i, frame in ipairs(state.results) do
-    if i > 1 then
-      local prev = state.results[i-1]
-      if frame.note and prev.note then
-        frame.delta_note = frame.note - prev.note
-      else
-        frame.delta_note = 0
-      end
-      frame.delta_rms = frame.rms - prev.rms
-    else
-      frame.delta_note = 0
-      frame.delta_rms = 0
-    end
-  end
-
-  local current_note = nil
-  local last_split_time = -1
-
-  for _, frame in ipairs(state.results) do
-    local is_voiced = (frame.note ~= nil and frame.rms > rms_noise_floor)
-
-    local should_split = false
-    local split_reason = ""
-
-    if is_voiced then
-      if not current_note then
-        should_split = true
-        split_reason = "Onset (from silence)"
-      else
-        -- Check for pitch jump (legato)
-        if math.abs(frame.delta_note) > pitch_jump_threshold then
-          should_split = true
-          split_reason = "Pitch Jump"
-        end
-
-        -- Check for amplitude spike (articulation)
-        if frame.delta_rms > frame.rms * 0.5 and frame.delta_rms > 0.02 then
-          should_split = true
-          split_reason = "Amplitude Spike"
-        end
-      end
-    else
-      -- Unvoiced gap
-      if current_note then
-        -- End current note
-        if (frame.time - current_note.start_time) >= min_note_dur then
-          table.insert(state.notes, current_note)
-        end
-        current_note = nil
-      end
-    end
-
-    if should_split and (frame.time - last_split_time) >= debounce_dur then
-      if current_note then
-        current_note.end_time = frame.time
-        if (current_note.end_time - current_note.start_time) >= min_note_dur then
-          table.insert(state.notes, current_note)
-        end
-      end
-
-      current_note = {
-        start_time = frame.time,
-        end_time = frame.time,
-        sum_note = 0,
-        count = 0,
-        frames = {}
-      }
-
-      table.insert(state.split_points, { time = frame.time, reason = split_reason })
-      last_split_time = frame.time
-    end
-
-    if current_note and is_voiced then
-      current_note.sum_note = current_note.sum_note + frame.note
-      current_note.count = current_note.count + 1
-      current_note.end_time = frame.time
-      table.insert(current_note.frames, frame)
-    end
-  end
-
-  -- Push last note
-  if current_note and (current_note.end_time - current_note.start_time) >= min_note_dur then
-    table.insert(state.notes, current_note)
-  end
-
-  -- Calculate anchor pitch
+  -- Anchor pitch
   for _, n in ipairs(state.notes) do
     if n.count > 0 then
       n.avg_note = n.sum_note / n.count
@@ -3414,7 +3763,7 @@ local function process_analysis_step()
     )
 
     if num_read > 0 then
-      local rms, freq = yin_process_block(state.buffer, state.sample_rate, params)
+      local rms, freq, lvl = yin_process_block(state.buffer, state.sample_rate, params)
       local note = nil
       if freq and freq >= params.min_freq and freq <= params.max_freq then
         note = freq_to_note(freq)
@@ -3423,7 +3772,8 @@ local function process_analysis_step()
         time = state.current_time,
         freq = freq,
         note = note,
-        rms = rms
+        rms = rms,
+        lvl = lvl
       })
     end
 
@@ -3923,7 +4273,7 @@ end
 
 --- The correction of `notes` for the canvas: K.correction_build's result with its points sorted by time, and a
 --- gen that counts the rebuilds. It is rebuilt only when something the trajectory reads changed (every note's
---- extent, arrays and controls, the effective Strength / Transition / Onset Ramp of each and the Legato Gap),
+--- extent, arrays and body, its Tighten, Tolerance, Slide In and effective Strength, its pitch points),
 --- compared each frame without allocating; so a value dragged in the top bar shows on the next frame and a
 --- frame that changed nothing rebuilds nothing. `item` gives the length the points are clamped to.
 K.correction_view = function(notes, item)
@@ -3945,20 +4295,16 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 5, c and c.tighten or 0) or changed
     changed = set(sig, k + 6, get_effective(n, "tolerance")) or changed
     changed = set(sig, k + 7, n.avg_note) or changed
-    changed = set(sig, k + 8, n.voiced_start_idx) or changed
+    changed = set(sig, k + 8, (K.note_body(n))) or changed
     changed = set(sig, k + 9, c and c.bypassed or false) or changed
     changed = set(sig, k + 10, c and c.center_pitch) or changed
-    changed = set(sig, k + 11, c and c.scoop_shape or 0) or changed
+    changed = set(sig, k + 11, c and c.slide_in or 0) or changed
     changed = set(sig, k + 12, get_effective(n, "retune_speed")) or changed
-    changed = set(sig, k + 13, get_effective(n, "transition_ms")) or changed
-    changed = set(sig, k + 14, get_effective(n, "onset_ramp_ms")) or changed
     -- An override that equals the inherited value still makes the note "edited"
-    changed = set(sig, k + 15, is_note_modified(n)) or changed
-    changed = set(sig, k + 16, n.points_rev or 0) or changed
-    k = k + 16
+    changed = set(sig, k + 13, is_note_modified(n)) or changed
+    changed = set(sig, k + 14, n.points_rev or 0) or changed
+    k = k + 14
   end
-  changed = set(sig, k + 1, get_effective(nil, "legato_threshold_ms")) or changed
-  k = k + 1
   if cv.n ~= k then
     cv.n = k
     changed = true
@@ -4118,24 +4464,23 @@ end
 --   show     factor from the stored value to the shown one; read / hover = the drag readout and the hover tooltip
 --   fine     Ctrl/Cmd-drag is fine adjust (HC2); zero_nil = a value of 0 is stored as "not set"
 --   hint     the setting highlight the canvas shows while it is dragged (K.setting_hint)
+-- Shift + drag anywhere on a note (every zone) adjusts Slide In.
 K.ZONE_CONTROLS = {
   tighten = {
     [false] = { key = "tighten", lo = 0, hi = 1, rows = 2, show = 100, fine = true, zero_nil = true,
                 read = "Tighten: %.0f%%", hover = "Tighten: %.0f%%", undo = "Adjust Tighten" },
-    [true]  = { key = "onset_ramp_ms", lo = 5, hi = 60, px = 0.5, inherit = true, hint = "onset_ramp_ms",
-                read = "Onset Ramp: %.0f ms", hover = "Onset Ramp: %.0fms (Shift+Drag)", undo = "Adjust Onset Ramp" },
   },
-  pitch = {
-    [true]  = { key = "transition_ms", lo = 5, hi = 60, px = 0.5, inherit = true, hint = "transition_ms",
-                read = "Transition: %.0f ms", hover = "Transition: %.0fms (Shift+Drag)", undo = "Adjust Transition" },
-  },
+  pitch = {},
   tolerance = {
     [false] = { key = "tolerance", lo = 0, hi = 50, rows = 1, inherit = true, fine = true, hint = "tolerance",
                 read = "Tolerance: %.0f\xC2\xA2", hover = "Tolerance: %.0f\xC2\xA2", undo = "Adjust Tolerance" },
-    [true]  = { key = "scoop_shape", lo = 0, hi = 1, rows = 2, show = 100, hint = "scoop_shape",
-                read = "Scoop: %.0f%% corrected", hover = "Scoop: %.0f%% corrected (Shift+Drag)", undo = "Adjust Scoop" },
   },
 }
+do
+  local slide_in = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, hint = "slide_in",
+                     read = "Slide In: %.0f%%", hover = "Slide In: %.0f%% (Shift+Drag)", undo = "Adjust Slide In" }
+  for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
+end
 K.TOLERANCE_IDLE = " (used once Tighten is above 0%)"   -- appended where a note's Tolerance is shown while its Tighten is 0
 
 --- The entry of K.ZONE_CONTROLS for a drag on `zone` with or without Shift, or nil (the pitch drag).
@@ -4303,16 +4648,13 @@ K.preview_lines = function(results, r0, r1, t_to_x, build)
   return pl.arrs, count
 end
 
--- Which spans of K.correction_build each setting shades
+-- Which spans of K.correction_build each setting shades (the joins and fades follow no setting)
 K.HINT_KINDS = {
-  transition_ms = { glide = true },
-  onset_ramp_ms = { onset = true, release = true },
-  legato_threshold_ms = { gap = true },
-  scoop_shape = { scoop = true },
+  slide_in = { scoop = true },
 }
 
 --- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
---- on every note Strength reaches, a span over each fade, glide, joined gap or scoop for the timing values.
+--- on every note Strength reaches, the Tolerance band of each tightened note, a span over each slide for Slide In.
 --- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
 --- `build` is K.correction_view's result, C the canvas palette. Returns how many marks were drawn.
 K.draw_setting_hint = function(draw_list, hint, build, C)
@@ -4329,7 +4671,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
     if not (n and n.controls) then return false end
     if set then return set[idx] ~= nil end
     if edited_only and (n.controls.bypassed or not is_note_modified(n)) then return false end
-    return key == "legato_threshold_ms" or n.controls[key] == nil
+    return n.controls[key] == nil
   end
   local function t_x(t) return m.px + (t - m.vt0) / (m.vt1 - m.vt0) * m.w end
   local function block_y(idx)
@@ -4379,15 +4721,8 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   if not kinds then return 0 end
   for _, sp in ipairs(build.spans) do
     if kinds[sp.kind] and sp.t1 >= m.vt0 and sp.t0 <= m.vt1 then
-      -- A glide is as long as the Transition of its second note; every other span belongs to its first
-      local ok
-      if sp.kind == "glide" then
-        ok = reached(sp.b, false)
-      elseif sp.kind == "gap" then
-        ok = (set == nil) or set[sp.a] ~= nil or set[sp.b] ~= nil
-      else
-        ok = reached(sp.a, true)
-      end
+      -- A slide belongs to the note it leads into
+      local ok = reached(sp.a, true)
       if ok and notes[sp.a] and notes[sp.a].controls and (not sp.b or (notes[sp.b] and notes[sp.b].controls)) then
         local top, bot = block_y(sp.a)
         if sp.b then
@@ -5705,9 +6040,12 @@ local function draw_graph(draw_ctx, w, h)
         if is_hov and not state.drag and not state.point_drag and not state.hovered_point then
           local has_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
 
-          if state.hovered_zone == "tighten" then
+          if has_shift then
+            -- Shift + drag anywhere on the note adjusts Slide In: the whole block is its zone
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y, C.zone_shift)
+          elseif state.hovered_zone == "tighten" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, sx + zone_w, bot_y, has_shift and C.zone_shift or C.zone_drift)
+              sx, top_y, sx + zone_w, bot_y, C.zone_drift)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
           elseif state.hovered_zone == "tolerance" then
@@ -5718,29 +6056,13 @@ local function draw_graph(draw_ctx, w, h)
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex, bot_y, fill)
-            if has_shift then
-              reaper.ImGui_DrawList_AddRectFilled(draw_list,
-                sx + zone_w, top_y, ex - zone_w, bot_y, C.zone_shift)
-            end
           end
 
-          if has_shift and block_w > 40 then
-            -- The zone names sit on a pill: the text over the amber zone highlight alone is not enough. All three are
-            -- drawn when each fits its zone (the pills never overlap); on a narrower block only the name of the zone
-            -- under the pointer is (the hover hint names it at any width)
+          if has_shift and block_w > 40 and pill_fits(PARAM_LABELS.slide_in, block_w) then
+            -- The name sits on a pill: the text over the amber highlight alone is not enough (the hover hint names
+            -- it at any width)
             local text_y = top_y + (bot_y - top_y) * 0.5 - 6
-            if pill_fits("Onset Ramp", zone_w) and pill_fits("Transition", block_w - zone_w * 2)
-                and pill_fits("Scoop", zone_w) then
-              pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
-              pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
-              pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
-            elseif state.hovered_zone == "tighten" then
-              pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
-            elseif state.hovered_zone == "tolerance" then
-              pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
-            else
-              pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
-            end
+            pill_text(sx + 2, text_y, PARAM_LABELS.slide_in, C.pill_text)
           end
         else
           reaper.ImGui_DrawList_AddRectFilled(draw_list,
@@ -6331,7 +6653,7 @@ local function draw_graph(draw_ctx, w, h)
       end
 
       --- One value row. `spread`: the value is written to every selected note (see spread_n), and the row says
-      --- how many. A value outside the cascade (Tighten, Scoop Shape) has nothing to inherit and shows no level.
+      --- how many. A value outside the cascade (Tighten, Slide In) has nothing to inherit and shows no level.
       local function draw_cm_slider(label, key, min_v, max_v, fmt, scale, default, spread)
          local level = get_override_level(note, key)
          local cur_val = ctrl[key] or get_effective(note, key) or default or 0
@@ -6407,9 +6729,7 @@ local function draw_graph(draw_ctx, w, h)
 
       draw_cm_slider(PARAM_LABELS.tighten, "tighten", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.tolerance, "tolerance", K.LIMITS.tolerance[1], K.LIMITS.tolerance[2], "%.0f \xC2\xA2", nil, nil, true)
-      draw_cm_slider("Onset Ramp", "onset_ramp_ms", 5, 60, "%.0f ms", nil, nil, true)
-      draw_cm_slider("Scoop Shape", "scoop_shape", 0, 100, "%.0f%%", 100, nil, true)
-      draw_cm_slider("Transition", "transition_ms", 5, 60, "%.0f ms", nil, nil, true)
+      draw_cm_slider(PARAM_LABELS.slide_in, "slide_in", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.retune_speed, "retune_speed", 0, 100, "%.0f%%", 100, nil, true)
 
       reaper.ImGui_PopItemWidth(draw_ctx)
@@ -7033,7 +7353,7 @@ end
 
 -- Keyboard Shortcuts & Help content: one entry per section, one { key, description } row each (draw_info_modal measures
 -- the columns from these strings). Keep a description near 52 characters so the table stays narrow; the terms follow
--- the UI labels (Pitched Items, item, Correction Strength, Transition, Onset Ramp, Legato Gap, Scoop shape).
+-- the UI labels (Pitched Items, item, Correction Strength, Tighten, Tolerance, Slide In, Separation).
 -- A row that is also in the panel's Shortcuts list carries panel = { group, order in the group, short text [, short key] }:
 -- the list is built from this table (K.panel_rows), so a key is never written in two places.
 K.INFO_SECTIONS = {
@@ -7056,9 +7376,7 @@ K.INFO_SECTIONS = {
       panel = { "Edit", 7, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
     { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
-    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 8, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
-    { "Shift + Drag Center Zone", "Adjust Transition" },
-    { "Shift + Drag Right Zone", "Adjust Scoop shape" },
+    { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 8, "Slide In", "Shift + Drag" } },
     { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 9, "Trim note", "Drag edge" } },
     { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 10, "Pitch point", "Drag dot" } },
     { "Double-click a pitch point", "Put it back to 0" },
@@ -7596,7 +7914,7 @@ local function draw_body_split(P, avail_w, total_h)
     local grip_x, grip_y = reaper.ImGui_GetCursorScreenPos(ctx)
     local column_w = reaper.ImGui_GetContentRegionAvail(ctx)
     state.sidebar_w = column_w
-    -- The panel has its own recessed surface (the Timing tray's), so it reads as a panel beside the canvas
+    -- The panel has its own recessed surface, so it reads as a panel beside the canvas
     reaper.ImGui_DrawList_AddRectFilled(reaper.ImGui_GetWindowDrawList(ctx),
       grip_x, grip_y, grip_x + column_w, grip_y + total_h, P.inset)
     reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.sm)
@@ -8247,11 +8565,15 @@ local function draw_confirm_modal()
   end
 
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
-  if confirmed then c.on_confirm() end
+  if confirmed then
+    c.confirmed = true
+    c.on_confirm()
+  end
 
   if c.opened and not reaper.ImGui_IsPopupOpen(ctx, popup_name) then
     Theme.modal_scrim(ctx, popup_name) -- not open any more: releases the scrim's first-frame latch
     state.confirm = nil
+    if not c.confirmed and c.on_cancel then c.on_cancel() end
   end
 end
 
@@ -8388,6 +8710,90 @@ local function request_analyze()
       if state.is_analyzing then
         set_status(string.format("Re-analyzing %s…", name))
       end
+    end,
+  })
+end
+
+--- Separation changed (state.separation; it was prev_separation): split the active item's notes again from the
+--- analysed frames in memory. A new note whose start and end are an old note's (within one frame) keeps that
+--- note's edits: its controls and bypass, its target as the same offset from its new centre, its pitch points.
+--- When other edited notes would lose their edits it asks first; Cancel puts Separation back. One undo point
+--- ("Change Note Separation") holds the envelope and the stored notes; the view stays, the selection is cleared.
+--- Without analysed frames (or while analysing) only the value is stored: the next analysis uses it.
+K.resplit = function(prev_separation)
+  local results = state.results
+  if state.is_analyzing or not state.target_take_guid or not results or #results < 2 then return end
+  if not target_take_exists() then
+    set_status("This item is no longer in the project")
+    return
+  end
+  -- A pending arrow-key nudge is its own undo point, and its note counts as edited below
+  if state.nudge_burst then flush_nudge_burst() end
+
+  local new_notes, split_points = K.segment(results, state.separation)
+  local tol_s = K.frame_step(results)   -- one frame, as K.segment measures it
+  local old_notes = state.notes
+  local matched, lost = K.resplit_match(old_notes or {}, new_notes, tol_s, is_note_modified)
+
+  local function run()
+    local any_edited = false
+    for i, n in ipairs(new_notes) do
+      if n.count > 0 then
+        n.avg_note = n.sum_note / n.count
+        n.display_note = math.floor(n.avg_note + 0.5)
+        local old = matched[i]
+        if old and old.controls then
+          -- As split_note_at: the target follows the centre extract_note_features finds, by the old offset
+          local pitch_offset = old.controls.center_pitch - old.avg_note
+          extract_note_features(n, K.controls_carry(old.controls))
+          if n.controls then
+            n.controls.center_pitch = n.avg_note + pitch_offset
+            K.points_transfer(n, { old }, {})
+          end
+        else
+          extract_note_features(n)
+        end
+        if is_note_modified(n) then any_edited = true end
+      end
+    end
+    state.notes, state.split_points = new_notes, split_points
+    state.analysis_empty = (#new_notes == 0)
+    clear_interaction_state(true)   -- note indices changed; the view stays
+
+    -- Written as an edit (the take's pitch mode is set) when an edit survived, else like a fresh analysis
+    if apply_envelope_to_take("Change Note Separation", not any_edited) then
+      set_status(string.format("Split into %d %s. %s+Z to undo", #new_notes, plural(#new_notes, "note", "notes"),
+        K.MOD_LABEL))
+    end
+  end
+
+  if lost == 0 then
+    run()
+    return
+  end
+  local guid = state.target_take_guid
+  request_confirm({
+    id = "resplit",
+    title = string.format("Re-split %s?", state.target_take_name or "this item"),
+    body_lines = {
+      string.format("This re-splits the notes and discards your edits to %d %s.", lost, plural(lost, "note", "notes")),
+      string.format("%s+Z restores them.", K.MOD_LABEL),
+    },
+    confirm_label = "Re-Split",
+    on_confirm = function()
+      -- The modal names one item, and the match was made against its notes as they were (an undo reloads them)
+      if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes
+        or not target_take_exists() then
+        set_status("The item changed meanwhile. Nothing was re-split.")
+        state.separation = prev_separation
+        K.save_settings("engine")
+        return
+      end
+      run()
+    end,
+    on_cancel = function()
+      state.separation = prev_separation
+      K.save_settings("engine")
     end,
   })
 end
@@ -8532,11 +8938,10 @@ end
 -- Every control of the window, in one place above the canvas, in four groups read from broad to specific:
 --   Clip          brand, target badge, Key, Scale
 --   Values        the selection pill (what a drag changes: the defaults, or the selected notes), Tighten,
---                 Strength, Tolerance, and "Timing", which opens and closes the Timing row
+--                 Strength, Tolerance, Slide In, and Separation (one value for the analysis, whatever is selected)
 --   Note actions  Snap, Quantize, Split, Merge
 --   Right         "…" (Analyze / Cancel, Reset, Layers, Note Tone, Settings, Help) and Close, right-aligned on row 1
---   Timing row    Transition, Onset Ramp, Scoop Shape, Legato Gap: the last row(s) of the bar while it is open
--- The Values, Note action and Timing row units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
+-- The Values and Note action units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
 -- section places them. Every width is measured from the longest text its control can show. On how many rows the
 -- units sit is a HDR_PLANS entry chosen from the content width alone (never from the selected item or the note
 -- selection), so nothing jumps while working: as the width shrinks the groups wrap onto more rows, and at the
@@ -8561,13 +8966,11 @@ do
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
-  local HDR_VALUES = { "pill", "tight", "strength", "tol", "timing" }
-  local HDR_TIMING = { "trans", "ramp", "scoop", "legato" }   -- the Timing row (shown while state.timing_open)
+  local HDR_VALUES = { "pill", "tight", "strength", "tol", "slide", "sep" }
   local HDR_ACTIONS = { "snap", "quantize", "split", "merge" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for _, id in ipairs(HDR_VALUES) do HDR_GROUP[id] = "values" end
-  for _, id in ipairs(HDR_TIMING) do HDR_GROUP[id] = "timing" end
   for _, id in ipairs(HDR_ACTIONS) do HDR_GROUP[id] = "actions" end
 
   --- One row holding the units of every list given, in order.
@@ -8584,7 +8987,7 @@ do
     { rows = { HDR_CLIP, hdr_row(HDR_VALUES, HDR_ACTIONS) } },
     { rows = { HDR_CLIP, HDR_VALUES, HDR_ACTIONS } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES, HDR_ACTIONS } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "timing" }, { "tight", "strength" }, { "tol" }, HDR_ACTIONS } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "strength", "tol" }, { "slide", "sep" }, HDR_ACTIONS } },
   }
   -- The plan a first-use window is sized for: two rows
   local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
@@ -8630,7 +9033,7 @@ do
     s.badge_min_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
     -- More, Panel, Close: the real gaps between them (see hdr_draw_right)
     s.right_w = s.more_w + L.sm + s.close_sz + L.lg + s.close_sz
-    -- The Values, Timing row and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
+    -- The Values and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
     s.bar = K.bar_measure(ctx)
     return s
   end
@@ -8723,33 +9126,15 @@ do
     return w
   end
 
-  --- How many values of the Timing row fit side by side in avail_w: all four, two, or one.
-  local function hdr_timing_per_row(s, avail_w)
-    local L = Theme.layout
-    local n = #HDR_TIMING
-    if hdr_row_w(HDR_TIMING, s, 0) <= avail_w then return n end
-    local pair_w = 0
-    for i = 1, n, 2 do
-      local w = hdr_element_w(HDR_TIMING[i], s, 0)
-      if HDR_TIMING[i + 1] then w = w + L.sm + hdr_element_w(HDR_TIMING[i + 1], s, 0) end
-      pair_w = math.max(pair_w, w)
-    end
-    return (pair_w <= avail_w) and 2 or 1
-  end
-
   --- Content width the narrowest floating window keeps (the last plan). With `full`: the width a first-use
-  --- window opens with (two rows). The second value is the number of rows the bar then has, the Timing row's
-  --- own rows included while it is open.
+  --- window opens with (two rows). The second value is the number of rows the bar then has.
   hdr_min_content_w = function(s, full)
     local plan = full and HDR_FIRST_USE_PLAN or HDR_PLANS[#HDR_PLANS]
     local w = hdr_plan_w(plan, s)
     -- Rows: what the bar drew last frame at the window's real width (s.rows_now), so a wide window may be as
     -- short as its bar allows; before the first frame, the plan's own count
     local rows = (not full) and s.rows_now or nil
-    if not rows then
-      rows = #plan.rows
-      if state.timing_open then rows = rows + math.ceil(#HDR_TIMING / hdr_timing_per_row(s, w)) end
-    end
+    if not rows then rows = #plan.rows end
     return w, rows
   end
 
@@ -8985,7 +9370,7 @@ do
       analyze_label = has_notes and "Re-Analyze" or "Analyze",
       reset_label = reset_label, reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
     }
-    -- The Values, Timing row and Note action units draw themselves (see TOP BAR CONTROLS)
+    -- The Values and Note action units draw themselves (see TOP BAR CONTROLS)
     local draw_unit = K.bar_frame(ctx, has_target, target_item, s.bar)
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
 
@@ -9016,38 +9401,7 @@ do
       end
       if r == 1 then close_clicked = hdr_draw_right(hs) end
     end
-    -- The Timing row: the last row(s) of the bar while it is open, as many values per row as the width holds
     s.rows_now = #plan.rows
-    if state.timing_open then
-      local per_row = hdr_timing_per_row(s, avail_w)
-      local timing_rows = math.ceil(#HDR_TIMING / per_row)
-      s.rows_now = s.rows_now + timing_rows
-      -- The row is a secondary bar: a recessed band across the whole window (the side panel's surface) with its
-      -- values, when they fit on one line, starting under the button that opened it (never past the bar's end)
-      local row_x, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
-      local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
-      local indent = 0
-      if timing_rows == 1 then
-        local tray_w = hdr_row_w(HDR_TIMING, s, 0)
-        indent = math.max(0, math.min((K.timing_btn_x or row_x) - row_x, avail_w - tray_w))
-      end
-      local win_x = reaper.ImGui_GetWindowPos(ctx)
-      local win_w = reaper.ImGui_GetWindowSize(ctx)
-      reaper.ImGui_DrawList_PushClipRect(draw_list, win_x, row_y - L.xs, win_x + win_w, row_y + 1e4, false)
-      reaper.ImGui_DrawList_AddRectFilled(draw_list,
-        win_x, row_y - L.xs,
-        win_x + win_w, row_y + timing_rows * s.frame_h + timing_rows * (spacing_y or 0),   -- down to the body: no gap
-        P.inset)
-      reaper.ImGui_DrawList_PopClipRect(draw_list)
-      for i, id in ipairs(HDR_TIMING) do
-        if (i - 1) % per_row ~= 0 then
-          reaper.ImGui_SameLine(ctx, 0, L.sm)
-        elseif indent > 0 then
-          reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + indent)
-        end
-        draw_unit(id)
-      end
-    end
     return close_clicked
   end
 end
@@ -9055,11 +9409,11 @@ end
 -------------------------------------------------------------------------------
 -- TOP BAR CONTROLS
 -------------------------------------------------------------------------------
--- The units of the Values group, the Timing row and the Note action group, drawn in every state (disabled, with
--- the reason, when there is nothing to act on): the selection pill, one value control per entry of BAR_VALUES
--- (a drag with its text inside and a range fill under it), the Timing toggle, and the actions (Snap, Quantize,
--- Split, Merge). A value control edits what the pill names: the selected notes, else the item's own value, else
--- the default.
+-- The units of the Values group and the Note action group, drawn in every state (disabled, with the reason, when
+-- there is nothing to act on): the selection pill, one value control per entry of BAR_VALUES (a drag with its text
+-- inside and a range fill under it), and the actions (Snap, Quantize, Split, Merge). A value control edits what the
+-- pill names: the selected notes, else the item's own value, else the default; Separation is the exception, one
+-- value for the analysis whatever is selected.
 -- K.bar_measure gives their widths, each from its longest label, so a value, an override mark or a selection
 -- never changes the layout; K.bar_frame returns the function that draws one unit this frame. The top bar
 -- (above) decides where they go. The status line that used to sit beside them is a pill on the canvas
@@ -9075,20 +9429,11 @@ do
   local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "Defaults", "1 note", "%d notes"
   local BAR_PILL_TIP_NONE = "Nothing is selected: the values here are the defaults. Select notes to change only those notes."
   local BAR_PILL_TIP_NOTES = "The values here belong to the selected notes. Press Esc to go back to the defaults."
-  -- The Timing toggle; %s is the mark when a value of the closed row is not the default. A triangle (half size
-  -- BAR_TIMING_ICON_HS) is drawn after the label; the gap and the icon's width are reserved in the button's width.
-  local BAR_TIMING_FMT = "Timing%s"
-  local BAR_TIMING_ICON_HS = 4
-  local BAR_TIMING_ICON_GAP = Theme.layout.sm
-  local BAR_TIMING_ICON_W = math.ceil(BAR_TIMING_ICON_HS * 1.4)
-  local BAR_TIMING_TIP_OPEN = "Show Transition, Onset Ramp, Scoop Shape and Legato Gap"
-  local BAR_TIMING_TIP_CLOSE = "Hide the timing values"
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
   local BAR_REASON_NO_TARGET = "Select an audio item"
   local BAR_REASON_NOT_ANALYZED = "Analyze an item first"
   local BAR_REASON_NEEDS_NOTES = string.format("Select notes to change it (%s+A selects all)", K.MOD_LABEL)
-  local BAR_REASON_PER_ITEM = "Set per item: press Esc to deselect, then change it"
   local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
   local BAR_HINT_OUTDATED = "Outdated: this item's envelope is from other settings. Edit a note to rewrite it."
   -- What a drag changes, by its target (a line of every value tooltip), and the gestures
@@ -9099,11 +9444,17 @@ do
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = "Used once Tighten is above 0%."
+  -- Separation (see draw_separation): what letting go does, and its gestures (no right-click menu)
+  local BAR_SEP_RESPLIT = "One value for every item. Letting go splits this item's notes again."
+  local BAR_SEP_NEXT = "One value for every item. The next analysis uses it."
+  local BAR_SEP_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value.",
+    K.MOD_LABEL, K.MOD_LABEL)
 
   -- The values of the bar, in the order they are shown. key = the model's key; label = the name on the control;
   -- lo / hi / num / unit = the range and the text in display units (scale x the stored value); levels = where the
-  -- value exists: "all" (default, item, note), "note" (notes only) or "item" (default and item only); timing = it
-  -- sits on the Timing row; zero_nil = 0 is stored as "no value"; tip = what the value does to the sound.
+  -- value exists: "all" (default, item, note), "note" (notes only) or "analysis" (one value for the analysis,
+  -- state[key], no level: see draw_separation); zero_nil = 0 is stored as "no value"; tip = what the value does to
+  -- the sound.
   local BAR_VALUES = {
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "note", zero_nil = true,
@@ -9114,18 +9465,12 @@ do
     { id = "tol", key = "tolerance", label = "Tolerance", lo = K.LIMITS.tolerance[1], hi = K.LIMITS.tolerance[2], scale = 1,
       num = "%.0f", unit = "\xC2\xA2", levels = "all",
       tip = "Tolerance: how far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement." },
-    { id = "trans", key = "transition_ms", label = "Transition", lo = 5, hi = 60, scale = 1, num = "%.0f", unit = "ms",
-      levels = "all", timing = true,
-      tip = "Transition: how long the glide from one note to the next takes. Short sounds tight and robotic, long sounds smooth and natural." },
-    { id = "ramp", key = "onset_ramp_ms", label = "Onset Ramp", lo = 5, hi = 60, scale = 1, num = "%.0f", unit = "ms",
-      levels = "all", timing = true,
-      tip = "Onset Ramp: how quickly correction comes in at the start of a note. Short corrects the attack at once, long lets the singer's attack through first." },
-    { id = "scoop", key = "scoop_shape", label = "Scoop Shape", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
-      levels = "note", timing = true,
-      tip = "Scoop Shape: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
-    { id = "legato", key = "legato_threshold_ms", label = "Legato Gap", lo = 50, hi = 300, scale = 1, num = "%.0f", unit = "ms",
-      levels = "item", timing = true,
-      tip = "Legato Gap: notes closer together than this are joined with a glide instead of treated as separate notes." },
+    { id = "slide", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
+      levels = "note",
+      tip = "Slide In: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
+    { id = "sep", key = "separation", label = "Separation", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
+      levels = "analysis",
+      tip = "Separation: how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
   }
   -- Actions: same commands as the keys
   local BAR_ACTIONS = {
@@ -9152,16 +9497,19 @@ do
     local mark_w = bar_text_w(bctx, " " .. BAR_OVERRIDE_MARK)
     for _, spec in ipairs(BAR_VALUES) do
       local hi_t = string.format(spec.num, spec.hi)
-      local widest = math.max(
-        bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit),
-        bar_text_w(bctx, spec.label .. " " .. hi_t .. BAR_RANGE_SEP .. hi_t .. spec.unit),
-        bar_text_w(bctx, spec.label .. " " .. BAR_NO_VALUE))
-      s.unit_w[spec.id] = widest + mark_w + s.pad_x
+      if spec.levels == "analysis" then
+        -- One value, never a range, a blank or a mark
+        s.unit_w[spec.id] = bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit) + s.pad_x
+      else
+        local widest = math.max(
+          bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit),
+          bar_text_w(bctx, spec.label .. " " .. hi_t .. BAR_RANGE_SEP .. hi_t .. spec.unit),
+          bar_text_w(bctx, spec.label .. " " .. BAR_NO_VALUE))
+        s.unit_w[spec.id] = widest + mark_w + s.pad_x
+      end
     end
     s.unit_w.pill = math.max(bar_text_w(bctx, BAR_PILL_NONE), bar_text_w(bctx, BAR_PILL_ONE),
       bar_text_w(bctx, string.format(BAR_PILL_MANY, 999))) + s.pad_x
-    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, " " .. BAR_OVERRIDE_MARK))
-      + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W + s.pad_x
     for _, spec in ipairs(BAR_ACTIONS) do
       s.unit_w[spec.id] = bar_text_w(bctx, spec.label) + s.pad_x
     end
@@ -9178,7 +9526,7 @@ do
       if guid ~= state.target_take_guid and data
          and not (data.overrides and data.overrides[key] ~= nil) then
         for _, note in ipairs(data.notes or {}) do
-          local own = key ~= "legato_threshold_ms" and note.controls and note.controls[key] ~= nil
+          local own = note.controls and note.controls[key] ~= nil
           if is_note_modified(note) and not own then
             state.stale_takes[guid] = true
             n = n + 1
@@ -9205,6 +9553,8 @@ do
   local bar_sel = {}
   -- The press now held on a value control: what it was aimed at when it began (see draw_value)
   local bar_gesture = { id = nil, target = nil, notes = nil, dead = false }
+  -- Separation while its control is held or typed into: the value from before the press (see draw_separation)
+  local bar_sep_before = nil
   local function bar_sel_notes()
     local n = 0
     if state.notes then
@@ -9330,7 +9680,7 @@ do
   end
 
   --- The units of this frame. `has_target` / `target_item` come from loop_body (the top bar's view of the
-  --- target); `s` from K.bar_measure. Returns draw_unit(id) for "pill", "timing", the ids of BAR_VALUES and the
+  --- target); `s` from K.bar_measure. Returns draw_unit(id) for "pill", the ids of BAR_VALUES and the
   --- ids of BAR_ACTIONS.
   K.bar_frame = function(bctx, has_target, target_item, s)
     local P = Theme.get_palette()
@@ -9369,7 +9719,7 @@ do
       local key = spec.key
       view = { lo_v = spec.lo, hi_v = spec.lo, mixed = false, level = "global", target = "default" }
       views[spec.id] = view
-      if sel_n > 0 and spec.levels ~= "item" then
+      if sel_n > 0 then
         view.target = "notes"
         local lo_v, hi_v = math.huge, -math.huge
         for i = 1, sel_n do
@@ -9395,8 +9745,6 @@ do
         view.blank = not (has_target and has_data)
       elseif spec.levels == "note" and sel_n == 0 then
         view.disabled, view.reason, view.blank = true, BAR_REASON_NEEDS_NOTES, true
-      elseif spec.levels == "item" and sel_n > 0 then
-        view.disabled, view.reason = true, BAR_REASON_PER_ITEM
       end
       return view
     end
@@ -9484,7 +9832,7 @@ do
       end
     end
 
-    --- Put the selected notes back to inheriting the value of `spec` (Tighten, Scoop Shape: to 0), as one undo point.
+    --- Put the selected notes back to inheriting the value of `spec` (Tighten, Slide In: to 0), as one undo point.
     local function reset_notes(spec)
       state.bar_edit = nil
       local had = false
@@ -9666,41 +10014,63 @@ do
       bar_tooltip((sel_n == 0) and BAR_PILL_TIP_NONE or BAR_PILL_TIP_NOTES)
     end
 
-    --- "Timing": opens and closes the Timing row (Transition, Onset Ramp, Scoop Shape, Legato Gap). While the
-    --- row is closed, a mark says that one of its values is not the default.
-    local function draw_timing()
-      local marked = false
-      if not state.timing_open then
-        for _, spec in ipairs(BAR_VALUES) do
-          if spec.timing then
-            local view = bar_view(spec)
-            if view.level ~= "global" and not view.blank then marked = true end
-          end
-        end
+    --- Separation: one value for the analysis (state.separation), the same whatever is selected: no item or note
+    --- level, so no mark and no right-click menu. A drag only moves the value; letting go (or a typed value, or
+    --- the double-click reset to the default) saves it and splits the item's notes again, given the value from
+    --- before (K.resplit: it may ask first, and Cancel puts the value back). Usable whenever no analysis runs and
+    --- no confirmation is open: without analysed notes the next analysis uses it.
+    local function draw_separation(spec)
+      local key, id = spec.key, "bv_" .. spec.id
+      local disabled = state.is_analyzing or state.confirm ~= nil
+      if disabled and bar_sep_before ~= nil then
+        state[key] = bar_sep_before   -- a drag cut short: nothing was saved or split, so the value goes back
+        bar_sep_before = nil
       end
 
-      -- Label and icon are centred together: the label is aligned so the icon's slot fits to its right
-      local label = string.format(BAR_TIMING_FMT, marked and (" " .. BAR_OVERRIDE_MARK) or "")
-      local label_w = bar_text_w(bctx, label)
-      local slack = s.unit_w.timing - s.pad_x - label_w
-      local align_x = slack > 0 and math.max(0, math.min(1, (slack - BAR_TIMING_ICON_GAP - BAR_TIMING_ICON_W) * 0.5 / slack)) or 0.5
-      reaper.ImGui_PushStyleVar(bctx, reaper.ImGui_StyleVar_ButtonTextAlign(), align_x, 0.5)
-      local pressed = reaper.ImGui_Button(bctx, label .. "###bar_timing", s.unit_w.timing, 0)
-      reaper.ImGui_PopStyleVar(bctx)
-      do
-        local bx1, by1 = reaper.ImGui_GetItemRectMin(bctx)
-        local bx2, by2 = reaper.ImGui_GetItemRectMax(bctx)
-        K.timing_btn_x = bx1   -- the Timing row starts under its button (see draw_header)
-        local text_x = bx1 + s.pad_x * 0.5 + (bx2 - bx1 - s.pad_x - label_w) * align_x
-        local icon = state.timing_open and Theme.icons.tri_down or Theme.icons.tri_right
-        icon(reaper.ImGui_GetWindowDrawList(bctx),
-          text_x + label_w + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W * 0.5, (by1 + by2) * 0.5, BAR_TIMING_ICON_HS, P.text)
+      reaper.ImGui_BeginDisabled(bctx, disabled)
+      reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
+      local fmt = spec.label .. " " .. spec.num .. (spec.unit:gsub("%%", "%%%%"))
+      local changed, v, committed, reset, cancelled = param_drag(bctx, id, nil, state[key] * spec.scale, spec.lo, spec.hi, fmt)
+      local back = K.drag_revert(id, state[key], cancelled)
+      local pressed, active, typed = K.drag_hot.activated, K.drag_hot.active, K.drag_hot.typed
+      reaper.ImGui_PopItemWidth(bctx)
+      reaper.ImGui_EndDisabled(bctx)
+
+      if disabled then
+        bar_tooltip(state.is_analyzing and (spec.tip .. "\n" .. BAR_REASON_ANALYZING) or spec.tip,
+          reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        return
       end
-      bar_tooltip(state.timing_open and BAR_TIMING_TIP_CLOSE or BAR_TIMING_TIP_OPEN)
-      if pressed then
-        state.timing_open = not state.timing_open
-        K.save_settings("bar")
+      local span = spec.hi - spec.lo
+      K.bar_value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
+      bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_SEP_GESTURES)
+
+      --- The edit is done: save the value and split again, once, only when it changed
+      local function commit(prev)
+        bar_sep_before = nil
+        if prev == nil or state[key] == prev then return end
+        K.save_settings("engine")
+        K.resplit(prev)
       end
+
+      if pressed then bar_sep_before = state[key] end
+      if back ~= nil then
+        -- Esc during the drag: the value from before it (or from the reset the same press already committed),
+        -- nothing saved or split
+        if bar_sep_before ~= nil then state[key] = bar_sep_before else state[key] = back end
+        bar_sep_before = nil
+      elseif reset or (changed and typed) then
+        local prev = state[key]
+        state[key] = reset and DEFAULTS[key] or v / spec.scale
+        commit(prev)
+        -- Still held (a double-click whose second press goes on into a drag): that drag starts from the value just
+        -- committed, and letting go commits it as its own edit
+        if active then bar_sep_before = state[key] end
+      else
+        if changed then state[key] = v / spec.scale end
+        if committed then commit(bar_sep_before) end
+      end
+      if not active then bar_sep_before = nil end   -- the press is over (a click that changed nothing)
     end
 
     --- The edit cursor relative to the target item's start (note times are item-relative); nil when unknown
@@ -9755,10 +10125,9 @@ do
     return function(id)
       if id == "pill" then
         draw_pill()
-      elseif id == "timing" then
-        draw_timing()
       elseif BAR_VALUE_BY_ID[id] then
-        draw_value(BAR_VALUE_BY_ID[id])
+        local spec = BAR_VALUE_BY_ID[id]
+        if spec.levels == "analysis" then draw_separation(spec) else draw_value(spec) end
       elseif BAR_ACTION_BY_ID[id] then
         draw_action(BAR_ACTION_BY_ID[id])
       end
@@ -10128,4 +10497,7 @@ local function main()
   loop()
 end
 
+if FANCY_PITCH_TEST then
+  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features }
+end
 main()
