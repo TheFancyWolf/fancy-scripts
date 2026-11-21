@@ -525,8 +525,9 @@ local function set_status(msg)
 end
 
 --- Ask the user to confirm a destructive action. draw_confirm_modal() shows the modal.
---- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function }
---- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once.
+--- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function, on_cancel = function | nil }
+--- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once, or on_cancel once when
+--- the modal closes without confirming.
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
   state.confirm = {
@@ -535,6 +536,7 @@ local function request_confirm(req)
     body_lines = req.body_lines or {},
     confirm_label = req.confirm_label or "Confirm",
     on_confirm = req.on_confirm,
+    on_cancel = req.on_cancel,
     open_pending = true,  -- OpenPopup once, on the next draw_confirm_modal() call
     opened = false,
   }
@@ -2139,9 +2141,9 @@ local function toggle_take_pitch_bypass(take)
 end
 
 --- Drop every in-flight gesture and selection, and show the whole item again (used when the model under
---- them is replaced).
-local function clear_interaction_state()
-  K.reset_view()
+--- them is replaced). keep_view: the canvas stays where it is (a re-split of the same item).
+local function clear_interaction_state(keep_view)
+  if not keep_view then K.reset_view() end
   state.selected_note = nil
   state.selected_notes = {}
   state.hovered_note = nil
@@ -3603,6 +3605,33 @@ K.segment = function(results, sep)
     split_points[#split_points + 1] = { time = note.start_time, reason = seg.reason }
   end
   return notes, split_points
+end
+
+--- Re-split: which new notes are old notes whose start and end did not move. pairs[new_index] = old_note when both
+--- edges differ by at most tol_s (seconds; the caller passes one frame); each old note pairs at most once. lost =
+--- how many old notes for which is_modified(old) is true are in no pair (their edits are dropped). Both lists are in
+--- time order. Pure: no REAPER calls.
+K.resplit_match = function(old_notes, new_notes, tol_s, is_modified)
+  local tol = tol_s + 1e-9   -- frame times are sums of the hop: one frame apart may differ by a rounding error
+  local pairs_, used, j = {}, {}, 1
+  for i, nn in ipairs(new_notes) do
+    -- Old notes that end before this note can start (within tol) cannot pair with it or with any later note
+    while old_notes[j] and old_notes[j].end_time < nn.start_time - tol do j = j + 1 end
+    local k = j
+    while old_notes[k] and old_notes[k].start_time <= nn.start_time + tol do
+      local o = old_notes[k]
+      if not used[k] and math.abs(o.start_time - nn.start_time) <= tol and math.abs(o.end_time - nn.end_time) <= tol then
+        pairs_[i], used[k] = o, true
+        break
+      end
+      k = k + 1
+    end
+  end
+  local lost = 0
+  for k, o in ipairs(old_notes) do
+    if not used[k] and is_modified(o) then lost = lost + 1 end
+  end
+  return pairs_, lost
 end
 
 local function run_hybrid_segmentation()
@@ -8480,11 +8509,15 @@ local function draw_confirm_modal()
   end
 
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
-  if confirmed then c.on_confirm() end
+  if confirmed then
+    c.confirmed = true
+    c.on_confirm()
+  end
 
   if c.opened and not reaper.ImGui_IsPopupOpen(ctx, popup_name) then
     Theme.modal_scrim(ctx, popup_name) -- not open any more: releases the scrim's first-frame latch
     state.confirm = nil
+    if not c.confirmed and c.on_cancel then c.on_cancel() end
   end
 end
 
@@ -8621,6 +8654,89 @@ local function request_analyze()
       if state.is_analyzing then
         set_status(string.format("Re-analyzing %s…", name))
       end
+    end,
+  })
+end
+
+--- Separation changed (state.separation; it was prev_separation): split the active item's notes again from the
+--- analysed frames in memory. A new note whose start and end are an old note's (within one frame) keeps that
+--- note's edits: its controls and bypass, its target as the same offset from its new centre, its pitch points.
+--- When other edited notes would lose their edits it asks first; Cancel puts Separation back. One undo point
+--- ("Change Note Separation") holds the envelope and the stored notes; the view stays, the selection is cleared.
+--- Without analysed frames (or while analysing) only the value is stored: the next analysis uses it.
+K.resplit = function(prev_separation)
+  local results = state.results
+  if state.is_analyzing or not state.target_take_guid or not results or #results < 2 then return end
+  if not target_take_exists() then
+    set_status("This item is no longer in the project")
+    return
+  end
+  -- A pending arrow-key nudge is its own undo point, and its note counts as edited below
+  if state.nudge_burst then flush_nudge_burst() end
+
+  local new_notes, split_points = K.segment(results, state.separation)
+  local tol_s = results[2].time - results[1].time   -- one frame
+  local old_notes = state.notes
+  local matched, lost = K.resplit_match(old_notes or {}, new_notes, tol_s, is_note_modified)
+
+  local function run()
+    local any_edited = false
+    for i, n in ipairs(new_notes) do
+      if n.count > 0 then
+        n.avg_note = n.sum_note / n.count
+        n.display_note = math.floor(n.avg_note + 0.5)
+        local old = matched[i]
+        if old and old.controls then
+          -- As split_note_at: the target follows the centre extract_note_features finds, by the old offset
+          local pitch_offset = old.controls.center_pitch - old.avg_note
+          extract_note_features(n, K.controls_carry(old.controls))
+          if n.controls then
+            n.controls.center_pitch = n.avg_note + pitch_offset
+            K.points_transfer(n, { old }, {})
+          end
+        else
+          extract_note_features(n)
+        end
+        if is_note_modified(n) then any_edited = true end
+      end
+    end
+    state.notes, state.split_points = new_notes, split_points
+    state.analysis_empty = (#new_notes == 0)
+    clear_interaction_state(true)   -- note indices changed; the view stays
+
+    -- Written as an edit (the take's pitch mode is set) when an edit survived, else like a fresh analysis
+    if apply_envelope_to_take("Change Note Separation", not any_edited) then
+      set_status(string.format("Split into %d %s. %s+Z to undo", #new_notes, plural(#new_notes, "note", "notes"),
+        K.MOD_LABEL))
+    end
+  end
+
+  if lost == 0 then
+    run()
+    return
+  end
+  local guid = state.target_take_guid
+  request_confirm({
+    id = "resplit",
+    title = string.format("Re-split %s?", state.target_take_name or "this item"),
+    body_lines = {
+      string.format("This re-splits the notes and discards your edits to %d %s.", lost, plural(lost, "note", "notes")),
+      string.format("%s+Z restores them.", K.MOD_LABEL),
+    },
+    confirm_label = "Re-Split",
+    on_confirm = function()
+      -- The modal names one item, and the match was made against its notes as they were (an undo reloads them)
+      if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes then
+        set_status("The item changed meanwhile. Nothing was re-split.")
+        state.separation = prev_separation
+        K.save_settings("engine")
+        return
+      end
+      run()
+    end,
+    on_cancel = function()
+      state.separation = prev_separation
+      K.save_settings("engine")
     end,
   })
 end

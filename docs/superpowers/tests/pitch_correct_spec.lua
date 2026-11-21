@@ -483,6 +483,47 @@ test("untouched_pair_writes_nothing", function()
   eq(#S.K.correction_build({ a, b }, 10).points, 0, "points")
 end)
 
+-- Re-split: notes { start_time, end_time, edited } and a predicate on `edited`
+local RTOL = 256 / 44100
+local function rnote(t0, t1, edited) return { start_time = t0, end_time = t1, edited = edited } end
+local function r_edited(n) return n.edited == true end
+
+test("resplit_match_identical", function()
+  local old = { rnote(0.1, 0.5, true), rnote(0.6, 0.9, false), rnote(1.0, 1.4, true) }
+  local new = { rnote(0.1, 0.5), rnote(0.6, 0.9), rnote(1.0, 1.4) }
+  local pairs_, lost = S.K.resplit_match(old, new, RTOL, r_edited)
+  for i = 1, 3 do eq(pairs_[i], old[i], "pair " .. i) end
+  eq(lost, 0, "lost")
+end)
+
+test("resplit_match_edited_cut", function()
+  local old = { rnote(0.1, 0.5, false), rnote(0.6, 1.4, true) }
+  local new = { rnote(0.1, 0.5), rnote(0.6, 1.0), rnote(1.0 + RTOL, 1.4) }
+  local pairs_, lost = S.K.resplit_match(old, new, RTOL, r_edited)
+  eq(pairs_[1], old[1], "kept")
+  eq(pairs_[2], nil, "first half")
+  eq(pairs_[3], nil, "second half")
+  eq(lost, 1, "lost")
+end)
+
+test("resplit_match_unedited_cut", function()
+  local old = { rnote(0.1, 0.5, true), rnote(0.6, 1.4, false) }
+  local new = { rnote(0.1, 0.5), rnote(0.6, 1.0), rnote(1.0 + RTOL, 1.4) }
+  local pairs_, lost = S.K.resplit_match(old, new, RTOL, r_edited)
+  eq(pairs_[1], old[1], "kept")
+  eq(pairs_[2], nil, "first half")
+  eq(lost, 0, "lost")
+end)
+
+test("resplit_match_tolerance", function()
+  local old = { rnote(0.1, 0.5, true), rnote(0.6, 0.9, true) }
+  local new = { rnote(0.1 + RTOL / 2, 0.5), rnote(0.6, 0.9 - 2 * RTOL) }
+  local pairs_, lost = S.K.resplit_match(old, new, RTOL, r_edited)
+  eq(pairs_[1], old[1], "half a tolerance pairs")
+  eq(pairs_[2], nil, "twice the tolerance does not")
+  eq(lost, 1, "lost")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
