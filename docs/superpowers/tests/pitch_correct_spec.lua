@@ -70,6 +70,131 @@ test("short_level_short_block", function()
   near(S.K.short_level(s, 100, 44100), 0.25, 1e-9)
 end)
 
+-- Note splitting (K.segment) -------------------------------------------------------------------
+
+local HOP = 256 / 44100
+local DIP_9DB = 0.1 * 10 ^ (-9 / 20)
+
+local function slide_segs(to)
+  return {
+    { dur = 0.4, note = 60 },
+    { dur = 0.04, note = function(t) return 60 + (to - 60) * t / 0.04 end },
+    { dur = 0.4, note = to },
+  }
+end
+local REARTIC_SEGS = { { dur = 0.4, note = 60 }, { dur = 0.03, note = 60, lvl = DIP_9DB }, { dur = 0.4, note = 60 } }
+local VIBRATO_SEGS = { { dur = 1, note = function(t) return 60 + 0.5 * math.sin(2 * math.pi * 5.5 * t) end } }
+
+local function segment(segs, hop_s, sep)
+  return S.K.segment(frames(segs, hop_s or HOP), sep or 0.5)
+end
+
+test("separation_params_columns", function()
+  local cols = {
+    [0] = { 1.5, 0.140, 12, 0.100 },
+    [0.5] = { 0.8, 0.090, 6, 0.070 },
+    [1] = { 0.4, 0.050, 3, 0.040 },
+  }
+  for sep, want in pairs(cols) do
+    local p = S.K.separation_params(sep)
+    near(p.pitch_st, want[1], 1e-12, "pitch_st " .. sep)
+    near(p.hold_s, want[2], 1e-12, "hold_s " .. sep)
+    near(p.dip_db, want[3], 1e-12, "dip_db " .. sep)
+    near(p.min_note_s, want[4], 1e-12, "min_note_s " .. sep)
+  end
+end)
+
+test("segment_slide", function()
+  local notes, splits = segment(slide_segs(62))
+  eq(#notes, 2, "notes")
+  near(notes[2].start_time, 0.42, 0.02, "boundary")
+  eq(splits[2].reason, "Pitch change")
+  near(splits[2].time, notes[2].start_time, 1e-12, "split time")
+end)
+
+test("segment_rearticulation", function()
+  local notes, splits = segment(REARTIC_SEGS)
+  eq(#notes, 2, "notes")
+  near(notes[2].start_time, 0.415, 0.02, "boundary")
+  eq(splits[2].reason, "Level dip")
+end)
+
+test("segment_vibrato", function()
+  eq(#segment(VIBRATO_SEGS), 1, "notes")
+end)
+
+test("segment_dropout", function()
+  eq(#segment({ { dur = 0.4, note = 60 }, { dur = 0.015 }, { dur = 0.4, note = 60 } }), 1, "notes")
+end)
+
+test("segment_octave_frame", function()
+  local fr = frames({ { dur = 0.8, note = 60 } }, HOP)
+  fr[70].note = 72
+  eq(#S.K.segment(fr, 0.5), 1, "notes")
+end)
+
+test("segment_short_octave_error", function()
+  local fr = frames({ { dur = 0.8, note = 60 } }, HOP)
+  for i = 70, 72 do fr[i].note = 72 end
+  eq(#S.K.segment(fr, 0.5), 1, "notes")
+end)
+
+test("segment_gap", function()
+  local notes, splits = segment({ { dur = 0.3, note = 60 }, { dur = 0.1 }, { dur = 0.3, note = 60 } })
+  eq(#notes, 2, "notes")
+  eq(#splits, 2, "splits")
+  eq(splits[1].reason, "Onset")
+  eq(splits[2].reason, "Onset")
+end)
+
+test("segment_separation_range", function()
+  eq(#segment(slide_segs(60.6), HOP, 0), 1, "sep 0")
+  eq(#segment(slide_segs(60.6), HOP, 1), 2, "sep 1")
+end)
+
+test("segment_hop_extremes", function()
+  for _, hop in ipairs({ 64 / 44100, 1024 / 44100 }) do
+    eq(#segment(slide_segs(62), hop), 2, "slide at hop " .. hop)
+    eq(#segment(VIBRATO_SEGS, hop), 1, "vibrato at hop " .. hop)
+  end
+end)
+
+test("segment_degenerate", function()
+  eq(#S.K.segment({}, 0.5), 0, "empty")
+  eq(#segment({ { dur = 1 } }), 0, "all unvoiced")
+  eq(#S.K.segment(frames({ { dur = 2 * HOP, note = 60 } }, HOP), 0.5), 0, "two frames")
+  local notes = segment({ { dur = 1, note = 60 } })
+  eq(#notes, 1, "one note")
+  near(notes[1].start_time, 0, HOP, "start")
+  near(notes[1].end_time, 1, HOP, "end")
+end)
+
+test("segment_missing_lvl", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  for _, f in ipairs(fr) do f.lvl = nil end
+  eq(#S.K.segment(fr, 0.5), 2, "notes")
+end)
+
+test("segment_frames_intact", function()
+  local fr = frames(slide_segs(62), HOP)
+  local before = {}
+  for i, f in ipairs(fr) do before[i] = f.note end
+  local notes = S.K.segment(fr, 0.5)
+  local owner, last_time = {}, -1
+  for ni, n in ipairs(notes) do
+    for _, f in ipairs(n.frames) do
+      eq(owner[f], nil, "frame in two notes")
+      owner[f] = ni
+      if f.time <= last_time then error("frames out of time order") end
+      last_time = f.time
+    end
+  end
+  for i, f in ipairs(fr) do
+    if f.note then eq(owner[f] ~= nil, true, "voiced frame " .. i .. " in no note") end
+    eq(f.note, before[i], "frame " .. i .. " note mutated")
+  end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

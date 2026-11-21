@@ -184,6 +184,7 @@ local DEFAULTS = {
   onset_ramp_ms = 35,        -- 5–60ms (silence → correction fade-in)
   legato_threshold_ms = 120, -- 50–300ms (gap below = legato blend)
   tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
+  separation = 0.5,          -- 0–1 how readily the analysis splits notes (see K.separation_params)
 }
 -- Analysis engine (Settings > Advanced DSP): the values of the default presets, so a preset table and its default pick
 -- can never drift apart
@@ -276,6 +277,7 @@ local K = {
     min_freq = { 20, 200 },
     max_freq = { 200, 2000 },
     tolerance = { 0, 50 },   -- cents
+    separation = { 0, 1 },
   },
 
   -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
@@ -363,6 +365,7 @@ local state = {
   min_freq = DEFAULTS.min_freq,
   max_freq = DEFAULTS.max_freq,
   hop_size = DEFAULTS.hop_size, -- How many samples to advance per block
+  separation = DEFAULTS.separation, -- how readily notes are split (K.segment)
   analysis_params = nil,        -- the five values above, frozen by start_analysis for the running analysis
 
   -- Analysis state
@@ -631,6 +634,7 @@ K.PERSIST = (function()
   number("engine", "pitch_threshold", state, "threshold", K.LIMITS.threshold)
   number("engine", "pitch_min_freq", state, "min_freq", K.LIMITS.min_freq)
   number("engine", "pitch_max_freq", state, "max_freq", K.LIMITS.max_freq)
+  number("engine", "pitch_separation", state, "separation", K.LIMITS.separation)
   flag("engine", "pitch_keep_pitch_mode", state, "keep_pitch_mode")
   add("engine", "pitch_algorithm", function() return string.format("%.14g", state.pitchmode_value) end, function(raw)
     local value = finite(raw)
@@ -3289,105 +3293,286 @@ trim_note_edge = function(note_idx, edge, new_time)
   return dropped
 end
 
+-- Note splitting: the fixed constants of K.segment (the ones Separation scales come from K.separation_params)
+K.SEG = {
+  BRIDGE_S = 0.025,      -- a shorter unvoiced stretch with matching pitch on both sides does not end the note
+  SILENCE_DB = 40,       -- a frame this far below the 95th-percentile level of the voiced frames is silent
+  DIP_REACH_S = 0.150,   -- how far each way a level dip looks for the peaks it must lie below
+  MEDIAN_S = 0.015,      -- pitch median filter window (at least 3 frames)
+  -- The Separation columns 0 / 0.5 / 1 (fewer notes -> more notes); K.separation_params is linear between them
+  SEPARATION = {
+    { pitch_st = 1.5, hold_s = 0.140, dip_db = 12, min_note_s = 0.100 },
+    { pitch_st = 0.8, hold_s = 0.090, dip_db = 6, min_note_s = 0.070 },
+    { pitch_st = 0.4, hold_s = 0.050, dip_db = 3, min_note_s = 0.040 },
+  },
+}
+
+--- The splitting thresholds at Separation `sep` (0..1): pitch_st (a departure from the note's centre beyond this...),
+--- hold_s (...that lasts this long starts a new note), dip_db (a level dip this deep splits) and min_note_s (a shorter
+--- piece is merged into a neighbour).
+K.separation_params = function(sep)
+  sep = math.max(0, math.min(1, sep or DEFAULTS.separation))
+  local cols = K.SEG.SEPARATION
+  local a, b, u
+  if sep <= 0.5 then a, b, u = cols[1], cols[2], sep / 0.5
+  else a, b, u = cols[2], cols[3], (sep - 0.5) / 0.5 end
+  local p = {}
+  for key, v in pairs(a) do p[key] = v * (1 - u) + b[key] * u end   -- exact at the columns
+  return p
+end
+
+--- Splits analysed frames (`results`: time-ordered { time, note | nil, rms, lvl }) into notes at Separation `sep`.
+--- Returns notes { start_time, end_time, frames, sum_note, count } (frames: the original result frames, voiced only)
+--- and split_points { time, reason } (one per note, reason "Onset" / "Pitch change" / "Level dip"). Every time constant
+--- is converted with the frames' own spacing. `results` is not modified.
+K.segment = function(results, sep)
+  local P, SEG = K.separation_params(sep), K.SEG
+  local notes, split_points = {}, {}
+  local n = #results
+  if n < 2 then return notes, split_points end
+
+  local function median(list)   -- sorts `list`
+    table.sort(list)
+    local m = #list
+    if m % 2 == 1 then return list[(m + 1) / 2] end
+    return (list[m / 2] + list[m / 2 + 1]) * 0.5
+  end
+
+  -- Frame spacing: the median step between frames
+  local steps = {}
+  for i = 2, n do steps[i - 1] = results[i].time - results[i - 1].time end
+  local hop = median(steps)
+  if not (hop > 0) then return notes, split_points end
+  local half_w = math.max(1, math.floor(SEG.MEDIAN_S / hop / 2 + 0.5))   -- median window 2*half_w + 1 frames
+
+  -- 1. Levels in dB; a frame is voiced when it has a pitch and is not silent relative to the item's loud level
+  local db, loud = {}, {}
+  for i, f in ipairs(results) do
+    db[i] = 20 * math.log(math.max(f.lvl or f.rms or 0, 1e-10), 10)
+    if f.note then loud[#loud + 1] = db[i] end
+  end
+  if #loud == 0 then return notes, split_points end
+  table.sort(loud)
+  local floor_db = loud[math.max(1, math.ceil(0.95 * #loud))] - SEG.SILENCE_DB
+  local voiced = {}
+  for i, f in ipairs(results) do voiced[i] = f.note ~= nil and db[i] >= floor_db end
+
+  -- 2. Runs of voiced frames; a short unvoiced stretch with matching pitch on both sides is bridged
+  local function side_pitch(list, from, to)
+    local vals = {}
+    for k = from, to do vals[#vals + 1] = results[list[k]].note end
+    return median(vals)
+  end
+  local runs, run = {}, nil   -- run: { idx = voiced result indices }
+  for i = 1, n do
+    if voiced[i] then
+      if run then
+        local last = run.idx[#run.idx]
+        if i > last + 1 then
+          local gap_s = results[i].time - results[last].time - hop
+          local after = {}
+          for j = i, n do
+            if voiced[j] then after[#after + 1] = j end
+            if #after > half_w then break end
+          end
+          local bridged = gap_s < SEG.BRIDGE_S and math.abs(
+            side_pitch(run.idx, math.max(1, #run.idx - half_w), #run.idx) - side_pitch(after, 1, #after)) <= P.pitch_st
+          if not bridged then run = nil end
+        end
+      end
+      if not run then
+        run = { idx = {} }
+        runs[#runs + 1] = run
+      end
+      run.idx[#run.idx + 1] = i
+    end
+  end
+
+  local segs = {}   -- { first, last (result indices), reason, run, voiced = result indices, pitch }
+  for r, rn in ipairs(runs) do
+    local idx, m = rn.idx, #rn.idx
+    local first, last = idx[1], idx[m]
+
+    -- 3. Median-filtered pitch of the run's voiced frames (working data; the frames keep their own pitch)
+    local pf = {}
+    for k = 1, m do
+      local win = {}
+      for q = math.max(1, k - half_w), math.min(m, k + half_w) do win[#win + 1] = results[idx[q]].note end
+      pf[k] = median(win)
+    end
+
+    -- 4. Pitch change: a departure from the note's centre beyond pitch_st, in one direction, lasting hold_s. The centre
+    -- is the median of the note's frames after its first hold_s (kept sorted); while a departure lasts it is frozen
+    local boundary = { [first] = "Onset" }
+    local s, k = 1, 2
+    local body, d, dir = {}, nil, nil
+    local function to_body(q)
+      if results[idx[q]].time >= results[idx[s]].time + P.hold_s then
+        local v, lo, hi = pf[q], 1, #body
+        while lo <= hi do
+          local mid = (lo + hi) // 2
+          if body[mid] <= v then lo = mid + 1 else hi = mid - 1 end
+        end
+        table.insert(body, lo, v)
+      end
+    end
+    while k <= m do
+      local split = false
+      if #body > 0 then
+        local nb = #body
+        local centre = nb % 2 == 1 and body[(nb + 1) // 2] or (body[nb // 2] + body[nb // 2 + 1]) * 0.5
+        local off = pf[k] - centre
+        local away = math.abs(off) > P.pitch_st
+        if d and not (away and (off > 0) == dir) then   -- came back (vibrato, a stray frame): part of the note
+          for q = d, k - 1 do to_body(q) end
+          d = nil
+        end
+        if away and not d then d, dir = k, off > 0 end
+        if d and results[idx[k]].time - results[idx[d]].time >= P.hold_s then
+          -- The new note starts where the pitch crossed halfway from the centre to the pitch it settled on
+          local held = {}
+          for q = d, k do held[#held + 1] = pf[q] end
+          local settled = median(held)
+          local half, sign = (centre + settled) * 0.5, settled - centre
+          local function past(q) return (pf[q] - half) * sign >= 0 end
+          local j = d
+          if past(j) then
+            while j - 1 > s and past(j - 1) do j = j - 1 end
+          else
+            while j < k and not past(j) do j = j + 1 end
+          end
+          boundary[idx[j]] = "Pitch change"
+          s, k, body, d = j, j + 1, {}, nil
+          split = true
+        end
+      end
+      if not split then
+        if not d then to_body(k) end
+        k = k + 1
+      end
+    end
+
+    -- 5. Level dip: a frame dip_db below the highest level within DIP_REACH_S on each side (bridged frames count).
+    -- Each stretch of such frames splits once, at its lowest frame (the middle one of equal lowest frames)
+    local function side_max(step)   -- per frame, the highest level within reach before (step 1) or after (step -1) it
+      local out, dq, h, tl = {}, {}, 1, 0
+      local from, to = first, last
+      if step < 0 then from, to = last, first end
+      for i = from, to, step do
+        if i ~= from then
+          local q = i - step
+          while tl >= h and db[dq[tl]] <= db[q] do tl = tl - 1 end
+          tl = tl + 1
+          dq[tl] = q
+        end
+        while tl >= h and math.abs(results[i].time - results[dq[h]].time) > SEG.DIP_REACH_S do h = h + 1 end
+        if tl >= h then out[i] = db[dq[h]] end
+      end
+      return out
+    end
+    local left, right = side_max(1), side_max(-1)
+    local i = first
+    while i <= last do
+      local function dip(q)
+        return left[q] and right[q] and db[q] <= left[q] - P.dip_db and db[q] <= right[q] - P.dip_db
+      end
+      if dip(i) then
+        local j = i
+        while j + 1 <= last and dip(j + 1) do j = j + 1 end
+        local low = math.huge
+        for q = i, j do low = math.min(low, db[q]) end
+        local ties = {}
+        for q = i, j do if db[q] <= low + 1e-9 then ties[#ties + 1] = q end end
+        local at = ties[(#ties + 1) // 2]
+        if not boundary[at] then boundary[at] = "Level dip" end
+        i = j + 1
+      else
+        i = i + 1
+      end
+    end
+
+    -- Segments of this run, from its boundaries
+    local starts = {}
+    for at in pairs(boundary) do starts[#starts + 1] = at end
+    table.sort(starts)
+    for b, at in ipairs(starts) do
+      local seg = { first = at, last = (starts[b + 1] or last + 1) - 1, reason = boundary[at], run = r, voiced = {} }
+      for q = 1, m do
+        if idx[q] >= seg.first and idx[q] <= seg.last then seg.voiced[#seg.voiced + 1] = idx[q] end
+      end
+      segs[#segs + 1] = seg
+    end
+    rn.pf = {}   -- filtered pitch by result index, for the merge below
+    for q = 1, m do rn.pf[idx[q]] = pf[q] end
+  end
+
+  -- 6. A segment shorter than min_note_s joins the touching neighbour closer in pitch, or is dropped without one
+  local function seg_pitch(seg)
+    if #seg.voiced == 0 then return nil end
+    local vals = {}
+    for q, i in ipairs(seg.voiced) do vals[q] = runs[seg.run].pf[i] end
+    return median(vals)
+  end
+  local function touching(a, b) return a and b and a.run == b.run end
+  local function seg_dur(x)
+    local seg, nxt = segs[x], segs[x + 1]
+    if #seg.voiced == 0 then return 0 end
+    local stop = touching(seg, nxt) and #nxt.voiced > 0 and results[nxt.voiced[1]].time
+      or results[seg.voiced[#seg.voiced]].time + hop
+    return stop - results[seg.voiced[1]].time
+  end
+  for _, seg in ipairs(segs) do seg.pitch = seg_pitch(seg) end
+  while true do
+    local x, shortest = nil, P.min_note_s
+    for q = 1, #segs do
+      local dur = seg_dur(q)
+      if dur < shortest then x, shortest = q, dur end
+    end
+    if not x then break end
+    local seg, prev, nxt = segs[x], segs[x - 1], segs[x + 1]
+    if not touching(prev, seg) then prev = nil end
+    if not touching(seg, nxt) then nxt = nil end
+    local into = prev or nxt
+    if prev and nxt and seg.pitch and nxt.pitch
+      and (not prev.pitch or math.abs(nxt.pitch - seg.pitch) < math.abs(prev.pitch - seg.pitch)) then
+      into = nxt
+    end
+    if into and into == prev then
+      prev.last = seg.last
+      for _, i in ipairs(seg.voiced) do prev.voiced[#prev.voiced + 1] = i end
+    elseif into then   -- the next segment now starts where this one did, for the same reason
+      nxt.first, nxt.reason = seg.first, seg.reason
+      for _, i in ipairs(nxt.voiced) do seg.voiced[#seg.voiced + 1] = i end
+      nxt.voiced = seg.voiced
+    end
+    if into then into.pitch = seg_pitch(into) end
+    table.remove(segs, x)
+  end
+
+  -- Notes: start at the first voiced frame; end where the touching next note starts, else one frame after the last
+  -- voiced frame (the span that frame stands for)
+  for x, seg in ipairs(segs) do
+    local fr, sum = {}, 0
+    for q, i in ipairs(seg.voiced) do
+      fr[q] = results[i]
+      sum = sum + results[i].note
+    end
+    local nxt = segs[x + 1]
+    local note = {
+      start_time = fr[1].time,
+      end_time = touching(seg, nxt) and results[nxt.voiced[1]].time or fr[#fr].time + hop,
+      frames = fr, sum_note = sum, count = #fr,
+    }
+    notes[#notes + 1] = note
+    split_points[#split_points + 1] = { time = note.start_time, reason = seg.reason }
+  end
+  return notes, split_points
+end
+
 local function run_hybrid_segmentation()
-  state.notes = {}
-  state.split_points = {} -- For debugging display
+  state.notes, state.split_points = K.segment(state.results or {}, state.separation)
 
-  if #state.results == 0 then return end
-
-  -- Configuration
-  local min_note_dur = 0.08 -- 80ms
-  local debounce_dur = 0.08 -- 80ms
-  local pitch_jump_threshold = 0.75 -- Semitones
-  local rms_noise_floor = 0.005 -- Absolute RMS threshold for silence
-
-  -- Calculate derivatives (applying a simple median filter logic by looking at 3 frames would be better, but we keep it simple for now)
-  for i, frame in ipairs(state.results) do
-    if i > 1 then
-      local prev = state.results[i-1]
-      if frame.note and prev.note then
-        frame.delta_note = frame.note - prev.note
-      else
-        frame.delta_note = 0
-      end
-      frame.delta_rms = frame.rms - prev.rms
-    else
-      frame.delta_note = 0
-      frame.delta_rms = 0
-    end
-  end
-
-  local current_note = nil
-  local last_split_time = -1
-
-  for _, frame in ipairs(state.results) do
-    local is_voiced = (frame.note ~= nil and frame.rms > rms_noise_floor)
-
-    local should_split = false
-    local split_reason = ""
-
-    if is_voiced then
-      if not current_note then
-        should_split = true
-        split_reason = "Onset (from silence)"
-      else
-        -- Check for pitch jump (legato)
-        if math.abs(frame.delta_note) > pitch_jump_threshold then
-          should_split = true
-          split_reason = "Pitch Jump"
-        end
-
-        -- Check for amplitude spike (articulation)
-        if frame.delta_rms > frame.rms * 0.5 and frame.delta_rms > 0.02 then
-          should_split = true
-          split_reason = "Amplitude Spike"
-        end
-      end
-    else
-      -- Unvoiced gap
-      if current_note then
-        -- End current note
-        if (frame.time - current_note.start_time) >= min_note_dur then
-          table.insert(state.notes, current_note)
-        end
-        current_note = nil
-      end
-    end
-
-    if should_split and (frame.time - last_split_time) >= debounce_dur then
-      if current_note then
-        current_note.end_time = frame.time
-        if (current_note.end_time - current_note.start_time) >= min_note_dur then
-          table.insert(state.notes, current_note)
-        end
-      end
-
-      current_note = {
-        start_time = frame.time,
-        end_time = frame.time,
-        sum_note = 0,
-        count = 0,
-        frames = {}
-      }
-
-      table.insert(state.split_points, { time = frame.time, reason = split_reason })
-      last_split_time = frame.time
-    end
-
-    if current_note and is_voiced then
-      current_note.sum_note = current_note.sum_note + frame.note
-      current_note.count = current_note.count + 1
-      current_note.end_time = frame.time
-      table.insert(current_note.frames, frame)
-    end
-  end
-
-  -- Push last note
-  if current_note and (current_note.end_time - current_note.start_time) >= min_note_dur then
-    table.insert(state.notes, current_note)
-  end
-
-  -- Calculate anchor pitch
+  -- Anchor pitch
   for _, n in ipairs(state.notes) do
     if n.count > 0 then
       n.avg_note = n.sum_note / n.count
