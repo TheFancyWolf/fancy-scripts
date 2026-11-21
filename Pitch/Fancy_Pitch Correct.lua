@@ -190,7 +190,7 @@ App.VOCAL_RANGES = VOCAL_RANGES
 
 for _, part in ipairs({
   "state", "dsp", "analysis", "notes", "session", "note_edit", "segmentation", "canvas_support",
-  "canvas", "item_actions", "panels", "top_bar"
+  "canvas_input", "canvas_draw", "canvas_menus", "canvas", "item_actions", "panels", "top_bar"
 }) do
   require("pitch_correct." .. part)
 end
