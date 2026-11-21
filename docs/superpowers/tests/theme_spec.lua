@@ -677,7 +677,8 @@ end)
 -------------------------------------------------------------------------------
 
 -- The sorted keys of P.canvas before this plan (taken from HEAD before Task 6 edited anything), plus span_edge and
--- span_fill (the setting highlights of Pitch Correct, 2026-11-19)
+-- span_fill (the setting highlights of Pitch Correct, 2026-11-19) and trace_far and trace_note (the quieter pitch
+-- trace of Pitch Correct v2.14.0, 2026-11-20)
 local CANVAS_KEYS = {
   "anchor", "bypass_border", "bypass_title", "grid", "grid_dim", "grid_plain", "grid_plain_black", "grid_tonic",
   "gutter_bg", "gutter_strip", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "handle", "handle_drag",
@@ -689,14 +690,14 @@ local CANVAS_KEYS = {
   "note_label", "note_label_edited", "note_label_selected", "note_selected", "note_selected_border",
   "note_selected_edited", "note_wave", "overview_bg", "overview_note", "pill_bg", "pill_text", "playhead", "preview",
   "row", "row_black", "row_dim", "row_dim_black", "row_plain", "row_plain_black", "row_tint", "row_tonic",
-  "row_tonic_tint", "ruler_bg", "scrim", "span_edge", "span_fill", "spot", "trace", "trend", "vibrato", "view_border", "view_fill", "view_grip",
+  "row_tonic_tint", "ruler_bg", "scrim", "span_edge", "span_fill", "spot", "trace", "trace_far", "trace_note", "trend", "vibrato", "view_border", "view_fill", "view_grip",
   "zone_divider", "zone_drift", "zone_shift",
 }
 
 local CANVAS_PALETTES = { { mode = "fancy" }, { mode = "match", theme = REAPERTIPS }, { mode = "match", theme = LIGHT } }
 
 test("canvas: key set unchanged, both modes", function()
-  assert(#CANVAS_KEYS == 81)
+  assert(#CANVAS_KEYS == 83)
   for _, o in ipairs(CANVAS_PALETTES) do
     local C = load_theme(o).build_palette().canvas
     for _, k in ipairs(CANVAS_KEYS) do assert(C[k] ~= nil, k) end
@@ -710,7 +711,7 @@ test("canvas: curated values", function()
   assert(C.row_dim == 0x282828FF and C.row_dim_black == 0x262626FF)
   assert(C.row_plain == 0x2E2E2EFF and C.row_plain_black == 0x2A2A2AFF)
   assert(C.grid_dim == 0x1D1D1DFF and C.grid_plain == 0x1D1D1DFF and C.grid_plain_black == 0x1D1D1DFF)
-  assert(C.gutter_bg == 0x333333FF and C.overview_bg == P.well)
+  assert(C.gutter_bg == 0x333333FF and C.overview_bg == P.inset)   -- the recessed surface (v2.14.0), not the input well
   assert(C.note_border == P.accent and C.note_edited_border == P.green and C.note_selected_border == 0xEDEDEDFF)
   assert(C.marker_split & 0xFFFFFF00 == P.accent2 & 0xFFFFFF00, "split markers follow the secondary accent")
 end)
