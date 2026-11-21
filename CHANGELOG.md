@@ -4,6 +4,12 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.16.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Automatic joins, Slide In and Separation:
+  - **Joins are automatic**: the correction blends across the slide you actually sang, with a short fixed fade into and out of silence. Transition, Onset Ramp and Legato Gap are gone, along with the `Timing` button and the Timing row in the top bar.
+  - **Slide In** replaces Scoop Shape: it flattens the slide into a note up to where the note actually settles (not a fixed length), and at 100 % it removes the slide completely. Shift + drag anywhere on a note adjusts it; it is also in the top bar and the note's right-click menu.
+  - **Separation** (top bar, 0–100 %, default 50 %): how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up. Changing it re-splits the current item straight away as one undo step; notes whose start and end did not move keep their edits, and it asks first if an edited note would lose its edits.
+  - **Better note splitting**: notes joined by a sung slide and re-articulations on the same pitch are found as separate notes; vibrato and short pitch-detection dropouts no longer cut a held note.
+  - **Re-analyze older items**: items analysed with an earlier version must be analysed again (Re-Analyze). Stored Transition, Onset Ramp, Legato Gap and Scoop values are not carried over.
 - **Fancy Pitch Correct v2.15.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Two new shortcuts:
   - **B** bypasses the selected notes; pressed again when they are all bypassed, it turns bypass off. One undo point, and the status line says how many notes changed.
   - **W** moves the edit cursor to the start of the item (like REAPER's Go to start of project); playback follows and a zoomed view scrolls back to the start.
