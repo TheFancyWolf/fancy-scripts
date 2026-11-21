@@ -1,8 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.4.0
+-- @version 1.4.1
 -- @changelog
---   + Reaper Tips look: control role swatches and a row of raw ImGui controls (button, checkbox, slider, input, tabs, scrollbar); the curated mode is now labelled "Fancy"
+--   + Icons: panel_right (side panel toggle)
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -564,6 +564,7 @@ local function draw_icons_section()
     { "pause",    Theme.icons.pause },
     { "close",    Theme.icons.close },
     { "plus",     Theme.icons.plus },
+    { "panel_right", Theme.icons.panel_right },
     { "info",     Theme.icons.info },
     { "tri_down", Theme.icons.tri_down },
     { "tri_up",   Theme.icons.tri_up },

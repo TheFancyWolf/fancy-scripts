@@ -4,6 +4,13 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.14.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Design pass on the top bar, the canvas curves and the side panel:
+  - **Side panel toggle**: a panel button in the top bar (next to `…`) shows and hides the panel and is lit while it shows. The panel has its own darker surface. The `▶` in the Pitched Items header and the closed strip are gone: hidden, the panel leaves the whole width to the canvas.
+  - **Timing row**: a secondary bar on a recessed band across the window, with its values under the `Timing` button instead of at the far left.
+  - **Quieter pitch trace**: dimmed over a note block and barely visible everywhere else, so the preview curve stands out; the preview is opaque and as saturated as its contrast allows.
+  - **Ruler and hint**: time labels keep room between them when zoomed in, and the idle hint on the canvas (`Select a note to edit it`) steps aside while a note is under it.
+  - **Value fills** use the accent colour (a note's own value keeps the selection pill's colour).
+- **Fancy Design System (`Utility/Fancy_Design System.lua`, `_lib/theme.lua`)** — New `panel_right` icon; canvas tokens `trace_note` and `trace_far`; palette colour `inset` (a recessed surface for secondary bars and side panels).
 - **Fancy Pitch Correct v2.13.0 (`Pitch/Fancy_Pitch Correct.lua`)** — The top bar follows your selection:
   - **One bar for defaults and notes**: with no note selected, the values in the top bar are the defaults (the pill reads `Defaults`). Select one or more notes and the same controls show and change those notes (`3 notes`). A note with its own value no longer greys the bar out.
   - **Change many notes at once**: with several notes selected, a drag moves them all by the same amount and keeps the differences between them; mixed values show as a range such as `20–60%`. Cmd/Ctrl-click a value and type a number to make them all equal. Double-click puts them back to what they inherit.

@@ -628,7 +628,9 @@ local function build_canvas_fancy(P)
   -- Curves, markers, selection, playhead. The trace and the playhead are the text colour (the blocks own the
   -- accent); the preview is a light green that reads on the edited (green) block it is drawn over.
   C.trace           = with_alpha(P.text, 0.90)
-  C.preview         = with_alpha(lighten(P.green, 0.45), 0.90)
+  C.trace_note      = with_alpha(P.text, 0.55)   -- the trace under a note block: behind the preview
+  C.trace_far       = with_alpha(P.text, 0.08)   -- the trace between notes: context only
+  C.preview         = lighten(P.green, 0.15)
   C.vibrato         = 0xFFAA4418
   C.trend           = 0x00FFFFFF
   C.spot            = 0xFFFF00FF
@@ -641,7 +643,7 @@ local function build_canvas_fancy(P)
   C.playhead        = P.text
   -- Overview strip (every note, small, under the rows) and range strip (beside them): the track, the notes on
   -- it, and the thumb that marks the visible window (fill, border and end grips)
-  C.overview_bg     = P.well
+  C.overview_bg     = P.inset or P.well   -- the recessed surface of secondary bars and side panels
   C.overview_note   = P.accent
   C.view_fill       = with_alpha(P.accent, 0.16)
   C.view_border     = P.accent
@@ -782,7 +784,11 @@ local function build_canvas_match(P)
   local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
   C.trace      = fit_contrast(with_alpha(P.text, 0.90), line_on, 3.0, rows, true)   -- raw pitch trace: text colour (90 % alpha)
   C.playhead   = fit_contrast(P.text, line_on, 3.0, rows, true)                  -- the playhead line: text colour
-  C.preview    = fit_contrast(with_alpha(toward(P.green, 0.45), 0.90), curve_on, 3.0, rows, true)   -- corrected-pitch preview: a green toward the text colour
+  -- The trace steps back where the preview matters: dimmer under a note block, faint between notes (a reference
+  -- layer, deliberately under 3:1; the legend and the full-strength swatch use C.trace)
+  C.trace_note = with_alpha(C.trace, 0.55)
+  C.trace_far  = with_alpha(C.trace, 0.08)
+  C.preview    = fit_contrast(toward(P.green, 0.15), curve_on, 3.0, rows, true)   -- corrected-pitch preview: opaque, as saturated a green as 3:1 allows
   C.trend      = fit_contrast(C.trend, curve_on, 3.0, rows, true)                -- trend line: the Fancy cyan (apart from marker_split's violet)
   C.anchor     = C.trend                                                         -- trend anchor diamond: same as the trend
   C.spot       = fit_contrast(P.yellow, curve_on, 3.0, rows, true)               -- smart-spot circle: yellow
@@ -792,7 +798,7 @@ local function build_canvas_match(P)
 
   -- Overview and range strips: a track a step away from the background; the notes on it, the thumb's border and
   -- its grips are fitted to >= 3:1 on the track, with and without the thumb's own fill over it
-  C.overview_bg   = away(bg, 0.25)
+  C.overview_bg   = P.inset or away(bg, 0.25)   -- the recessed surface a side panel beside the canvas also uses
   local track     = { C.overview_bg, composite_over(C.view_fill, C.overview_bg) }
   C.overview_note = fit_contrast(P.accent, track, 3.0)
   C.view_border   = fit_contrast(P.accent, track, 3.0)
@@ -955,6 +961,9 @@ function Theme.build_palette(overrides)
 
   -- slider_grab_active = Lighter accent: kept for scripts (SliderGrabActive is thumb_a)
   P.slider_grab_active = overrides.slider_grab_active or lighten(P.accent, 0.15)
+
+  -- inset = a recessed surface a step darker than the window: secondary bars and side panels (well is for inputs)
+  P.inset = overrides.inset or darken(P.bg, 0.18)
 
   -- Control roles (see the design spec, section 2)
   local dark_text = luminance(P.text) > 0.179          -- light text on a dark theme: "toward text" is lighter
@@ -1523,6 +1532,17 @@ function Theme.icons.tri_right(dl, cx, cy, hs, col)
     ox - math.floor(hs * 0.4), oy - math.floor(hs * 0.7),
     ox - math.floor(hs * 0.4), oy + math.floor(hs * 0.7),
     ox + math.floor(hs * 0.6), oy, col)
+end
+
+--- Side panel toggle (a window outline whose right-hand pane is filled).
+--- Use for: showing or hiding a panel docked on the right of a window.
+function Theme.icons.panel_right(dl, cx, cy, hs, col)
+  local ox, oy = math.floor(cx), math.floor(cy)
+  local w, h = math.floor(hs * 0.95), math.floor(hs * 0.75)
+  local th = math.max(1, hs * 0.2)
+  local split = ox + math.floor(w * 0.25)
+  reaper.ImGui_DrawList_AddRectFilled(dl, split, oy - h, ox + w, oy + h, col, 1)
+  reaper.ImGui_DrawList_AddRect(dl, ox - w, oy - h, ox + w, oy + h, col, 1, 0, th)
 end
 
 --- ⚙ Gear / cog icon (central ring with radiating teeth).
