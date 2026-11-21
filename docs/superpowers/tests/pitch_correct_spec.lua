@@ -166,7 +166,7 @@ test("segment_degenerate", function()
   local notes = segment({ { dur = 1, note = 60 } })
   eq(#notes, 1, "one note")
   near(notes[1].start_time, 0, HOP, "start")
-  near(notes[1].end_time, 1, HOP, "end")
+  near(notes[1].end_time, 1, 1.5 * HOP, "end")
 end)
 
 test("segment_missing_lvl", function()
@@ -193,6 +193,42 @@ test("segment_frames_intact", function()
     if f.note then eq(owner[f] ~= nil, true, "voiced frame " .. i .. " in no note") end
     eq(f.note, before[i], "frame " .. i .. " note mutated")
   end
+end)
+
+local function vibrato(centre, amp, rate, phase)
+  return function(t) return centre + amp * math.sin(2 * math.pi * rate * t + (phase or 0)) end
+end
+
+test("segment_vibrato_all_separations", function()
+  for _, hop in ipairs({ 64 / 44100, 256 / 44100, 1024 / 44100 }) do
+    for _, sep in ipairs({ 0, 0.5, 0.75, 1 }) do
+      eq(#segment({ { dur = 1.5, note = vibrato(60, 0.5, 5.5) } }, hop, sep), 1,
+        "hop " .. math.floor(hop * 44100 + 0.5) .. " sep " .. sep)
+    end
+  end
+end)
+
+test("segment_wide_vibrato_default", function()
+  for _, f in ipairs({ 5, 6.5 }) do
+    eq(#segment({ { dur = 1.5, note = vibrato(60, 1.0, f) } }, HOP, 0.5), 1, "rate " .. f)
+  end
+end)
+
+test("segment_vibrato_phase", function()
+  eq(#segment({ { dur = 1.5, note = vibrato(60, 0.5, 5.5, math.pi / 2) } }, HOP, 1), 1, "notes")
+end)
+
+test("segment_vibrato_then_step", function()
+  for _, sep in ipairs({ 0.5, 1 }) do
+    local notes = segment({ { dur = 0.6, note = vibrato(60, 0.5, 5.5) }, { dur = 0.6, note = vibrato(62, 0.5, 5.5) } },
+      HOP, sep)
+    eq(#notes, 2, "notes at sep " .. sep)
+    near(notes[2].start_time, 0.6, 0.05, "boundary at sep " .. sep)
+  end
+end)
+
+test("segment_short_note", function()
+  eq(#segment({ { dur = 0.12, note = 60 }, { dur = 0.4, note = 62 } }, HOP, 0.5), 2, "notes")
 end)
 
 -- Tests appended by later tasks go above this line.

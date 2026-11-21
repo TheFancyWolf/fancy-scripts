@@ -3299,6 +3299,7 @@ K.SEG = {
   SILENCE_DB = 40,       -- a frame this far below the 95th-percentile level of the voiced frames is silent
   DIP_REACH_S = 0.150,   -- how far each way a level dip looks for the peaks it must lie below
   MEDIAN_S = 0.015,      -- pitch median filter window (at least 3 frames)
+  CYCLE_S = 0.18,        -- about one vibrato cycle: the window of the cycle median the note's centre is taken from
   -- The Separation columns 0 / 0.5 / 1 (fewer notes -> more notes); K.separation_params is linear between them
   SEPARATION = {
     { pitch_st = 1.5, hold_s = 0.140, dip_db = 12, min_note_s = 0.100 },
@@ -3401,20 +3402,55 @@ K.segment = function(results, sep)
       pf[k] = median(win)
     end
 
-    -- 4. Pitch change: a departure from the note's centre beyond pitch_st, in one direction, lasting hold_s. The centre
-    -- is the median of the note's frames after its first hold_s (kept sorted); while a departure lasts it is frozen
-    local boundary = { [first] = "Onset" }
-    local s, k = 1, 2
-    local body, d, dir = {}, nil, nil
-    local function to_body(q)
-      if results[idx[q]].time >= results[idx[s]].time + P.hold_s then
-        local v, lo, hi = pf[q], 1, #body
-        while lo <= hi do
-          local mid = (lo + hi) // 2
-          if body[mid] <= v then lo = mid + 1 else hi = mid - 1 end
+    -- Cycle median: the median of pf over about one vibrato cycle (an unbiased centre for vibrato). The window is
+    -- centred, shifted at the run's edges to stay full length; win_lo[k] is where it starts
+    local cyc_w = math.min(m, 2 * math.max(1, math.floor(SEG.CYCLE_S / hop / 2 + 0.5)) + 1)
+    local cyc_half = (cyc_w - 1) // 2
+    local cyc, win_lo = {}, {}
+    do
+      local sorted, lo, hi = {}, 1, 0
+      local function find(v)   -- the first position in `sorted` whose value is >= v
+        local a, b = 1, #sorted
+        while a <= b do
+          local mid = (a + b) // 2
+          if sorted[mid] < v then a = mid + 1 else b = mid - 1 end
         end
-        table.insert(body, lo, v)
+        return a
       end
+      for k = 1, m do
+        local want_lo = math.max(1, math.min(k - cyc_half, m - cyc_w + 1))
+        local want_hi = want_lo + cyc_w - 1
+        while hi < want_hi do hi = hi + 1; table.insert(sorted, find(pf[hi]), pf[hi]) end
+        while lo < want_lo do table.remove(sorted, find(pf[lo])); lo = lo + 1 end
+        local nc = #sorted
+        cyc[k] = nc % 2 == 1 and sorted[(nc + 1) // 2] or (sorted[nc // 2] + sorted[nc // 2 + 1]) * 0.5
+        win_lo[k] = want_lo
+      end
+    end
+
+    -- 4. Pitch change: pf stays more than pitch_st from the note's centre, on one side, for hold_s, and has settled
+    -- there (the cycle median in the middle of that stretch is more than pitch_st / 2 from the centre). The centre is
+    -- the median of the note's cycle-median values so far (kept sorted), frozen while a departure lasts. A cycle-median
+    -- window never reaches back before the note's start: near the start it is the note's first cycle
+    local boundary = { [first] = "Onset" }
+    local s, k = 1, 1
+    local body, d, dir, head = {}, nil, nil, nil
+    local function note_cyc(q)
+      if win_lo[q] >= s then return cyc[q] end
+      if not head then
+        local vals = {}
+        for x = s, math.min(m, s + cyc_w - 1) do vals[#vals + 1] = pf[x] end
+        head = median(vals)
+      end
+      return head
+    end
+    local function to_body(q)
+      local v, lo, hi = note_cyc(q), 1, #body
+      while lo <= hi do
+        local mid = (lo + hi) // 2
+        if body[mid] <= v then lo = mid + 1 else hi = mid - 1 end
+      end
+      table.insert(body, lo, v)
     end
     while k <= m do
       local split = false
@@ -3428,7 +3464,8 @@ K.segment = function(results, sep)
           d = nil
         end
         if away and not d then d, dir = k, off > 0 end
-        if d and results[idx[k]].time - results[idx[d]].time >= P.hold_s then
+        if d and results[idx[k]].time - results[idx[d]].time >= P.hold_s
+          and math.abs(note_cyc((d + k) // 2) - centre) > P.pitch_st / 2 then
           -- The new note starts where the pitch crossed halfway from the centre to the pitch it settled on
           local held = {}
           for q = d, k do held[#held + 1] = pf[q] end
@@ -3442,7 +3479,7 @@ K.segment = function(results, sep)
             while j < k and not past(j) do j = j + 1 end
           end
           boundary[idx[j]] = "Pitch change"
-          s, k, body, d = j, j + 1, {}, nil
+          s, k, body, d, head = j, j, {}, nil, nil
           split = true
         end
       end
@@ -3549,8 +3586,7 @@ K.segment = function(results, sep)
     table.remove(segs, x)
   end
 
-  -- Notes: start at the first voiced frame; end where the touching next note starts, else one frame after the last
-  -- voiced frame (the span that frame stands for)
+  -- Notes: start at the first voiced frame; end where the touching next note starts, else at the last voiced frame
   for x, seg in ipairs(segs) do
     local fr, sum = {}, 0
     for q, i in ipairs(seg.voiced) do
@@ -3560,7 +3596,7 @@ K.segment = function(results, sep)
     local nxt = segs[x + 1]
     local note = {
       start_time = fr[1].time,
-      end_time = touching(seg, nxt) and results[nxt.voiced[1]].time or fr[#fr].time + hop,
+      end_time = touching(seg, nxt) and results[nxt.voiced[1]].time or fr[#fr].time,
       frames = fr, sum_note = sum, count = #fr,
     }
     notes[#notes + 1] = note
