@@ -45,10 +45,29 @@ local function frames(segs, hop_s)
   return out
 end
 
+local S = load_script()   -- once: it re-runs the whole script
+
 test("loads", function()
-  local S = load_script()
   eq(type(S), "table")
   eq(type(S.K.correction_build), "function")
+end)
+
+test("short_level_constant", function()
+  local s = {}
+  for i = 1, 2048 do s[i] = 0.5 end
+  near(S.K.short_level(s, 2048, 44100), 0.5, 1e-9)
+end)
+
+test("short_level_centre_burst", function()
+  local s = {}
+  for i = 1, 2048 do s[i] = (i >= 804 and i <= 1244) and 1.0 or 0 end
+  near(S.K.short_level(s, 2048, 44100), 1.0, 1e-9)
+end)
+
+test("short_level_short_block", function()
+  local s = {}
+  for i = 1, 100 do s[i] = 0.25 end
+  near(S.K.short_level(s, 100, 44100), 0.25, 1e-9)
 end)
 
 -- Tests appended by later tasks go above this line.

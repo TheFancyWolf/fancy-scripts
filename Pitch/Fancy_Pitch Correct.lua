@@ -977,6 +977,20 @@ local function midi_to_name(midi)
   return NOTE_NAMES[note_idx] .. octave
 end
 
+K.LEVEL_WINDOW_S = 0.010
+
+--- RMS of the samples in a LEVEL_WINDOW_S window centred on the block (the whole block if it is shorter).
+--- A whole-block RMS smears a quick dip in loudness; this follows it. `s` is a plain Lua array.
+K.short_level = function(s, b_size, sample_rate)
+  local n = math.min(b_size, math.max(1, math.floor(K.LEVEL_WINDOW_S * sample_rate + 0.5)))
+  local first = math.floor((b_size - n) / 2) + 1
+  local sum = 0
+  for i = first, first + n - 1 do
+    sum = sum + s[i] * s[i]
+  end
+  return math.sqrt(sum / n)
+end
+
 -- Process a single block of audio using the YIN algorithm
 local function yin_process_block(samples, sample_rate, params)
   local b_size = params.calc_block_size or params.block_size
@@ -992,6 +1006,7 @@ local function yin_process_block(samples, sample_rate, params)
     rms_sum = rms_sum + s[i] * s[i]
   end
   local rms = math.sqrt(rms_sum / b_size)
+  local lvl = K.short_level(s, b_size, sample_rate)
 
   local W = math.floor(b_size / 2)
   local max_tau = math.floor(sample_rate / params.min_freq)
@@ -1050,7 +1065,7 @@ local function yin_process_block(samples, sample_rate, params)
     end
     -- If even the global minimum is high, it's likely unvoiced
     if min_val > params.threshold * 2 then
-      return rms, nil
+      return rms, nil, lvl
     end
   end
 
@@ -1069,7 +1084,7 @@ local function yin_process_block(samples, sample_rate, params)
     end
   end
 
-  return rms, sample_rate / better_tau
+  return rms, sample_rate / better_tau, lvl
 end
 
 -------------------------------------------------------------------------------
@@ -3414,7 +3429,7 @@ local function process_analysis_step()
     )
 
     if num_read > 0 then
-      local rms, freq = yin_process_block(state.buffer, state.sample_rate, params)
+      local rms, freq, lvl = yin_process_block(state.buffer, state.sample_rate, params)
       local note = nil
       if freq and freq >= params.min_freq and freq <= params.max_freq then
         note = freq_to_note(freq)
@@ -3423,7 +3438,8 @@ local function process_analysis_step()
         time = state.current_time,
         freq = freq,
         note = note,
-        rms = rms
+        rms = rms,
+        lvl = lvl
       })
     end
 
