@@ -1,23 +1,29 @@
 -- @description Fancy Mapper Smooth CC
 -- @author Fancy Scripts
--- @version 5.2.0
+-- @version 5.2.1
 -- @changelog
---   + Initial release: Convert CC lane events in active take to smooth linear curves
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Converts stepped or square MIDI CC events in the active take or selected item
 --   into smooth linear ramps (shape = 1) for seamless vector playback.
---   Requirements: REAPER 7.0+
+--   Requirements: REAPER 7.0+, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. SHARED LIBRARY BOOTSTRAP
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/mapper_engine.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Mapper Smooth CC -- Missing library", 0)
+  return
+end
 
 local MapperEngine = require("mapper_engine")
 

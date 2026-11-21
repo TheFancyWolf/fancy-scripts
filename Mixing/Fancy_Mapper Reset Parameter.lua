@@ -1,8 +1,8 @@
 -- @description Fancy Mapper Reset Parameter
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
---   + v5.1: Context-aware reset across all modes (FX default, pan center, volume 0dB, width 100%, MIDI vel, MIDI CC, item slip)
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Resets the active parameter based on current Fancy Mapper mode.
 --   - FX: resets last-touched FX parameter to default value.
@@ -13,15 +13,21 @@
 --   - MIDI CC: resets selected CC events to default (0 or 64).
 --   - Item Slip: resets item audio offset to 0.
 --   Assign to a Fancy Mapper button slot or any keyboard shortcut.
---   Requirements: REAPER 7.0+
+--   Requirements: REAPER 7.0+, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/mapper_engine.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Mapper Reset Parameter -- Missing library", 0)
+  return
+end
 
 local MapperEngine = require("mapper_engine")
 

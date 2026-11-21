@@ -1,31 +1,18 @@
 -- @description Fancy Mapper Settings
 -- @author Fancy Scripts
--- @version 5.2.1
+-- @version 5.2.2
 -- @changelog
---   + New look from the shared design system: matches the Reapertips Theme
---   + Fix: symbols the new font lacks no longer show as ?
---   + v5.2: Mode panel: pick a mode to see only its settings and button actions
---   + v5.2: Guided calibration dialog (counts ticks without rebinding the dial)
---   + v5.2: Action Ring mode chips, per-mode smoothing toggles, HUD & toast settings in General
---   + v5.2: Smooth CC recording (60 Hz real-time slew streamer)
---   + v5.2: CC lane linearization (vector ramps instead of staircase)
---   + v5.2: Auto-linearize take on record stop & 1-click smooth take button
---   + v5.1: Added Width, Multi-CC, Velocity, Track Nav, Marker, Transient, Item Slip
---   + v5.1: Configurable Multi-CC targets and presets (e.g. 1, 11)
---   + v5.1: Multi-mode button action mapping
---   + v5.1: Cut Send mode
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Central settings hub for all Fancy Mapper scripts.
 --   Configure calibration, modes, scrub behavior, sensitivity,
 --   button actions, toast appearance, and more.
 --   No need to edit script files — everything is here.
---   Requirements: REAPER 7.0+, ReaImGui, SWS Extension
+--   Requirements: REAPER 7.0+, ReaImGui, SWS Extension, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -46,6 +33,13 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Mapper Settings -- Missing library", 0)
+  return
+end
 
 local Theme = require("theme")
 local MapperEngine = require("mapper_engine")

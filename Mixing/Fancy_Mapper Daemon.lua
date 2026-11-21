@@ -1,25 +1,31 @@
 -- @description Fancy Mapper Daemon
 -- @author Fancy Scripts
--- @version 5.2.0
+-- @version 5.2.1
 -- @changelog
---   + Initial release: 60 Hz background slew engine for universal Smooth Dial
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Background consumer daemon for Fancy Mapper.
 --   Interpolates parameter movements at 60 Hz for smooth, analog-style
 --   continuous control (Volume, Pan, Width, FX, MIDI CC, Scrub, Item Slip).
 --   Auto-wakes when you turn the dial and auto-sleeps after 10 seconds of inactivity.
---   Requirements: REAPER 7.0+
+--   Requirements: REAPER 7.0+, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. SHARED LIBRARY BOOTSTRAP
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/mapper_engine.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Mapper Daemon -- Missing library", 0)
+  return
+end
 
 local MapperEngine = require("mapper_engine")
 local EXTSTATE_SECTION = "FancyMapper"

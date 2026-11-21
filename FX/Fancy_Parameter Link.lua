@@ -1,22 +1,18 @@
 -- @description Fancy Parameter Link
 -- @author Fancy Scripts
--- @version 5.4.2
+-- @version 5.4.3
 -- @changelog
---   + New look from the shared design system: matches the Reapertips Theme
---   + Fix: symbols the new font lacks no longer show as ?
---   + Fixed ReaImGui double-End error when the window is in an inactive dock tab or fully clipped
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Links FX parameters between tracks: Follow or Inverse with adjustable strength.
 --   Features: multi-track selector, auto group-scan for same plugin, full-mesh linking,
 --   bidirectional engine (move any linked knob), global presets, live inspector,
 --   and settings modal.
---   Requirements: ReaImGui extension (install via ReaPack)
+--   Requirements: ReaImGui extension (install via ReaPack), Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 --   [data] ../toolbar_icons/toolbar_fancy_parameter_link.png > toolbar_icons/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/150/toolbar_fancy_parameter_link.png > toolbar_icons/150/toolbar_fancy_parameter_link.png
 --   [data] ../toolbar_icons/200/toolbar_fancy_parameter_link.png > toolbar_icons/200/toolbar_fancy_parameter_link.png
@@ -40,6 +36,13 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Parameter Link -- Missing library", 0)
+  return
+end
 
 local Theme = require("theme")
 local JSON  = require("json")

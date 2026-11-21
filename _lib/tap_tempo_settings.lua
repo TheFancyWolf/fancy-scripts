@@ -1,3 +1,4 @@
+-- @noindex
 -------------------------------------------------------------------------------
 -- Fancy Scripts -- Tap Tempo settings (shared by the tap action and its
 -- settings window). DEFAULTS is the single source of truth.

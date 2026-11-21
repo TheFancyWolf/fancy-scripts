@@ -1,19 +1,17 @@
 -- @description Fancy Mapper Sensitivity Down
 -- @author Fancy Scripts
--- @version 5.1.1
+-- @version 5.1.2
 -- @changelog
---   + New look from the shared design system: matches the Reapertips Theme
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Decreases the sensitivity of the currently active Fancy Mapper mode.
 --   Shows a brief toast with the new value. Step size is configurable
 --   in Fancy Mapper Settings.
---   Requirements: REAPER 7.0+, ReaImGui
+--   Requirements: REAPER 7.0+, ReaImGui, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
@@ -27,6 +25,13 @@ reaper.set_action_options(1)
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Mapper Sensitivity Down -- Missing library", 0)
+  return
+end
 local Theme = require("theme")
 
 -------------------------------------------------------------------------------

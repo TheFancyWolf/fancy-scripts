@@ -1,20 +1,18 @@
 -- @description Fancy Pan Snap
 -- @author Fancy Scripts
--- @version 1.8.0
+-- @version 1.8.1
 -- @changelog
---   + New look from the shared design system: matches the Reapertips Theme
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Background auto-snap utility that snaps Track Pan, Track Width / Dual Pan,
 --   and Send Pans to configurable percentage increments (default 10%) on release.
 --   Features a sleek ReaImGui HUD, floating cursor tooltip badge, customizable step buttons,
 --   bypass modifier (Shift/Alt), and docking support.
---   Requirements: REAPER 7.0+, ReaImGui
+--   Requirements: REAPER 7.0+, ReaImGui, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -35,6 +33,13 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Pan Snap -- Missing library", 0)
+  return
+end
 
 local Theme = require("theme")
 local JSON  = require("json")

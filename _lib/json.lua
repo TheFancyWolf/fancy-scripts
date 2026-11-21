@@ -1,3 +1,4 @@
+-- @noindex
 -- Fancy Scripts — Shared JSON Library
 -- Lightweight JSON encoder/decoder for REAPER Lua scripts.
 -- Loaded via: local JSON = require("json")

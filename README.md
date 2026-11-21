@@ -18,6 +18,7 @@ The easiest way to install and stay updated:
    ```
 3. Go to **Extensions > ReaPack > Browse Packages...**
 4. Search for **"Fancy"**, right-click → **Install**, and click **Apply**.
+5. Install **Fancy Scripts Library** as well. It holds the files the scripts share (theme, fonts, utilities); every script with a window, and the Fancy Mapper and Tap Tempo Slew actions, need it. A script that cannot find it says so when you run it.
 
 ---
 

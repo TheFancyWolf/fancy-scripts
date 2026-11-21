@@ -1,20 +1,18 @@
 -- @description Fancy Tap Tempo Slew Settings
 -- @author Fancy Scripts
--- @version 1.0.1
+-- @version 1.0.2
 -- @changelog
---   + New look from the shared design system: matches the Reapertips Theme
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Settings window for Fancy Tap Tempo Slew: instant or glide, taps per
 --   change, whether the tempo updates on every tap or once per group, the
 --   restart gap and the tempo range. Changes save at once and apply on the
 --   next tap.
---   Requirements: REAPER 7.03+, ReaImGui
+--   Requirements: REAPER 7.03+, ReaImGui, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -32,6 +30,13 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Tap Tempo Slew Settings -- Missing library", 0)
+  return
+end
 
 local Theme    = require("theme")
 local Settings = require("tap_tempo_settings")

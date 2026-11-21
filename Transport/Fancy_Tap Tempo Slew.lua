@@ -1,8 +1,8 @@
 -- @description Fancy Tap Tempo Slew
 -- @author Fancy Scripts
--- @version 1.0.0
+-- @version 1.0.1
 -- @changelog
---   + Initial release
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Tap tempo for following a live player. After the 4th tap the tempo
 --   changes at once, or glides at a configurable slew rate.
@@ -11,12 +11,11 @@
 --   Slew Settings" action to change the mode, taps per change and limits.
 --   An instant change inserts a tempo marker at the play position, so the
 --   play position does not jump and sounding notes are not retriggered.
---   Requirements: REAPER 7.03+
+--   Requirements: REAPER 7.03+, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. SETTINGS
@@ -24,6 +23,13 @@
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/tap_tempo_settings.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Tap Tempo Slew -- Missing library", 0)
+  return
+end
 
 local Settings = require("tap_tempo_settings")
 local CONFIG = Settings.load() -- re-read on every press (each press relaunches)

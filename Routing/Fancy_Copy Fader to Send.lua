@@ -1,8 +1,8 @@
 -- @description Fancy Copy Fader to Send
 -- @author Fancy Scripts
--- @version 1.1.0
+-- @version 1.1.1
 -- @changelog
---   + Migrated to shared _lib/ modules
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Sets specified Send volume to match the Main Track Fader.
 --   Useful for copying your current Main Mix to a Pre-Fader Headphone Send.
@@ -10,13 +10,19 @@
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 -------------------------------------------------------------------------------
 -- 1. BOOTSTRAP & MODULES
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/utils.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Copy Fader to Send -- Missing library", 0)
+  return
+end
 
 local Utils = require("utils")
 

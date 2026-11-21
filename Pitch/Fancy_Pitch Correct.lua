@@ -4,16 +4,15 @@
 -- @changelog
 --   No change in how the script works or looks
 --   Under the hood: the script is split into several files (the pitch_correct folder next to it), installed and updated with it
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Native Lua pitch correction and tracking.
---   Requirements: REAPER 7.0+, ReaImGui
+--   Requirements: REAPER 7.0+, ReaImGui, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
 --   [nomain] pitch_correct/*.lua
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
@@ -25,6 +24,13 @@ end
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "?.lua;" .. script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Pitch Correct -- Missing library", 0)
+  return
+end
 
 local Theme = require("theme")
 local JSON  = require("json")

@@ -1,3 +1,4 @@
+-- @noindex
 -- Fancy Scripts -- Design System & Theme Engine
 -- Single source of truth for ALL visual decisions. local Theme = require("theme")
 --

@@ -1,19 +1,17 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.4.1
+-- @version 1.4.2
 -- @changelog
---   + Icons: panel_right (side panel toggle)
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
 --   Use this to visually tune the design language before propagating changes.
---   Requirements: REAPER 7.0+, ReaImGui
+--   Requirements: REAPER 7.0+, ReaImGui, Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
---   [nomain] ../_lib/fonts/*
 
 -------------------------------------------------------------------------------
 -- 1. DEPENDENCY CHECK
@@ -31,6 +29,13 @@ end
 -------------------------------------------------------------------------------
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/theme.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Design System -- Missing library", 0)
+  return
+end
 
 local Theme = require("theme")
 

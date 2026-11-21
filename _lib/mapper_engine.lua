@@ -1,7 +1,5 @@
--- @description Fancy Mapper Core Engine
--- @author Fancy Scripts
--- @version 5.1.0
--- @about
+-- @noindex
+-- Fancy Mapper Core Engine. Part of the Fancy Scripts Library package (Fancy_Library.lua).
 --   Shared engine for Fancy Mapper scripts.
 --   Provides unified configuration, throttling, context targeting,
 --   parameter math, and undo management for hardware dials and encoders.

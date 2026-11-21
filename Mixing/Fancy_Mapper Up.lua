@@ -1,21 +1,26 @@
 -- @description Fancy Mapper Up
 -- @author Fancy Scripts
--- @version 5.1.0
+-- @version 5.1.1
 -- @changelog
---   + v5.1: Powered by shared MapperEngine
---   + v5.1: Added Width (auto-stereo pan), Multi-CC, Velocity, Track Nav, Marker, Transient, Item Slip
+--   The shared library files (_lib) now come from the "Fancy Scripts Library" package: install it once from ReaPack
 -- @about
 --   Context-sensitive dial control for hardware dials and rotary encoders (clockwise / up).
 --   Reads all configuration from Fancy Mapper Settings.
---   Requirements: REAPER 7.0+, SWS Extension (optional for Grid scrub)
+--   Requirements: REAPER 7.0+, SWS Extension (optional for Grid scrub), Fancy Scripts Library
 -- @donation https://github.com/sponsors/TheFancyWolf
 -- @link Website https://github.com/TheFancyWolf/fancy-scripts
 -- @provides
 --   [main] .
---   [nomain] ../_lib/*.lua
 
 local script_dir = debug.getinfo(1, "S").source:match([[^@?(.*[\/])[^\/]-$]])
 package.path = script_dir .. "../_lib/?.lua;" .. package.path
+if not reaper.file_exists(script_dir .. "../_lib/mapper_engine.lua") then
+  reaper.ShowMessageBox(
+    "This script needs the \"Fancy Scripts Library\" package.\n\n"
+    .. "Install it via Extensions > ReaPack > Browse Packages, then run this script again.",
+    "Fancy Mapper Up -- Missing library", 0)
+  return
+end
 
 local MapperEngine = require("mapper_engine")
 
