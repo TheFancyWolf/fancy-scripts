@@ -361,7 +361,7 @@ local state = {
   max_freq = DEFAULTS.max_freq,
   hop_size = DEFAULTS.hop_size, -- How many samples to advance per block
   separation = DEFAULTS.separation, -- how readily notes are split (K.segment)
-  analysis_params = nil,        -- the five values above, frozen by start_analysis for the running analysis
+  analysis_params = nil,        -- the five detection values above (not separation), frozen by start_analysis
 
   -- Analysis state
   accessor = nil,
@@ -966,12 +966,20 @@ local function midi_to_name(midi)
   return NOTE_NAMES[note_idx] .. octave
 end
 
-K.LEVEL_WINDOW_S = 0.010
+K.LEVEL_WINDOW_S = 0.010   -- the shortest short-level window
+K.LEVEL_PERIODS = 2        -- a voiced frame's window spans at least this many periods of its pitch
 
---- RMS of the samples in a LEVEL_WINDOW_S window centred on the block (the whole block if it is shorter).
---- A whole-block RMS smears a quick dip in loudness; this follows it. `s` is a plain Lua array.
-K.short_level = function(s, b_size, sample_rate)
-  local n = math.min(b_size, math.max(1, math.floor(K.LEVEL_WINDOW_S * sample_rate + 0.5)))
+--- The short-level window (seconds) for a frame of pitch `freq` Hz (nil or 0: unvoiced): LEVEL_WINDOW_S, or
+--- LEVEL_PERIODS periods if that is longer. A window shorter than a period swings with where it lands in the period.
+K.level_window_s = function(freq)
+  if freq and freq > 0 then return math.max(K.LEVEL_WINDOW_S, K.LEVEL_PERIODS / freq) end
+  return K.LEVEL_WINDOW_S
+end
+
+--- RMS of the samples in a `window_s` window (default LEVEL_WINDOW_S) centred on the block (the whole block if it is
+--- shorter). A whole-block RMS smears a quick dip in loudness; this follows it. `s` is a plain Lua array.
+K.short_level = function(s, b_size, sample_rate, window_s)
+  local n = math.min(b_size, math.max(1, math.floor((window_s or K.LEVEL_WINDOW_S) * sample_rate + 0.5)))
   local first = math.floor((b_size - n) / 2) + 1
   local sum = 0
   for i = first, first + n - 1 do
@@ -995,7 +1003,6 @@ local function yin_process_block(samples, sample_rate, params)
     rms_sum = rms_sum + s[i] * s[i]
   end
   local rms = math.sqrt(rms_sum / b_size)
-  local lvl = K.short_level(s, b_size, sample_rate)
 
   local W = math.floor(b_size / 2)
   local max_tau = math.floor(sample_rate / params.min_freq)
@@ -1054,7 +1061,7 @@ local function yin_process_block(samples, sample_rate, params)
     end
     -- If even the global minimum is high, it's likely unvoiced
     if min_val > params.threshold * 2 then
-      return rms, nil, lvl
+      return rms, nil, K.short_level(s, b_size, sample_rate)
     end
   end
 
@@ -1073,7 +1080,9 @@ local function yin_process_block(samples, sample_rate, params)
     end
   end
 
-  return rms, sample_rate / better_tau, lvl
+  local freq = sample_rate / better_tau
+  -- The short level spans two periods of the pitch found (10 ms at least): it does not swing within a period
+  return rms, freq, K.short_level(s, b_size, sample_rate, K.level_window_s(freq))
 end
 
 -------------------------------------------------------------------------------
@@ -3324,6 +3333,16 @@ K.separation_params = function(sep)
   return p
 end
 
+--- The frame spacing of `results` (time-ordered frames, at least two): the median step between frames.
+K.frame_step = function(results)
+  local steps = {}
+  for i = 2, #results do steps[i - 1] = results[i].time - results[i - 1].time end
+  table.sort(steps)
+  local m = #steps
+  if m % 2 == 1 then return steps[(m + 1) / 2] end
+  return (steps[m / 2] + steps[m / 2 + 1]) * 0.5
+end
+
 --- Splits analysed frames (`results`: time-ordered { time, note | nil, rms, lvl }) into notes at Separation `sep`.
 --- Returns notes { start_time, end_time, frames, sum_note, count } (frames: the original result frames, voiced only)
 --- and split_points { time, reason } (one per note, reason "Onset" / "Pitch change" / "Level dip"). Every time constant
@@ -3340,11 +3359,37 @@ K.segment = function(results, sep)
     if m % 2 == 1 then return list[(m + 1) / 2] end
     return (list[m / 2] + list[m / 2 + 1]) * 0.5
   end
+  -- Binary heaps: h[1] is the entry for which less(h[1], x) holds against every other x
+  local function hpush(h, e, less)
+    local c = #h + 1
+    h[c] = e
+    while c > 1 do
+      local up = c // 2
+      if not less(e, h[up]) then break end
+      h[c], h[up] = h[up], e
+      c = up
+    end
+  end
+  local function hpop(h, less)
+    local top, c = h[1], #h
+    h[1] = h[c]
+    h[c] = nil
+    c = c - 1
+    local i = 1
+    while true do
+      local l, best = 2 * i, i
+      if l <= c and less(h[l], h[best]) then best = l end
+      if l + 1 <= c and less(h[l + 1], h[best]) then best = l + 1 end
+      if best == i then break end
+      h[i], h[best] = h[best], h[i]
+      i = best
+    end
+    return top
+  end
+  local function lt(x, y) return x < y end
+  local function gt(x, y) return x > y end
 
-  -- Frame spacing: the median step between frames
-  local steps = {}
-  for i = 2, n do steps[i - 1] = results[i].time - results[i - 1].time end
-  local hop = median(steps)
+  local hop = K.frame_step(results)
   if not (hop > 0) then return notes, split_points end
   local half_w = math.max(1, math.floor(SEG.MEDIAN_S / hop / 2 + 0.5))   -- median window 2*half_w + 1 frames
 
@@ -3436,7 +3481,9 @@ K.segment = function(results, sep)
     -- window never reaches back before the note's start: near the start it is the note's first cycle
     local boundary = { [first] = "Onset" }
     local s, k = 1, 1
-    local body, d, dir, head = {}, nil, nil, nil
+    -- The note's cycle-median values so far: the lower half in a max-heap (one more when odd), the upper half in a
+    -- min-heap, so the median is at their tops
+    local body_lo, body_hi, d, dir, head = {}, {}, nil, nil, nil
     local function note_cyc(q)
       if win_lo[q] >= s then return cyc[q] end
       if not head then
@@ -3447,18 +3494,15 @@ K.segment = function(results, sep)
       return head
     end
     local function to_body(q)
-      local v, lo, hi = note_cyc(q), 1, #body
-      while lo <= hi do
-        local mid = (lo + hi) // 2
-        if body[mid] <= v then lo = mid + 1 else hi = mid - 1 end
-      end
-      table.insert(body, lo, v)
+      local v = note_cyc(q)
+      if body_lo[1] and v > body_lo[1] then hpush(body_hi, v, lt) else hpush(body_lo, v, gt) end
+      if #body_lo > #body_hi + 1 then hpush(body_hi, hpop(body_lo, gt), lt)
+      elseif #body_hi > #body_lo then hpush(body_lo, hpop(body_hi, lt), gt) end
     end
     while k <= m do
       local split = false
-      if #body > 0 then
-        local nb = #body
-        local centre = nb % 2 == 1 and body[(nb + 1) // 2] or (body[nb // 2] + body[nb // 2 + 1]) * 0.5
+      if #body_lo > 0 then
+        local centre = #body_lo > #body_hi and body_lo[1] or (body_lo[1] + body_hi[1]) * 0.5
         local off = pf[k] - centre
         local away = math.abs(off) > P.pitch_st
         if d and not (away and (off > 0) == dir) then   -- came back (vibrato, a stray frame): part of the note
@@ -3481,7 +3525,7 @@ K.segment = function(results, sep)
             while j < k and not past(j) do j = j + 1 end
           end
           boundary[idx[j]] = "Pitch change"
-          s, k, body, d, head = j, j, {}, nil, nil
+          s, k, body_lo, body_hi, d, head = j, j, {}, {}, nil, nil
           split = true
         end
       end
@@ -3534,10 +3578,13 @@ K.segment = function(results, sep)
     local starts = {}
     for at in pairs(boundary) do starts[#starts + 1] = at end
     table.sort(starts)
+    local q = 1   -- idx and starts are both in order: one walk hands each voiced frame to its segment
     for b, at in ipairs(starts) do
       local seg = { first = at, last = (starts[b + 1] or last + 1) - 1, reason = boundary[at], run = r, voiced = {} }
-      for q = 1, m do
-        if idx[q] >= seg.first and idx[q] <= seg.last then seg.voiced[#seg.voiced + 1] = idx[q] end
+      while q <= m and idx[q] < seg.first do q = q + 1 end
+      while q <= m and idx[q] <= seg.last do
+        seg.voiced[#seg.voiced + 1] = idx[q]
+        q = q + 1
       end
       segs[#segs + 1] = seg
     end
@@ -3545,47 +3592,84 @@ K.segment = function(results, sep)
     for q = 1, m do rn.pf[idx[q]] = pf[q] end
   end
 
-  -- 6. A segment shorter than min_note_s joins the touching neighbour closer in pitch, or is dropped without one
-  local function seg_pitch(seg)
-    if #seg.voiced == 0 then return nil end
-    local vals = {}
-    for q, i in ipairs(seg.voiced) do vals[q] = runs[seg.run].pf[i] end
-    return median(vals)
-  end
+  -- 6. A segment shorter than min_note_s joins the touching neighbour closer in pitch, or is dropped without one.
+  -- The shortest goes first (the earliest of equally short ones). The segments are a linked list and the short ones
+  -- sit in a heap keyed by (duration, order), so a merge only looks at its neighbours
   local function touching(a, b) return a and b and a.run == b.run end
-  local function seg_dur(x)
-    local seg, nxt = segs[x], segs[x + 1]
+  local function seg_dur(seg)
+    local nxt = seg.nxt
     if #seg.voiced == 0 then return 0 end
     local stop = touching(seg, nxt) and #nxt.voiced > 0 and results[nxt.voiced[1]].time
       or results[seg.voiced[#seg.voiced]].time + hop
     return stop - results[seg.voiced[1]].time
   end
-  for _, seg in ipairs(segs) do seg.pitch = seg_pitch(seg) end
-  while true do
-    local x, shortest = nil, P.min_note_s
-    for q = 1, #segs do
-      local dur = seg_dur(q)
-      if dur < shortest then x, shortest = q, dur end
+  local function pitch_of(seg)   -- the median of seg.sorted (its voiced frames' filtered pitch, in order)
+    local v, c = seg.sorted, #seg.sorted
+    if c == 0 then return nil end
+    if c % 2 == 1 then return v[(c + 1) // 2] end
+    return (v[c // 2] + v[c // 2 + 1]) * 0.5
+  end
+  local heap = {}
+  local function before(x, y) return x.dur < y.dur or (x.dur == y.dur and x.seg.ord < y.seg.ord) end
+  local function push(seg)   -- (re)queue seg when it is short; an older entry for it goes stale with seg.ver
+    seg.ver = (seg.ver or 0) + 1
+    local dur = seg_dur(seg)
+    if dur < P.min_note_s then hpush(heap, { dur = dur, seg = seg, ver = seg.ver }, before) end
+  end
+  for x, seg in ipairs(segs) do
+    seg.ord, seg.prv, seg.nxt = x, segs[x - 1], segs[x + 1]
+    seg.sorted = {}
+    for q, i in ipairs(seg.voiced) do seg.sorted[q] = runs[seg.run].pf[i] end
+    table.sort(seg.sorted)
+    seg.pitch = pitch_of(seg)
+  end
+  for _, seg in ipairs(segs) do push(seg) end
+  local head = segs[1]
+  while #heap > 0 do
+    local e = hpop(heap, before)
+    local seg = e.seg
+    if not seg.gone and e.ver == seg.ver then
+      local prev, nxt = seg.prv, seg.nxt
+      if not touching(prev, seg) then prev = nil end
+      if not touching(seg, nxt) then nxt = nil end
+      local into = prev or nxt
+      if prev and nxt and seg.pitch and nxt.pitch
+        and (not prev.pitch or math.abs(nxt.pitch - seg.pitch) < math.abs(prev.pitch - seg.pitch)) then
+        into = nxt
+      end
+      if into and into == prev then
+        prev.last = seg.last
+        for _, i in ipairs(seg.voiced) do prev.voiced[#prev.voiced + 1] = i end
+      elseif into then   -- the next segment now starts where this one did, for the same reason
+        nxt.first, nxt.reason = seg.first, seg.reason
+        for _, i in ipairs(nxt.voiced) do seg.voiced[#seg.voiced + 1] = i end
+        nxt.voiced = seg.voiced
+      end
+      if into then
+        local sorted = into.sorted
+        for _, v in ipairs(seg.sorted) do   -- insert after equal values: the same multiset as a fresh sort
+          local lo, hi = 1, #sorted
+          while lo <= hi do
+            local mid = (lo + hi) // 2
+            if sorted[mid] <= v then lo = mid + 1 else hi = mid - 1 end
+          end
+          table.insert(sorted, lo, v)
+        end
+        into.pitch = pitch_of(into)
+      end
+      -- Unlink seg; the durations that can change are those of the segments now on either side of the gap
+      seg.gone = true
+      if seg.prv then seg.prv.nxt = seg.nxt else head = seg.nxt end
+      if seg.nxt then seg.nxt.prv = seg.prv end
+      if seg.prv then push(seg.prv) end
+      if seg.nxt then push(seg.nxt) end
     end
-    if not x then break end
-    local seg, prev, nxt = segs[x], segs[x - 1], segs[x + 1]
-    if not touching(prev, seg) then prev = nil end
-    if not touching(seg, nxt) then nxt = nil end
-    local into = prev or nxt
-    if prev and nxt and seg.pitch and nxt.pitch
-      and (not prev.pitch or math.abs(nxt.pitch - seg.pitch) < math.abs(prev.pitch - seg.pitch)) then
-      into = nxt
-    end
-    if into and into == prev then
-      prev.last = seg.last
-      for _, i in ipairs(seg.voiced) do prev.voiced[#prev.voiced + 1] = i end
-    elseif into then   -- the next segment now starts where this one did, for the same reason
-      nxt.first, nxt.reason = seg.first, seg.reason
-      for _, i in ipairs(nxt.voiced) do seg.voiced[#seg.voiced + 1] = i end
-      nxt.voiced = seg.voiced
-    end
-    if into then into.pitch = seg_pitch(into) end
-    table.remove(segs, x)
+  end
+  segs = {}
+  local cur = head
+  while cur do
+    segs[#segs + 1] = cur
+    cur = cur.nxt
   end
 
   -- Notes: start at the first voiced frame; end where the touching next note starts, else at the last voiced frame
@@ -8647,7 +8731,7 @@ K.resplit = function(prev_separation)
   if state.nudge_burst then flush_nudge_burst() end
 
   local new_notes, split_points = K.segment(results, state.separation)
-  local tol_s = results[2].time - results[1].time   -- one frame
+  local tol_s = K.frame_step(results)   -- one frame, as K.segment measures it
   local old_notes = state.notes
   local matched, lost = K.resplit_match(old_notes or {}, new_notes, tol_s, is_note_modified)
 
@@ -8698,7 +8782,8 @@ K.resplit = function(prev_separation)
     confirm_label = "Re-Split",
     on_confirm = function()
       -- The modal names one item, and the match was made against its notes as they were (an undo reloads them)
-      if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes then
+      if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes
+        or not target_take_exists() then
         set_status("The item changed meanwhile. Nothing was re-split.")
         state.separation = prev_separation
         K.save_settings("engine")
@@ -9349,7 +9434,6 @@ do
   local BAR_REASON_NO_TARGET = "Select an audio item"
   local BAR_REASON_NOT_ANALYZED = "Analyze an item first"
   local BAR_REASON_NEEDS_NOTES = string.format("Select notes to change it (%s+A selects all)", K.MOD_LABEL)
-  local BAR_REASON_PER_ITEM = "Set per item: press Esc to deselect, then change it"
   local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
   local BAR_HINT_OUTDATED = "Outdated: this item's envelope is from other settings. Edit a note to rewrite it."
   -- What a drag changes, by its target (a line of every value tooltip), and the gestures
@@ -9368,9 +9452,9 @@ do
 
   -- The values of the bar, in the order they are shown. key = the model's key; label = the name on the control;
   -- lo / hi / num / unit = the range and the text in display units (scale x the stored value); levels = where the
-  -- value exists: "all" (default, item, note), "note" (notes only) or "item" (default and item only); analysis = one
-  -- value for the analysis (state[key], no level: see draw_separation); zero_nil = 0 is stored as "no value";
-  -- tip = what the value does to the sound.
+  -- value exists: "all" (default, item, note), "note" (notes only) or "analysis" (one value for the analysis,
+  -- state[key], no level: see draw_separation); zero_nil = 0 is stored as "no value"; tip = what the value does to
+  -- the sound.
   local BAR_VALUES = {
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "note", zero_nil = true,
@@ -9635,7 +9719,7 @@ do
       local key = spec.key
       view = { lo_v = spec.lo, hi_v = spec.lo, mixed = false, level = "global", target = "default" }
       views[spec.id] = view
-      if sel_n > 0 and spec.levels ~= "item" then
+      if sel_n > 0 then
         view.target = "notes"
         local lo_v, hi_v = math.huge, -math.huge
         for i = 1, sel_n do
@@ -9661,8 +9745,6 @@ do
         view.blank = not (has_target and has_data)
       elseif spec.levels == "note" and sel_n == 0 then
         view.disabled, view.reason, view.blank = true, BAR_REASON_NEEDS_NOTES, true
-      elseif spec.levels == "item" and sel_n > 0 then
-        view.disabled, view.reason = true, BAR_REASON_PER_ITEM
       end
       return view
     end
@@ -9973,16 +10055,17 @@ do
 
       if pressed then bar_sep_before = state[key] end
       if back ~= nil then
-        state[key] = back   -- Esc during the drag: the value from before it, nothing saved or split
+        -- Esc during the drag: the value from before it (or from the reset the same press already committed),
+        -- nothing saved or split
+        if bar_sep_before ~= nil then state[key] = bar_sep_before else state[key] = back end
         bar_sep_before = nil
-      elseif reset then
+      elseif reset or (changed and typed) then
         local prev = state[key]
-        state[key] = DEFAULTS[key]
+        state[key] = reset and DEFAULTS[key] or v / spec.scale
         commit(prev)
-      elseif changed and typed then
-        local prev = state[key]
-        state[key] = v / spec.scale
-        commit(prev)
+        -- Still held (a double-click whose second press goes on into a drag): that drag starts from the value just
+        -- committed, and letting go commits it as its own edit
+        if active then bar_sep_before = state[key] end
       else
         if changed then state[key] = v / spec.scale end
         if committed then commit(bar_sep_before) end
@@ -10414,5 +10497,7 @@ local function main()
   loop()
 end
 
-if FANCY_PITCH_TEST then return { K = K, state = state, DEFAULTS = DEFAULTS } end
+if FANCY_PITCH_TEST then
+  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features }
+end
 main()

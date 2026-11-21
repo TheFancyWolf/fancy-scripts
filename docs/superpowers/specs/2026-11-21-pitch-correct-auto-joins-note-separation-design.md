@@ -82,8 +82,10 @@ Replace with:
 - **Re-articulation = level dip.** A local minimum in level (in dB) that is at least the dip depth below the
   peaks on both sides, within about 150 ms each way, splits the note at the minimum. The level each frame
   stores today is measured over the whole pitch-detection block (about 46 ms by default), which smears a 30 ms
-  dip down to 3–4 dB. So the analysis also stores a short-window level per frame (about 10 ms, centred on the
-  frame) and the dip test uses that. Pitch detection itself is untouched. Items analysed before this change
+  dip down to 3–4 dB. So the analysis also stores a short-window level per frame (about 10 ms or two periods
+  of the frame's detected pitch, whichever is longer, centred on the frame; an unvoiced frame uses 10 ms) and
+  the dip test uses that. A window shorter than one period (below about 100 Hz) would swing with where it lands
+  in the period and cut a steady low note into pieces. Pitch detection itself is untouched. Items analysed before this change
   have no short level and must be analysed again; no fallback. (My call.)
 - **No debounce.** A segment shorter than the minimum note length is merged into the neighbour closer in
   pitch (or dropped if it has no touching neighbour) instead of swallowing the next split.
@@ -97,6 +99,10 @@ tune against the tests:
 | Hold time | 140 ms | 90 ms | 50 ms |
 | Dip depth | 12 dB | 6 dB | 3 dB |
 | Minimum note length | 100 ms | 70 ms | 40 ms |
+
+A note separated from its neighbours only by pitch must last about 100 ms to be found at any Separation (the
+vibrato-aware centre needs about that long to settle); notes separated by a level dip are found from about
+40–50 ms. Very wide vibrato (beyond about ±0.7 st) can still split at 100 %.
 
 Separation is an analysis setting stored beside the other engine settings (global, remembered). Changing it
 re-splits the current item from the frames stored with the take (no new pitch detection), once, when the drag

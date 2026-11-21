@@ -227,8 +227,105 @@ test("segment_vibrato_then_step", function()
   end
 end)
 
+-- Real sample blocks: a band-limited pulse train at f0 (harmonics up to 5 kHz, all equal: very peaky), amplitude
+-- amp(t), cut into 2048-sample blocks at `hop` samples. Each frame's level is K.short_level over the window
+-- K.level_window_s gives for f0, as yin_process_block does; `note` is the MIDI pitch of f0.
+local SR, BLOCK = 44100, 2048
+local function pulse_frames(f0, dur, hop, amp)
+  local h = math.floor(5000 / f0)
+  local total = math.floor(dur * SR) + BLOCK
+  local s = {}
+  for i = 1, total do
+    local t, v = (i - 1) / SR, 0
+    for k = 1, h do v = v + math.cos(2 * math.pi * k * f0 * t) end
+    s[i] = (amp and amp(t) or 1) * v / h
+  end
+  local note, win, out = 69 + 12 * math.log(f0 / 440, 2), S.K.level_window_s(f0), {}
+  for st = 0, math.floor(dur * SR) - 1, hop do
+    local blk = {}
+    for i = 1, BLOCK do blk[i] = s[st + i] end
+    local lvl = S.K.short_level(blk, BLOCK, SR, win)
+    out[#out + 1] = { time = st / SR, note = note, rms = lvl, lvl = lvl }
+  end
+  return out
+end
+
+test("short_level_window", function()
+  near(S.K.level_window_s(nil), S.K.LEVEL_WINDOW_S, 1e-12, "unvoiced")
+  near(S.K.level_window_s(440), S.K.LEVEL_WINDOW_S, 1e-12, "high pitch")
+  near(S.K.level_window_s(82), 2 / 82, 1e-12, "low pitch")
+  local s = {}
+  for i = 1, 2048 do s[i] = 0.5 end
+  near(S.K.short_level(s, 2048, 44100, 1), 0.5, 1e-9, "capped at the block")
+end)
+
+test("segment_low_steady_note", function()
+  for _, f0 in ipairs({ 82, 70 }) do
+    for _, hop in ipairs({ 256, 512 }) do
+      local fr = pulse_frames(f0, 1.5, hop)
+      local lo, hi = math.huge, -math.huge
+      for _, f in ipairs(fr) do
+        local d = 20 * math.log(f.lvl, 10)
+        lo, hi = math.min(lo, d), math.max(hi, d)
+      end
+      local tag = f0 .. " Hz hop " .. hop
+      if hi - lo >= 3 then error("level swing " .. (hi - lo) .. " dB at " .. tag) end
+      for _, sep in ipairs({ 0.5, 1 }) do eq(#S.K.segment(fr, sep), 1, tag .. " sep " .. sep) end
+    end
+  end
+end)
+
+test("segment_low_dip_still_found", function()
+  local quiet = 10 ^ (-9 / 20)
+  local fr = pulse_frames(110, 0.83, 256, function(t) return (t >= 0.4 and t < 0.43) and quiet or 1 end)
+  eq(#S.K.segment(fr, 0.5), 2, "notes")
+end)
+
 test("segment_short_note", function()
   eq(#segment({ { dur = 0.12, note = 60 }, { dur = 0.4, note = 62 } }, HOP, 0.5), 2, "notes")
+end)
+
+test("segment_pitch_only_floor", function()
+  local function run(mid) return { { dur = 0.4, note = 60 }, { dur = mid, note = 62 }, { dur = 0.4, note = 60 } } end
+  eq(#segment(run(0.15), HOP, 0.5), 3, "0.15 s middle note at sep 0.5")
+  -- This pins a known limit, not a goal: a note set apart only by pitch needs about 100 ms (the cycle-median centre
+  -- needs that long to settle), so a 60 ms one is not found even at Separation 100 %
+  if #segment(run(0.06), HOP, 1) >= 3 then error("a 60 ms pitch-only note was found: update the spec and changelog") end
+end)
+
+-- Noisy frames (a fixed generator, so the same on every run): pitch noise, steps of 0.7 st, 1 % dropouts and a level
+-- that jumps up to 12 dB from frame to frame
+local function noisy_frames(dur, hop)
+  local seed, out = 777, {}
+  local function rnd() seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648 end
+  for i = 0, math.floor(dur / hop) - 1 do
+    local note = 60 + (rnd() - 0.5) * 1.5 + ((i // 200) % 3) * 0.7
+    if rnd() < 0.01 then note = nil end
+    local lvl = 0.1 * 10 ^ (-(rnd() * 12) / 20)
+    out[#out + 1] = { time = i * hop, note = note, rms = lvl, lvl = lvl }
+  end
+  return out
+end
+
+test("segment_noisy_matches_recorded", function()
+  -- Literals recorded from K.segment before the short-segment merge and the note centre used heaps
+  local want = { [0] = { 1, 1703, 9.9903854875283447 }, [0.5] = { 73, 63775, 35506.265396825402 },
+                 [1] = { 155, 132815, 160996.89650793653 } }
+  local fr = noisy_frames(10, HOP)
+  for sep, w in pairs(want) do
+    local notes = S.K.segment(fr, sep)
+    local c, t = 0, 0
+    for i, n in ipairs(notes) do c, t = c + i * n.count, t + i * (n.start_time + n.end_time) end
+    eq(#notes, w[1], "notes at sep " .. sep)
+    eq(c, w[2], "frames at sep " .. sep)
+    near(t, w[3], 1e-9, "times at sep " .. sep)
+  end
+end)
+
+test("segment_frame_step", function()
+  local fr = frames({ { dur = 0.1, note = 60 } }, HOP)
+  fr[3].time = fr[3].time + 0.5 * HOP   -- one uneven frame does not move the median step
+  near(S.K.frame_step(fr), HOP, 1e-12, "step")
 end)
 
 local function body_note(n, low_first, tighten)
@@ -310,9 +407,12 @@ end)
 
 test("slide_in_cap", function()
   local s0, s1 = slide_shifts(12, 0), slide_shifts(12, 1)
+  local most = 0
   for i = 1, 6 do
     if math.abs(s1[i] - s0[i]) > S.K.SCOOP_MAX_ST + 1e-9 then error("moved too far at " .. i) end
+    most = math.max(most, math.abs(s1[i] - s0[i]))
   end
+  near(most, S.K.SCOOP_MAX_ST, 1e-9, "the far slide frames are pulled by the cap")
 end)
 
 -- Automatic joins (K.correction_build part 2) ----------------------------------------------------
@@ -443,6 +543,54 @@ test("join_slide_in", function()
   near(p.val, b.frame_shifts[bs], 1e-9, "end value")
 end)
 
+test("join_edited_to_untouched", function()
+  -- A: a tightened, shifted note with vibrato in its body; U: an untouched note (no edits at all)
+  local function edited(t0, slide)
+    local n = join_note(t0, 0.3, 60, 0.3, slide)
+    local first = S.K.note_body(n)
+    for i = first, #n.frames do
+      local w = 60 + 0.2 * math.sin(2 * math.pi * 5 * n.frames[i].time)
+      n.frames[i].note, n.smooth[i] = w, w
+    end
+    n.controls.tighten = 0.6
+    return n
+  end
+  local function untouched(t0, slide)
+    local n = join_note(t0, 0.3, 62, 0, slide)
+    n.controls.retune_speed = nil
+    return n
+  end
+  local function check(build, tag)
+    local g = spans_of(build, "glide")
+    eq(#g, 1, tag .. " glides")
+    g = g[1]
+    if max_step(build.points) >= 0.12 then error(tag .. " step " .. max_step(build.points)) end
+    local covered = false
+    for _, r in ipairs(build.ranges) do
+      if r.t0 <= g.t0 + 1e-9 and r.t1 >= g.t1 - 1e-9 then covered = true end
+    end
+    eq(covered, true, tag .. " ranges cover the glide")
+    return g
+  end
+  -- Edited first: the blend runs to 0 where it meets the untouched note
+  local a = edited(0.1)
+  local u = untouched(a.end_time, { from = 60, dur = 0.04 })
+  local g = check(S.K.correction_build({ a, u }, 10), "edited first")
+  local build = S.K.correction_build({ a, u }, 10)
+  local p = point_at(build.points, g.t1)
+  if not p then error("no point at t1") end
+  near(p.val, 0, 1e-9, "edited first: 0 on the untouched side")
+  -- Untouched first: the blend starts from 0
+  u = untouched(0.1)
+  local b = edited(u.end_time, { from = 62, dur = 0.04 })
+  build = S.K.correction_build({ u, b }, 10)
+  g = check(build, "untouched first")
+  p = point_at(build.points, g.t0)
+  if not p then error("no point at t0") end
+  near(p.val, 0, 1e-9, "untouched first: 0 on the untouched side")
+  near(point_at(build.points, g.t1).val, b.frame_shifts[S.K.note_body(b)], 1e-9, "meets the edited body")
+end)
+
 test("unjoined_fades", function()
   local a = join_note(0.1, 0.3, 60, 0.3)
   local b = join_note(a.end_time + 0.2, 0.3, 62, -0.2)
@@ -481,6 +629,32 @@ test("untouched_pair_writes_nothing", function()
   local b = join_note(a.end_time, 0.3, 62, 0)
   a.controls.retune_speed, b.controls.retune_speed = nil, nil
   eq(#S.K.correction_build({ a, b }, 10).points, 0, "points")
+end)
+
+test("segment_to_correction", function()
+  -- K.segment -> extract_note_features -> K.correction_build, as an analysis and a target edit run them
+  -- 0.1 s of silence each side: the fades into and out of the notes lie inside the item
+  local segs = slide_segs(62)
+  table.insert(segs, 1, { dur = 0.1 })
+  segs[#segs + 1] = { dur = 0.1 }
+  local fr = frames(segs, HOP)
+  local item_len = fr[#fr].time + HOP
+  local notes = S.K.segment(fr, 0.5)
+  eq(#notes, 2, "notes")
+  for i, n in ipairs(notes) do
+    n.avg_note = n.sum_note / n.count
+    n.display_note = math.floor(n.avg_note + 0.5)
+    S.extract_note_features(n)
+    -- 0.2 st apart: this slide leaves a blend of about three frames at this hop, so a step stays under the bound
+    n.controls.center_pitch = n.avg_note + (i == 1 and 0.15 or -0.05)
+    n.controls.retune_speed = 1
+  end
+  local build = S.K.correction_build(notes, item_len)
+  eq(#spans_of(build, "glide"), 1, "glides")
+  if max_step(build.points) >= 0.12 then error("step " .. max_step(build.points)) end
+  for _, q in ipairs(build.points) do
+    if q.time < 0 or q.time > item_len then error("point outside the item at " .. q.time) end
+  end
 end)
 
 -- Re-split: notes { start_time, end_time, edited } and a predicate on `edited`
