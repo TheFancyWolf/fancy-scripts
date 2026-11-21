@@ -315,6 +315,174 @@ test("slide_in_cap", function()
   end
 end)
 
+-- Automatic joins (K.correction_build part 2) ----------------------------------------------------
+
+local JHOP = 0.005
+
+-- A note from t0 lasting dur, centred on `centre`, shifted by `shift` (Strength 100 %). slide = { from, dur }: it
+-- starts with a linear slide from `from`, whose smoothed pitch lies outside the 0.5 st body.
+local function join_note(t0, dur, centre, shift, slide)
+  local fr, sm = {}, {}
+  local nf = math.floor(dur / JHOP + 0.5)
+  for i = 1, nf do
+    local lt = (i - 1) * JHOP
+    local v, s = centre, centre
+    if slide and lt < slide.dur then
+      v = slide.from + (centre - slide.from) * lt / slide.dur
+      s = centre - 1
+    end
+    fr[i] = { time = t0 + lt, note = v }
+    sm[i] = s
+  end
+  return { start_time = t0, end_time = t0 + nf * JHOP, frames = fr, smooth = sm, avg_note = centre,
+           controls = { center_pitch = centre + shift, retune_speed = 1, bypassed = false } }
+end
+
+local function max_step(points)
+  local p = {}
+  for i, q in ipairs(points) do p[i] = q end
+  table.sort(p, function(a, b) return a.time < b.time end)
+  local m = 0
+  for i = 2, #p do m = math.max(m, math.abs(p[i].val - p[i - 1].val)) end
+  return m
+end
+
+local function value_at(points, t)
+  local p = {}
+  for i, q in ipairs(points) do p[i] = q end
+  table.sort(p, function(a, b) return a.time < b.time end)
+  if #p == 0 or t <= p[1].time then return p[1] and p[1].val or 0 end
+  for i = 2, #p do
+    if p[i].time >= t then
+      local dt = p[i].time - p[i - 1].time
+      return dt > 0 and p[i - 1].val + (p[i].val - p[i - 1].val) * (t - p[i - 1].time) / dt or p[i].val
+    end
+  end
+  return p[#p].val
+end
+
+local function spans_of(build, kind)
+  local out = {}
+  for _, sp in ipairs(build.spans) do if sp.kind == kind then out[#out + 1] = sp end end
+  return out
+end
+
+local function point_at(points, t)
+  for _, p in ipairs(points) do if math.abs(p.time - t) < 1e-9 then return p end end
+end
+
+local function slid_pair(slide_dur, b_dur)
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local b = join_note(a.end_time, b_dur or 0.3, 62, -0.2, { from = 60, dur = slide_dur })
+  return a, b
+end
+
+test("join_continuous", function()
+  local a, b = slid_pair(0.04)
+  local build = S.K.correction_build({ a, b }, 10)
+  eq(#spans_of(build, "glide"), 1, "glides")
+  if max_step(build.points) >= 0.12 then error("step " .. max_step(build.points)) end
+end)
+
+test("join_span_follows_slide", function()
+  local a, b = slid_pair(0.04)
+  local g = spans_of(S.K.correction_build({ a, b }, 10), "glide")[1]
+  local _, a_end = S.K.note_body(a)
+  local b_start = S.K.note_body(b)
+  near(g.t0, a.frames[a_end].time, JHOP, "t0")
+  near(g.t1, b.frames[b_start].time, JHOP, "t1")
+end)
+
+test("join_limits", function()
+  local a, b = slid_pair(0.3, 1.0)
+  local g = spans_of(S.K.correction_build({ a, b }, 10), "glide")[1]
+  if g.t1 - g.t0 > S.K.JOIN.MAX_S + JHOP then error("glide " .. (g.t1 - g.t0)) end
+  a, b = slid_pair(0.03, 0.05)
+  g = spans_of(S.K.correction_build({ a, b }, 10), "glide")[1]
+  if g.t1 > b.start_time + 0.4 * (b.end_time - b.start_time) + 1e-9 then error("t1 " .. g.t1) end
+end)
+
+test("join_min", function()
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local b = join_note(a.end_time, 0.3, 62, -0.2)
+  local g = spans_of(S.K.correction_build({ a, b }, 10), "glide")[1]
+  near(g.t1 - g.t0, 0.010, JHOP, "length")
+  near((g.t0 + g.t1) / 2, a.end_time, JHOP, "centre")
+end)
+
+test("join_meets_tightened_body", function()
+  local a, b = slid_pair(0.04)
+  local first = S.K.note_body(b)
+  for i = first, #b.frames do
+    local w = 62 + 0.2 * math.sin(2 * math.pi * 5 * b.frames[i].time)
+    b.frames[i].note, b.smooth[i] = w, w
+  end
+  b.controls.tighten = 0.6
+  local build = S.K.correction_build({ a, b }, 10)
+  local g = spans_of(build, "glide")[1]
+  local bs = S.K.note_body(b)
+  local p = point_at(build.points, g.t1)
+  if not p then error("no point at t1") end
+  near(g.t1, b.frames[bs].time, 1e-9, "t1 on the body start")
+  near(p.val, b.frame_shifts[bs], 1e-9, "meets the body")
+  if max_step(build.points) >= 0.12 then error("step " .. max_step(build.points)) end
+end)
+
+test("join_slide_in", function()
+  local a, b = slid_pair(0.04)
+  b.controls.slide_in = 1
+  local build = S.K.correction_build({ a, b }, 10)
+  local g = spans_of(build, "glide")[1]
+  -- Continuous: no step beyond the frame-to-frame change Slide In itself writes into the slide
+  local own = 0
+  for i = 2, #b.frame_shifts do own = math.max(own, math.abs(b.frame_shifts[i] - b.frame_shifts[i - 1])) end
+  if max_step(build.points) >= own + 0.12 then error("step " .. max_step(build.points)) end
+  local bs = S.K.note_body(b)
+  local p = point_at(build.points, g.t1)
+  if not p then error("no point at t1") end
+  near(p.val, b.frame_shifts[bs], 1e-9, "end value")
+end)
+
+test("unjoined_fades", function()
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local b = join_note(a.end_time + 0.2, 0.3, 62, -0.2)
+  local build = S.K.correction_build({ a, b }, 10)
+  eq(#spans_of(build, "glide"), 0, "glides")
+  local rel, ons
+  for _, sp in ipairs(spans_of(build, "release")) do if sp.a == 1 then rel = sp end end
+  for _, sp in ipairs(spans_of(build, "onset")) do if sp.a == 2 then ons = sp end end
+  if not (rel and ons) then error("missing fade") end
+  near(rel.t1 - rel.t0, 0.030, 1e-6, "release")
+  near(ons.t1 - ons.t0, 0.030, 1e-6, "onset")
+  near(value_at(build.points, (a.end_time + b.start_time) / 2), 0, 1e-9, "between")
+end)
+
+test("joined_by_short_gap", function()
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local b = join_note(a.end_time + 0.04, 0.3, 62, -0.2)
+  local build = S.K.correction_build({ a, b }, 10)
+  eq(#spans_of(build, "glide"), 1, "glides")
+  for _, sp in ipairs(spans_of(build, "release")) do if sp.a == 1 then error("release between") end end
+  for _, sp in ipairs(spans_of(build, "onset")) do if sp.a == 2 then error("onset between") end end
+end)
+
+test("join_bodiless_note", function()
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local b = join_note(a.end_time, 3 * JHOP, 62, -0.2)
+  for i = 1, 3 do b.frames[i].note, b.smooth[i] = 65, 65 end
+  eq(S.K.note_body(b), nil, "bodiless")
+  local build = S.K.correction_build({ a, b }, 10)
+  eq(#spans_of(build, "glide"), 1, "glides")
+  if max_step(build.points) > 0.5 + 1e-9 then error("step " .. max_step(build.points)) end
+end)
+
+test("untouched_pair_writes_nothing", function()
+  local a = join_note(0.1, 0.3, 60, 0)
+  local b = join_note(a.end_time, 0.3, 62, 0)
+  a.controls.retune_speed, b.controls.retune_speed = nil, nil
+  eq(#S.K.correction_build({ a, b }, 10).points, 0, "points")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

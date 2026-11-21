@@ -180,9 +180,6 @@ local DEFAULTS = {
   keep_pitch_mode = false,   -- Settings: leave each item's own pitch algorithm alone
   -- Cascade parameters (Global -> Item -> Note)
   retune_speed = 1.0,        -- 0.0–1.0 (correction strength)
-  transition_ms = 35,        -- 5–60ms (smoothstep crossfade)
-  onset_ramp_ms = 35,        -- 5–60ms (silence → correction fade-in)
-  legato_threshold_ms = 120, -- 50–300ms (gap below = legato blend)
   tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
   separation = 0.5,          -- 0–1 how readily the analysis splits notes (see K.separation_params)
 }
@@ -197,18 +194,12 @@ DEFAULTS.hop_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].hop   -- how many
 -- Global cascade defaults (project-wide, persisted in ExtState)
 local global_defaults = {
   retune_speed = DEFAULTS.retune_speed,
-  transition_ms = DEFAULTS.transition_ms,
-  onset_ramp_ms = DEFAULTS.onset_ramp_ms,
-  legato_threshold_ms = DEFAULTS.legato_threshold_ms,
   tolerance = DEFAULTS.tolerance,
 }
 
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
 local PARAM_LABELS = {
   retune_speed = "Correction Strength",
-  transition_ms = "Transition",
-  onset_ramp_ms = "Onset Ramp",
-  legato_threshold_ms = "Legato Gap",
   slide_in = "Slide In", -- per-note only (the top bar's Timing row, note context menu)
   tighten = "Tighten",         -- per-note only (the top bar, the left side of a note, note context menu)
   tolerance = "Tolerance",
@@ -500,14 +491,11 @@ K.set_pitch_algorithm = function(idx)
 end
 
 --- Resolve an effective value through the Global → Item → Note cascade.
---- For per-note cascadable keys: retune_speed, transition_ms, onset_ramp_ms.
---- For per-item only keys: legato_threshold_ms.
+--- For the cascadable keys: retune_speed, tolerance.
 local function get_effective(note, key)
-  -- 1. Per-note override (not applicable for legato_threshold_ms)
-  if key ~= "legato_threshold_ms" then
-    if note and note.controls and note.controls[key] ~= nil then
-      return note.controls[key]
-    end
+  -- 1. Per-note override
+  if note and note.controls and note.controls[key] ~= nil then
+    return note.controls[key]
   end
   -- 2. Per-item override
   if state.target_take_guid then
@@ -522,9 +510,7 @@ end
 
 --- Returns the override level for display: "note", "item", or "global"
 local function get_override_level(note, key)
-  if key ~= "legato_threshold_ms" then
-    if note and note.controls and note.controls[key] ~= nil then return "note" end
-  end
+  if note and note.controls and note.controls[key] ~= nil then return "note" end
   if state.target_take_guid then
     local take_data = state.session_takes[state.target_take_guid]
     if take_data and take_data.overrides and take_data.overrides[key] ~= nil then return "item" end
@@ -620,9 +606,6 @@ K.PERSIST = (function()
 
   -- Global cascade defaults (project-wide), saved when a drag or a typed entry is committed or reset
   number("cascade", "pitch_retune_speed", global_defaults, "retune_speed", { 0, 1 })
-  number("cascade", "pitch_transition_ms", global_defaults, "transition_ms", { 5, 60 })
-  number("cascade", "pitch_onset_ramp_ms", global_defaults, "onset_ramp_ms", { 5, 60 })
-  number("cascade", "pitch_legato_thresh_ms", global_defaults, "legato_threshold_ms", { 50, 300 })
   number("cascade", "pitch_tolerance", global_defaults, "tolerance", K.LIMITS.tolerance)
 
   -- Top bar: whether the Timing row is open, saved when it is toggled
@@ -1423,8 +1406,6 @@ end
 K.NOTE_CONTROLS = {
   { key = "tighten",       merge = "weighted", edited = "positive" },   -- 0 (as sung) .. 1 (a flat line)
   { key = "tolerance",     merge = "first",    edited = "set" },        -- cents; inherits item -> global
-  { key = "transition_ms", merge = "first",    edited = "set" },        -- inherits
-  { key = "onset_ramp_ms", merge = "first",    edited = "set" },        -- inherits
   { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
   { key = "slide_in",      merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
 }
@@ -2383,18 +2364,23 @@ local function end_apply(take, undo_desc)
   note_own_write()
 end
 
+-- Joins and fades between notes (seconds). Two neighbours closer than 2 * FADE_S are joined: the blend runs from
+-- the first note's body end to the second note's body start, at least MIN_S, at most MAX_S and MAX_PART of either
+-- note. Every other edge of an edited note fades over FADE_S, or a quarter of the note when that is shorter.
+K.JOIN = { FADE_S = 0.030, MIN_S = 0.010, MAX_S = 0.120, MAX_PART = 0.4 }
+
 --- The pitch correction of `notes` as a trajectory: what the take pitch envelope holds and what the canvas
 --- draws, from one calculation. Pure (no REAPER calls); it sets note.frame_shifts on every note.
 --- Returns { points, spans, ranges }:
 ---   points  { time, val } in semitones, in generation order (the envelope writer simplifies and sorts them)
----   spans   { kind, t0, t1, a, b }: where a timing value acts. "onset" / "release" (the fade before / after
----           note a), "glide" (the blend between notes a and b; its length is note b's Transition), "gap" (the
----           joined gap between a and b), "scoop" (the bent onset of note a). a and b are note indices.
+---   spans   { kind, t0, t1, a, b }: "onset" / "release" (the fade before / after note a), "glide" (the join of
+---           notes a and b, across the slide between their bodies), "scoop" (the slide of note a that Slide In
+---           flattens). a and b are note indices.
 ---   ranges  { t0, t1 }, sorted and merged: the time ranges an edited, non-bypassed note corrects (with its
----           ramps and glides)
+---           fades and joins)
+--- No timing setting: joins and fades follow K.JOIN.
 K.correction_build = function(notes, item_len)
   local all_points, spans, ranges = {}, {}, {}
-  local scooped = {}   -- [note index] = true: its onset frames carry a scoop correction
   local num_notes = #notes
 
   -- 1. Precalculate continuous frame shifts for every note
@@ -2439,7 +2425,6 @@ K.correction_build = function(notes, item_len)
                 n.frame_shifts[i] = natural + pull * slide_in
               end
             end
-            scooped[idx] = true
             spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[a - 1].time, a = idx }
           end
         end
@@ -2455,141 +2440,160 @@ K.correction_build = function(notes, item_len)
     end
   end
 
-  -- 2. Build continuous trajectory across notes and boundaries
-  local legato_thresh = get_effective(nil, "legato_threshold_ms") * 0.001
+  -- 2. The trajectory across notes. Two neighbours closer than two fades are joined (K.JOIN): the correction
+  -- blends across the slide the singer sang between their bodies. Every other edge of an edited note fades.
+  local J = K.JOIN
+  local function emit(t, val)
+    all_points[#all_points + 1] = { time = math.max(0.0, math.min(item_len, t)), val = val }
+  end
+  -- Corrected (edited and not bypassed): such a note writes its own points and takes part in its joins
+  local function active(n)
+    return n ~= nil and not (n.controls and n.controls.bypassed) and is_note_modified(n)
+  end
+  -- The note's shift at time t: its frame shifts joined by straight lines, the first / last one before / after them
+  local function shift_at(n, t)
+    local fr, sh = n.frames, n.frame_shifts
+    local nf = fr and #fr or 0
+    if nf == 0 or not sh then return 0.0 end
+    if t <= fr[1].time then return sh[1] or 0.0 end
+    if t >= fr[nf].time then return sh[nf] or 0.0 end
+    local lo, hi = 1, nf
+    while hi - lo > 1 do
+      local mid = math.floor((lo + hi) / 2)
+      if fr[mid].time <= t then lo = mid else hi = mid end
+    end
+    local t0, t1 = fr[lo].time, fr[hi].time
+    local v0, v1 = sh[lo] or 0.0, sh[hi] or 0.0
+    return (t1 > t0) and v0 + (v1 - v0) * (t - t0) / (t1 - t0) or v1
+  end
+  -- The times of the first and last frame of the note's body; a note without a body is all body
+  local function body_times(n)
+    local fr = n.frames
+    if not fr or #fr == 0 then return n.start_time, n.end_time end
+    local a, b = K.note_body(n)
+    return fr[a or 1].time, fr[b or #fr].time
+  end
+
+  -- joins[i]: the blend { t0, t1 } between notes i and i + 1, from the first note's body end to the second note's
+  -- body start; at least MIN_S (grown evenly), at most MAX_S and MAX_PART of either note on its side (cut from the
+  -- far ends, so the part nearest the boundary stays)
+  local joins = {}
+  for i = 1, num_notes - 1 do
+    local na, nb = notes[i], notes[i + 1]
+    if nb.start_time - na.end_time < 2 * J.FADE_S and (active(na) or active(nb)) then
+      local _, a_end = body_times(na)
+      local b_start = body_times(nb)
+      local s0, s1 = a_end, math.max(a_end, b_start)
+      if s1 - s0 < J.MIN_S then
+        local c = (s0 + s1) * 0.5
+        s0, s1 = c - J.MIN_S * 0.5, c + J.MIN_S * 0.5
+      end
+      local bnd = (na.end_time + nb.start_time) * 0.5
+      local left, right = math.max(0, bnd - s0), math.max(0, s1 - bnd)
+      if left + right > J.MAX_S then
+        local half = J.MAX_S * 0.5
+        if left < half then right = J.MAX_S - left
+        elseif right < half then left = J.MAX_S - right
+        else left, right = half, half end
+      end
+      s0 = math.max(0.0, bnd - left, na.end_time - J.MAX_PART * (na.end_time - na.start_time))
+      s1 = math.min(item_len, bnd + right, nb.start_time + J.MAX_PART * (nb.end_time - nb.start_time))
+      joins[i] = { t0 = s0, t1 = math.max(s0, s1) }
+    end
+  end
+
+  -- The blend of join j from note na into note nb (index b_idx): the first note's shift held at the span start,
+  -- crossfaded (smoothstep) into the second note's own shift, one point per frame of either note
+  local function emit_join(na, nb, b_idx, j)
+    local hold = shift_at(na, j.t0)
+    local len = j.t1 - j.t0
+    local function put(t)
+      local u = (len > 0) and (t - j.t0) / len or 1
+      local own = shift_at(nb, t)
+      emit(t, (u >= 1) and own or hold + (own - hold) * smoothstep(u))
+    end
+    put(j.t0)
+    local fa, fb = na.frames or {}, nb.frames or {}
+    local pa, pb = 1, 1
+    while true do
+      while fa[pa] and fa[pa].time <= j.t0 do pa = pa + 1 end
+      while fb[pb] and fb[pb].time <= j.t0 do pb = pb + 1 end
+      local ta = fa[pa] and fa[pa].time or math.huge
+      local tb = fb[pb] and fb[pb].time or math.huge
+      local t = math.min(ta, tb)
+      if t >= j.t1 then break end
+      put(t)
+      if ta == t then pa = pa + 1 end
+      if tb == t then pb = pb + 1 end
+    end
+    put(j.t1)
+    spans[#spans + 1] = { kind = "glide", t0 = j.t0, t1 = j.t1, a = b_idx - 1, b = b_idx }
+  end
 
   for idx = 1, num_notes do
     local n = notes[idx]
-    local prev_n = notes[idx - 1]
-    local next_n = notes[idx + 1]
+    local jp, jn = joins[idx - 1], joins[idx]
 
-    -- Bypassed notes produce zero shifts — skip trajectory generation
-    if n.controls and n.controls.bypassed then
-      goto continue_note
-    end
+    -- A. The join from the previous note (written by whichever of the two is edited)
+    if jp then emit_join(notes[idx - 1], n, idx, jp) end
 
-    local is_mod = is_note_modified(n)
-    local prev_mod = is_note_modified(prev_n)
-    local next_mod = is_note_modified(next_n)
+    if active(n) then
+      local fade = math.min(J.FADE_S, (n.end_time - n.start_time) * 0.25)
+      local start_shift, end_shift = shift_at(n, n.start_time), shift_at(n, n.end_time)
+      -- The time range this note corrects, with its joins and fades
+      local range = { t0 = jp and jp.t0 or n.start_time, t1 = jn and jn.t1 or n.end_time }
+      -- The body runs from the end of the join before (or the note start) to the start of the join after (or the
+      -- note end); an edge a join or fade already wrote is not written again
+      local body_t0 = jp and jp.t1 or n.start_time
+      local body_t1 = jn and jn.t0 or n.end_time
+      local t0_written = jp ~= nil
 
-    -- If this note and both its neighbors are untouched, skip entirely
-    if not is_mod and not prev_mod and not next_mod then
-      goto continue_note
-    end
-
-    local start_shift = (n.frame_shifts and n.frame_shifts[1]) or 0.0
-    local end_shift = (n.frame_shifts and n.frame_shifts[#n.frame_shifts]) or 0.0
-
-    local trans_dur = math.min(get_effective(n, "transition_ms") * 0.001, 0.060)
-    trans_dur = math.min(trans_dur, (n.end_time - n.start_time) * 0.4)
-
-    -- The time range this note corrects (grown below by its ramps and glides)
-    local range = is_mod and { t0 = n.start_time, t1 = n.end_time } or nil
-
-    -- A. START TRANSITION
-    local prev_gap = prev_n and (n.start_time - prev_n.end_time) or 999
-    if prev_gap < legato_thresh and prev_n then
-      -- Legato transition with previous note: smoothstep blend centered at boundary
-      local prev_end_shift = (prev_n.frame_shifts and prev_n.frame_shifts[#prev_n.frame_shifts]) or 0.0
-      local t_bnd = (prev_n.end_time + n.start_time) * 0.5
-      local t_start = math.max(0.0, t_bnd - trans_dur * 0.5)
-      local t_end = math.min(item_len, t_bnd + trans_dur * 0.5)
-
-      local steps = 5
-      for s = 0, steps do
-        local u = s / steps
-        local t = t_start + u * (t_end - t_start)
-        local val = prev_end_shift + (start_shift - prev_end_shift) * smoothstep(u)
-        table.insert(all_points, { time = t, val = val })
-      end
-      if is_mod or prev_mod then
-        spans[#spans + 1] = { kind = "glide", t0 = t_start, t1 = t_end, a = idx - 1, b = idx }
-        spans[#spans + 1] = { kind = "gap", t0 = prev_n.end_time, t1 = n.start_time, a = idx - 1, b = idx }
-        -- The glide belongs to the range of whichever side is edited; the previous note's range is the last one
-        if range then range.t0 = math.min(range.t0, t_start) end
-        local last = ranges[#ranges]
-        if prev_mod and last and not (prev_n.controls and prev_n.controls.bypassed) then
-          last.t1 = math.max(last.t1, t_end)
-        end
-      end
-    else
-      -- Onset from silence / start of take: smooth ramp into pitch shift
-      if is_mod and math.abs(start_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
-        local t_pre = math.max(0.0, n.start_time - ramp_t)
-        table.insert(all_points, { time = t_pre, val = 0.0 })
+      -- B. Onset from silence: smooth ramp into the note's shift
+      if not jp and math.abs(start_shift) > 0.001 then
+        local t_pre = math.max(0.0, n.start_time - fade)
         local steps = 4
-        for s = 1, steps do
+        for s = 0, steps do
           local u = s / steps
-          local t = t_pre + u * (n.start_time - t_pre)
-          local val = start_shift * smoothstep(u)
-          table.insert(all_points, { time = t, val = val })
+          emit(t_pre + u * (n.start_time - t_pre), start_shift * smoothstep(u))
         end
         spans[#spans + 1] = { kind = "onset", t0 = t_pre, t1 = n.start_time, a = idx }
         range.t0 = math.min(range.t0, t_pre)
+        t0_written = true
       end
-    end
 
-    -- B. NOTE BODY
-    -- A tightened note and a scooped onset differ from frame to frame: their frames are written.
-    -- A note with pitch points is also written frame by frame, up to each edge that is not joined to a neighbour.
-    local has_points = K.points_offsets(n) ~= nil
-    local fine_changed = is_mod and (scooped[idx] == true or has_points or K.tighten_line(n) ~= nil)
-    local body_t_start = n.start_time + trans_dur * 0.5
-    local body_t_end = n.end_time - trans_dur * 0.5
-    local start_written = false   -- section A already wrote a point at body_t_start (the end of its onset ramp)
-    if has_points then
-      if not (prev_gap < legato_thresh and prev_n) then
-        body_t_start = n.start_time
-        start_written = math.abs(start_shift) > 0.001
-      end
-      if not (next_n and (next_n.start_time - n.end_time) < legato_thresh) then
-        body_t_end = n.end_time   -- section C's release ramp starts after n.end_time (Onset Ramp >= 5 ms)
-      end
-    end
-
-    if not fine_changed then
-      -- Coarse shift or untouched: hold shift across body
-      if is_mod then
-        table.insert(all_points, { time = math.min(item_len, body_t_start), val = start_shift })
-        table.insert(all_points, { time = math.min(item_len, body_t_end), val = end_shift })
-      end
-    else
-      -- Fine contour: one point per frame across the body
-      if n.frames then
-        for i = 1, #n.frames do
-          local t = n.frames[i].time
-          if (t > body_t_start or (t == body_t_start and not start_written)) and t <= body_t_end then
-            table.insert(all_points, { time = math.min(item_len, t), val = n.frame_shifts[i] })
-          end
+      -- C. The body: one point per frame when its shifts vary, its two ends when they are constant
+      if not t0_written then emit(body_t0, shift_at(n, body_t0)) end
+      local sh, fr = n.frame_shifts, n.frames
+      local varies = false
+      if fr and sh and sh[1] then
+        for i = 2, #fr do
+          if math.abs((sh[i] or 0) - sh[1]) > 1e-9 then varies = true break end
         end
       end
-    end
+      if varies then
+        for i = 1, #fr do
+          local t = fr[i].time
+          if t > body_t0 and t < body_t1 then emit(t, sh[i]) end
+        end
+      end
 
-    -- C. END TRANSITION TO SILENCE (if next note is far or this is last note)
-    local next_gap = next_n and (next_n.start_time - n.end_time) or 999
-    if next_gap >= legato_thresh then
-      if is_mod and math.abs(end_shift) > 0.001 then
-        local onset_ramp = get_effective(n, "onset_ramp_ms") * 0.001
-        local ramp_t = math.min(onset_ramp, (n.end_time - n.start_time) * 0.25)
+      -- D. Release into silence: smooth ramp out of the note's shift
+      if not jn and math.abs(end_shift) > 0.001 then
         local steps = 4
-        for s = 1, steps do
+        for s = 0, steps do
           local u = s / steps
-          local t = math.min(item_len, n.end_time + u * ramp_t)
-          local val = end_shift * (1.0 - smoothstep(u))
-          table.insert(all_points, { time = t, val = val })
+          emit(n.end_time + u * fade, end_shift * (1.0 - smoothstep(u)))
         end
-        local t_post = math.min(item_len, n.end_time + ramp_t + 0.001)
-        table.insert(all_points, { time = t_post, val = 0.0 })
-        spans[#spans + 1] = { kind = "release", t0 = n.end_time, t1 = math.min(item_len, n.end_time + ramp_t), a = idx }
+        local t_post = math.min(item_len, n.end_time + fade + 0.001)
+        emit(t_post, 0.0)
+        spans[#spans + 1] = { kind = "release", t0 = n.end_time, t1 = math.min(item_len, n.end_time + fade), a = idx }
         range.t1 = math.max(range.t1, t_post)
+      elseif not jn then
+        emit(body_t1, shift_at(n, body_t1))
       end
+
+      ranges[#ranges + 1] = range
     end
-
-    if range then ranges[#ranges + 1] = range end
-
-    ::continue_note::
   end
 
   -- Ranges are in note order; merge the ones that touch
@@ -4183,15 +4187,11 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 10, c and c.center_pitch) or changed
     changed = set(sig, k + 11, c and c.slide_in or 0) or changed
     changed = set(sig, k + 12, get_effective(n, "retune_speed")) or changed
-    changed = set(sig, k + 13, get_effective(n, "transition_ms")) or changed
-    changed = set(sig, k + 14, get_effective(n, "onset_ramp_ms")) or changed
     -- An override that equals the inherited value still makes the note "edited"
-    changed = set(sig, k + 15, is_note_modified(n)) or changed
-    changed = set(sig, k + 16, n.points_rev or 0) or changed
-    k = k + 16
+    changed = set(sig, k + 13, is_note_modified(n)) or changed
+    changed = set(sig, k + 14, n.points_rev or 0) or changed
+    k = k + 14
   end
-  changed = set(sig, k + 1, get_effective(nil, "legato_threshold_ms")) or changed
-  k = k + 1
   if cv.n ~= k then
     cv.n = k
     changed = true
