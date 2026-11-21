@@ -1,0 +1,24 @@
+-- @description Fancy Scripts Library
+-- @author Fancy Scripts
+-- @version 1.0.0
+-- @changelog
+--   First release: the shared files every Fancy script loads, as one package of their own
+-- @about
+--   The shared library of Fancy Scripts: the design system (theme and fonts), JSON, utilities and the engines
+--   several scripts share. Install it once; every Fancy script with a window, and the Fancy Mapper and
+--   Tap Tempo Slew actions, need it.
+--   It adds nothing to the Action List.
+-- @donation https://github.com/sponsors/TheFancyWolf
+-- @link Website https://github.com/TheFancyWolf/fancy-scripts
+-- @provides
+--   [nomain] .
+--   [nomain] theme.lua
+--   [nomain] json.lua
+--   [nomain] utils.lua
+--   [nomain] mapper_engine.lua
+--   [nomain] tap_tempo_settings.lua
+--   [nomain] fonts/*
+
+-- This file only carries the package: the scripts load the files listed above with require().
+-- ReaPack delivers a change to any of them only with a new @version here, so raise it whenever one changes.
+return true
