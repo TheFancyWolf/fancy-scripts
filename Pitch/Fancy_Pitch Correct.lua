@@ -10128,4 +10128,5 @@ local function main()
   loop()
 end
 
+if FANCY_PITCH_TEST then return { K = K, state = state, DEFAULTS = DEFAULTS } end
 main()
