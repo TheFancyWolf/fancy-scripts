@@ -209,7 +209,7 @@ local PARAM_LABELS = {
   transition_ms = "Transition",
   onset_ramp_ms = "Onset Ramp",
   legato_threshold_ms = "Legato Gap",
-  scoop_shape = "Scoop Shape", -- per-note only (the top bar's Timing row, note context menu)
+  slide_in = "Slide In", -- per-note only (the top bar's Timing row, note context menu)
   tighten = "Tighten",         -- per-note only (the top bar, the left side of a note, note context menu)
   tolerance = "Tolerance",
 }
@@ -404,7 +404,7 @@ local state = {
   context_menu_live = false, -- the note's points could be added to (K.points_live_at) when the note menu was opened
   context_point = nil,  -- { note_idx, frame, start_st }: the point the point menu ("##point_context_menu") is on
   -- The setting that is hovered or dragged (K.setting_hint): the canvas shades where it acts. key = cascade key
-  -- or "scoop_shape"; notes = nil (every note the top bar value reaches) or a set of note indices; frame = the
+  -- or "slide_in"; notes = nil (every note the top bar value reaches) or a set of note indices; frame = the
   -- ImGui frame that reported it; said = the "nothing in view" status was posted for this drag
   setting_hint = { frame = -1, menu_set = {}, zone_set = {} },
   view_t0 = nil,        -- visible time window of the canvas, seconds relative to the item start; nil = the whole item
@@ -1426,7 +1426,7 @@ K.NOTE_CONTROLS = {
   { key = "transition_ms", merge = "first",    edited = "set" },        -- inherits
   { key = "onset_ramp_ms", merge = "first",    edited = "set" },        -- inherits
   { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
-  { key = "scoop_shape",   merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
+  { key = "slide_in",      merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
 }
 
 --- The values a note cut from the note with `old_ctrl` keeps (Split, Trim): all of them, and its bypass.
@@ -1607,25 +1607,6 @@ local function extract_note_features(note, preserve_controls)
       note.controls[k] = v
     end
   end
-
-  -- 7. ONSET ANALYSIS — scoop magnitude and voiced start detection
-  local scoop_frames = math.min(10, math.floor(#raw_pitch * 0.3))
-  local scoop_sum = 0
-  for i = 1, scoop_frames do
-    scoop_sum = scoop_sum + math.abs(raw_pitch[i] - note.avg_note)
-  end
-  note.scoop_magnitude = scoop_frames > 0 and (scoop_sum / scoop_frames) or 0
-
-  -- Find first frame with stable voicing (3+ consecutive voiced frames)
-  note.voiced_start_idx = 1
-  for i = 1, math.min(#note.frames, 15) do
-    if i + 2 <= #note.frames
-      and note.frames[i].note and note.frames[i+1].note and note.frames[i+2].note then
-      note.voiced_start_idx = i
-      break
-    end
-  end
-  note.voiced_start_time = note.frames[note.voiced_start_idx].time
 end
 
 -------------------------------------------------------------------------------
@@ -2057,9 +2038,6 @@ local function save_take_data(take, data)
         avg_note = note.avg_note,
         display_note = note.display_note,
         controls = note.controls,
-        scoop_magnitude = note.scoop_magnitude,
-        voiced_start_idx = note.voiced_start_idx,
-        voiced_start_time = note.voiced_start_time,
         frames = note.frames
       })
     end
@@ -2441,28 +2419,28 @@ K.correction_build = function(notes, item_len)
           n.frame_shifts[i] = tight and (coarse - (tight[i] or 0)) or coarse
         end
 
-        -- Scoop: flatten the slide into the note. The onset frames are pulled toward the pitch the corrected
-        -- note settles at right after the onset: fully on the first frame at 100 %, easing out to the note's
-        -- normal correction by the end of the onset (so the onset meets the body without a step). 0 % leaves
-        -- the slide as sung. The pull of one frame is limited to K.SCOOP_MAX_ST, so a mis-detected onset frame
-        -- (an octave error) cannot write a jump of that size into the envelope.
-        local scoop = (n.controls and n.controls.scoop_shape) or 0
-        if scoop > 0 and is_mod and n.voiced_start_idx then
-          local onset_end = math.min(n.voiced_start_idx + 8, #n.frames)
-          local settle = n.frames[onset_end + 1]
-          if onset_end > 1 and onset_end < #n.frames and settle and settle.note then
-            local settle_pitch = settle.note + n.frame_shifts[onset_end + 1]
-            for i = 1, onset_end do
+        -- Slide In: flatten the slide into the note. The slide is the frames before the note's body (K.note_body).
+        -- Each is pulled toward the pitch the corrected note has at its body start: fully at 100 %, not at all at
+        -- 0 % (the slide as sung). No taper, so the slide meets the body without a step. The pull of one frame is
+        -- limited to K.SCOOP_MAX_ST, so a mis-detected frame (an octave error) cannot write a jump of that size
+        -- into the envelope. A note that starts on pitch has no slide.
+        local slide_in = (n.controls and n.controls.slide_in) or 0
+        if slide_in > 0 and is_mod then
+          local a = K.note_body(n)
+          local settle = a and a > 1 and n.frames[a] and n.frames[a].note
+          if settle then
+            local settle_pitch = settle + n.frame_shifts[a]
+            for i = 1, a - 1 do
               local sung = n.frames[i].note
               if sung then
                 local natural = n.frame_shifts[i]
                 local pull = (settle_pitch - sung) - natural   -- what would put this frame on the settled pitch
                 pull = math.max(-K.SCOOP_MAX_ST, math.min(K.SCOOP_MAX_ST, pull))
-                n.frame_shifts[i] = natural + pull * scoop * (1 - (i - 1) / onset_end)
+                n.frame_shifts[i] = natural + pull * slide_in
               end
             end
             scooped[idx] = true
-            spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[onset_end].time, a = idx }
+            spans[#spans + 1] = { kind = "scoop", t0 = n.frames[1].time, t1 = n.frames[a - 1].time, a = idx }
           end
         end
 
@@ -4200,10 +4178,10 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 5, c and c.tighten or 0) or changed
     changed = set(sig, k + 6, get_effective(n, "tolerance")) or changed
     changed = set(sig, k + 7, n.avg_note) or changed
-    changed = set(sig, k + 8, n.voiced_start_idx) or changed
+    changed = set(sig, k + 8, (K.note_body(n))) or changed
     changed = set(sig, k + 9, c and c.bypassed or false) or changed
     changed = set(sig, k + 10, c and c.center_pitch) or changed
-    changed = set(sig, k + 11, c and c.scoop_shape or 0) or changed
+    changed = set(sig, k + 11, c and c.slide_in or 0) or changed
     changed = set(sig, k + 12, get_effective(n, "retune_speed")) or changed
     changed = set(sig, k + 13, get_effective(n, "transition_ms")) or changed
     changed = set(sig, k + 14, get_effective(n, "onset_ramp_ms")) or changed
@@ -4387,7 +4365,7 @@ K.ZONE_CONTROLS = {
   tolerance = {
     [false] = { key = "tolerance", lo = 0, hi = 50, rows = 1, inherit = true, fine = true, hint = "tolerance",
                 read = "Tolerance: %.0f\xC2\xA2", hover = "Tolerance: %.0f\xC2\xA2", undo = "Adjust Tolerance" },
-    [true]  = { key = "scoop_shape", lo = 0, hi = 1, rows = 2, show = 100, hint = "scoop_shape",
+    [true]  = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, hint = "slide_in",
                 read = "Scoop: %.0f%% corrected", hover = "Scoop: %.0f%% corrected (Shift+Drag)", undo = "Adjust Scoop" },
   },
 }
@@ -4563,7 +4541,7 @@ K.HINT_KINDS = {
   transition_ms = { glide = true },
   onset_ramp_ms = { onset = true, release = true },
   legato_threshold_ms = { gap = true },
-  scoop_shape = { scoop = true },
+  slide_in = { scoop = true },
 }
 
 --- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
@@ -6663,7 +6641,7 @@ local function draw_graph(draw_ctx, w, h)
       draw_cm_slider(PARAM_LABELS.tighten, "tighten", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.tolerance, "tolerance", K.LIMITS.tolerance[1], K.LIMITS.tolerance[2], "%.0f \xC2\xA2", nil, nil, true)
       draw_cm_slider("Onset Ramp", "onset_ramp_ms", 5, 60, "%.0f ms", nil, nil, true)
-      draw_cm_slider("Scoop Shape", "scoop_shape", 0, 100, "%.0f%%", 100, nil, true)
+      draw_cm_slider("Slide In", "slide_in", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider("Transition", "transition_ms", 5, 60, "%.0f ms", nil, nil, true)
       draw_cm_slider(PARAM_LABELS.retune_speed, "retune_speed", 0, 100, "%.0f%%", 100, nil, true)
 
@@ -9375,7 +9353,7 @@ do
     { id = "ramp", key = "onset_ramp_ms", label = "Onset Ramp", lo = 5, hi = 60, scale = 1, num = "%.0f", unit = "ms",
       levels = "all", timing = true,
       tip = "Onset Ramp: how quickly correction comes in at the start of a note. Short corrects the attack at once, long lets the singer's attack through first." },
-    { id = "scoop", key = "scoop_shape", label = "Scoop Shape", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
+    { id = "scoop", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "note", timing = true,
       tip = "Scoop Shape: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
     { id = "legato", key = "legato_threshold_ms", label = "Legato Gap", lo = 50, hi = 300, scale = 1, num = "%.0f", unit = "ms",

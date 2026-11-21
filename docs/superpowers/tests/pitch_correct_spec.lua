@@ -269,6 +269,52 @@ test("tighten_unchanged", function()
   near(out[100], 0.16270590047208416, 1e-9, "last")
 end)
 
+local function slide_note(onset_low, slide_in)
+  local fr, sm = {}, {}
+  for i = 1, 30 do
+    local v = 60
+    if i <= 6 then v = 60 - onset_low * (7 - i) / 6 end
+    fr[i] = { time = (i - 1) * 0.01, note = v }
+    sm[i] = (i <= 6) and (v - 1) or v   -- the slide lies outside the 0.5 st body, whatever its size
+  end
+  return { start_time = 0, end_time = 0.3, frames = fr, smooth = sm, avg_note = 60,
+           controls = { center_pitch = 60.3, retune_speed = 1, slide_in = slide_in, bypassed = false } }
+end
+
+local function slide_shifts(onset_low, slide_in)
+  local n = slide_note(onset_low, slide_in)
+  S.K.correction_build({ n }, 1)
+  return n.frame_shifts, n
+end
+
+test("slide_in_zero", function()
+  local sh = slide_shifts(1, 0)
+  for i = 1, 6 do near(sh[i], 0.3, 1e-9, "coarse " .. i) end
+end)
+
+test("slide_in_full", function()
+  local sh, n = slide_shifts(1, 1)
+  local target = n.frames[7].note + sh[7]
+  for i = 1, 6 do near(n.frames[i].note + sh[i], target, 1e-9, "frame " .. i) end
+end)
+
+test("slide_in_half", function()
+  local s0, s1, sh = slide_shifts(1, 0), slide_shifts(1, 1), slide_shifts(1, 0.5)
+  for i = 1, 6 do near(sh[i], (s0[i] + s1[i]) / 2, 1e-9, "frame " .. i) end
+end)
+
+test("slide_in_no_slide", function()
+  local s0, s1 = slide_shifts(0, 0), slide_shifts(0, 1)
+  for i = 1, 30 do near(s0[i], s1[i], 1e-9, "frame " .. i) end
+end)
+
+test("slide_in_cap", function()
+  local s0, s1 = slide_shifts(12, 0), slide_shifts(12, 1)
+  for i = 1, 6 do
+    if math.abs(s1[i] - s0[i]) > S.K.SCOOP_MAX_ST + 1e-9 then error("moved too far at " .. i) end
+  end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
