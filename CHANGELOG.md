@@ -4,6 +4,10 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.15.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Two new shortcuts:
+  - **B** bypasses the selected notes; pressed again when they are all bypassed, it turns bypass off. One undo point, and the status line says how many notes changed.
+  - **W** moves the edit cursor to the start of the item (like REAPER's Go to start of project); playback follows and a zoomed view scrolls back to the start.
+  - Both show in the side panel's Shortcuts list.
 - **Fancy Pitch Correct v2.14.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Design pass on the top bar, the canvas curves and the side panel:
   - **Side panel toggle**: a panel button in the top bar (next to `…`) shows and hides the panel and is lit while it shows. The panel has its own darker surface. The `▶` in the Pitched Items header and the closed strip are gone: hidden, the panel leaves the whole width to the canvas.
   - **Timing row**: a secondary bar on a recessed band across the window, with its values under the `Timing` button instead of at the far left.
