@@ -200,7 +200,7 @@ local global_defaults = {
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
 local PARAM_LABELS = {
   retune_speed = "Correction Strength",
-  slide_in = "Slide In", -- per-note only (the top bar's Timing row, note context menu)
+  slide_in = "Slide In", -- per-note only (the top bar, Shift + drag on a note, note context menu)
   tighten = "Tighten",         -- per-note only (the top bar, the left side of a note, note context menu)
   tolerance = "Tolerance",
 }
@@ -210,7 +210,7 @@ local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
 
-  -- The most a Scoop may move one onset frame, in semitones (see K.correction_build)
+  -- The most Slide In may move one slide frame, in semitones (see K.correction_build)
   SCOOP_MAX_ST = 3.0,
 
   -- How long a status message replaces the hint on the canvas's status pill
@@ -389,7 +389,6 @@ local state = {
   shift_mode = false,   -- true when Shift held before click (zone remap)
   context_menu_note = nil, -- index of note for right-click context menu
   bar_edit = nil,       -- { id, notes, acc, raws, starts }: a top bar value is being dragged on the selected notes (see draw_value)
-  timing_open = false,  -- the top bar's Timing row is shown (persisted)
   context_edit = nil,   -- { note, key, raw }: a note menu slider changed and not yet written (raw = the value before)
   context_menu_time = nil, -- the pointer's time (item seconds) when the note menu was opened
   context_menu_live = false, -- the note's points could be added to (K.points_live_at) when the note menu was opened
@@ -609,9 +608,6 @@ K.PERSIST = (function()
   -- Global cascade defaults (project-wide), saved when a drag or a typed entry is committed or reset
   number("cascade", "pitch_retune_speed", global_defaults, "retune_speed", { 0, 1 })
   number("cascade", "pitch_tolerance", global_defaults, "tolerance", K.LIMITS.tolerance)
-
-  -- Top bar: whether the Timing row is open, saved when it is toggled
-  flag("bar", "pitch_timing_open", state, "timing_open")
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
   choice("engine", "pitch_block_size", state, "block_size", BLOCK_SIZES)
@@ -4189,7 +4185,7 @@ end
 
 --- The correction of `notes` for the canvas: K.correction_build's result with its points sorted by time, and a
 --- gen that counts the rebuilds. It is rebuilt only when something the trajectory reads changed (every note's
---- extent, arrays and controls, the effective Strength / Transition / Onset Ramp of each and the Legato Gap),
+--- extent, arrays and body, its Tighten, Tolerance, Slide In and effective Strength, its pitch points),
 --- compared each frame without allocating; so a value dragged in the top bar shows on the next frame and a
 --- frame that changed nothing rebuilds nothing. `item` gives the length the points are clamped to.
 K.correction_view = function(notes, item)
@@ -4380,24 +4376,23 @@ end
 --   show     factor from the stored value to the shown one; read / hover = the drag readout and the hover tooltip
 --   fine     Ctrl/Cmd-drag is fine adjust (HC2); zero_nil = a value of 0 is stored as "not set"
 --   hint     the setting highlight the canvas shows while it is dragged (K.setting_hint)
+-- Shift + drag anywhere on a note (every zone) adjusts Slide In.
 K.ZONE_CONTROLS = {
   tighten = {
     [false] = { key = "tighten", lo = 0, hi = 1, rows = 2, show = 100, fine = true, zero_nil = true,
                 read = "Tighten: %.0f%%", hover = "Tighten: %.0f%%", undo = "Adjust Tighten" },
-    [true]  = { key = "onset_ramp_ms", lo = 5, hi = 60, px = 0.5, inherit = true, hint = "onset_ramp_ms",
-                read = "Onset Ramp: %.0f ms", hover = "Onset Ramp: %.0fms (Shift+Drag)", undo = "Adjust Onset Ramp" },
   },
-  pitch = {
-    [true]  = { key = "transition_ms", lo = 5, hi = 60, px = 0.5, inherit = true, hint = "transition_ms",
-                read = "Transition: %.0f ms", hover = "Transition: %.0fms (Shift+Drag)", undo = "Adjust Transition" },
-  },
+  pitch = {},
   tolerance = {
     [false] = { key = "tolerance", lo = 0, hi = 50, rows = 1, inherit = true, fine = true, hint = "tolerance",
                 read = "Tolerance: %.0f\xC2\xA2", hover = "Tolerance: %.0f\xC2\xA2", undo = "Adjust Tolerance" },
-    [true]  = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, hint = "slide_in",
-                read = "Scoop: %.0f%% corrected", hover = "Scoop: %.0f%% corrected (Shift+Drag)", undo = "Adjust Scoop" },
   },
 }
+do
+  local slide_in = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, hint = "slide_in",
+                     read = "Slide In: %.0f%%", hover = "Slide In: %.0f%% (Shift+Drag)", undo = "Adjust Slide In" }
+  for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
+end
 K.TOLERANCE_IDLE = " (used once Tighten is above 0%)"   -- appended where a note's Tolerance is shown while its Tighten is 0
 
 --- The entry of K.ZONE_CONTROLS for a drag on `zone` with or without Shift, or nil (the pitch drag).
@@ -4565,16 +4560,13 @@ K.preview_lines = function(results, r0, r1, t_to_x, build)
   return pl.arrs, count
 end
 
--- Which spans of K.correction_build each setting shades
+-- Which spans of K.correction_build each setting shades (the joins and fades follow no setting)
 K.HINT_KINDS = {
-  transition_ms = { glide = true },
-  onset_ramp_ms = { onset = true, release = true },
-  legato_threshold_ms = { gap = true },
   slide_in = { scoop = true },
 }
 
 --- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
---- on every note Strength reaches, a span over each fade, glide, joined gap or scoop for the timing values.
+--- on every note Strength reaches, the Tolerance band of each tightened note, a span over each slide for Slide In.
 --- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
 --- `build` is K.correction_view's result, C the canvas palette. Returns how many marks were drawn.
 K.draw_setting_hint = function(draw_list, hint, build, C)
@@ -4591,7 +4583,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
     if not (n and n.controls) then return false end
     if set then return set[idx] ~= nil end
     if edited_only and (n.controls.bypassed or not is_note_modified(n)) then return false end
-    return key == "legato_threshold_ms" or n.controls[key] == nil
+    return n.controls[key] == nil
   end
   local function t_x(t) return m.px + (t - m.vt0) / (m.vt1 - m.vt0) * m.w end
   local function block_y(idx)
@@ -4641,15 +4633,8 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   if not kinds then return 0 end
   for _, sp in ipairs(build.spans) do
     if kinds[sp.kind] and sp.t1 >= m.vt0 and sp.t0 <= m.vt1 then
-      -- A glide is as long as the Transition of its second note; every other span belongs to its first
-      local ok
-      if sp.kind == "glide" then
-        ok = reached(sp.b, false)
-      elseif sp.kind == "gap" then
-        ok = (set == nil) or set[sp.a] ~= nil or set[sp.b] ~= nil
-      else
-        ok = reached(sp.a, true)
-      end
+      -- A slide belongs to the note it leads into
+      local ok = reached(sp.a, true)
       if ok and notes[sp.a] and notes[sp.a].controls and (not sp.b or (notes[sp.b] and notes[sp.b].controls)) then
         local top, bot = block_y(sp.a)
         if sp.b then
@@ -5967,9 +5952,12 @@ local function draw_graph(draw_ctx, w, h)
         if is_hov and not state.drag and not state.point_drag and not state.hovered_point then
           local has_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
 
-          if state.hovered_zone == "tighten" then
+          if has_shift then
+            -- Shift + drag anywhere on the note adjusts Slide In: the whole block is its zone
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y, C.zone_shift)
+          elseif state.hovered_zone == "tighten" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, sx + zone_w, bot_y, has_shift and C.zone_shift or C.zone_drift)
+              sx, top_y, sx + zone_w, bot_y, C.zone_drift)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
           elseif state.hovered_zone == "tolerance" then
@@ -5980,29 +5968,13 @@ local function draw_graph(draw_ctx, w, h)
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex, bot_y, fill)
-            if has_shift then
-              reaper.ImGui_DrawList_AddRectFilled(draw_list,
-                sx + zone_w, top_y, ex - zone_w, bot_y, C.zone_shift)
-            end
           end
 
-          if has_shift and block_w > 40 then
-            -- The zone names sit on a pill: the text over the amber zone highlight alone is not enough. All three are
-            -- drawn when each fits its zone (the pills never overlap); on a narrower block only the name of the zone
-            -- under the pointer is (the hover hint names it at any width)
+          if has_shift and block_w > 40 and pill_fits(PARAM_LABELS.slide_in, block_w) then
+            -- The name sits on a pill: the text over the amber highlight alone is not enough (the hover hint names
+            -- it at any width)
             local text_y = top_y + (bot_y - top_y) * 0.5 - 6
-            if pill_fits("Onset Ramp", zone_w) and pill_fits("Transition", block_w - zone_w * 2)
-                and pill_fits("Scoop", zone_w) then
-              pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
-              pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
-              pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
-            elseif state.hovered_zone == "tighten" then
-              pill_text(sx + 2, text_y, "Onset Ramp", C.pill_text)
-            elseif state.hovered_zone == "tolerance" then
-              pill_text(ex - zone_w + 2, text_y, "Scoop", C.pill_text)
-            else
-              pill_text(sx + zone_w + 2, text_y, "Transition", C.pill_text)
-            end
+            pill_text(sx + 2, text_y, PARAM_LABELS.slide_in, C.pill_text)
           end
         else
           reaper.ImGui_DrawList_AddRectFilled(draw_list,
@@ -6593,7 +6565,7 @@ local function draw_graph(draw_ctx, w, h)
       end
 
       --- One value row. `spread`: the value is written to every selected note (see spread_n), and the row says
-      --- how many. A value outside the cascade (Tighten, Scoop Shape) has nothing to inherit and shows no level.
+      --- how many. A value outside the cascade (Tighten, Slide In) has nothing to inherit and shows no level.
       local function draw_cm_slider(label, key, min_v, max_v, fmt, scale, default, spread)
          local level = get_override_level(note, key)
          local cur_val = ctrl[key] or get_effective(note, key) or default or 0
@@ -6669,9 +6641,7 @@ local function draw_graph(draw_ctx, w, h)
 
       draw_cm_slider(PARAM_LABELS.tighten, "tighten", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.tolerance, "tolerance", K.LIMITS.tolerance[1], K.LIMITS.tolerance[2], "%.0f \xC2\xA2", nil, nil, true)
-      draw_cm_slider("Onset Ramp", "onset_ramp_ms", 5, 60, "%.0f ms", nil, nil, true)
-      draw_cm_slider("Slide In", "slide_in", 0, 100, "%.0f%%", 100, nil, true)
-      draw_cm_slider("Transition", "transition_ms", 5, 60, "%.0f ms", nil, nil, true)
+      draw_cm_slider(PARAM_LABELS.slide_in, "slide_in", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.retune_speed, "retune_speed", 0, 100, "%.0f%%", 100, nil, true)
 
       reaper.ImGui_PopItemWidth(draw_ctx)
@@ -7295,7 +7265,7 @@ end
 
 -- Keyboard Shortcuts & Help content: one entry per section, one { key, description } row each (draw_info_modal measures
 -- the columns from these strings). Keep a description near 52 characters so the table stays narrow; the terms follow
--- the UI labels (Pitched Items, item, Correction Strength, Transition, Onset Ramp, Legato Gap, Scoop shape).
+-- the UI labels (Pitched Items, item, Correction Strength, Tighten, Tolerance, Slide In, Separation).
 -- A row that is also in the panel's Shortcuts list carries panel = { group, order in the group, short text [, short key] }:
 -- the list is built from this table (K.panel_rows), so a key is never written in two places.
 K.INFO_SECTIONS = {
@@ -7318,9 +7288,7 @@ K.INFO_SECTIONS = {
       panel = { "Edit", 7, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
     { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
-    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 8, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
-    { "Shift + Drag Center Zone", "Adjust Transition" },
-    { "Shift + Drag Right Zone", "Adjust Scoop shape" },
+    { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 8, "Slide In", "Shift + Drag" } },
     { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 9, "Trim note", "Drag edge" } },
     { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 10, "Pitch point", "Drag dot" } },
     { "Double-click a pitch point", "Put it back to 0" },
@@ -7858,7 +7826,7 @@ local function draw_body_split(P, avail_w, total_h)
     local grip_x, grip_y = reaper.ImGui_GetCursorScreenPos(ctx)
     local column_w = reaper.ImGui_GetContentRegionAvail(ctx)
     state.sidebar_w = column_w
-    -- The panel has its own recessed surface (the Timing tray's), so it reads as a panel beside the canvas
+    -- The panel has its own recessed surface, so it reads as a panel beside the canvas
     reaper.ImGui_DrawList_AddRectFilled(reaper.ImGui_GetWindowDrawList(ctx),
       grip_x, grip_y, grip_x + column_w, grip_y + total_h, P.inset)
     reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + L.sm)
@@ -8881,11 +8849,10 @@ end
 -- Every control of the window, in one place above the canvas, in four groups read from broad to specific:
 --   Clip          brand, target badge, Key, Scale
 --   Values        the selection pill (what a drag changes: the defaults, or the selected notes), Tighten,
---                 Strength, Tolerance, and "Timing", which opens and closes the Timing row
+--                 Strength, Tolerance, Slide In, and Separation (one value for the analysis, whatever is selected)
 --   Note actions  Snap, Quantize, Split, Merge
 --   Right         "…" (Analyze / Cancel, Reset, Layers, Note Tone, Settings, Help) and Close, right-aligned on row 1
---   Timing row    Transition, Onset Ramp, Scoop Shape, Legato Gap: the last row(s) of the bar while it is open
--- The Values, Note action and Timing row units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
+-- The Values and Note action units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
 -- section places them. Every width is measured from the longest text its control can show. On how many rows the
 -- units sit is a HDR_PLANS entry chosen from the content width alone (never from the selected item or the note
 -- selection), so nothing jumps while working: as the width shrinks the groups wrap onto more rows, and at the
@@ -8910,13 +8877,11 @@ do
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
-  local HDR_VALUES = { "pill", "tight", "strength", "tol", "timing" }
-  local HDR_TIMING = { "trans", "ramp", "scoop", "legato" }   -- the Timing row (shown while state.timing_open)
+  local HDR_VALUES = { "pill", "tight", "strength", "tol", "slide", "sep" }
   local HDR_ACTIONS = { "snap", "quantize", "split", "merge" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for _, id in ipairs(HDR_VALUES) do HDR_GROUP[id] = "values" end
-  for _, id in ipairs(HDR_TIMING) do HDR_GROUP[id] = "timing" end
   for _, id in ipairs(HDR_ACTIONS) do HDR_GROUP[id] = "actions" end
 
   --- One row holding the units of every list given, in order.
@@ -8933,7 +8898,7 @@ do
     { rows = { HDR_CLIP, hdr_row(HDR_VALUES, HDR_ACTIONS) } },
     { rows = { HDR_CLIP, HDR_VALUES, HDR_ACTIONS } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES, HDR_ACTIONS } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "timing" }, { "tight", "strength" }, { "tol" }, HDR_ACTIONS } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "strength", "tol" }, { "slide", "sep" }, HDR_ACTIONS } },
   }
   -- The plan a first-use window is sized for: two rows
   local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
@@ -8979,7 +8944,7 @@ do
     s.badge_min_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
     -- More, Panel, Close: the real gaps between them (see hdr_draw_right)
     s.right_w = s.more_w + L.sm + s.close_sz + L.lg + s.close_sz
-    -- The Values, Timing row and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
+    -- The Values and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
     s.bar = K.bar_measure(ctx)
     return s
   end
@@ -9072,33 +9037,15 @@ do
     return w
   end
 
-  --- How many values of the Timing row fit side by side in avail_w: all four, two, or one.
-  local function hdr_timing_per_row(s, avail_w)
-    local L = Theme.layout
-    local n = #HDR_TIMING
-    if hdr_row_w(HDR_TIMING, s, 0) <= avail_w then return n end
-    local pair_w = 0
-    for i = 1, n, 2 do
-      local w = hdr_element_w(HDR_TIMING[i], s, 0)
-      if HDR_TIMING[i + 1] then w = w + L.sm + hdr_element_w(HDR_TIMING[i + 1], s, 0) end
-      pair_w = math.max(pair_w, w)
-    end
-    return (pair_w <= avail_w) and 2 or 1
-  end
-
   --- Content width the narrowest floating window keeps (the last plan). With `full`: the width a first-use
-  --- window opens with (two rows). The second value is the number of rows the bar then has, the Timing row's
-  --- own rows included while it is open.
+  --- window opens with (two rows). The second value is the number of rows the bar then has.
   hdr_min_content_w = function(s, full)
     local plan = full and HDR_FIRST_USE_PLAN or HDR_PLANS[#HDR_PLANS]
     local w = hdr_plan_w(plan, s)
     -- Rows: what the bar drew last frame at the window's real width (s.rows_now), so a wide window may be as
     -- short as its bar allows; before the first frame, the plan's own count
     local rows = (not full) and s.rows_now or nil
-    if not rows then
-      rows = #plan.rows
-      if state.timing_open then rows = rows + math.ceil(#HDR_TIMING / hdr_timing_per_row(s, w)) end
-    end
+    if not rows then rows = #plan.rows end
     return w, rows
   end
 
@@ -9334,7 +9281,7 @@ do
       analyze_label = has_notes and "Re-Analyze" or "Analyze",
       reset_label = reset_label, reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
     }
-    -- The Values, Timing row and Note action units draw themselves (see TOP BAR CONTROLS)
+    -- The Values and Note action units draw themselves (see TOP BAR CONTROLS)
     local draw_unit = K.bar_frame(ctx, has_target, target_item, s.bar)
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
 
@@ -9365,38 +9312,7 @@ do
       end
       if r == 1 then close_clicked = hdr_draw_right(hs) end
     end
-    -- The Timing row: the last row(s) of the bar while it is open, as many values per row as the width holds
     s.rows_now = #plan.rows
-    if state.timing_open then
-      local per_row = hdr_timing_per_row(s, avail_w)
-      local timing_rows = math.ceil(#HDR_TIMING / per_row)
-      s.rows_now = s.rows_now + timing_rows
-      -- The row is a secondary bar: a recessed band across the whole window (the side panel's surface) with its
-      -- values, when they fit on one line, starting under the button that opened it (never past the bar's end)
-      local row_x, row_y = reaper.ImGui_GetCursorScreenPos(ctx)
-      local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
-      local indent = 0
-      if timing_rows == 1 then
-        local tray_w = hdr_row_w(HDR_TIMING, s, 0)
-        indent = math.max(0, math.min((K.timing_btn_x or row_x) - row_x, avail_w - tray_w))
-      end
-      local win_x = reaper.ImGui_GetWindowPos(ctx)
-      local win_w = reaper.ImGui_GetWindowSize(ctx)
-      reaper.ImGui_DrawList_PushClipRect(draw_list, win_x, row_y - L.xs, win_x + win_w, row_y + 1e4, false)
-      reaper.ImGui_DrawList_AddRectFilled(draw_list,
-        win_x, row_y - L.xs,
-        win_x + win_w, row_y + timing_rows * s.frame_h + timing_rows * (spacing_y or 0),   -- down to the body: no gap
-        P.inset)
-      reaper.ImGui_DrawList_PopClipRect(draw_list)
-      for i, id in ipairs(HDR_TIMING) do
-        if (i - 1) % per_row ~= 0 then
-          reaper.ImGui_SameLine(ctx, 0, L.sm)
-        elseif indent > 0 then
-          reaper.ImGui_SetCursorPosX(ctx, reaper.ImGui_GetCursorPosX(ctx) + indent)
-        end
-        draw_unit(id)
-      end
-    end
     return close_clicked
   end
 end
@@ -9404,11 +9320,11 @@ end
 -------------------------------------------------------------------------------
 -- TOP BAR CONTROLS
 -------------------------------------------------------------------------------
--- The units of the Values group, the Timing row and the Note action group, drawn in every state (disabled, with
--- the reason, when there is nothing to act on): the selection pill, one value control per entry of BAR_VALUES
--- (a drag with its text inside and a range fill under it), the Timing toggle, and the actions (Snap, Quantize,
--- Split, Merge). A value control edits what the pill names: the selected notes, else the item's own value, else
--- the default.
+-- The units of the Values group and the Note action group, drawn in every state (disabled, with the reason, when
+-- there is nothing to act on): the selection pill, one value control per entry of BAR_VALUES (a drag with its text
+-- inside and a range fill under it), and the actions (Snap, Quantize, Split, Merge). A value control edits what the
+-- pill names: the selected notes, else the item's own value, else the default; Separation is the exception, one
+-- value for the analysis whatever is selected.
 -- K.bar_measure gives their widths, each from its longest label, so a value, an override mark or a selection
 -- never changes the layout; K.bar_frame returns the function that draws one unit this frame. The top bar
 -- (above) decides where they go. The status line that used to sit beside them is a pill on the canvas
@@ -9424,14 +9340,6 @@ do
   local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "Defaults", "1 note", "%d notes"
   local BAR_PILL_TIP_NONE = "Nothing is selected: the values here are the defaults. Select notes to change only those notes."
   local BAR_PILL_TIP_NOTES = "The values here belong to the selected notes. Press Esc to go back to the defaults."
-  -- The Timing toggle; %s is the mark when a value of the closed row is not the default. A triangle (half size
-  -- BAR_TIMING_ICON_HS) is drawn after the label; the gap and the icon's width are reserved in the button's width.
-  local BAR_TIMING_FMT = "Timing%s"
-  local BAR_TIMING_ICON_HS = 4
-  local BAR_TIMING_ICON_GAP = Theme.layout.sm
-  local BAR_TIMING_ICON_W = math.ceil(BAR_TIMING_ICON_HS * 1.4)
-  local BAR_TIMING_TIP_OPEN = "Show Transition, Onset Ramp, Scoop Shape and Legato Gap"
-  local BAR_TIMING_TIP_CLOSE = "Hide the timing values"
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
   local BAR_REASON_NO_TARGET = "Select an audio item"
@@ -9448,11 +9356,17 @@ do
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = "Used once Tighten is above 0%."
+  -- Separation (see draw_separation): what letting go does, and its gestures (no right-click menu)
+  local BAR_SEP_RESPLIT = "One value for every item. Letting go splits this item's notes again."
+  local BAR_SEP_NEXT = "One value for every item. The next analysis uses it."
+  local BAR_SEP_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value.",
+    K.MOD_LABEL, K.MOD_LABEL)
 
   -- The values of the bar, in the order they are shown. key = the model's key; label = the name on the control;
   -- lo / hi / num / unit = the range and the text in display units (scale x the stored value); levels = where the
-  -- value exists: "all" (default, item, note), "note" (notes only) or "item" (default and item only); timing = it
-  -- sits on the Timing row; zero_nil = 0 is stored as "no value"; tip = what the value does to the sound.
+  -- value exists: "all" (default, item, note), "note" (notes only) or "item" (default and item only); analysis = one
+  -- value for the analysis (state[key], no level: see draw_separation); zero_nil = 0 is stored as "no value";
+  -- tip = what the value does to the sound.
   local BAR_VALUES = {
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "note", zero_nil = true,
@@ -9463,18 +9377,12 @@ do
     { id = "tol", key = "tolerance", label = "Tolerance", lo = K.LIMITS.tolerance[1], hi = K.LIMITS.tolerance[2], scale = 1,
       num = "%.0f", unit = "\xC2\xA2", levels = "all",
       tip = "Tolerance: how far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement." },
-    { id = "trans", key = "transition_ms", label = "Transition", lo = 5, hi = 60, scale = 1, num = "%.0f", unit = "ms",
-      levels = "all", timing = true,
-      tip = "Transition: how long the glide from one note to the next takes. Short sounds tight and robotic, long sounds smooth and natural." },
-    { id = "ramp", key = "onset_ramp_ms", label = "Onset Ramp", lo = 5, hi = 60, scale = 1, num = "%.0f", unit = "ms",
-      levels = "all", timing = true,
-      tip = "Onset Ramp: how quickly correction comes in at the start of a note. Short corrects the attack at once, long lets the singer's attack through first." },
-    { id = "scoop", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
-      levels = "note", timing = true,
-      tip = "Scoop Shape: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
-    { id = "legato", key = "legato_threshold_ms", label = "Legato Gap", lo = 50, hi = 300, scale = 1, num = "%.0f", unit = "ms",
-      levels = "item", timing = true,
-      tip = "Legato Gap: notes closer together than this are joined with a glide instead of treated as separate notes." },
+    { id = "slide", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
+      levels = "note",
+      tip = "Slide In: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
+    { id = "sep", key = "separation", label = "Separation", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
+      levels = "analysis",
+      tip = "Separation: how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
   }
   -- Actions: same commands as the keys
   local BAR_ACTIONS = {
@@ -9501,16 +9409,19 @@ do
     local mark_w = bar_text_w(bctx, " " .. BAR_OVERRIDE_MARK)
     for _, spec in ipairs(BAR_VALUES) do
       local hi_t = string.format(spec.num, spec.hi)
-      local widest = math.max(
-        bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit),
-        bar_text_w(bctx, spec.label .. " " .. hi_t .. BAR_RANGE_SEP .. hi_t .. spec.unit),
-        bar_text_w(bctx, spec.label .. " " .. BAR_NO_VALUE))
-      s.unit_w[spec.id] = widest + mark_w + s.pad_x
+      if spec.levels == "analysis" then
+        -- One value, never a range, a blank or a mark
+        s.unit_w[spec.id] = bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit) + s.pad_x
+      else
+        local widest = math.max(
+          bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit),
+          bar_text_w(bctx, spec.label .. " " .. hi_t .. BAR_RANGE_SEP .. hi_t .. spec.unit),
+          bar_text_w(bctx, spec.label .. " " .. BAR_NO_VALUE))
+        s.unit_w[spec.id] = widest + mark_w + s.pad_x
+      end
     end
     s.unit_w.pill = math.max(bar_text_w(bctx, BAR_PILL_NONE), bar_text_w(bctx, BAR_PILL_ONE),
       bar_text_w(bctx, string.format(BAR_PILL_MANY, 999))) + s.pad_x
-    s.unit_w.timing = bar_text_w(bctx, string.format(BAR_TIMING_FMT, " " .. BAR_OVERRIDE_MARK))
-      + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W + s.pad_x
     for _, spec in ipairs(BAR_ACTIONS) do
       s.unit_w[spec.id] = bar_text_w(bctx, spec.label) + s.pad_x
     end
@@ -9527,7 +9438,7 @@ do
       if guid ~= state.target_take_guid and data
          and not (data.overrides and data.overrides[key] ~= nil) then
         for _, note in ipairs(data.notes or {}) do
-          local own = key ~= "legato_threshold_ms" and note.controls and note.controls[key] ~= nil
+          local own = note.controls and note.controls[key] ~= nil
           if is_note_modified(note) and not own then
             state.stale_takes[guid] = true
             n = n + 1
@@ -9554,6 +9465,8 @@ do
   local bar_sel = {}
   -- The press now held on a value control: what it was aimed at when it began (see draw_value)
   local bar_gesture = { id = nil, target = nil, notes = nil, dead = false }
+  -- Separation while its control is held or typed into: the value from before the press (see draw_separation)
+  local bar_sep_before = nil
   local function bar_sel_notes()
     local n = 0
     if state.notes then
@@ -9679,7 +9592,7 @@ do
   end
 
   --- The units of this frame. `has_target` / `target_item` come from loop_body (the top bar's view of the
-  --- target); `s` from K.bar_measure. Returns draw_unit(id) for "pill", "timing", the ids of BAR_VALUES and the
+  --- target); `s` from K.bar_measure. Returns draw_unit(id) for "pill", the ids of BAR_VALUES and the
   --- ids of BAR_ACTIONS.
   K.bar_frame = function(bctx, has_target, target_item, s)
     local P = Theme.get_palette()
@@ -9833,7 +9746,7 @@ do
       end
     end
 
-    --- Put the selected notes back to inheriting the value of `spec` (Tighten, Scoop Shape: to 0), as one undo point.
+    --- Put the selected notes back to inheriting the value of `spec` (Tighten, Slide In: to 0), as one undo point.
     local function reset_notes(spec)
       state.bar_edit = nil
       local had = false
@@ -10015,41 +9928,62 @@ do
       bar_tooltip((sel_n == 0) and BAR_PILL_TIP_NONE or BAR_PILL_TIP_NOTES)
     end
 
-    --- "Timing": opens and closes the Timing row (Transition, Onset Ramp, Scoop Shape, Legato Gap). While the
-    --- row is closed, a mark says that one of its values is not the default.
-    local function draw_timing()
-      local marked = false
-      if not state.timing_open then
-        for _, spec in ipairs(BAR_VALUES) do
-          if spec.timing then
-            local view = bar_view(spec)
-            if view.level ~= "global" and not view.blank then marked = true end
-          end
-        end
+    --- Separation: one value for the analysis (state.separation), the same whatever is selected: no item or note
+    --- level, so no mark and no right-click menu. A drag only moves the value; letting go (or a typed value, or
+    --- the double-click reset to the default) saves it and splits the item's notes again, given the value from
+    --- before (K.resplit: it may ask first, and Cancel puts the value back). Usable whenever no analysis runs and
+    --- no confirmation is open: without analysed notes the next analysis uses it.
+    local function draw_separation(spec)
+      local key, id = spec.key, "bv_" .. spec.id
+      local disabled = state.is_analyzing or state.confirm ~= nil
+      if disabled and bar_sep_before ~= nil then
+        state[key] = bar_sep_before   -- a drag cut short: nothing was saved or split, so the value goes back
+        bar_sep_before = nil
       end
 
-      -- Label and icon are centred together: the label is aligned so the icon's slot fits to its right
-      local label = string.format(BAR_TIMING_FMT, marked and (" " .. BAR_OVERRIDE_MARK) or "")
-      local label_w = bar_text_w(bctx, label)
-      local slack = s.unit_w.timing - s.pad_x - label_w
-      local align_x = slack > 0 and math.max(0, math.min(1, (slack - BAR_TIMING_ICON_GAP - BAR_TIMING_ICON_W) * 0.5 / slack)) or 0.5
-      reaper.ImGui_PushStyleVar(bctx, reaper.ImGui_StyleVar_ButtonTextAlign(), align_x, 0.5)
-      local pressed = reaper.ImGui_Button(bctx, label .. "###bar_timing", s.unit_w.timing, 0)
-      reaper.ImGui_PopStyleVar(bctx)
-      do
-        local bx1, by1 = reaper.ImGui_GetItemRectMin(bctx)
-        local bx2, by2 = reaper.ImGui_GetItemRectMax(bctx)
-        K.timing_btn_x = bx1   -- the Timing row starts under its button (see draw_header)
-        local text_x = bx1 + s.pad_x * 0.5 + (bx2 - bx1 - s.pad_x - label_w) * align_x
-        local icon = state.timing_open and Theme.icons.tri_down or Theme.icons.tri_right
-        icon(reaper.ImGui_GetWindowDrawList(bctx),
-          text_x + label_w + BAR_TIMING_ICON_GAP + BAR_TIMING_ICON_W * 0.5, (by1 + by2) * 0.5, BAR_TIMING_ICON_HS, P.text)
+      reaper.ImGui_BeginDisabled(bctx, disabled)
+      reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
+      local fmt = spec.label .. " " .. spec.num .. (spec.unit:gsub("%%", "%%%%"))
+      local changed, v, committed, reset, cancelled = param_drag(bctx, id, nil, state[key] * spec.scale, spec.lo, spec.hi, fmt)
+      local back = K.drag_revert(id, state[key], cancelled)
+      local pressed, active, typed = K.drag_hot.activated, K.drag_hot.active, K.drag_hot.typed
+      reaper.ImGui_PopItemWidth(bctx)
+      reaper.ImGui_EndDisabled(bctx)
+
+      if disabled then
+        bar_tooltip(state.is_analyzing and (spec.tip .. "\n" .. BAR_REASON_ANALYZING) or spec.tip,
+          reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        return
       end
-      bar_tooltip(state.timing_open and BAR_TIMING_TIP_CLOSE or BAR_TIMING_TIP_OPEN)
-      if pressed then
-        state.timing_open = not state.timing_open
-        K.save_settings("bar")
+      local span = spec.hi - spec.lo
+      K.bar_value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
+      bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_SEP_GESTURES)
+
+      --- The edit is done: save the value and split again, once, only when it changed
+      local function commit(prev)
+        bar_sep_before = nil
+        if prev == nil or state[key] == prev then return end
+        K.save_settings("engine")
+        K.resplit(prev)
       end
+
+      if pressed then bar_sep_before = state[key] end
+      if back ~= nil then
+        state[key] = back   -- Esc during the drag: the value from before it, nothing saved or split
+        bar_sep_before = nil
+      elseif reset then
+        local prev = state[key]
+        state[key] = DEFAULTS[key]
+        commit(prev)
+      elseif changed and typed then
+        local prev = state[key]
+        state[key] = v / spec.scale
+        commit(prev)
+      else
+        if changed then state[key] = v / spec.scale end
+        if committed then commit(bar_sep_before) end
+      end
+      if not active then bar_sep_before = nil end   -- the press is over (a click that changed nothing)
     end
 
     --- The edit cursor relative to the target item's start (note times are item-relative); nil when unknown
@@ -10104,10 +10038,9 @@ do
     return function(id)
       if id == "pill" then
         draw_pill()
-      elseif id == "timing" then
-        draw_timing()
       elseif BAR_VALUE_BY_ID[id] then
-        draw_value(BAR_VALUE_BY_ID[id])
+        local spec = BAR_VALUE_BY_ID[id]
+        if spec.levels == "analysis" then draw_separation(spec) else draw_value(spec) end
       elseif BAR_ACTION_BY_ID[id] then
         draw_action(BAR_ACTION_BY_ID[id])
       end

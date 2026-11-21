@@ -524,6 +524,19 @@ test("resplit_match_tolerance", function()
   eq(lost, 1, "lost")
 end)
 
+test("no_removed_names", function()
+  local f = assert(io.open(SCRIPT, "rb"))
+  local src = f:read("a")
+  f:close()
+  for _, name in ipairs({ "transition_ms", "onset_ramp_ms", "legato_threshold_ms", "scoop_shape",
+      '"Legato Gap"', '"Onset Ramp"', '"Scoop Shape"', "timing_open" }) do
+    eq(src:find(name, 1, true), nil, name)
+  end
+  for _, name in ipairs({ '"Slide In"', '"Separation"' }) do
+    eq(src:find(name, 1, true) ~= nil, true, name)
+  end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
