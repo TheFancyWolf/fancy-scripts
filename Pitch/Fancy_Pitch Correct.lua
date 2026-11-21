@@ -1,12 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.14.0
+-- @version 2.15.0
 -- @changelog
---   Side panel: a panel button in the top bar shows and hides it (lit while it shows); the panel has its own darker surface, and hidden it leaves the whole width to the canvas
---   Timing row: now a secondary bar on a recessed band, its values under the Timing button
---   Pitch trace: dimmed over a note block and barely visible everywhere else, so the preview curve stands out; the preview is opaque and more saturated
---   Top bar values: the fill under a value uses the accent colour
---   Ruler labels keep room between them when zoomed in; the idle hint on the canvas no longer covers a note
+--   New shortcuts: B bypasses the selected notes (press again to turn bypass off); W moves the edit cursor to the start of the item, like REAPER's Go to start of project. Both are in the side panel's Shortcuts list
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -5466,6 +5462,11 @@ local function draw_graph(draw_ctx, w, h)
       K.note_action("merge")
     end
 
+    -- B: Toggle bypass on the selected notes (with none selected it says so)
+    if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_B()) then
+      K.note_action("bypass")
+    end
+
     -- Left / Right: Jump or range-extend (Shift) selection to previous / next note
     local left_plain = reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_LeftArrow(), repeat_flag)
     local left_extend = reaper.ImGui_Shortcut(draw_ctx, shift_mod | reaper.ImGui_Key_LeftArrow(), repeat_flag)
@@ -5526,6 +5527,17 @@ local function draw_graph(draw_ctx, w, h)
     end
 
     -- Space is forwarded to the user's own REAPER binding by forward_space_to_reaper() in loop_body (HC6).
+  end
+
+  -- W: edit cursor to the start of the item (as REAPER's "Go to start of project"), playback follows, and a
+  -- zoomed view scrolls back to the start. Navigation only, so it also works on a bypassed take.
+  if not state.drag and not state.edge_drag and not state.point_drag and not gesture and shortcuts_live
+    and reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_W()) then
+    local _, w_item = K.frame_target()
+    if w_item then
+      reaper.SetEditCurPos(reaper.GetMediaItemInfo_Value(w_item, "D_POSITION"), false, true)
+      set_view(item_t0, 0, vt1 - vt0)
+    end
   end
 
   -- Double-click: a pitch point back to 0, a point added on the add-square, else on the pitch zone: Snap to nearest
@@ -7036,19 +7048,19 @@ K.INFO_SECTIONS = {
     { "Click a Pitched Items row", "Switch the active item" },
     { "Select an audio item in REAPER", "Becomes the active item" },
     { "Drag the divider", "Resize Pitched Items" },
-    { "H", "Show / hide the Shortcuts list", panel = { "General", 2, "Hide this list" } },
+    { "H", "Show / hide the Shortcuts list", panel = { "General", 3, "Hide this list" } },
   } },
   { title = "Pitch & Note Editing", rows = {
     { "Drag Center Zone", string.format("Move note pitch (%s = fine adjust)", K.MOD_LABEL) },
     { "Drag Left Zone", string.format("Tighten: steady the note, slow drift first; 100%% is a flat line (%s = fine)", K.MOD_LABEL),
-      panel = { "Edit", 6, "Tighten · Tolerance", "Drag note side" } },
+      panel = { "Edit", 7, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
     { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
-    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 7, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
+    { "Shift + Drag Left Zone", "Adjust Onset Ramp", panel = { "Edit", 8, "Onset Ramp · Transition · Scoop", "Shift + Drag" } },
     { "Shift + Drag Center Zone", "Adjust Transition" },
     { "Shift + Drag Right Zone", "Adjust Scoop shape" },
-    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 8, "Trim note", "Drag edge" } },
-    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 9, "Pitch point", "Drag dot" } },
+    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 9, "Trim note", "Drag edge" } },
+    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 10, "Pitch point", "Drag dot" } },
     { "Double-click a pitch point", "Put it back to 0" },
     { "Double-click the pitch line", "Add a pitch point" },
     { "Right-click a pitch point", "Point menu: type a value, Reset, Remove" },
@@ -7063,10 +7075,11 @@ K.INFO_SECTIONS = {
     { "Drag the pitch strip", "Scroll; drag an end to zoom" },
     { "↑ / ↓", "Nudge pitch ±1 semitone", panel = { "Edit", 1, "±1 semitone" } },
     { "Shift + ↑ / ↓", "Fine-tune pitch ±10 cents", panel = { "Edit", 2, "±10 cents" } },
-    { "S / Double-Click", "Snap note to nearest semitone", panel = { "Edit", 4, "Snap to semitone", "Double-click" } },
+    { "S / Double-Click", "Snap note to nearest semitone", panel = { "Edit", 5, "Snap to semitone", "Double-click" } },
     { "Q", "Quantize selected note(s) to scale" },
+    { "B", "Bypass the selected notes (again: turn bypass off)", panel = { "Edit", 4, "Bypass note" } },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch", panel = { "Edit", 3, "Reset pitch", "R" } },
-    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset", panel = { "Edit", 5, "Note menu", "Right-click" } },
+    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset", panel = { "Edit", 6, "Note menu", "Right-click" } },
     { "Right-click a top bar value", "Item override and reset" },
     { "Double-click a value", "Reset to its default" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
@@ -7076,6 +7089,7 @@ K.INFO_SECTIONS = {
   { title = "Note Topology & REAPER Transport", rows = {
     { "X", "Split note at REAPER edit cursor" },
     { "M", "Merge 2+ contiguous selected notes" },
+    { "W", "Edit cursor to the start of the item", panel = { "General", 2, "Go to item start" } },
     { "Space", "Runs your REAPER action for Space (default Play/Stop)", panel = { "General", 1, "Play / stop" } },
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
@@ -8299,6 +8313,33 @@ K.note_action = function(id, note_idx)
   end
   if count_selected_notes() == 0 then
     set_status("Select a note first")
+    return
+  end
+  if id == "bypass" then
+    -- Toggle: when every selected note is already bypassed, turn bypass off; otherwise bypass them all
+    local notes = {}
+    for idx in pairs(state.selected_notes) do
+      local n = state.notes[idx]
+      if n and n.controls then notes[#notes + 1] = n end
+    end
+    if #notes == 0 then
+      local n = state.selected_note and state.notes[state.selected_note]
+      if n and n.controls then notes[1] = n end
+    end
+    if #notes == 0 then
+      set_status("Select a note first")
+      return
+    end
+    local all_bypassed = true
+    for _, n in ipairs(notes) do
+      if not n.controls.bypassed then all_bypassed = false break end
+    end
+    local new_bp = not all_bypassed
+    for _, n in ipairs(notes) do n.controls.bypassed = new_bp end
+    if apply_envelope_to_take(new_bp and "Bypass Notes" or "Unbypass Notes") then
+      set_status(string.format("%s %d %s.%s", new_bp and "Bypassed" or "Turned bypass off on",
+        #notes, plural(#notes, "note", "notes"), undo_hint))
+    end
     return
   end
   if id == "snap" then
