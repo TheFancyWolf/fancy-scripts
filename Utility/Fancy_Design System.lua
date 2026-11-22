@@ -1,8 +1,9 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.4.1
+-- @version 1.5.0
 -- @changelog
---   + Icons: panel_right (side panel toggle)
+--   + Icons: snap, quantize, cursor_to_note, split, merge (note editing)
+--   + Canvas: gutter_bg_dim (the out-of-scale cell of the note-name column)
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -231,8 +232,8 @@ local CANVAS_GROUPS = {
     "row", "row_black", "row_tonic", "row_dim", "row_dim_black", "row_plain", "row_plain_black" } },
   { "Row tints & grid", "accent tints over the in-scale and root rows, and the lines between rows", {
     "row_tint", "row_tonic_tint", "grid", "grid_tonic", "grid_dim", "grid_plain", "grid_plain_black" } },
-  { "Note-name column", "the flat strip left of the rows: labels >= 4.5:1, the root row's strip >= 3:1", {
-    "gutter_bg", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "gutter_strip" } },
+  { "Note-name column", "the flat strip left of the rows: labels >= 4.5:1 (out-of-scale names 3:1 on their darker cell), the root row's strip >= 3:1", {
+    "gutter_bg", "gutter_bg_dim", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "gutter_strip" } },
   { "Piano keys", "fixed in both theme modes (a piano does not follow the REAPER theme); the root strip follows the accent", {
     "key_white", "key_black", "key_plain_black", "key_tonic_white", "key_tonic_black",
     "key_dim_white", "key_dim_black", "key_outline", "key_tonic_strip" } },
@@ -572,6 +573,11 @@ local function draw_icons_section()
     { "check",    Theme.icons.check },
     { "dot",      Theme.icons.dot },
     { "ring",     Theme.icons.ring },
+    { "snap",     Theme.icons.snap },
+    { "quantize", Theme.icons.quantize },
+    { "cursor_to_note", Theme.icons.cursor_to_note },
+    { "split",    Theme.icons.split },
+    { "merge",    Theme.icons.merge },
   }
 
   -- Three size tiers deriving from icon presets

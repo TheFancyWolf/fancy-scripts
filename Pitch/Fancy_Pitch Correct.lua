@@ -1,12 +1,17 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.16.0
+-- @version 2.17.0
 -- @changelog
---   Joins between notes are now automatic: the correction blends across the slide you actually sang, with a short fixed fade into and out of silence. Transition, Onset Ramp, Legato Gap and the Timing button are gone
---   Scoop Shape is now Slide In: it flattens the slide into a note up to where the note really settles, and at 100% removes the slide completely. Shift + drag on a note adjusts it; it is also in the top bar and the note menu
---   New Separation value in the top bar (0-100%, default 50%): how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up. Changing it re-splits the item at once as one undo step; notes whose start and end did not move keep their edits, and it asks first if an edited note would lose them
---   Better note splitting: notes joined by a slide and repeated notes on the same pitch now come out as separate notes; vibrato and short pitch-detection dropouts no longer cut a held note
---   Items analysed with an earlier version need Re-Analyze; stored Transition, Onset Ramp, Legato Gap and Scoop values are not carried over
+--   Snap, Quantize, Split and Merge are now a small bar of icon buttons right under the selected note (above it at the bottom of the view); drag its grip to move it out of the way, double-click the grip to put it back; the four buttons are gone from the top bar. The S / Q / X / M keys and the note menu work as before. Its size is in Settings (Small, Medium, Large; Medium by default)
+--   The bar starts with the selected note's name and cents in place of its separate label (or the count of selected notes), at a fixed width so the buttons never move
+--   C (and a Cursor button on the bar) moves the edit cursor to the middle of the selected note; hold C and turn the wheel to move the edit cursor (Cmd/Ctrl = finer)
+--   The key's root row is no longer tinted: its name in the note column keeps the accent colour and strip
+--   Out-of-key note names sit on a darker cell in a dimmer grey, like their rows
+--   Q, X and M are now in the Shortcuts list
+--   Undo or redo of a Separation change now puts the Separation value back too
+--   A bypassed note next to an edited note is no longer corrected at its start or end: the blend stays on the edited note
+--   Shift + drag for Slide In fine-adjusts with Cmd/Ctrl, like Tighten and Tolerance
+--   Slide In on a note with no slide into it says there is nothing to flatten
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -186,6 +191,7 @@ local DEFAULTS = {
   retune_speed = 1.0,        -- 0.0–1.0 (correction strength)
   tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
   separation = 0.5,          -- 0–1 how readily the analysis splits notes (see K.separation_params)
+  note_bar_size = 2,         -- Settings > Appearance: the note action bar's size, an index into K.NOTE_BAR_SIZES (Medium)
 }
 -- Analysis engine (Settings > Advanced DSP): the values of the default presets, so a preset table and its default pick
 -- can never drift apart
@@ -213,6 +219,9 @@ local PARAM_LABELS = {
 local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
+
+  -- The note action bar's grip offset is kept within this many pixels of its place under the note
+  NOTE_BAR_OFFSET_MAX = 2000,
 
   -- The most Slide In may move one slide frame, in semitones (see K.correction_build)
   SCOOP_MAX_ST = 3.0,
@@ -406,6 +415,7 @@ local state = {
   view_p0 = nil,        -- visible pitch range of the canvas, semitones (MIDI note numbers); nil = fitted to the notes
   view_p1 = nil,        -- (both nil or both set; same lifetime as view_t0 / view_t1, see K.reset_view)
   view_drag = nil,      -- a drag on the overview strip or the pitch strip: { kind ("t_pan" / "t0" / "t1" / "p_pan" / "p0" / "p1"), start (pointer x or y), a0, a1 (the window when it began) }
+  note_bar_rect = nil,  -- { x1, y1, x2, y2 }: where the note action bar was drawn last frame (K.draw_note_bar); nil = not drawn
 
   -- Visualization toggles
   show_note_blocks = true,
@@ -413,6 +423,10 @@ local state = {
   show_smart_spots = true,
   show_split_points = false,
   show_preview = true,
+  note_bar_size = DEFAULTS.note_bar_size,   -- Settings > Appearance: Small / Medium / Large (K.NOTE_BAR_SIZES)
+  note_bar_dx = 0,      -- the note action bar's offset from its place under the note, pixels (its grip; saved)
+  note_bar_dy = 0,
+  note_bar_grip = nil,  -- { mx, my, dx, dy, above } while the grip is dragged
 
   -- Target item binding (persistent GUID lock)
   target_take_guid = nil,
@@ -637,6 +651,12 @@ K.PERSIST = (function()
   flag("layers", "pitch_show_preview", state, "show_preview")
   flag("layers", "pitch_show_smart_spots", state, "show_smart_spots")
   flag("layers", "pitch_show_split_points", state, "show_split_points")
+
+  -- Appearance: the note action bar's size, saved when the Settings combo changes
+  choice("appearance", "pitch_note_bar_size", state, "note_bar_size", { 1, 2, 3 })
+  -- ... and its offset from its place under the note, saved when a drag of its grip ends or it is double-clicked
+  number("appearance", "pitch_note_bar_dx", state, "note_bar_dx", { -K.NOTE_BAR_OFFSET_MAX, K.NOTE_BAR_OFFSET_MAX }, "%.0f")
+  number("appearance", "pitch_note_bar_dy", state, "note_bar_dy", { -K.NOTE_BAR_OFFSET_MAX, K.NOTE_BAR_OFFSET_MAX }, "%.0f")
 
   -- The note tone while a note is dragged, saved when the More menu item is toggled
   flag("tone", "pitch_note_tone", state, "note_tone")
@@ -965,6 +985,17 @@ local function midi_to_name(midi)
   local octave = math.floor(midi / 12) - 1
   return NOTE_NAMES[note_idx] .. octave
 end
+
+--- The name and cents deviation of a note at centre pitch `cp` (MIDI, fractional): "A3", "+3\xC2\xA2". The label
+--- pill and the note action bar's readout both show them.
+K.note_name_cents = function(cp)
+  local nearest = math.floor(cp + 0.5)
+  local cents = math.floor((cp - nearest) * 100 + 0.5)
+  return midi_to_name(nearest), string.format("%s%d\xC2\xA2", cents >= 0 and "+" or "", cents)
+end
+
+K.SCRUB_PX = 6     -- hold C + wheel: the edit cursor moves this many pixels of the current view per notch
+K.SCRUB_FINE = 5   -- ... and this many times less with Ctrl/Cmd held (HC2)
 
 K.LEVEL_WINDOW_S = 0.010   -- the shortest short-level window
 K.LEVEL_PERIODS = 2        -- a voiced frame's window spans at least this many periods of its pitch
@@ -2020,6 +2051,7 @@ local function save_take_data(take, data)
     notes = {},
     key_idx = data.key_idx or state.key_idx,
     scale_idx = data.scale_idx or state.scale_idx,
+    separation = data.separation,   -- the Separation the notes were split at (see K.follow_resplit_undo)
     overrides = data.overrides or nil
   }
   if data.notes then
@@ -2299,7 +2331,10 @@ local function sync_with_project()
         local is_active = (guid == state.target_take_guid)
         if data then
           state.session_takes[guid] = data
-          if is_active then adopt_take_data(guid, data) end
+          if is_active then
+            adopt_take_data(guid, data)
+            K.follow_resplit_undo(data)
+          end
           i = i + 1
         elseif raw == "" then
           -- The analysis was undone away: the take has no pitch data any more
@@ -2458,8 +2493,9 @@ K.correction_build = function(notes, item_len)
     all_points[#all_points + 1] = { time = math.max(0.0, math.min(item_len, t)), val = val }
   end
   -- Corrected (edited and not bypassed): such a note writes its own points and takes part in its joins
+  local function bypassed(n) return n.controls ~= nil and n.controls.bypassed == true end
   local function active(n)
-    return n ~= nil and not (n.controls and n.controls.bypassed) and is_note_modified(n)
+    return n ~= nil and not bypassed(n) and is_note_modified(n)
   end
   -- The note's shift at time t: its frame shifts joined by straight lines, the first / last one before / after them
   local function shift_at(n, t)
@@ -2509,6 +2545,15 @@ K.correction_build = function(notes, item_len)
       end
       s0 = math.max(0.0, bnd - left, na.end_time - J.MAX_PART * (na.end_time - na.start_time))
       s1 = math.min(item_len, bnd + right, nb.start_time + J.MAX_PART * (nb.end_time - nb.start_time))
+      -- A bypassed note is not corrected: the blend stays on the edited side and ends (or starts) at the boundary,
+      -- MIN_S long at least
+      if bypassed(nb) then
+        s1 = bnd
+        s0 = math.max(0.0, na.start_time, math.min(s0, bnd - J.MIN_S))
+      elseif bypassed(na) then
+        s0 = bnd
+        s1 = math.min(item_len, nb.end_time, math.max(s1, bnd + J.MIN_S))
+      end
       joins[i] = { t0 = s0, t1 = math.max(s0, s1) }
     end
   end
@@ -3390,7 +3435,7 @@ K.segment = function(results, sep)
   local function gt(x, y) return x > y end
 
   local hop = K.frame_step(results)
-  if not (hop > 0) then return notes, split_points end
+  if not (hop > 0) then return notes, split_points end   -- luacheck: ignore 581 (also catches NaN)
   local half_w = math.max(1, math.floor(SEG.MEDIAN_S / hop / 2 + 0.5))   -- median window 2*half_w + 1 frames
 
   -- 1. Levels in dB; a frame is voiced when it has a pitch and is not silent relative to the item's loud level
@@ -3589,7 +3634,7 @@ K.segment = function(results, sep)
       segs[#segs + 1] = seg
     end
     rn.pf = {}   -- filtered pitch by result index, for the merge below
-    for q = 1, m do rn.pf[idx[q]] = pf[q] end
+    for x = 1, m do rn.pf[idx[x]] = pf[x] end
   end
 
   -- 6. A segment shorter than min_note_s joins the touching neighbour closer in pitch, or is dropped without one.
@@ -3808,7 +3853,8 @@ local function process_analysis_step()
         results = state.results,
         notes = state.notes,
         key_idx = state.key_idx,
-        scale_idx = state.scale_idx
+        scale_idx = state.scale_idx,
+        separation = state.separation,
       }
       state.session_takes[state.target_take_guid] = take_data
 
@@ -4477,7 +4523,7 @@ K.ZONE_CONTROLS = {
   },
 }
 do
-  local slide_in = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, hint = "slide_in",
+  local slide_in = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, fine = true, hint = "slide_in",
                      read = "Slide In: %.0f%%", hover = "Slide In: %.0f%% (Shift+Drag)", undo = "Adjust Slide In" }
   for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
 end
@@ -4749,6 +4795,196 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   return drawn
 end
 
+-------------------------------------------------------------------------------
+-- NOTE ACTION BAR (Snap, Quantize, Cursor, Split, Merge, under the selected note)
+-------------------------------------------------------------------------------
+
+--- The note action bar's anchor this frame (state.draw_cache.map is the mapping): the block of note `idx` as
+--- { x = the middle of its visible part, top, bot } in pixels, or nil when the block is not in view (outside the
+--- visible window, or not wholly between the ruler, ruler_h tall, and the bottom of the note area).
+K.note_bar_anchor = function(idx, ruler_h)
+  local m = state.draw_cache.map
+  if not (m.w and m.h and m.range and m.vt1 and m.vt1 > m.vt0 and m.range > 0) then return nil end
+  local note = state.notes and state.notes[idx]
+  local cp = note and note.controls and note.controls.center_pitch
+  if not cp or note.end_time <= m.vt0 or note.start_time >= m.vt1 then return nil end
+  local function p_to_y(p) return m.py + m.h - ((p - m.min) / m.range) * m.h end
+  local top, bot = p_to_y(cp + 0.5), p_to_y(cp - 0.5)
+  if top < m.py + ruler_h or bot > m.py + m.h then return nil end
+  local mid_t = (math.max(note.start_time, m.vt0) + math.min(note.end_time, m.vt1)) * 0.5
+  local x = m.px + (mid_t - m.vt0) / (m.vt1 - m.vt0) * m.w
+  return { x = x, top = top, bot = bot }
+end
+
+--- Top-left corner of the note action bar (bar_w x bar_h) for the anchor `a` (K.note_bar_anchor) and the user's
+--- offset dx, dy: below the block with L.sm to spare, centred on it, moved by the offset. When that runs past
+--- the bottom of the note area, above the block instead (the vertical offset mirrored); then kept inside the note
+--- area, under the ruler (ruler_h) and L.xs from the sides. Also returns whether it went above.
+K.note_bar_pos = function(a, bar_w, bar_h, ruler_h, dx, dy)
+  local m = state.draw_cache.map
+  local L = Theme.layout
+  local y, above = a.bot + L.sm + dy, false
+  if y + bar_h > m.py + m.h then y, above = a.top - L.sm - bar_h - dy, true end
+  y = math.max(m.py + ruler_h, math.min(y, m.py + m.h - bar_h))
+  local x = math.max(m.px + L.xs, math.min(a.x - bar_w * 0.5 + dx, m.px + m.w - L.xs - bar_w))
+  return math.floor(x + 0.5), math.floor(y + 0.5), above
+end
+
+--- Draw the note action bar: a grip, the selection readout and K.NOTE_ACTIONS as icon buttons on a panel under the
+--- primary selected note (placement: K.note_bar_anchor, K.note_bar_pos, moved by the grip's saved offset). Hidden
+--- while notes, edges, Slide In or pitch points are dragged, during a box-select or a drag on a strip, while any popup
+--- or modal is open, during an analysis, and when the anchor note is not in view; the caller leaves it out on a
+--- bypassed take. has_target / target_item = the canvas's target. A disabled button shows its reason in the tooltip.
+--- Returns true when it was drawn (it moved the layout cursor into the canvas).
+-- The note action bar's sizes (Settings > Appearance): the icon drawn in each button, from the layout scale. Small is
+-- the smallest that still reads (24 px buttons); Medium (the default) is 32 px and Large 40 px.
+K.NOTE_BAR_SIZES = { "Small", "Medium", "Large" }
+K.note_bar_icon_size = function()
+  local L = Theme.layout
+  local sizes = { L.xl, L.xxl, L.xxl + L.md }
+  return sizes[state.note_bar_size] or sizes[DEFAULTS.note_bar_size]
+end
+
+--- True while the note action bar stays hidden whatever is selected (a drag, a box-select, a popup, an analysis).
+K.note_bar_hidden = function(dctx)
+  return state.is_analyzing or not state.notes or state.drag or state.edge_drag or state.point_drag
+    or state.marquee or state.view_drag
+    or reaper.ImGui_IsPopupOpen(dctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
+end
+
+--- Widths of the readout's two columns: the widest note name (every name, octaves -1 to 9) and the widest cents
+--- value (-50 to +50), in the current font. A fixed slot, so the buttons never move as the value changes.
+K.note_readout_widths = function(dctx)
+  local key = reaper.ImGui_GetFontSize(dctx)
+  local cache = K.readout_w_cache
+  if cache and cache.key == key then return cache.name_w, cache.cents_w end
+  local name_w, cents_w = 0, 0
+  for midi = 0, 131 do
+    name_w = math.max(name_w, (reaper.ImGui_CalcTextSize(dctx, midi_to_name(midi))))
+  end
+  for c = -50, 50 do
+    local _, txt = K.note_name_cents(60 + c / 100)
+    cents_w = math.max(cents_w, (reaper.ImGui_CalcTextSize(dctx, txt)))
+  end
+  K.readout_w_cache = { key = key, name_w = name_w, cents_w = cents_w }
+  return name_w, cents_w
+end
+
+K.draw_note_bar = function(dctx, draw_list, ruler_h, has_target, target_item)
+  if K.note_bar_hidden(dctx) then return false end
+  local selected = {}
+  for idx in pairs(state.selected_notes) do
+    if state.notes[idx] then selected[#selected + 1] = idx end
+  end
+  if #selected == 0 and state.selected_note and state.notes[state.selected_note] then
+    selected[1] = state.selected_note
+  end
+  if #selected == 0 then return false end
+  -- Anchored on the primary note (the one clicked last); else on the first selected note in view
+  local anchor = state.selected_notes[state.selected_note] and K.note_bar_anchor(state.selected_note, ruler_h)
+  if not anchor then
+    table.sort(selected)
+    for _, idx in ipairs(selected) do
+      anchor = K.note_bar_anchor(idx, ruler_h)
+      if anchor then break end
+    end
+  end
+  if not anchor then return false end
+
+  local L = Theme.layout
+  local P = Theme.get_palette()
+  local preset = L.icon_md
+  local icon_size = K.note_bar_icon_size()     -- Settings > Appearance; even Small is larger than the preset's icon
+  local btn = icon_size + preset.pad * 2       -- Theme.icon_btn sizes the button from the icon (Small 24 px: MT1's target)
+  local n = #K.NOTE_ACTIONS
+  -- The readout: one note's name and cents, or the count of the selection (each note keeps its pill then)
+  local name_txt, cents_txt
+  local one = #selected == 1 and state.notes[selected[1]].controls
+  if one then
+    name_txt, cents_txt = K.note_name_cents(one.center_pitch)
+  elseif #selected == 1 then
+    name_txt, cents_txt = "", ""
+  else
+    name_txt, cents_txt = string.format("%d notes", #selected), ""
+  end
+  local name_w, cents_w = K.note_readout_widths(dctx)
+  local slot_w = math.max(name_w + L.sm + cents_w, (reaper.ImGui_CalcTextSize(dctx, name_txt)))
+  local grip_w = math.floor(btn * 0.5)            -- the grip grows with the bar size: half a button wide
+  local grip_seg = L.xs + grip_w + L.xs          -- the grip's own segment, closed by a full-height line
+  local text_x0 = grip_seg + L.md                -- then the readout
+  local lead_w = text_x0 + slot_w + L.md         -- ... then the divider before the buttons
+  local bar_w = lead_w + L.sm + n * btn + (n - 1) * L.sm + L.xs
+  local bar_h = btn + L.xs * 2
+  local x, y, above = K.note_bar_pos(anchor, bar_w, bar_h, ruler_h, state.note_bar_dx, state.note_bar_dy)
+  reaper.ImGui_DrawList_AddRectFilled(draw_list, x, y, x + bar_w, y + bar_h, P.panel, L.rounding)
+  reaper.ImGui_DrawList_AddRect(draw_list, x, y, x + bar_w, y + bar_h, P.border, L.rounding, 0, L.border)
+  local _, text_h = reaper.ImGui_CalcTextSize(dctx, name_txt)
+  local text_y = math.floor(y + (bar_h - text_h) * 0.5 + 0.5)
+  reaper.ImGui_DrawList_AddText(draw_list, x + text_x0, text_y, P.text, name_txt)
+  if cents_txt ~= "" then
+    local cw = reaper.ImGui_CalcTextSize(dctx, cents_txt)
+    reaper.ImGui_DrawList_AddText(draw_list, x + text_x0 + slot_w - cw, text_y, P.text, cents_txt)
+  end
+
+  -- The grip: drag moves the bar (one offset for every note, saved on release); double-click puts it back
+  -- (the whole segment, full height, is the handle)
+  reaper.ImGui_SetCursorScreenPos(dctx, x, y)
+  reaper.ImGui_InvisibleButton(dctx, "##note_bar_grip", grip_seg, bar_h)
+  local grip_hot = reaper.ImGui_IsItemHovered(dctx) or reaper.ImGui_IsItemActive(dctx)
+  if grip_hot then
+    reaper.ImGui_DrawList_AddRectFilled(draw_list, x + L.border, y + L.border, x + grip_seg, y + bar_h - L.border,
+      reaper.ImGui_IsItemActive(dctx) and P.btn_a or P.btn_h, L.rounding, reaper.ImGui_DrawFlags_RoundCornersLeft())
+  end
+  reaper.ImGui_DrawList_AddLine(draw_list, x + grip_seg, y, x + grip_seg, y + bar_h, P.border, L.border)
+  if grip_hot then reaper.ImGui_SetMouseCursor(dctx, reaper.ImGui_MouseCursor_ResizeAll()) end
+  local gmx, gmy = reaper.ImGui_GetMousePos(dctx)
+  if reaper.ImGui_IsItemHovered(dctx) and reaper.ImGui_IsMouseDoubleClicked(dctx, 0) then
+    state.note_bar_dx, state.note_bar_dy, state.note_bar_grip = 0, 0, nil
+    K.save_settings("appearance")
+  elseif reaper.ImGui_IsItemActivated(dctx) then
+    state.note_bar_grip = { mx = gmx, my = gmy, dx = state.note_bar_dx, dy = state.note_bar_dy, above = above }
+  elseif reaper.ImGui_IsItemActive(dctx) and state.note_bar_grip then
+    local g, lim = state.note_bar_grip, K.NOTE_BAR_OFFSET_MAX
+    state.note_bar_dx = math.max(-lim, math.min(lim, g.dx + gmx - g.mx))
+    state.note_bar_dy = math.max(-lim, math.min(lim, g.dy + (g.above and -1 or 1) * (gmy - g.my)))
+  end
+  if reaper.ImGui_IsItemDeactivated(dctx) and state.note_bar_grip then
+    state.note_bar_grip = nil
+    K.save_settings("appearance")
+  end
+  if reaper.ImGui_IsItemHovered(dctx, reaper.ImGui_HoveredFlags_ForTooltip()) and not reaper.ImGui_IsItemActive(dctx) then
+    Theme.tooltip(dctx, "Drag to move the bar\nDouble-click: back under the note")
+  end
+  local dot_col = grip_hot and P.text or P.text_dim
+  local dot_r, dot_gap = btn / 22, btn / 5        -- 2 x 3 dots, in proportion to the button
+  local dcx, dcy = x + grip_seg * 0.5, y + bar_h * 0.5
+  for row = -1, 1 do
+    for col = -1, 1, 2 do
+      reaper.ImGui_DrawList_AddCircleFilled(draw_list, dcx + col * dot_gap * 0.5, dcy + row * dot_gap, dot_r, dot_col)
+    end
+  end
+  local div_x = x + lead_w
+  reaper.ImGui_DrawList_AddLine(draw_list, div_x, y + L.xs, div_x, y + bar_h - L.xs, P.border, L.border)
+
+  local reason_of, sel_idx = K.note_actions_frame(has_target, target_item)
+  local tip_flags = reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()
+  reaper.ImGui_SetCursorScreenPos(dctx, div_x + L.sm, y + L.xs)
+  for i, spec in ipairs(K.NOTE_ACTIONS) do
+    if i > 1 then reaper.ImGui_SameLine(dctx, 0, L.sm) end
+    local reason = reason_of(spec.id)
+    reaper.ImGui_BeginDisabled(dctx, reason ~= nil)
+    local clicked = Theme.icon_btn(dctx, "##note_bar_" .. spec.id, Theme.icons[spec.icon or spec.id],
+      { preset = preset, icon_size = icon_size, color = reason and P.text_dim or nil })
+    reaper.ImGui_EndDisabled(dctx)
+    if reaper.ImGui_IsItemHovered(dctx, tip_flags) and not reaper.ImGui_IsItemActive(dctx) then
+      Theme.tooltip(dctx, reason and (spec.tip .. "\n" .. reason) or spec.tip)
+    end
+    if clicked and not reason then K.note_action(spec.id, sel_idx) end
+  end
+  state.note_bar_rect = { x, y, x + bar_w, y + bar_h }
+  return true
+end
+
 local function draw_graph(draw_ctx, w, h)
   local draw_list = reaper.ImGui_GetWindowDrawList(draw_ctx)
   local px, py = reaper.ImGui_GetCursorScreenPos(draw_ctx)
@@ -4757,11 +4993,25 @@ local function draw_graph(draw_ctx, w, h)
   local C = P.canvas   -- the canvas colours (Theme section 4A): rows, keys, notes, curves, pills; they follow the theme mode
 
   -- Claim canvas space and enable mouse interaction. A Button submitted later on top of it (the empty-state and
-  -- BYPASSED actions) takes the hover where it sits, so the canvas allows itself to be overlapped.
+  -- BYPASSED actions, the note action bar) takes the hover where it sits, so the canvas allows itself to be overlapped.
   reaper.ImGui_SetNextItemAllowOverlap(draw_ctx)
   reaper.ImGui_InvisibleButton(draw_ctx, "##pitch_canvas", w, h)
   local is_canvas_hovered = reaper.ImGui_IsItemHovered(draw_ctx)
   local canvas_tip_ready = reaper.ImGui_IsItemHovered(draw_ctx, reaper.ImGui_HoveredFlags_ForTooltip())   -- the hover hint waits like every tooltip
+  -- The note action bar owns the pointer where it was drawn: the overlap above hands the hover over only from the
+  -- frame after the pointer reaches a button, so on that first frame a click would also reach the canvas (deselect,
+  -- marquee, edit cursor). Every canvas gesture below is gated on is_canvas_hovered. The bar records itself again
+  -- when it is drawn this frame.
+  do
+    local bar = state.note_bar_rect
+    state.note_bar_rect = nil
+    if bar and is_canvas_hovered then
+      local bmx, bmy = reaper.ImGui_GetMousePos(draw_ctx)
+      if bmx >= bar[1] and bmx < bar[3] and bmy >= bar[2] and bmy < bar[4] then
+        is_canvas_hovered, canvas_tip_ready = false, false
+      end
+    end
+  end
 
   -- Draw background
   reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + h, P.bg)
@@ -5008,7 +5258,18 @@ local function draw_graph(draw_ctx, w, h)
     local wheel_mods = reaper.ImGui_GetKeyMods(draw_ctx) or 0
     if wheel_x == 0 and (wheel_mods & reaper.ImGui_Mod_Shift()) ~= 0 then wheel_y, wheel_x = 0, wheel_y end
     local notches = wheel_y ~= 0 and wheel_y or wheel_x   -- the zooms take either axis
-    if notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then
+    local _, scrub_item = K.frame_target()
+    if notches ~= 0 and scrub_item and reaper.ImGui_IsKeyDown(draw_ctx, reaper.ImGui_Key_C())
+       and not reaper.ImGui_IsAnyItemActive(draw_ctx) then
+      -- Hold C + wheel: move the edit cursor (wheel up = later) by K.SCRUB_PX of the view per notch, Ctrl/Cmd =
+      -- a fifth of that; kept inside the item, and playback follows as on the ruler
+      local step = K.SCRUB_PX * span / math.max(w, 1)
+      if (wheel_mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then step = step / K.SCRUB_FINE end
+      local item_pos = reaper.GetMediaItemInfo_Value(scrub_item, "D_POSITION")
+      local t = reaper.GetCursorPosition() - item_pos + notches * step
+      t = math.max(item_t0, math.min(t, item_t0 + duration))
+      reaper.SetEditCurPos(item_pos + t, false, true)
+    elseif notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then
       local frac = math.max(0, math.min(1, (mx - px) / math.max(w, 1)))
       set_view(x_to_t(px + frac * w), frac, span / K.ZOOM_STEP ^ notches)
     elseif notches ~= 0 and (wheel_mods & reaper.ImGui_Mod_Alt()) ~= 0 then
@@ -5132,14 +5393,20 @@ local function draw_graph(draw_ctx, w, h)
   -- Text on a small panel-coloured pill (C.pill_bg), so it stays readable over any canvas surface (HC1): the text tokens
   -- (C.pill_text, C.marquee_text) are fitted to >= 4.5:1 on the pill over every row and every note fill. The pill
   -- is kept inside the note area (below the ruler); with flip_dx it moves to the left of x when it would run past the right edge.
-  local function pill_text(x, y, text, col, flip_dx)
+  -- `big`: the drag readout's pill, in the large font with more padding, centred on y.
+  local function pill_text(x, y, text, col, flip_dx, big)
+    local pushed = big and Theme.push_font(draw_ctx, fonts.large)
     local tw, th = reaper.ImGui_CalcTextSize(draw_ctx, text)
-    local pill_w, pill_h = tw + L.sm * 2, th + L.xs * 2
+    local pad_x, pad_y = L.sm, L.xs
+    if big then pad_x, pad_y = L.md, L.sm end
+    local pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
+    if big then y = y - pill_h * 0.5 end
     if flip_dx and x + pill_w > px + w then x = x - pill_w - flip_dx end
     x = math.max(px, math.min(x, px + w - pill_w))
     y = math.max(py + ruler_h, math.min(y, py + h - pill_h))
     reaper.ImGui_DrawList_AddRectFilled(draw_list, x, y, x + pill_w, y + pill_h, C.pill_bg, L.rounding)
-    reaper.ImGui_DrawList_AddText(draw_list, x + L.sm, y + L.xs, col, text)
+    reaper.ImGui_DrawList_AddText(draw_list, x + pad_x, y + pad_y, col, text)
+    Theme.pop_font(draw_ctx, pushed)
   end
 
   --- True when `text` on a pill fits `room` pixels: the pill pill_text draws, plus the offset the zone labels start at.
@@ -5769,7 +6036,7 @@ local function draw_graph(draw_ctx, w, h)
         nudge_selected_notes(-0.10, "down")
       end
 
-      -- S: Snap to nearest semitone (the status line reports it, as for the top bar's Snap button)
+      -- S: Snap to nearest semitone (the status line reports it, as for the note action bar's Snap button)
       if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_S()) then
         K.note_action("snap")
       end
@@ -5790,6 +6057,12 @@ local function draw_graph(draw_ctx, w, h)
       if sel and reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_X()) then
         K.note_action("split", state.selected_note)
       end
+    end
+
+    -- C: Edit cursor to the middle of the primary selected note (with none selected it says so). Held, the wheel
+    -- moves the edit cursor (see the canvas's wheel handling).
+    if reaper.ImGui_Shortcut(draw_ctx, reaper.ImGui_Key_C()) then
+      K.note_action("cursor")
     end
 
     -- M: Merge selected notes (requires 2+ contiguous selected; with fewer it says so)
@@ -5956,7 +6229,6 @@ local function draw_graph(draw_ctx, w, h)
                           or n % 12 == 8 or n % 12 == 10)
     local pc = (n % 12 + 12) % 12
     local in_scale = is_pitch_in_scale(pc)
-    local is_root = (pc == root_pc)
 
     local row_bg
     local row_tint = nil
@@ -5966,17 +6238,10 @@ local function draw_graph(draw_ctx, w, h)
       row_bg = is_black_key and C.row_plain_black or C.row_plain
       grid_color = is_black_key and C.grid_plain_black or C.grid_plain
     elseif in_scale then
-      if is_root then
-        -- Tonic/Root note row: subtle theme accent tint
-        row_bg = C.row_tonic
-        row_tint = C.row_tonic_tint
-        grid_color = C.grid_tonic
-      else
-        -- In-scale note row: subtle theme tinting
-        row_bg = is_black_key and C.row_black or C.row
-        row_tint = C.row_tint
-        grid_color = C.grid
-      end
+      -- In-scale note row (the root too: only its name in the note column is marked, a tinted row got in the way)
+      row_bg = is_black_key and C.row_black or C.row
+      row_tint = C.row_tint
+      grid_color = C.grid
     else
       -- Out-of-scale note row: dimmed
       row_bg = is_black_key and C.row_dim_black or C.row_dim
@@ -6178,12 +6443,12 @@ local function draw_graph(draw_ctx, w, h)
         local held = state.drag and state.drag.dirty and state.drag.zone == "pitch"
           and state.drag.note_idx == n_idx
         if not held and (is_hov or n_idx == state.selected_note or (is_selected and label_all_selected)) then
-          local nearest = math.floor(cp + 0.5)
-          local cents = math.floor((cp - nearest) * 100 + 0.5)
-          local sign = cents >= 0 and "+" or ""
+          local name, cents = K.note_name_cents(cp)
           labels[#labels + 1] = {
             x = math.max(sx, px), top = top_y, bot = bot_y,
-            text = string.format("%s %s%d\xC2\xA2", midi_to_name(nearest), sign, cents),
+            text = name .. " " .. cents,
+            -- the one selected note: the note action bar's readout shows its name and cents instead of the pill
+            fold = (selected_n == 1 and is_selected) or (selected_n == 0 and n_idx == state.selected_note),
           }
         end
       end
@@ -6215,7 +6480,8 @@ local function draw_graph(draw_ctx, w, h)
       local marks = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
       if hint.dragging and marks == 0 and not hint.said then
         hint.said = true
-        set_status(hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first"
+        set_status((hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first")
+          or (hint.key == "slide_in" and "Nothing to flatten: no edited note in view slides into its pitch")
           or "No edited note in view uses this value")
       end
     end
@@ -6299,10 +6565,13 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   do
     local pill_h = line_h + L.xs * 2
+    local bar_shows = not is_bypassed and not K.note_bar_hidden(draw_ctx)
     for _, lb in ipairs(labels) do
+      if lb.fold and bar_shows then goto next_label end
       local y = lb.top - pill_h - L.xs
       if y < py + ruler_h then y = lb.bot + L.xs end
       pill_text(lb.x, y, lb.text, C.pill_text)
+      ::next_label::
     end
   end
 
@@ -6394,8 +6663,9 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   ---------------------------------------------------------------------------
-  -- DRAG READOUT (a pill on the canvas) and HOVER HINT (a tooltip)
+  -- DRAG READOUT (a pill on the canvas, drawn after the playhead so it sits in front of it) and HOVER HINT (a tooltip)
   ---------------------------------------------------------------------------
+  local drag_tip = nil
   if state.point_drag and state.point_drag.dirty then
     -- The point's own offset in whole cents, then the pitch the note aims for there (the note readout's format)
     local pd = state.point_drag
@@ -6407,7 +6677,7 @@ local function draw_graph(draw_ctx, w, h)
       local cents = math.floor((aim - nearest) * 100 + 0.5)
       local tip = string.format("%+d\xC2\xA2 \xC2\xB7 %s %s%d\xC2\xA2", math.floor((knot and knot.st or 0) * 100 + 0.5),
         midi_to_name(nearest), cents >= 0 and "+" or "", cents)
-      pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
+      drag_tip = tip
     end
   elseif state.drag and state.drag.dirty then
     local d_note = state.notes[state.drag.note_idx]
@@ -6428,8 +6698,7 @@ local function draw_graph(draw_ctx, w, h)
         tip = string.format("%s %s%d\xC2\xA2%s",
           midi_to_name(nearest), sign, cents, count_suffix)
       end
-      -- Beside the pointer, never outside the note area (nor over the note-name column or the ruler)
-      pill_text(mx + L.xl, my - line_h * 0.5, tip, C.pill_text, L.xl * 2)
+      drag_tip = tip
     end
   elseif canvas_tip_ready and state.hovered_point and not state.drag and not state.marquee and not state.point_drag then
     Theme.tooltip(draw_ctx, string.format(
@@ -6475,6 +6744,9 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
+  -- The drag readout, beside the pointer, never outside the note area (nor over the note-name column or the ruler)
+  if drag_tip then pill_text(mx + L.xl, my, drag_tip, C.pill_text, L.xl * 2, true) end
+
   reaper.ImGui_DrawList_PopClipRect(draw_list)   -- the note area
 
   ---------------------------------------------------------------------------
@@ -6487,17 +6759,22 @@ local function draw_graph(draw_ctx, w, h)
     local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
     local pc = (n % 12 + 12) % 12
     local is_root = (not is_chromatic) and pc == root_pc
+    local in_scale = is_chromatic or is_pitch_in_scale(pc)
+    -- An out-of-scale row's name sits on a darker cell, as its row does
+    if not in_scale then
+      reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, key_top, px, key_bot, C.gutter_bg_dim)
+    end
     reaper.ImGui_DrawList_AddLine(draw_list, full_px, key_bot, px, key_bot, C.grid)
     if is_root then
       reaper.ImGui_DrawList_AddRectFilled(draw_list, px - L.xs - L.border, key_top, px, key_bot, C.gutter_strip)
     end
     -- Every row is named while a row is at least a text line tall; below that only the C rows are, so the names
-    -- never overlap. Out-of-scale rows are named in the dimmer colour (every name is >= 4.5:1 on the column).
+    -- never overlap. Out-of-scale rows are named in the dimmer colour (3:1 on their darker cell, the rest >= 4.5:1).
     if px_per_st >= line_h or pc == 0 then
       local text_col = C.gutter_text_dim
       if is_root then
         text_col = C.gutter_text_tonic
-      elseif is_chromatic or is_pitch_in_scale(pc) then
+      elseif in_scale then
         text_col = C.gutter_text
       end
       reaper.ImGui_DrawList_AddText(draw_list, full_px + L.sm, (key_top + key_bot) * 0.5 - line_h * 0.5, text_col, midi_to_name(n))
@@ -6601,6 +6878,12 @@ local function draw_graph(draw_ctx, w, h)
   K.canvas_status(draw_list, px + L.sm, py + h - L.sm, w - L.sm * 2, not is_bypassed, function(x1, y1, x2, y2)
     return K.note_under(state.notes, t_to_x, py, h, min_note, note_range, x1, y1, x2, y2)
   end)
+
+  -- Note action bar (Snap, Quantize, Cursor, Split, Merge) under the selected note, over everything on the canvas but the
+  -- menus; real Buttons, so they take the hover from the canvas (see the overlap above)
+  if not is_bypassed and K.draw_note_bar(draw_ctx, draw_list, ruler_h, target_take ~= nil, target_item) then
+    buttons_used = true
+  end
 
   -- Note Context Menu
   local note_menu_open = reaper.ImGui_BeginPopup(draw_ctx, "##note_context_menu")
@@ -7368,17 +7651,17 @@ K.INFO_SECTIONS = {
     { "Click a Pitched Items row", "Switch the active item" },
     { "Select an audio item in REAPER", "Becomes the active item" },
     { "Drag the divider", "Resize Pitched Items" },
-    { "H", "Show / hide the Shortcuts list", panel = { "General", 3, "Hide this list" } },
+    { "H", "Show / hide the Shortcuts list", panel = { "General", 5, "Hide this list" } },
   } },
   { title = "Pitch & Note Editing", rows = {
     { "Drag Center Zone", string.format("Move note pitch (%s = fine adjust)", K.MOD_LABEL) },
     { "Drag Left Zone", string.format("Tighten: steady the note, slow drift first; 100%% is a flat line (%s = fine)", K.MOD_LABEL),
-      panel = { "Edit", 7, "Tighten · Tolerance", "Drag note side" } },
+      panel = { "Edit", 10, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
     { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
-    { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 8, "Slide In", "Shift + Drag" } },
-    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 9, "Trim note", "Drag edge" } },
-    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 10, "Pitch point", "Drag dot" } },
+    { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 11, "Slide In", "Shift + Drag" } },
+    { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 12, "Trim note", "Drag edge" } },
+    { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 13, "Pitch point", "Drag dot" } },
     { "Double-click a pitch point", "Put it back to 0" },
     { "Double-click the pitch line", "Add a pitch point" },
     { "Right-click a pitch point", "Point menu: type a value, Reset, Remove" },
@@ -7394,20 +7677,24 @@ K.INFO_SECTIONS = {
     { "↑ / ↓", "Nudge pitch ±1 semitone", panel = { "Edit", 1, "±1 semitone" } },
     { "Shift + ↑ / ↓", "Fine-tune pitch ±10 cents", panel = { "Edit", 2, "±10 cents" } },
     { "S / Double-Click", "Snap note to nearest semitone", panel = { "Edit", 5, "Snap to semitone", "Double-click" } },
-    { "Q", "Quantize selected note(s) to scale" },
+    { "Q", "Quantize selected note(s) to scale", panel = { "Edit", 6, "Quantize to scale" } },
     { "B", "Bypass the selected notes (again: turn bypass off)", panel = { "Edit", 4, "Bypass note" } },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch", panel = { "Edit", 3, "Reset pitch", "R" } },
-    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset", panel = { "Edit", 6, "Note menu", "Right-click" } },
+    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset", panel = { "Edit", 9, "Note menu", "Right-click" } },
     { "Right-click a top bar value", "Item override and reset" },
     { "Double-click a value", "Reset to its default" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
     { "Hover or drag a setting", "Shows on the notes where it acts" },
-    { "Snap / Quantize / Split / Merge buttons", "Same as S / Q / X / M" },
+    { "Note action bar (under the selected note)", "Snap · Quantize · Cursor · Split · Merge (S / Q / C / X / M)" },
+    { "Drag the bar's grip (its left end)", "Move the bar; double-click it to put it back under the note" },
   } },
   { title = "Note Topology & REAPER Transport", rows = {
-    { "X", "Split note at REAPER edit cursor" },
-    { "M", "Merge 2+ contiguous selected notes" },
+    { "X", "Split note at REAPER edit cursor", panel = { "Edit", 7, "Split at cursor" } },
+    { "M", "Merge 2+ contiguous selected notes", panel = { "Edit", 8, "Merge notes" } },
     { "W", "Edit cursor to the start of the item", panel = { "General", 2, "Go to item start" } },
+    { "C", "Edit cursor to the middle of the selected note", panel = { "General", 3, "Cursor to note" } },
+    { "Hold C + Wheel", string.format("Move the edit cursor (wheel up = later, %s = fine)", K.MOD_LABEL),
+      panel = { "General", 4, "Move cursor", "C + Wheel" } },
     { "Space", "Runs your REAPER action for Space (default Play/Stop)", panel = { "General", 1, "Play / stop" } },
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
@@ -8355,6 +8642,15 @@ local function draw_settings_modal()
     Theme.align(ctx)
     Theme.tooltip_setting_widget(ctx, { label = "Show Tooltips" })
 
+    Theme.align(ctx)
+    local bar_idx, bar_changed = Theme.combo(ctx, "Note Action Bar Size##note_bar_size", K.NOTE_BAR_SIZES,
+      state.note_bar_size, { w = Theme.calc_combo_width(ctx, K.NOTE_BAR_SIZES),
+        tooltip = "Size of the Snap, Quantize, Split and Merge buttons under the selected note" })
+    if bar_changed then
+      state.note_bar_size = bar_idx
+      K.save_settings("appearance")
+    end
+
     -- Analysis internals: extra canvas layers for checking what the detection did (off unless enabled here)
     reaper.ImGui_Dummy(ctx, 0, L.sm)
     if Theme.collapsing_header(ctx, "Diagnostics") then
@@ -8601,13 +8897,30 @@ local function target_take_exists()
   return state.target_take_guid ~= nil and resolve_take_by_guid(state.target_take_guid, true) ~= nil
 end
 
---- Run a note command and say what happened in the status line. The top bar's action buttons, their keys (S, Q, X, M),
+--- Run a note command and say what happened in the status line. The note action bar's buttons, their keys (S, Q, X, M),
 --- the note menu and the pitch-zone double-click all come through here, so they report alike. A refusal or a
 --- no-op says why; a success names the count and promises an undo point only when one was written.
----   id        "snap", "quantize", "split" (at the edit cursor) or "merge"
----   note_idx  the note to split (default: the primary selected note)
+---   id        "snap", "quantize", "cursor" (edit cursor to the note's middle), "split" (at the edit cursor) or "merge"
+---   note_idx  the note to split or move the cursor to (default: the primary selected note)
 K.note_action = function(id, note_idx)
   local undo_hint = string.format(" %s+Z to undo", K.MOD_LABEL)
+  if id == "cursor" then
+    -- Navigation, like a click on the ruler: playback follows, no undo point
+    local idx = note_idx or state.selected_note
+    local note = idx and state.notes and state.notes[idx]
+    if not note then
+      set_status("Select a note first")
+      return
+    end
+    local _, item = get_target_take()
+    if not item then
+      set_status("This item is no longer in the project")
+      return
+    end
+    local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    reaper.SetEditCurPos(item_pos + (note.start_time + note.end_time) * 0.5, false, true)
+    return
+  end
   if id == "merge" then
     local count = count_selected_notes()
     local ok, info = merge_selected_notes()
@@ -8714,6 +9027,29 @@ local function request_analyze()
   })
 end
 
+K.RESPLIT_UNDO = "Change Note Separation"   -- the undo label of K.resplit
+
+--- The target's notes were reloaded by an undo or redo (`data`: what is stored now). When the step undone or redone
+--- is a re-split, Separation follows it: the value the stored notes were split at (data.separation), or, for notes
+--- stored without one, the value from before / after this session's last re-split of the item. ExtState is not
+--- part of REAPER's undo, so without this the bar would keep a value the notes no longer match.
+K.follow_resplit_undo = function(data)
+  local undone = reaper.Undo_CanRedo2(0) == K.RESPLIT_UNDO
+  local redone = reaper.Undo_CanUndo2(0) == K.RESPLIT_UNDO
+  if not (undone or redone) then return end
+  local sep = tonumber(data and data.separation)
+  if not sep then
+    local last = K.resplit_last
+    if not (last and last.guid == state.target_take_guid) then return end
+    sep = undone and last.before or last.after
+  end
+  sep = math.max(K.LIMITS.separation[1], math.min(K.LIMITS.separation[2], sep))
+  if sep ~= state.separation then
+    state.separation = sep
+    K.save_settings("engine")
+  end
+end
+
 --- Separation changed (state.separation; it was prev_separation): split the active item's notes again from the
 --- analysed frames in memory. A new note whose start and end are an old note's (within one frame) keeps that
 --- note's edits: its controls and bypass, its target as the same offset from its new centre, its pitch points.
@@ -8758,10 +9094,14 @@ K.resplit = function(prev_separation)
     end
     state.notes, state.split_points = new_notes, split_points
     state.analysis_empty = (#new_notes == 0)
+    -- Stored with the notes, so an undo / redo of this step brings its Separation back (K.follow_resplit_undo)
+    local data = state.session_takes[state.target_take_guid]
+    if data then data.separation = state.separation end
+    K.resplit_last = { guid = state.target_take_guid, before = prev_separation, after = state.separation }
     clear_interaction_state(true)   -- note indices changed; the view stays
 
     -- Written as an edit (the take's pitch mode is set) when an edit survived, else like a fresh analysis
-    if apply_envelope_to_take("Change Note Separation", not any_edited) then
+    if apply_envelope_to_take(K.RESPLIT_UNDO, not any_edited) then
       set_status(string.format("Split into %d %s. %s+Z to undo", #new_notes, plural(#new_notes, "note", "notes"),
         K.MOD_LABEL))
     end
@@ -8935,13 +9275,13 @@ end
 -------------------------------------------------------------------------------
 -- TOP BAR
 -------------------------------------------------------------------------------
--- Every control of the window, in one place above the canvas, in four groups read from broad to specific:
+-- The window's controls above the canvas, in three groups read from broad to specific (the note actions Snap,
+-- Quantize, Split and Merge are on the canvas, in the note action bar under the selected note: K.draw_note_bar):
 --   Clip          brand, target badge, Key, Scale
 --   Values        the selection pill (what a drag changes: the defaults, or the selected notes), Tighten,
 --                 Strength, Tolerance, Slide In, and Separation (one value for the analysis, whatever is selected)
---   Note actions  Snap, Quantize, Split, Merge
 --   Right         "…" (Analyze / Cancel, Reset, Layers, Note Tone, Settings, Help) and Close, right-aligned on row 1
--- The Values and Note action units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
+-- The Values units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
 -- section places them. Every width is measured from the longest text its control can show. On how many rows the
 -- units sit is a HDR_PLANS entry chosen from the content width alone (never from the selected item or the note
 -- selection), so nothing jumps while working: as the width shrinks the groups wrap onto more rows, and at the
@@ -8967,11 +9307,9 @@ do
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
   local HDR_VALUES = { "pill", "tight", "strength", "tol", "slide", "sep" }
-  local HDR_ACTIONS = { "snap", "quantize", "split", "merge" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for _, id in ipairs(HDR_VALUES) do HDR_GROUP[id] = "values" end
-  for _, id in ipairs(HDR_ACTIONS) do HDR_GROUP[id] = "actions" end
 
   --- One row holding the units of every list given, in order.
   local function hdr_row(...)
@@ -8983,11 +9321,10 @@ do
   end
 
   local HDR_PLANS = {
-    { rows = { hdr_row(HDR_CLIP, HDR_VALUES, HDR_ACTIONS) } },
-    { rows = { HDR_CLIP, hdr_row(HDR_VALUES, HDR_ACTIONS) } },
-    { rows = { HDR_CLIP, HDR_VALUES, HDR_ACTIONS } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES, HDR_ACTIONS } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "strength", "tol" }, { "slide", "sep" }, HDR_ACTIONS } },
+    { rows = { hdr_row(HDR_CLIP, HDR_VALUES) } },
+    { rows = { HDR_CLIP, HDR_VALUES } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "strength", "tol" }, { "slide", "sep" } } },
   }
   -- The plan a first-use window is sized for: two rows
   local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
@@ -9033,7 +9370,7 @@ do
     s.badge_min_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
     -- More, Panel, Close: the real gaps between them (see hdr_draw_right)
     s.right_w = s.more_w + L.sm + s.close_sz + L.lg + s.close_sz
-    -- The Values and Note action units (see TOP BAR CONTROLS): s.bar.unit_w[id]
+    -- The Values units (see TOP BAR CONTROLS): s.bar.unit_w[id]
     s.bar = K.bar_measure(ctx)
     return s
   end
@@ -9370,8 +9707,8 @@ do
       analyze_label = has_notes and "Re-Analyze" or "Analyze",
       reset_label = reset_label, reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
     }
-    -- The Values and Note action units draw themselves (see TOP BAR CONTROLS)
-    local draw_unit = K.bar_frame(ctx, has_target, target_item, s.bar)
+    -- The Values units draw themselves (see TOP BAR CONTROLS)
+    local draw_unit = K.bar_frame(ctx, has_target, s.bar)
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
 
     local close_clicked = false
@@ -9409,9 +9746,10 @@ end
 -------------------------------------------------------------------------------
 -- TOP BAR CONTROLS
 -------------------------------------------------------------------------------
--- The units of the Values group and the Note action group, drawn in every state (disabled, with the reason, when
--- there is nothing to act on): the selection pill, one value control per entry of BAR_VALUES (a drag with its text
--- inside and a range fill under it), and the actions (Snap, Quantize, Split, Merge). A value control edits what the
+-- The units of the Values group, drawn in every state (disabled, with the reason, when there is nothing to act on):
+-- the selection pill and one value control per entry of BAR_VALUES (a drag with its text inside and a range fill
+-- under it). The note actions (Snap, Quantize, Split, Merge) share the bar's enable rules and reasons
+-- (K.note_actions_frame) but are drawn on the canvas, under the selected note (K.draw_note_bar). A value control edits what the
 -- pill names: the selected notes, else the item's own value, else the default; Separation is the exception, one
 -- value for the analysis whatever is selected.
 -- K.bar_measure gives their widths, each from its longest label, so a value, an override mark or a selection
@@ -9472,16 +9810,17 @@ do
       levels = "analysis",
       tip = "Separation: how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
   }
-  -- Actions: same commands as the keys
-  local BAR_ACTIONS = {
-    { id = "snap",     label = "Snap",     tip = "Snap to nearest semitone (S)" },
-    { id = "quantize", label = "Quantize", tip = "Quantize to the active scale (Q)" },
-    { id = "split",    label = "Split",    tip = "Split at the edit cursor (X)" },
-    { id = "merge",    label = "Merge",    tip = "Merge the selected notes (M)" },
+  -- The note actions, in the order of the note action bar (K.draw_note_bar): the same commands as the keys and the
+  -- note menu. id = K.note_action's id and the Theme.icons entry; tip = the tooltip
+  K.NOTE_ACTIONS = {
+    { id = "snap",     tip = "Snap to nearest semitone (S)" },
+    { id = "quantize", tip = "Quantize to the active scale (Q)" },
+    { id = "cursor",   tip = "Edit cursor to the middle of the note (C)\nHold C and turn the wheel to move it", icon = "cursor_to_note" },
+    { id = "split",    tip = "Split at the edit cursor (X)" },
+    { id = "merge",    tip = "Merge the selected notes (M)" },
   }
-  local BAR_VALUE_BY_ID, BAR_ACTION_BY_ID = {}, {}
+  local BAR_VALUE_BY_ID = {}
   for _, spec in ipairs(BAR_VALUES) do BAR_VALUE_BY_ID[spec.id] = spec end
-  for _, spec in ipairs(BAR_ACTIONS) do BAR_ACTION_BY_ID[spec.id] = spec end
 
   local function bar_text_w(bctx, text)
     return (reaper.ImGui_CalcTextSize(bctx, text)) or 0
@@ -9510,9 +9849,6 @@ do
     end
     s.unit_w.pill = math.max(bar_text_w(bctx, BAR_PILL_NONE), bar_text_w(bctx, BAR_PILL_ONE),
       bar_text_w(bctx, string.format(BAR_PILL_MANY, 999))) + s.pad_x
-    for _, spec in ipairs(BAR_ACTIONS) do
-      s.unit_w[spec.id] = bar_text_w(bctx, spec.label) + s.pad_x
-    end
     return s
   end
 
@@ -9624,6 +9960,63 @@ do
     return sel_count, sel_idx
   end
 
+  --- Why the bar's values and the note actions cannot be used at all (nil = they can): an analysis is running,
+  --- there is no target, or it has no notes yet. has_data = the target is analysed and has notes.
+  local function bar_inspector_reason(has_target, has_data)
+    if state.is_analyzing then return BAR_REASON_ANALYZING end
+    if not has_target then return BAR_REASON_NO_TARGET end
+    if not has_data then return BAR_REASON_NOT_ANALYZED end
+    return nil
+  end
+
+  --- The note actions this frame (K.NOTE_ACTIONS, drawn by K.draw_note_bar). `has_target`: there is a target take
+  --- (nil = state.target_take_guid decides); `target_item`: its item (nil = K.frame_target's). Returns reason(id),
+  --- why the action `id` cannot run now (nil = it can; the same rules as the S / Q / X / M keys), and the note a
+  --- single-note action acts on (sel_idx, for K.note_action).
+  K.note_actions_frame = function(has_target, target_item)
+    if has_target == nil then has_target = (state.target_take_guid ~= nil) end
+    local has_data = (#state.results > 0 and state.notes ~= nil and #state.notes > 0)
+    local inspector_reason = bar_inspector_reason(has_target, has_data)
+    local sel_count, sel_idx = bar_selection()
+    local single_note = (sel_count == 1) and state.notes[sel_idx] or nil
+
+    -- Split needs the edit cursor strictly inside the selected note, as the X key does (asked once per frame).
+    -- Note times are relative to the item's start.
+    local cursor_in_note = nil
+    local function edit_cursor_in_note()
+      if cursor_in_note == nil then
+        cursor_in_note = false
+        local item = target_item
+        if not item then
+          local _, target = K.frame_target()
+          item = target
+        end
+        local item_pos = item and reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        local cursor = item_pos and reaper.GetCursorPosition()
+        if single_note and item_pos and cursor then
+          local t = cursor - item_pos
+          cursor_in_note = (t > single_note.start_time and t < single_note.end_time)
+        end
+      end
+      return cursor_in_note
+    end
+
+    local function reason(id)
+      if inspector_reason then return inspector_reason end
+      if id == "merge" then
+        if sel_count < 2 then return "Select 2 or more notes" end
+        return nil
+      end
+      if sel_count == 0 then return "Select a note" end
+      if id == "split" then
+        if sel_count > 1 then return "Select one note to split" end
+        if not edit_cursor_in_note() then return "Move the edit cursor into the selected note" end
+      end
+      return nil
+    end
+    return reason, sel_idx
+  end
+
   --- The status line: a status message (set_status) while it lasts, else what the window is doing or waiting
   --- for; "" when there is nothing to say. `editing` = notes are on the canvas and can be edited (an empty
   --- canvas carries its own centred message, and a bypassed one its badge, so neither adds a hint).
@@ -9679,29 +10072,16 @@ do
     reaper.ImGui_DrawList_AddText(draw_list, x + L.sm, top_y + L.xs, C.pill_text, text)
   end
 
-  --- The units of this frame. `has_target` / `target_item` come from loop_body (the top bar's view of the
-  --- target); `s` from K.bar_measure. Returns draw_unit(id) for "pill", the ids of BAR_VALUES and the
-  --- ids of BAR_ACTIONS.
-  K.bar_frame = function(bctx, has_target, target_item, s)
+  --- The units of this frame. `has_target` comes from loop_body (the top bar's view of the target); `s` from K.bar_measure. Returns draw_unit(id) for "pill" and the ids of BAR_VALUES.
+  K.bar_frame = function(bctx, has_target, s)
     local P = Theme.get_palette()
     if has_target == nil then has_target = (state.target_take_guid ~= nil) end
 
     local has_data = (#state.results > 0 and state.notes ~= nil and #state.notes > 0)
     local take_data = state.target_take_guid and state.session_takes[state.target_take_guid] or nil
 
-    -- Selection: how many notes, and the note itself when there is exactly one
-    local sel_count, sel_idx = bar_selection()
-    local single_note = (sel_count == 1) and state.notes[sel_idx] or nil
-
-    -- Why the values and the actions are disabled (nil = usable)
-    local inspector_reason = nil
-    if state.is_analyzing then
-      inspector_reason = BAR_REASON_ANALYZING
-    elseif not has_target then
-      inspector_reason = BAR_REASON_NO_TARGET
-    elseif not has_data then
-      inspector_reason = BAR_REASON_NOT_ANALYZED
-    end
+    -- Why the values are disabled (nil = usable)
+    local inspector_reason = bar_inspector_reason(has_target, has_data)
 
     -- What the value controls act on: the selected notes that hold values (none = the defaults)
     local sel_notes, sel_n = bar_sel_notes()
@@ -10073,63 +10453,12 @@ do
       if not active then bar_sep_before = nil end   -- the press is over (a click that changed nothing)
     end
 
-    --- The edit cursor relative to the target item's start (note times are item-relative); nil when unknown
-    local function edit_cursor_offset()
-      local item = target_item
-      if not item then
-        local _, target = K.frame_target()
-        item = target
-      end
-      if not item then return nil end
-      local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
-      local cursor = reaper.GetCursorPosition()
-      if not item_pos or not cursor then return nil end
-      return cursor - item_pos
-    end
-
-    -- Split needs the edit cursor strictly inside the selected note, as the X key does (asked once per frame)
-    local cursor_in_note_cache = nil
-    local function edit_cursor_in_note(note)
-      if cursor_in_note_cache == nil then
-        local t = edit_cursor_offset()
-        cursor_in_note_cache = (note ~= nil and t ~= nil and t > note.start_time and t < note.end_time)
-      end
-      return cursor_in_note_cache
-    end
-
-    --- Why an action is unavailable (nil = available)
-    local function action_reason(id)
-      if inspector_reason then return inspector_reason end
-      if id == "merge" then
-        if sel_count < 2 then return "Select 2 or more notes" end
-        return nil
-      end
-      if sel_count == 0 then return "Select a note" end
-      if id == "split" then
-        if sel_count > 1 then return "Select one note to split" end
-        if not edit_cursor_in_note(single_note) then return "Move the edit cursor into the selected note" end
-      end
-      return nil
-    end
-
-    local function draw_action(spec)
-      local reason = action_reason(spec.id)
-      reaper.ImGui_BeginDisabled(bctx, reason ~= nil)
-      local clicked = reaper.ImGui_Button(bctx, spec.label .. "###bar_" .. spec.id, s.unit_w[spec.id], 0)
-      reaper.ImGui_EndDisabled(bctx)
-      bar_tooltip(reason and (spec.tip .. "\n" .. reason) or spec.tip,
-        reason and reaper.ImGui_HoveredFlags_AllowWhenDisabled() or 0)
-      if clicked and not reason then K.note_action(spec.id, sel_idx) end
-    end
-
     return function(id)
       if id == "pill" then
         draw_pill()
       elseif BAR_VALUE_BY_ID[id] then
         local spec = BAR_VALUE_BY_ID[id]
         if spec.levels == "analysis" then draw_separation(spec) else draw_value(spec) end
-      elseif BAR_ACTION_BY_ID[id] then
-        draw_action(BAR_ACTION_BY_ID[id])
       end
     end
   end
@@ -10497,7 +10826,7 @@ local function main()
   loop()
 end
 
-if FANCY_PITCH_TEST then
+if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features }
 end
 main()
