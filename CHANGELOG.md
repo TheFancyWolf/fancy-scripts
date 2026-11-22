@@ -4,6 +4,15 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Design System v1.5.0 (`Utility/Fancy_Design System.lua`) and `_lib/theme.lua`** — Five new icons, `Theme.icons.snap`, `quantize`, `cursor_to_note`, `split` and `merge` (a note is a rounded bar, the edit cursor a triangle with a line), shown in the icon gallery; the canvas colours gain `gutter_bg_dim`, the darker cell behind an out-of-key note name.
+- **Fancy Pitch Correct v2.17.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Note action bar, and fixes after review:
+  - **Note action bar**: Snap, Quantize, Split and Merge are a small bar of icon buttons centred right under the selected note (above it when the note is at the bottom of the view). Drag the grip at its left end to move it out of the way: it keeps that offset for every note, and a double-click on the grip puts it back. It hides while you drag, box-select or have a menu open. A button that cannot act is dimmed and its tooltip says why. The four text buttons are gone from the top bar, so the values there stay visible at narrower widths. The S / Q / X / M keys and the right-click note menu work as before. Settings > Appearance & Options has a Note Action Bar Size (Small, Medium, Large: 24, 32 and 40 px buttons; Medium by default). The bar starts with the selected note's name and cents (`E3 -3¢`) in place of its separate label, or the count when several notes are selected; that part has a fixed width, so the buttons stay put as the value changes. A Cursor button (key C) moves the edit cursor to the middle of the selected note, ready for Split; hold C and turn the wheel to move the edit cursor from there (Cmd/Ctrl for finer steps).
+  - **Quieter key rows**: the key's root row is no longer tinted; its name in the note column keeps the accent colour and strip. Out-of-key note names sit on a darker cell in a dimmer grey, like their rows.
+  - **Shortcuts list**: Q (Quantize), X (Split) and M (Merge) are now listed.
+  - **Undo restores Separation**: undoing or redoing a Separation change now puts the Separation value back as well as the notes.
+  - **Bypassed notes stay uncorrected**: next to an edited note, the blend between the two now stays on the edited note instead of reaching into the bypassed one.
+  - **Fine adjust for Slide In**: Shift + Cmd/Ctrl-drag on a note changes Slide In finely, like Tighten and Tolerance.
+  - **Clearer Slide In message**: on a note with no slide into it, the status line says there is nothing to flatten.
 - **Fancy Pitch Correct v2.16.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Automatic joins, Slide In and Separation:
   - **Joins are automatic**: the correction blends across the slide you actually sang, with a short fixed fade into and out of silence. Transition, Onset Ramp and Legato Gap are gone, along with the `Timing` button and the Timing row in the top bar.
   - **Slide In** replaces Scoop Shape: it flattens the slide into a note up to where the note actually settles (not a fixed length), and at 100 % it removes the slide completely. Shift + drag anywhere on a note adjusts it; it is also in the top bar and the note's right-click menu.

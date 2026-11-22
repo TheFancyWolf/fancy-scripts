@@ -80,7 +80,8 @@
 --   Pass via opts.preset: Theme.icon_btn(ctx, id, fn, {preset = L.icon_sm})
 --
 -- ICONS -- Theme.icons.<name>(dl, cx, cy, half_size, color), vector shapes for the draw list:
---   play pause close plus info tri_down tri_up tri_left tri_right slider gear check dot ring
+--   play pause close plus info tri_down tri_up tri_left tri_right slider gear check dot ring panel_right
+--   snap quantize split merge (note editing: a note is a rounded bar, the edit cursor a triangle with a line)
 --
 -- FONTS -- Theme.font_sizes: small=11 default=13 medium=14 large=16 header=18  (Fira Sans, bundled in _lib/fonts/)
 --   create_fonts(ctx)          -> {default,small,medium,large,header,default_bold,medium_bold,large_bold}
@@ -570,10 +571,13 @@ local function build_canvas_fancy(P)
   C.grid_dim        = 0x1D1D1DFF
   C.grid_plain      = 0x1D1D1DFF
   C.grid_plain_black = 0x1D1D1DFF
-  -- Note-name column (a flat strip left of the rows): labels >= 4.5:1 on gutter_bg, the root row's strip >= 3:1
+  -- Note-name column (a flat strip left of the rows): labels >= 4.5:1 on gutter_bg, the root row's strip >= 3:1.
+  -- An out-of-scale row's name sits on a darker cell (gutter_bg_dim, the same step as row -> row_dim) in a dimmer
+  -- grey held at 3:1: it reads, but steps back like its row.
   C.gutter_bg         = 0x333333FF
+  C.gutter_bg_dim     = 0x2B2B2BFF
   C.gutter_text       = 0xC8C8C8FF
-  C.gutter_text_dim   = P.text_dim
+  C.gutter_text_dim   = 0x7A7A7AFF
   C.gutter_text_tonic = P.accent_l
   C.gutter_strip      = P.accent
   -- Piano keys (fixed in both modes: a piano does not change colour with the REAPER theme)
@@ -708,7 +712,8 @@ local function build_canvas_match(P)
   C.ruler_bg          = with_alpha(P.panel, 0.90)                                    -- the time ruler: the same panel colour
   local gutter = { C.gutter_bg }
   C.gutter_text       = fit_contrast(with_alpha(P.text, 0.80), gutter, 4.5)          -- in-scale row name
-  C.gutter_text_dim   = fit_contrast(P.text_dim, gutter, 4.5)                        -- out-of-scale row name
+  C.gutter_bg_dim     = away(P.panel, 0.08 * k)                                      -- out-of-scale row's cell
+  C.gutter_text_dim   = fit_contrast(with_alpha(P.text_dim, 0.55), { C.gutter_bg_dim }, 3.0) -- out-of-scale row name
   C.gutter_text_tonic = fit_contrast(P.accent_l, gutter, 4.5)                        -- the root row's name
   C.gutter_strip      = fit_contrast(P.accent, gutter, 3.0)                          -- the root row's strip
 
@@ -1572,6 +1577,92 @@ function Theme.icons.gear(dl, cx, cy, hs, col)
 
   -- Central ring
   reaper.ImGui_DrawList_AddCircle(dl, ox, oy, mid_r, col, 16, ring_th)
+end
+
+-- The note-editing icons (snap, quantize, cursor_to_note, split, merge) share one picture language: a note is a filled rounded
+-- bar, a pitch row is a thin line, the edit cursor is a small down-pointing triangle with a line under it. They
+-- span about 2..22 of a 24-unit box (0.83 hs either side of the centre).
+local NOTE_ICON_SPAN = 0.83   -- half the drawn width, in hs
+local NOTE_BAR_HH = 0.25      -- half the height of a note bar, in hs
+local NOTE_BAR_Y = 0.25       -- the note bars of split and merge sit this far below the centre, in hs
+
+--- A note bar from x1 to x2, centred on y (half height hh), rounded at both ends (`flags`: only those corners).
+local function note_bar(dl, x1, y, x2, hh, col, flags)
+  reaper.ImGui_DrawList_AddRectFilled(dl, x1, y - hh, x2, y + hh, col, hh, flags or 0)
+end
+
+--- Snap to semitone (a note bar centred between two faint pitch row lines).
+--- Use for: snapping a note to the nearest semitone.
+function Theme.icons.snap(dl, cx, cy, hs, col)
+  local span = hs * NOTE_ICON_SPAN
+  local th = math.max(1.0, hs * 0.16)
+  local row_y = hs * 0.72   -- clear of the bar, so the note reads as sitting inside its row
+  local faint = with_alpha(col, ((col & 0xFF) / 255) * 0.55)
+  reaper.ImGui_DrawList_AddLine(dl, cx - span, cy - row_y, cx + span, cy - row_y, faint, th)
+  reaper.ImGui_DrawList_AddLine(dl, cx - span, cy + row_y, cx + span, cy + row_y, faint, th)
+  note_bar(dl, cx - hs * 0.6, cy, cx + hs * 0.6, hs * NOTE_BAR_HH, col)
+end
+
+--- Quantize (a regular-weight Q: a stroked circle with a short diagonal tail at its lower right).
+--- Use for: quantize commands (pitch to a scale, timing to a grid).
+function Theme.icons.quantize(dl, cx, cy, hs, col)
+  local th = math.max(1.2, hs * 0.18)
+  local r = hs * 0.66
+  local qx, qy = cx, cy - hs * 0.06
+  local d = math.sqrt(0.5)   -- the 45 degree direction toward the lower right
+  reaper.ImGui_DrawList_AddCircle(dl, qx, qy, r, col, 0, th)
+  -- A letter's tail, not a handle: it starts inside the bowl and crosses the rim only a little
+  reaper.ImGui_DrawList_AddLine(dl, qx + r * 0.35 * d, qy + r * 0.35 * d,
+    qx + (r + hs * 0.26) * d, qy + (r + hs * 0.26) * d, col, th)
+end
+
+--- Split at the edit cursor (the cursor's triangle and line, with a note bar on each side and a gap round the line).
+--- Use for: splitting a note or an item at the edit cursor.
+function Theme.icons.split(dl, cx, cy, hs, col)
+  local span = hs * NOTE_ICON_SPAN
+  local th = math.max(1.0, hs * 0.16)
+  local top = cy - span
+  local tri_w, tri_h = hs * 0.32, hs * 0.36
+  reaper.ImGui_DrawList_AddTriangleFilled(dl, cx - tri_w, top, cx + tri_w, top, cx, top + tri_h, col)
+  reaper.ImGui_DrawList_AddLine(dl, cx, top + tri_h * 0.5, cx, cy + span, col, th)
+  local gap = hs * 0.2
+  local by = cy + hs * NOTE_BAR_Y
+  note_bar(dl, cx - span, by, cx - gap, hs * NOTE_BAR_HH, col)
+  note_bar(dl, cx + gap, by, cx + span, hs * NOTE_BAR_HH, col)
+end
+
+--- Edit cursor to the note (the cursor's triangle and line coming down onto the middle of a whole note bar).
+--- Use for: moving the edit cursor onto a note or an item.
+function Theme.icons.cursor_to_note(dl, cx, cy, hs, col)
+  local span = hs * NOTE_ICON_SPAN
+  local th = math.max(1.0, hs * 0.16)
+  local top = cy - span
+  local tri_w, tri_h = hs * 0.32, hs * 0.36
+  local by = cy + hs * NOTE_BAR_Y
+  local bar_top = by - hs * NOTE_BAR_HH
+  reaper.ImGui_DrawList_AddTriangleFilled(dl, cx - tri_w, top, cx + tri_w, top, cx, top + tri_h, col)
+  -- The line stops a hair above the bar, so the note reads as whole (split's line runs through a gap instead)
+  reaper.ImGui_DrawList_AddLine(dl, cx, top + tri_h * 0.5, cx, bar_top - hs * 0.12, col, th)
+  note_bar(dl, cx - span, by, cx + span, hs * NOTE_BAR_HH, col)
+end
+
+--- Merge notes (two triangles at the top pointing at each other, above two note bars that meet at a hairline seam).
+--- Use for: joining notes or items into one.
+function Theme.icons.merge(dl, cx, cy, hs, col)
+  local span = hs * NOTE_ICON_SPAN
+  local tri_w, tri_hh = hs * 0.34, hs * 0.26
+  local tri_y = cy - span + tri_hh   -- top-aligned with split's cursor triangle
+  local tip = hs * 0.16              -- a clear gap between the tips, so the two read as two arrows
+  -- Left one points right, right one points left; they meet near the centre
+  reaper.ImGui_DrawList_AddTriangleFilled(dl, cx - tip - tri_w, tri_y - tri_hh, cx - tip - tri_w, tri_y + tri_hh,
+    cx - tip, tri_y, col)
+  reaper.ImGui_DrawList_AddTriangleFilled(dl, cx + tip + tri_w, tri_y - tri_hh, cx + tip, tri_y,
+    cx + tip + tri_w, tri_y + tri_hh, col)
+  local seam = 0.5   -- half of a 1 px seam
+  local by = cy + hs * NOTE_BAR_Y
+  -- Square at the seam, so the two read as one note with a hairline in it
+  note_bar(dl, cx - span, by, cx - seam, hs * NOTE_BAR_HH, col, reaper.ImGui_DrawFlags_RoundCornersLeft())
+  note_bar(dl, cx + seam, by, cx + span, hs * NOTE_BAR_HH, col, reaper.ImGui_DrawFlags_RoundCornersRight())
 end
 
 -------------------------------------------------------------------------------

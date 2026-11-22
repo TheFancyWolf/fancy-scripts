@@ -7,7 +7,7 @@ local function load_script()
     GetExtState = function() return "" end,   -- top-level code tonumber()s this
   },
     { __index = function() return function() end end })
-  FANCY_PITCH_TEST = true
+  FANCY_PITCH_TEST = true   -- luacheck: ignore 111 (the script returns its internals instead of running)
   return dofile(SCRIPT)
 end
 
@@ -709,6 +709,127 @@ test("no_removed_names", function()
   for _, name in ipairs({ '"Slide In"', '"Separation"' }) do
     eq(src:find(name, 1, true) ~= nil, true, name)
   end
+end)
+
+test("join_bypassed_neighbour", function()
+  -- An edited note touching a bypassed one: the blend stays on the edited side, the bypassed note gets nothing
+  local function bypassed(t0, slide)
+    local n = join_note(t0, 0.3, 62, 0.5, slide)
+    n.controls.bypassed = true
+    return n
+  end
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local b = bypassed(a.end_time, { from = 60, dur = 0.04 })
+  local bnd = a.end_time
+  local build = S.K.correction_build({ a, b }, 10)
+  local g = spans_of(build, "glide")
+  eq(#g, 1, "edited first: glides")
+  if g[1].t1 > bnd + 1e-9 then error("edited first: glide ends at " .. g[1].t1) end
+  if g[1].t1 - g[1].t0 < S.K.JOIN.MIN_S - 1e-9 then error("edited first: glide " .. (g[1].t1 - g[1].t0)) end
+  for _, p in ipairs(build.points) do
+    if p.time >= bnd - 1e-9 and math.abs(p.val) > 1e-9 then error("edited first: " .. p.val .. " at " .. p.time) end
+  end
+  -- Bypassed first: nothing before the boundary
+  b = bypassed(0.1)
+  local c = join_note(b.end_time, 0.3, 62, -0.2, { from = 60, dur = 0.04 })
+  bnd = b.end_time
+  build = S.K.correction_build({ b, c }, 10)
+  g = spans_of(build, "glide")
+  eq(#g, 1, "bypassed first: glides")
+  if g[1].t0 < bnd - 1e-9 then error("bypassed first: glide starts at " .. g[1].t0) end
+  for _, p in ipairs(build.points) do
+    if p.time <= bnd + 1e-9 and math.abs(p.val) > 1e-9 then error("bypassed first: " .. p.val .. " at " .. p.time) end
+  end
+end)
+
+test("follow_resplit_undo", function()
+  local st, K = S.state, S.K
+  local can_undo, can_redo
+  reaper.Undo_CanUndo2 = function() return can_undo end
+  reaper.Undo_CanRedo2 = function() return can_redo end
+  st.target_take_guid = "{T}"
+  -- Undone: the stored notes' own value
+  st.separation, can_undo, can_redo = 0.8, "Move edit cursor", K.RESPLIT_UNDO
+  K.follow_resplit_undo({ separation = 0.5 })
+  near(st.separation, 0.5, 1e-12, "undone, stored value")
+  -- Redone
+  can_undo, can_redo = K.RESPLIT_UNDO, nil
+  K.follow_resplit_undo({ separation = 0.8 })
+  near(st.separation, 0.8, 1e-12, "redone, stored value")
+  -- Notes stored without a value: this session's last re-split of the item
+  K.resplit_last = { guid = "{T}", before = 0.3, after = 0.8 }
+  can_undo, can_redo = "Move edit cursor", K.RESPLIT_UNDO
+  K.follow_resplit_undo({})
+  near(st.separation, 0.3, 1e-12, "undone, no stored value")
+  -- Any other undo leaves it alone
+  can_undo, can_redo = "Adjust Tighten", "Adjust Slide In"
+  K.follow_resplit_undo({ separation = 0.9 })
+  near(st.separation, 0.3, 1e-12, "other undo")
+  reaper.Undo_CanUndo2, reaper.Undo_CanRedo2, K.resplit_last, st.target_take_guid = nil, nil, nil, nil
+end)
+
+test("note_bar_place", function()
+  local st, K = S.state, S.K
+  local L = require("theme").layout
+  local saved_map, saved_notes = st.draw_cache.map, st.notes
+  -- Note area 400 x 300 at (100, 50), seconds 0..4, pitch 60..72 (25 px a semitone), ruler 20 px
+  st.draw_cache.map = { px = 100, py = 50, w = 400, h = 300, vt0 = 0, vt1 = 4, min = 60, range = 12 }
+  local function note(t0, t1, cp) return { start_time = t0, end_time = t1, controls = { center_pitch = cp } } end
+  st.notes = { note(1, 2, 66), note(-1, 0.5, 64), note(-1, -0.5, 66), note(1, 2, 80), note(3, 3.5, 60.5) }
+  local bw, bh, ruler = 96, 24, 20
+  -- Note 1: block 65.5 .. 66.5, 1 .. 2 s (middle at 250 px)
+  local a = K.note_bar_anchor(1, ruler)
+  near(a.x, 250, 1e-9, "middle"); near(a.top, 350 - 6.5 * 25, 1e-9, "top"); near(a.bot, 350 - 5.5 * 25, 1e-9, "bot")
+  local x, y, above = K.note_bar_pos(a, bw, bh, ruler, 0, 0)
+  eq(x, 250 - bw / 2, "centred"); eq(y, math.floor(a.bot + L.sm + 0.5), "below"); eq(above, false, "not above")
+  -- The offset moves it
+  x, y = K.note_bar_pos(a, bw, bh, ruler, 30, -10)
+  eq(x, 250 - bw / 2 + 30, "dx"); eq(y, math.floor(a.bot + L.sm - 10 + 0.5), "dy")
+  -- A note that starts before the window: centred on its visible part (0 .. 0.5 s), then kept L.xs inside
+  a = K.note_bar_anchor(2, ruler)
+  near(a.x, 125, 1e-9, "visible middle")
+  x = K.note_bar_pos(a, bw, bh, ruler, 0, 0)
+  eq(x, 100 + L.xs, "inside the area")
+  -- Out of view (time / pitch): nothing
+  eq(K.note_bar_anchor(3, ruler), nil, "before the window")
+  eq(K.note_bar_anchor(4, ruler), nil, "above the view")
+  -- At the bottom of the view: above the block, the vertical offset mirrored
+  a = K.note_bar_anchor(5, ruler)
+  local _, y2, above2 = K.note_bar_pos(a, bw, bh, ruler, 0, 5)
+  eq(above2, true, "flipped"); eq(y2, math.floor(a.top - L.sm - bh - 5 + 0.5), "above, mirrored")
+  -- Right edge clamp
+  x = K.note_bar_pos(a, bw, bh, ruler, 1000, 0)
+  eq(x, 100 + 400 - L.xs - bw, "clamped right")
+  st.draw_cache.map, st.notes = saved_map, saved_notes
+end)
+
+test("note_actions_frame", function()
+  local st, K = S.state, S.K
+  local saved = { st.results, st.notes, st.selected_notes, st.selected_note, st.is_analyzing }
+  st.results = { { time = 0, note = 60 } }
+  st.notes = { { start_time = 1, end_time = 2, controls = {} }, { start_time = 2, end_time = 3, controls = {} } }
+  st.is_analyzing = false
+  st.selected_notes, st.selected_note = {}, nil
+  local reason = K.note_actions_frame(true, nil)
+  eq(reason("snap"), "Select a note"); eq(reason("merge"), "Select 2 or more notes")
+  st.selected_notes = { [1] = true, [2] = true }
+  reason = K.note_actions_frame(true, nil)
+  eq(reason("snap"), nil); eq(reason("quantize"), nil); eq(reason("merge"), nil)
+  eq(reason("split"), "Select one note to split")
+  st.selected_notes, st.selected_note = { [1] = true }, 1
+  local item = {}
+  reaper.GetMediaItemInfo_Value = function() return 10 end
+  reaper.GetCursorPosition = function() return 11.5 end
+  local idx
+  reason, idx = K.note_actions_frame(true, item)
+  eq(reason("split"), nil, "cursor inside"); eq(idx, 1)
+  reaper.GetCursorPosition = function() return 13 end
+  reason = K.note_actions_frame(true, item)
+  eq(reason("split"), "Move the edit cursor into the selected note")
+  reason = K.note_actions_frame(false, item)
+  eq(reason("snap"), "Select an audio item")
+  reaper.GetMediaItemInfo_Value, reaper.GetCursorPosition = nil, nil
+  st.results, st.notes, st.selected_notes, st.selected_note, st.is_analyzing = table.unpack(saved)
 end)
 
 -- Tests appended by later tasks go above this line.

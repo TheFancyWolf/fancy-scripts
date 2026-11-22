@@ -680,7 +680,7 @@ end)
 -- span_fill (the setting highlights of Pitch Correct, 2026-11-19)
 local CANVAS_KEYS = {
   "anchor", "bypass_border", "bypass_title", "grid", "grid_dim", "grid_plain", "grid_plain_black", "grid_tonic",
-  "gutter_bg", "gutter_strip", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "handle", "handle_drag",
+  "gutter_bg", "gutter_bg_dim", "gutter_strip", "gutter_text", "gutter_text_dim", "gutter_text_tonic", "handle", "handle_drag",
   "handle_hover", "key_black", "key_dim_black", "key_dim_white", "key_outline", "key_plain_black", "key_text_black",
   "key_text_dim_black", "key_text_dim_white", "key_text_plain_black", "key_text_plain_white", "key_text_tonic_black",
   "key_text_tonic_white", "key_text_white", "key_tonic_black", "key_tonic_strip", "key_tonic_white", "key_white",
@@ -696,7 +696,7 @@ local CANVAS_KEYS = {
 local CANVAS_PALETTES = { { mode = "fancy" }, { mode = "match", theme = REAPERTIPS }, { mode = "match", theme = LIGHT } }
 
 test("canvas: key set unchanged, both modes", function()
-  assert(#CANVAS_KEYS == 81)
+  assert(#CANVAS_KEYS == 82)
   for _, o in ipairs(CANVAS_PALETTES) do
     local C = load_theme(o).build_palette().canvas
     for _, k in ipairs(CANVAS_KEYS) do assert(C[k] ~= nil, k) end
@@ -739,7 +739,9 @@ test("canvas: contrast, all three palettes", function()
       end
     end
     check(contrast(C.gutter_text, C.gutter_bg), 4.5, "gutter text")
-    check(contrast(C.gutter_text_dim, C.gutter_bg), 4.5, "gutter text dim")
+    -- Out-of-scale names step back on purpose (user request, 2026-11-21): 3:1 on their darker cell, and dimmer
+    check(contrast(C.gutter_text_dim, composite(C.gutter_bg_dim, C.gutter_bg)), 3.0, "gutter text dim")
+    assert(contrast(C.gutter_text_dim, C.gutter_bg_dim) < contrast(C.gutter_text, C.gutter_bg), tag .. ": dim name dimmer")
     check(contrast(C.pill_text, composite(C.pill_bg, C.row)), 4.5, "pill text")
   end
 end)
@@ -771,6 +773,18 @@ test("icons: check, dot and ring exist and each draws", function()
     local n = count(stub.calls, "ImGui_DrawList_AddLine") + count(stub.calls, "ImGui_DrawList_AddCircle")
               + count(stub.calls, "ImGui_DrawList_AddCircleFilled")
     assert(n >= 1, name .. " issued no draw-list call")
+  end
+end)
+
+test("icons: snap, quantize, split and merge exist and each draws", function()
+  local T, stub = load_theme({})
+  for _, name in ipairs({ "snap", "quantize", "cursor_to_note", "split", "merge" }) do
+    assert(type(T.icons[name]) == "function", name .. " is a function")
+    stub.calls = {}
+    T.icons[name]("dl", 10, 10, 6, 0xFFFFFFFF)
+    local n = count(stub.calls, "ImGui_DrawList_AddLine") + count(stub.calls, "ImGui_DrawList_AddCircle")
+              + count(stub.calls, "ImGui_DrawList_AddRectFilled") + count(stub.calls, "ImGui_DrawList_AddTriangleFilled")
+    assert(n >= 2, name .. " issued too few draw-list calls")
   end
 end)
 
