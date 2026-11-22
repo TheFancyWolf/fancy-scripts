@@ -655,7 +655,12 @@ local function build_canvas_fancy(P)
   -- Overlays: pills (readouts, zone names), ruler strip, scrim
   C.pill_bg         = with_alpha(P.panel, 0.90)
   C.pill_text       = P.text
-  C.ruler_bg        = with_alpha(0x333333FF, 0.90)   -- the note column's #333333, as the theme's MIDI ruler
+  -- Time ruler: REAPER's own timeline colours in both theme modes, so the strip reads as part of the arrange
+  -- view above it (the fallbacks are the default theme's values). The labels are fitted to >= 4.5:1 on the strip.
+  C.ruler_bg        = read_theme_color("col_tl_bg", 0x333333FF)     -- timeline background (opaque, as in REAPER)
+  C.ruler_tick      = read_theme_color("col_tl_fg2", 0x585858FF)    -- minor ticks and the strip's top and bottom edge
+  C.ruler_text      = fit_contrast(read_theme_color("col_tl_fg", 0x9A9A9AFF), { C.ruler_bg }, 4.5)   -- labels and major ticks
+  C.ruler_edge      = composite_over(with_alpha(C.ruler_tick, 0.30), C.ruler_bg)   -- the faint light line above the strip
   C.scrim           = with_alpha(P.bg, 0.75)
   -- BYPASSED badge on the card, over the scrim: title and border are exactly P.yellow
   C.bypass_title    = P.yellow
@@ -669,7 +674,8 @@ end
 --- Tokens not assigned below keep their build_canvas_fancy value, by design: the piano keys and their
 --- black/white labels and outline (key_white ... key_text_tonic_white), and the accent / text / blue / panel /
 --- bg alphas that already follow the palette (row_tint, row_tonic_tint, grid, grid_tonic, zone_drift,
---- zone_divider, marquee_fill, marquee_border, view_fill, pill_bg, scrim).
+--- zone_divider, marquee_fill, marquee_border, view_fill, pill_bg, scrim), and the time ruler (ruler_bg, ruler_tick,
+--- ruler_text, ruler_edge), which reads REAPER's timeline colours in both modes.
 local function build_canvas_match(P)
   local C = build_canvas_fancy(P)
   local bg = P.bg
@@ -709,7 +715,6 @@ local function build_canvas_match(P)
 
   -- Note-name column: the panel colour; its labels fitted to >= 4.5:1 and the root row's strip to >= 3:1 on it
   C.gutter_bg         = P.panel                                                      -- the curated #333333 does not follow a theme
-  C.ruler_bg          = with_alpha(P.panel, 0.90)                                    -- the time ruler: the same panel colour
   local gutter = { C.gutter_bg }
   C.gutter_text       = fit_contrast(with_alpha(P.text, 0.80), gutter, 4.5)          -- in-scale row name
   C.gutter_bg_dim     = away(P.panel, 0.08 * k)                                      -- out-of-scale row's cell

@@ -750,15 +750,20 @@ test("canvas: Match Theme keeps its derivation (the note column follows the them
   for _, fx in ipairs({ REAPERTIPS, LIGHT }) do
     local P = load_theme({ mode = "match", theme = fx }).build_palette()
     assert(P.canvas.gutter_bg == P.panel, "gutter_bg is P.panel")
-    assert(P.canvas.ruler_bg == load_theme({}).with_alpha(P.panel, 0.90), "ruler_bg is P.panel at 90 %")
   end
 end)
 
-test("canvas: curated ruler is the note column's grey; its labels read on it over every row", function()
-  local T = load_theme({ mode = "fancy" }); local P = T.build_palette(); local C = P.canvas
-  assert(C.ruler_bg == T.with_alpha(0x333333FF, 0.90))
-  for _, r in ipairs({ C.row, C.row_black, C.row_tonic, C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black }) do
-    assert(contrast(P.text_dim, composite(C.ruler_bg, r)) >= 4.5, "ruler labels (P.text_dim)")
+test("canvas: the time ruler takes REAPER's timeline colours in both modes; its labels read on it", function()
+  for _, mode in ipairs({ "fancy", "match" }) do
+    -- No timeline keys in the theme: the default theme's values
+    local C = load_theme({ mode = mode }).build_palette().canvas
+    assert(C.ruler_bg == 0x333333FF and C.ruler_tick == 0x585858FF, mode .. ": fallbacks")
+    assert(contrast(C.ruler_text, C.ruler_bg) >= 4.5, mode .. ": fallback labels")
+    -- A theme's own timeline colours are used as they are; the labels are fitted to 4.5:1 on the strip
+    local keys = { col_tl_bg = 0x202428, col_tl_fg = 0x505050, col_tl_fg2 = 0x445566 }
+    C = load_theme({ mode = mode, theme = keys }).build_palette().canvas
+    assert(C.ruler_bg == 0x202428FF and C.ruler_tick == 0x445566FF, mode .. ": theme colours")
+    assert(contrast(C.ruler_text, C.ruler_bg) >= 4.5, mode .. ": fitted labels")
   end
 end)
 
