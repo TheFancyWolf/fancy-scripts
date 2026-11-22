@@ -803,6 +803,23 @@ test("note_bar_place", function()
   st.draw_cache.map, st.notes = saved_map, saved_notes
 end)
 
+test("beat ruler: the label step follows the zoom, from parts of a beat out to many bars", function()
+  local K = load_script().K
+  local function steps(beat_px) return table.pack(K.ruler_beat_steps(beat_px, 4, 60, 90)) end
+  local function is(got, bars, label_beats, tick_beats, bar_ticks)
+    eq(got[1], bars, "bars"); eq(got[2], label_beats, "label_beats")
+    eq(got[3], tick_beats, "tick_beats"); eq(got[4], bar_ticks, "bar_ticks")
+  end
+  is(steps(400), 1, 0.25, 0.125, false)   -- quarter beats labelled, eighths ticked
+  is(steps(200), 1, 0.5, 0.125, false)    -- half beats labelled
+  is(steps(100), 1, 1, 0.25, false)       -- every beat labelled, quarters ticked
+  is(steps(20), 1, nil, 1, false)         -- every bar labelled (80 px), beats ticked
+  is(steps(10), 2, nil, nil, true)        -- every 2nd bar labelled, the bars between ticked
+  is(steps(1), 16, nil, nil, false)       -- every 16th bar labelled, bars too tight (4 px) to tick
+  is(table.pack(K.ruler_beat_steps(20, 3, 60, 90)), 1, nil, 1, false)     -- 3/4: a 60 px bar still fits its label
+  is(table.pack(K.ruler_beat_steps(0.0001, 4, 60, 90)), 1024, nil, nil, false)   -- the step is capped
+end)
+
 test("note_actions_frame", function()
   local st, K = S.state, S.K
   local saved = { st.results, st.notes, st.selected_notes, st.selected_note, st.is_analyzing }

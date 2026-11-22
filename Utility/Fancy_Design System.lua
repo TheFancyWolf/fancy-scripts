@@ -1,9 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.5.0
+-- @version 1.6.0
 -- @changelog
---   + Icons: snap, quantize, cursor_to_note, split, merge (note editing)
---   + Canvas: gutter_bg_dim (the out-of-scale cell of the note-name column)
+--   + Canvas: ruler_tick, ruler_text and ruler_edge; the time ruler tokens now read REAPER's timeline colours
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -250,7 +249,8 @@ local CANVAS_GROUPS = {
   { "Curves & markers", "pitch trace, preview, trend, smart spots, split markers and the playhead (>= 3:1 on the rows)", {
     "trace", "preview", "vibrato", "trend", "spot", "anchor", "marker_split", "marker_split_text", "playhead" } },
   { "Selection & overlays", "marquee, pills behind canvas text, time-ruler strip, bypass scrim", {
-    "marquee_fill", "marquee_border", "marquee_text", "pill_bg", "pill_text", "ruler_bg", "scrim" } },
+    "marquee_fill", "marquee_border", "marquee_text", "pill_bg", "pill_text", "ruler_bg", "ruler_tick", "ruler_text", "ruler_edge",
+    "scrim" } },
   { "Overview & range strips", "the track, the notes on it, and the thumb marking the visible window (>= 3:1 on the track)", {
     "overview_bg", "overview_note", "view_fill", "view_border", "view_grip" } },
 }

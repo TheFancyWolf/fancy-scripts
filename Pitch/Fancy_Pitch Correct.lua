@@ -1,17 +1,10 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.17.0
+-- @version 2.18.0
 -- @changelog
---   Snap, Quantize, Split and Merge are now a small bar of icon buttons right under the selected note (above it at the bottom of the view); drag its grip to move it out of the way, double-click the grip to put it back; the four buttons are gone from the top bar. The S / Q / X / M keys and the note menu work as before. Its size is in Settings (Small, Medium, Large; Medium by default)
---   The bar starts with the selected note's name and cents in place of its separate label (or the count of selected notes), at a fixed width so the buttons never move
---   C (and a Cursor button on the bar) moves the edit cursor to the middle of the selected note; hold C and turn the wheel to move the edit cursor (Cmd/Ctrl = finer)
---   The key's root row is no longer tinted: its name in the note column keeps the accent colour and strip
---   Out-of-key note names sit on a darker cell in a dimmer grey, like their rows
---   Q, X and M are now in the Shortcuts list
---   Undo or redo of a Separation change now puts the Separation value back too
---   A bypassed note next to an edited note is no longer corrected at its start or end: the blend stays on the edited note
---   Shift + drag for Slide In fine-adjusts with Cmd/Ctrl, like Tighten and Tolerance
---   Slide In on a note with no slide into it says there is nothing to flatten
+--   The time ruler now looks like REAPER's own: it takes the timeline colours of your REAPER theme (background, grey ticks, labels) in both theme modes
+--   The ruler follows REAPER's ruler unit: bars and beats (33.1) when REAPER's ruler shows measures, project time (0:52.5) otherwise, instead of seconds from the start of the item; tempo and time signature changes are followed
+--   A faint light line runs along the top of the note column, the ruler and the side panel; the line under the ruler is gone
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -315,6 +308,8 @@ local K = {
   RULER_WIDEN = 1.5,       -- a label interval that does not fit grows to the next 1-2-5 step above interval * this
   RULER_LABEL_ROOM = 2,    -- a label interval is at least this many times as wide as its widest label
   RULER_MAX_TRIES = 8,     -- widenings tried before the ruler gives up on making every label fit
+  RULER_MIN_TICK_PX = 6,   -- beat ruler: ticks closer together than this are not drawn
+  RULER_MAX_BARS = 1024,   -- beat ruler: the widest label step, in bars
 
   -- Pitch view of the canvas (see draw_graph): the range is fitted to the notes unless the user chose one
   PITCH_PAD_ST = 2,        -- semitones shown above the highest and below the lowest note
@@ -4799,6 +4794,31 @@ end
 -- NOTE ACTION BAR (Snap, Quantize, Cursor, Split, Merge, under the selected note)
 -------------------------------------------------------------------------------
 
+--- The beat ruler's steps at a zoom level. beat_px: the width of one beat; cml: beats in a bar; need: the room a
+--- bar or beat label ("33.1") takes; need_sub: the room a part-beat label ("33.1.50") takes. Returns
+---   bars: a label every this many bars (1 when beats or parts of a beat are labelled),
+---   label_beats: the label spacing inside a bar in beats (1, 0.5, 0.25), or nil when only bar starts are labelled,
+---   tick_beats: the tick spacing inside a bar in beats, or nil when no tick falls inside a bar,
+---   bar_ticks: whether the bars between two labelled bars get a short tick.
+K.ruler_beat_steps = function(beat_px, cml, need, need_sub)
+  local min_px = K.RULER_MIN_TICK_PX
+  -- The finest tick of `steps` (beats, finest first) that is still min_px wide, or `fallback`
+  local function finest(steps, fallback)
+    for _, step in ipairs(steps) do
+      if beat_px * step >= min_px then return step end
+    end
+    return fallback
+  end
+  if beat_px * 0.25 >= need_sub then return 1, 0.25, finest({ 0.125 }, 0.25), false end
+  if beat_px * 0.5 >= need_sub then return 1, 0.5, finest({ 0.125, 0.25 }, 0.5), false end
+  if beat_px >= need then return 1, 1, finest({ 0.25, 0.5 }, 1), false end
+  local bar_px = beat_px * math.max(cml, 1)
+  local bars = 1
+  while bars * bar_px < need and bars < K.RULER_MAX_BARS do bars = bars * 2 end
+  if bars == 1 then return 1, nil, beat_px >= min_px and 1 or nil, false end
+  return bars, nil, nil, bar_px >= min_px
+end
+
 --- The note action bar's anchor this frame (state.draw_cache.map is the mapping): the block of note `idx` as
 --- { x = the middle of its visible part, top, bot } in pixels, or nil when the block is not in view (outside the
 --- visible window, or not wholly between the ruler, ruler_h tall, and the bottom of the note area).
@@ -6602,58 +6622,125 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   do
     local span = vt1 - vt0
+    -- REAPER's own timeline colours (C.ruler_*): the strip, grey ticks and labels match the arrange view's ruler.
+    -- As there, no line closes the strip at the bottom: the ticks end on the rows.
     reaper.ImGui_DrawList_AddRectFilled(draw_list, px, py, px + w, py + ruler_h, C.ruler_bg)
-    reaper.ImGui_DrawList_AddLine(draw_list, px, py + ruler_h, px + w, py + ruler_h, P.border)
 
-    -- Smallest 1-2-5 x 10^n number of seconds that is at least t_min
-    local function nice_step(t_min)
-      local base = 10 ^ math.floor(math.log(t_min, 10))
-      local ratio = t_min / base
-      return base * (ratio <= 1 and 1 or (ratio <= 2 and 2 or (ratio <= 5 and 5 or 10)))
-    end
-    -- "12.5s" while the window ends before a minute, "1:05.5" from then on
-    local show_minutes = (vt1 - item_t0) >= 60
-    local function time_label(t, decimals)
-      local scale = math.floor(10 ^ decimals + 0.5)
-      local ticks = math.floor(math.max(t, 0) * scale + 0.5)
-      local whole = ticks // scale
-      local fraction = decimals > 0 and string.format(".%0" .. decimals .. "d", ticks % scale) or ""
-      if show_minutes then
-        return string.format("%d:%02d", whole // 60, whole % 60) .. fraction
-      end
-      return string.format("%d", whole) .. fraction .. "s"
-    end
+    local _, ruler_item = K.frame_target()
+    local item_pos = ruler_item and reaper.GetMediaItemInfo_Value(ruler_item, "D_POSITION") or 0
 
-    -- The major step: the smallest one whose labels fit with room between them (starting from one digit per step)
-    local digit_w = reaper.ImGui_CalcTextSize(draw_ctx, "0") or 0
-    local interval = nice_step(span * math.max(digit_w, 1) / math.max(w, 1))
-    local decimals = 0
-    for attempt = 1, K.RULER_MAX_TRIES do
-      decimals = interval >= 1 and 0 or math.ceil(-math.log(interval, 10) - K.VIEW_EPS_S)
-      local widest = reaper.ImGui_CalcTextSize(draw_ctx, time_label(vt1 - item_t0, decimals)) or 0
-      if interval / span * w >= widest * K.RULER_LABEL_ROOM or attempt == K.RULER_MAX_TRIES then break end
-      interval = nice_step(interval * K.RULER_WIDEN)
-    end
-
-    -- Ticks: a label and a full-height tick at every major step, a short tick at every minor one. A label
-    -- that would touch the previous one (or leave the note area) is dropped, so labels never overlap.
-    local minor = interval / K.RULER_MINOR_DIV
+    -- One tick: tall with a label at a major step, short at a minor one. A label that would touch the previous
+    -- one (or leave the note area) is dropped, so labels never overlap.
     local label_y = py + L.xs
     local next_free_x = px
-    for m = math.ceil((vt0 - item_t0) / minor - K.VIEW_EPS_S), math.floor((vt1 - item_t0) / minor + K.VIEW_EPS_S) do
-      local t = item_t0 + m * minor
-      local x = t_to_x(t)
-      if m % K.RULER_MINOR_DIV == 0 then
-        reaper.ImGui_DrawList_AddLine(draw_list, x, py, x, py + ruler_h, P.text_dim)
-        local label = time_label(t - item_t0, decimals)
-        local label_w = reaper.ImGui_CalcTextSize(draw_ctx, label) or 0
-        local label_x = x + L.sm
-        if label_x >= next_free_x and label_x + label_w <= px + w then
-          reaper.ImGui_DrawList_AddText(draw_list, label_x, label_y, P.text_dim, label)
-          next_free_x = label_x + label_w + L.md
+    local major_top = py + ruler_h // 3   -- a major tick is the lower two thirds of the strip
+    local function draw_tick(x, label)
+      if not label then
+        reaper.ImGui_DrawList_AddLine(draw_list, x, py + ruler_h - L.sm, x, py + ruler_h, C.ruler_tick)
+        return
+      end
+      reaper.ImGui_DrawList_AddLine(draw_list, x, major_top, x, py + ruler_h, C.ruler_text)
+      local label_w = reaper.ImGui_CalcTextSize(draw_ctx, label) or 0
+      local label_x = x + L.sm
+      if label_x >= next_free_x and label_x + label_w <= px + w then
+        reaper.ImGui_DrawList_AddText(draw_list, label_x, label_y, C.ruler_text, label)
+        next_free_x = label_x + label_w + L.md
+      end
+    end
+
+    -- The ruler follows REAPER's own ruler unit: bars and beats when the project's time format starts with
+    -- measures.beats ("33.1.00", with or without a time after it), project time otherwise. REAPER's tempo map
+    -- places every bar and beat, so tempo and time signature changes need nothing here.
+    local t_first, t_last = item_pos + vt0, item_pos + vt1
+    local unit = reaper.format_timestr_pos(t_first, "", -1)
+    local beats_drawn = false
+    if type(unit) == "string" and unit:match("^%-?%d+%.%d+%.%d+") then
+      local _, bar_first = reaper.TimeMap2_timeToBeats(0, t_first)
+      local _, bar_last = reaper.TimeMap2_timeToBeats(0, t_last)
+      local bar_t0, _, _, cml = reaper.TimeMap_GetMeasureInfo(0, bar_first or 0)
+      local bar_t1 = reaper.TimeMap_GetMeasureInfo(0, (bar_first or 0) + 1)
+      if bar_first and bar_last and bar_t0 and bar_t1 and bar_t1 > bar_t0 and cml and cml > 0 then
+        beats_drawn = true
+        -- The bar number as REAPER shows it (a project's measure offset included)
+        local function bar_name(bar, bar_t)
+          local shown = reaper.format_timestr_pos(bar_t + K.VIEW_EPS_S, "", 2)
+          return type(shown) == "string" and shown:match("^(%-?%d+)%.") or tostring(bar + 1)
         end
-      else
-        reaper.ImGui_DrawList_AddLine(draw_list, x, py + ruler_h - L.sm, x, py + ruler_h, P.border)
+        local widest_bar = bar_name(bar_last, reaper.TimeMap_GetMeasureInfo(0, bar_last) or t_last)
+        local need = (reaper.ImGui_CalcTextSize(draw_ctx, widest_bar .. ".1") or 0) * K.RULER_LABEL_ROOM
+        local need_sub = (reaper.ImGui_CalcTextSize(draw_ctx, widest_bar .. ".1.50") or 0) * K.RULER_LABEL_ROOM
+        local beat_px = (bar_t1 - bar_t0) / cml / span * w
+        local bars, label_beats, tick_beats, bar_ticks = K.ruler_beat_steps(beat_px, cml, need, need_sub)
+
+        local step = (bars > 1 and not bar_ticks) and bars or 1
+        for bar = bar_first - bar_first % step, bar_last, step do
+          local bar_t, _, _, bar_cml = reaper.TimeMap_GetMeasureInfo(0, bar)
+          if not bar_t then break end
+          local name = bar_name(bar, bar_t)
+          if tick_beats then
+            -- Ticks inside the bar: each time comes from the tempo map; a label at every label_beats (or the bar start)
+            local per_label = label_beats and math.floor(label_beats / tick_beats + 0.5) or nil
+            for i = 0, math.floor((bar_cml or cml) / tick_beats + 0.5) - 1 do
+              local beat = i * tick_beats
+              local t = i == 0 and bar_t or reaper.TimeMap2_beatsToTime(0, beat, bar)
+              if t and t >= t_first - K.VIEW_EPS_S and t <= t_last + K.VIEW_EPS_S then
+                local label = nil
+                if (per_label and i % per_label == 0) or (not per_label and i == 0) then
+                  local whole = math.floor(beat + K.VIEW_EPS_S)
+                  local part = math.floor((beat - whole) * 100 + 0.5)
+                  label = string.format("%s.%d", name, whole + 1) .. (part > 0 and string.format(".%02d", part) or "")
+                end
+                draw_tick(t_to_x(t - item_pos), label)
+              end
+            end
+          elseif bar_t >= t_first - K.VIEW_EPS_S and bar_t <= t_last + K.VIEW_EPS_S then
+            draw_tick(t_to_x(bar_t - item_pos), bar % bars == 0 and (name .. ".1") or nil)
+          end
+        end
+      end
+    end
+
+    if not beats_drawn then
+      -- Project time, as on REAPER's ruler (the project start time offset included): the item's position is added
+      -- to the canvas time, and the ticks sit on round project times, not round item times
+      local proj_t0 = item_pos + reaper.GetProjectTimeOffset(0, false)
+
+      -- Smallest 1-2-5 x 10^n number of seconds that is at least t_min
+      local function nice_step(t_min)
+        local base = 10 ^ math.floor(math.log(t_min, 10))
+        local ratio = t_min / base
+        return base * (ratio <= 1 and 1 or (ratio <= 2 and 2 or (ratio <= 5 and 5 or 10)))
+      end
+      -- "1:02.5" (minutes:seconds, as REAPER's ruler), "1:00:02.5" from an hour on; "-" before the project start
+      local function time_label(t, decimals)
+        local scale = math.floor(10 ^ decimals + 0.5)
+        local ticks = math.floor(math.abs(t) * scale + 0.5)
+        local sign = (t < 0 and ticks > 0) and "-" or ""
+        local whole = ticks // scale
+        local fraction = decimals > 0 and string.format(".%0" .. decimals .. "d", ticks % scale) or ""
+        if whole >= 3600 then
+          return sign .. string.format("%d:%02d:%02d", whole // 3600, whole // 60 % 60, whole % 60) .. fraction
+        end
+        return sign .. string.format("%d:%02d", whole // 60, whole % 60) .. fraction
+      end
+
+      -- The major step: the smallest one whose labels fit with room between them (starting from one digit per step)
+      local digit_w = reaper.ImGui_CalcTextSize(draw_ctx, "0") or 0
+      local interval = nice_step(span * math.max(digit_w, 1) / math.max(w, 1))
+      local decimals = 0
+      for attempt = 1, K.RULER_MAX_TRIES do
+        decimals = interval >= 1 and 0 or math.ceil(-math.log(interval, 10) - K.VIEW_EPS_S)
+        local widest = math.max(
+          reaper.ImGui_CalcTextSize(draw_ctx, time_label(proj_t0 + vt0, decimals)) or 0,
+          reaper.ImGui_CalcTextSize(draw_ctx, time_label(proj_t0 + vt1, decimals)) or 0)
+        if interval / span * w >= widest * K.RULER_LABEL_ROOM or attempt == K.RULER_MAX_TRIES then break end
+        interval = nice_step(interval * K.RULER_WIDEN)
+      end
+
+      -- A label at every major step, a short tick at every minor one
+      local minor = interval / K.RULER_MINOR_DIV
+      for m = math.ceil((proj_t0 + vt0) / minor - K.VIEW_EPS_S), math.floor((proj_t0 + vt1) / minor + K.VIEW_EPS_S) do
+        draw_tick(t_to_x(m * minor - proj_t0), m % K.RULER_MINOR_DIV == 0 and time_label(m * minor, decimals) or nil)
       end
     end
 
@@ -8150,6 +8237,13 @@ local function render_pitched_items_sidebar(sidebar_ctx)
       reaper.ImGui_EndChild(sidebar_ctx)
     end
   end
+
+  -- The body's top hairline (see the main window) continues over the panel: the first header sits on the panel's
+  -- top edge and would cover a line drawn under this child
+  local panel_x, panel_y = reaper.ImGui_GetWindowPos(sidebar_ctx)
+  local panel_w = reaper.ImGui_GetWindowWidth(sidebar_ctx)
+  reaper.ImGui_DrawList_AddLine(reaper.ImGui_GetWindowDrawList(sidebar_ctx),
+    panel_x, panel_y, panel_x + panel_w, panel_y, Theme.get_palette().canvas.ruler_edge)
 end
 
 --- Body, panel open: canvas | grip | Pitched Items in a resizable two-column table (canvas stretches,
@@ -10590,6 +10684,7 @@ local function loop_body()
     -- no bottom row (the status line is a pill on the canvas, see K.canvas_status)
     local avail_w, body_h = reaper.ImGui_GetContentRegionAvail(ctx)
     local total_h = math.max(60, body_h)
+    local body_x, body_y = reaper.ImGui_GetCursorScreenPos(ctx)
 
     -- The panel is drawn only when the window has room for it beside a usable canvas; otherwise the
     -- canvas takes the whole body without touching the saved open / closed preference
@@ -10624,6 +10719,10 @@ local function loop_body()
         msg_x + math.max(0, (avail_w - msg_w) * 0.5), msg_y + (body_h - msg_h) * 0.5, P.text_dim, msg)
     end
     state.sidebar_tabled = split_drawn
+    -- A light hairline along the top of the body, across the note column, the ruler and the side panel: the
+    -- faint edge REAPER draws above its own ruler (C.ruler_edge)
+    reaper.ImGui_DrawList_AddLine(reaper.ImGui_GetWindowDrawList(ctx),
+      body_x, body_y, body_x + avail_w, body_y, P.canvas.ruler_edge)
   end
 
   -- Pop custom window padding & item spacing before rendering modals
