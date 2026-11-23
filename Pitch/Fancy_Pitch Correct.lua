@@ -437,7 +437,7 @@ local state = {
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
   raw_cache = {},           -- [guid] = raw P_EXT string last written or loaded by this script
   missing_takes = {},       -- [guid] = true when the take no longer resolves (row is kept in the sidebar)
-  undone_takes = {},        -- [guid] = true: an undo took the take's analysis away; a redo may bring it back (sync_with_project)
+  undone_takes = {},        -- [guid] = n: an undo took the take's analysis away (n: in which order); a redo may bring it back (sync_with_project)
   stale_takes = {},         -- [guid] = true: the take's pitch envelope is not what today's settings and its notes would write (K.envelope_check)
   stale_env = {},           -- [guid] = { points }: the envelope a stale take really holds, for the preview curve of the open item
   stale_queue = {},         -- guids whose envelope is still to be compared (one per frame, K.stale_check_step)
@@ -2853,6 +2853,9 @@ local function sync_with_project()
   if state.is_analyzing or K.batch then return end
   local count = reaper.GetProjectStateChangeCount(0)
   if state.last_change_count == count then return end
+  -- A change that is not this script's own (undo, redo, an edit in REAPER): a held closing message ("Analyzed 3
+  -- items") no longer describes the project. A count this script forgot on purpose (nil) is not such a change.
+  if state.last_change_count ~= nil then K.status_release() end
   state.last_change_count = count
   K.queue_stale_checks()   -- an undo, a redo or an edit in REAPER may have changed an envelope
 
@@ -2885,7 +2888,8 @@ local function sync_with_project()
           state.session_takes[guid] = nil
           state.stale_takes[guid] = nil
           table.remove(state.session_order, i)
-          state.undone_takes[guid] = true
+          K.undone_seq = (K.undone_seq or 0) + 1
+          state.undone_takes[guid] = K.undone_seq   -- in the order of the list, so a redo lists them as before
           if is_active then
             clear_interaction_state()
             state.results = {}
@@ -2921,7 +2925,10 @@ local function sync_with_project()
 
   -- Items whose analysis an undo took away: a redo may have put it back. One undo can take away many (a batch), and
   -- only one of them is the open item, so each is looked at again whenever the project changes.
-  for guid in pairs(state.undone_takes) do
+  local undone = {}
+  for guid in pairs(state.undone_takes) do undone[#undone + 1] = guid end
+  table.sort(undone, function(a, b) return state.undone_takes[a] < state.undone_takes[b] end)
+  for _, guid in ipairs(undone) do
     if state.session_takes[guid] then
       state.undone_takes[guid] = nil   -- analysed again since
     else
@@ -12117,6 +12124,7 @@ local function loop_body()
         local target_lost = state.target_take_guid ~= nil
           and not resolve_take_by_guid(state.target_take_guid, true)
         if sel_changed or target_lost then
+          K.status_release()   -- a held closing message belongs to the item being left
           -- Commit a pending arrow-key nudge to the take being left
           flush_nudge_burst()
           local switched = switch_active_target(cur_guid, cur_sel_take)

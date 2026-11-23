@@ -2783,6 +2783,28 @@ test("sync_brings_back_a_redone_analysis", function()
   if not ok then error(err, 0) end
 end)
 
+-- A held closing message describes the project as the batch left it: an undo, a redo or an edit in REAPER ends it
+test("held_message_goes_when_the_project_changes", function()
+  local K, st = S.K, S.state
+  local changes = 5
+  reaper.GetProjectStateChangeCount = function() return changes end
+  local saved = st.last_change_count
+  local ok, err = pcall(function()
+    K.status_hold("Analyzed 3 items.")
+    st.last_change_count = nil     -- as a batch leaves it: the next frame reads the project again
+    S.sync_with_project()
+    eq(st.status.text, "Analyzed 3 items.", "the batch's own resync keeps it")
+    S.sync_with_project()
+    eq(st.status.text, "Analyzed 3 items.", "nothing changed")
+    changes = 6                    -- Cmd+Z in REAPER
+    S.sync_with_project()
+    eq(st.status.text, "", "gone once the project changed")
+  end)
+  reaper.GetProjectStateChangeCount = nil
+  st.last_change_count, st.status.text, st.status.hold = saved, "", nil
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
