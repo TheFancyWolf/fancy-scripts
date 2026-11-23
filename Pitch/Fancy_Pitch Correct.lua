@@ -1,12 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.20.0
+-- @version 2.21.0
 -- @changelog
---   Pitch detection: each moment's pitch is now chosen together with the moments around it, not on its own. A note read an octave too high (a strong overtone) or too low (a shaky note start) is now read right, without relying on the repair added in 2.19.1
---   The Detection setting now only decides what counts as a pitched sound; it no longer changes which octave a note is read in
---   The pitch line and the notes sit half an analysis block later (about 10 ms at Standard quality), where the sound actually is; they were drawn early. The line now starts and ends that far inside the item
---   No more false low reading at the very end of an item
---   Analyze an item again to get this
+--   Analyze All Selected Items: with two or more audio items selected in REAPER, the button on an empty item analyzes all of them, one after another, as one undo step. The same command is in the "…" menu as "Analyze Selected Items (N)"
+--   Before a batch replaces notes you already have, it asks once and lists those items
+--   Cancel during a batch keeps the items already finished; a closing message says how many were analyzed
+--   Re-Analyze now reads the true pitch of an item that has corrections (it used to read the corrected sound)
+--   The Pitched Items list cannot be changed while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
