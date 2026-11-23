@@ -2273,6 +2273,59 @@ test("analysis_pitch_range_follows_the_final_choice", function()
   if not ok then error(err, 0) end
 end)
 
+-- Analyze All Selected Items (docs/design/pitch-correct-analyze-selected.md) ----------------------------------------
+
+-- Every analysis reads the uncorrected audio: the accessor is made while the take's Pitch envelope is bypassed
+local ENV_CHUNK = "<PITCHENV\nEGUID {E}\nACT 1 -1\nVIS 1 1 1\nPT 0 0 0\nPT 0.5 0.244 5 0\n>"
+local function with_envelope(chunk, create, fn)   -- runs fn(log) with the envelope and accessor calls recorded
+  local log = {}
+  reaper.GetTakeEnvelopeByName = function() return chunk and "ENV" or nil end
+  reaper.GetEnvelopeStateChunk = function() return true, chunk end
+  reaper.SetEnvelopeStateChunk = function(_, c) log[#log + 1] = "set:" .. c; return true end
+  reaper.CreateTakeAudioAccessor = function() log[#log + 1] = "create"; return create() end
+  local ok, err = pcall(fn, log)
+  reaper.GetTakeEnvelopeByName, reaper.GetEnvelopeStateChunk, reaper.SetEnvelopeStateChunk,
+    reaper.CreateTakeAudioAccessor = nil, nil, nil, nil
+  if not ok then error(err, 0) end
+end
+
+test("open_accessor_reads_around_the_envelope", function()
+  with_envelope(ENV_CHUNK, function() return "ACC" end, function(log)
+    eq(S.K.open_accessor("TAKE"), "ACC")
+    eq(#log, 3, "calls")
+    eq(log[1], "set:" .. (ENV_CHUNK:gsub("ACT 1", "ACT 0", 1)), "bypassed first")
+    eq(log[2], "create")
+    eq(log[3], "set:" .. ENV_CHUNK, "put back byte for byte")
+  end)
+end)
+
+test("open_accessor_restores_when_creation_fails", function()
+  with_envelope(ENV_CHUNK, function() error("boom") end, function(log)
+    eq(S.K.open_accessor("TAKE"), nil)
+    eq(log[#log], "set:" .. ENV_CHUNK, "envelope put back")
+  end)
+end)
+
+test("open_accessor_leaves_other_envelopes_alone", function()
+  for _, chunk in ipairs({ false, (ENV_CHUNK:gsub("ACT 1", "ACT 0", 1)), "<PITCHENV\nACT 1 -1\nVIS 1 1 1\n>" }) do
+    with_envelope(chunk, function() return "ACC" end, function(log)
+      eq(S.K.open_accessor("TAKE"), "ACC")
+      eq(#log, 1, "only the accessor is created"); eq(log[1], "create")
+    end)
+  end
+end)
+
+test("analysis_begin_refuses_offline_media", function()
+  local st = S.state
+  reaper.GetMediaSourceSampleRate = function() return 0 end
+  local created = false
+  reaper.CreateTakeAudioAccessor = function() created = true; return "ACC" end
+  local ok, reason = S.K.analysis_begin("TAKE", "ITEM")
+  reaper.GetMediaSourceSampleRate, reaper.CreateTakeAudioAccessor = nil, nil
+  eq(ok, false); eq(reason, "offline"); eq(st.is_analyzing == true, false, "not analysing")
+  eq(created, false, "nothing was opened")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

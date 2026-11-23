@@ -1331,15 +1331,49 @@ local function pitch_envelope_needs_setup(take)
   return chunk:match("ACT%s+0") ~= nil or chunk:match("VIS%s+0") ~= nil
 end
 
-local function start_analysis()
-  -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
-  -- get_target_take() falls back to the selected audio item only when there is no usable target.
-  local take, item = get_target_take()
-
-  if not item or not take then
-    set_status("Select an audio item first")
-    return
+--- An audio accessor that reads the take without its pitch correction. REAPER's take accessor returns the audio with
+--- the take's active Pitch envelope applied (seen 2026-11-23: a note quantized by -0.59 st was read 0.59 st low), and
+--- it keeps the take state it was made with until AudioAccessorValidateState / AudioAccessorUpdate is called, which
+--- this script never does. So the envelope is bypassed, the accessor made and the envelope's chunk put back byte for
+--- byte, all in this one call: nothing is heard, no undo point is added, and the envelope is as it was whatever
+--- happens to the analysis afterwards. An envelope that is bypassed already or holds no points is left alone.
+--- Returns the accessor, or nil when REAPER gave none.
+K.open_accessor = function(take)
+  local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+  local chunk = nil
+  if env then
+    local ok, text = reaper.GetEnvelopeStateChunk(env, "", false)
+    if ok and text and text:match("ACT%s+1") and text:match("\nPT ") then chunk = text end
   end
+  if chunk then reaper.SetEnvelopeStateChunk(env, (chunk:gsub("ACT%s+1", "ACT 0", 1)), false) end
+  local ok, accessor = pcall(reaper.CreateTakeAudioAccessor, take)
+  if chunk then
+    reaper.SetEnvelopeStateChunk(env, chunk, false)
+    note_own_write()   -- the two chunk writes moved the project's change count: they are this script's own
+  end
+  if ok and accessor then return accessor end
+  return nil
+end
+
+--- Start analysing `take` (in `item`): it becomes the target and its audio is read slice by slice from the next
+--- frame on (process_analysis_step). opts (optional):
+---   sample_rate     the rate to read at, when the caller already knows it (a batch records it when it starts:
+---                   REAPER can report 0 for every source while it is in the background, see K.batch_selection)
+---   defer_envelope  do not create or show the take's Pitch envelope now (a batch does it in its one undo block)
+--- Returns true, or false and why: "offline" (the source has no sample rate: its media is offline) or "accessor"
+--- (REAPER gave no audio accessor). Nothing is changed when it returns false.
+K.analysis_begin = function(take, item, opts)
+  opts = opts or {}
+  local sample_rate = opts.sample_rate
+  if not sample_rate then
+    local source = reaper.GetMediaItemTake_Source(take)
+    sample_rate = source and reaper.GetMediaSourceSampleRate(source)
+  end
+  -- Without a rate nothing can be read; analysing anyway would store an analysis with no notes
+  if not sample_rate or sample_rate <= 0 then return false, "offline" end
+
+  local accessor = K.open_accessor(take)
+  if not accessor then return false, "accessor" end
 
   local guid = get_take_guid(take)
   if guid then state.target_take_guid = guid end
@@ -1349,9 +1383,7 @@ local function start_analysis()
   state.item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
   state.end_time = state.item_len
   state.current_time = 0
-
-  local source = reaper.GetMediaItemTake_Source(take)
-  state.sample_rate = reaper.GetMediaSourceSampleRate(source)
+  state.sample_rate = sample_rate
 
   -- A bad engine value must never crash (negative array size) or hang (a hop of 0 never advances the
   -- analysis time) an analysis: clamp to 64 <= block, 1 <= hop <= block before anything is allocated
@@ -1367,7 +1399,7 @@ local function start_analysis()
     min_freq = state.min_freq, max_freq = state.max_freq,
   }
 
-  state.accessor = reaper.CreateTakeAudioAccessor(take)
+  state.accessor = accessor
   state.buffer = reaper.new_array(state.analysis_params.block_size)
 
   state.results = {}
@@ -1379,11 +1411,27 @@ local function start_analysis()
 
   -- Ensure take pitch envelope is created and active on the take upfront (own named undo point,
   -- and only when it actually changes something)
-  if pitch_envelope_needs_setup(take) then
+  if not opts.defer_envelope and pitch_envelope_needs_setup(take) then
     reaper.Undo_BeginBlock()
     ensure_take_pitch_envelope(take, item, true)
     reaper.Undo_EndBlock("Show Pitch Envelope", -1)
     note_own_write()
+  end
+  return true
+end
+
+--- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected).
+local function start_analysis()
+  -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
+  -- get_target_take() falls back to the selected audio item only when there is no usable target.
+  local take, item = get_target_take()
+
+  if not item or not take then
+    set_status("Select an audio item first")
+    return
+  end
+  if not K.analysis_begin(take, item) then
+    set_status("Couldn't read this item's audio. Check that its media is online, then try again.")
   end
 end
 
