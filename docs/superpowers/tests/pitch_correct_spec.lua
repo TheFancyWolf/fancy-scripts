@@ -868,8 +868,8 @@ local function wobbly(n, tighten, tolerance)
   return n
 end
 
-local function untouched_note(t0, dur, centre, slide)
-  local n = join_note(t0, dur, centre, 0, slide)
+local function untouched_note(t0, dur, centre, slide)   -- a note nobody edited (a Strength of its own counts as one)
+  local n = join_note(t0, dur or 0.3, centre or 60, 0, slide)
   n.controls.retune_speed = nil
   return n
 end
@@ -1183,6 +1183,75 @@ test("natural_same_text", function()
 end)
 
 if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
+
+local function with_item_mode(mode, fn)   -- runs fn with an open item whose mode is `mode` (nil = none)
+  local st = S.state
+  local saved_guid, saved_take = st.target_take_guid, st.session_takes["{M}"]
+  st.target_take_guid = "{M}"
+  st.session_takes["{M}"] = { overrides = { correct_mode = mode } }
+  local ok, err = pcall(fn)
+  st.target_take_guid, st.session_takes["{M}"] = saved_guid, saved_take
+  if not ok then error(err, 0) end
+end
+
+test("mode_load_holds_range", function()
+  for _, bad in ipairs({ 3, 1.5, -1, "x" }) do
+    local ctrl = {}
+    S.K.controls_load(ctrl, { correct_mode = bad })
+    eq(ctrl.correct_mode, nil, "bad " .. tostring(bad))
+  end
+  for _, good in ipairs({ 0, 1, 2 }) do
+    local ctrl = {}
+    S.K.controls_load(ctrl, { correct_mode = good })
+    eq(ctrl.correct_mode, good)
+  end
+end)
+
+test("mode_first_attempt_data_is_natural", function()
+  local ctrl = {}
+  S.K.controls_load(ctrl, { tighten = 1.4, tune_mode = 2 })
+  eq(ctrl.tighten, 1, "Tighten above 100% reads as 100%")
+  eq(ctrl.tune_mode, nil); eq(ctrl.correct_mode, nil)
+end)
+
+test("mode_value_and_note_mode", function()
+  local moved = join_note(0.1, 0.3, 60, 0.5)
+  local untouched = untouched_note(0.5)
+  eq(S.K.mode_value(moved), 0); eq(S.K.note_mode(moved), nil)
+  with_item_mode(1, function()
+    eq(S.K.mode_value(nil), 1, "the item's")
+    eq(S.K.note_mode(moved), "classic", "edited note takes the item's mode")
+    eq(S.K.note_mode(untouched), nil, "an untouched note is never corrected")
+    moved.controls.correct_mode = 0
+    eq(S.K.note_mode(moved), nil, "its own Natural wins")
+    moved.controls.correct_mode = 2
+    eq(S.K.note_mode(moved), "hard")
+    moved.controls.bypassed = true
+    eq(S.K.note_mode(moved), nil, "bypassed")
+  end)
+  with_item_mode(7, function() eq(S.K.mode_value(nil), 0, "a bad item mode is Natural") end)
+  untouched.controls.correct_mode = 1
+  eq(S.K.note_mode(untouched), "classic", "choosing a mode is an edit")
+end)
+
+test("mode_carry_merge_clear", function()
+  local a, b = join_note(0.1, 0.3, 60, 0), join_note(0.4, 0.3, 62, 0)
+  a.controls.correct_mode, b.controls.correct_mode = 2, 1
+  eq(S.K.controls_carry(a.controls).correct_mode, 2)
+  eq(S.K.controls_merge({ a, b }).correct_mode, 2, "the first note's")
+  eq(S.K.controls_clear(a.controls), true); eq(a.controls.correct_mode, nil)
+end)
+
+test("mode_unused", function()
+  local c, h, n = { controls = { correct_mode = 1 } }, { controls = { correct_mode = 2 } }, { controls = {} }
+  eq(S.K.mode_unused("tolerance", { c, h }, 2), "mode")
+  eq(S.K.mode_unused("retune_speed", { c, n }, 2), nil)
+  eq(S.K.mode_unused("slide_in", {}, 0), nil)
+  eq(S.K.mode_unused("tighten", { h, h }, 2), "hard")
+  eq(S.K.mode_unused("tighten", { c }, 1), "classic")
+  eq(S.K.mode_unused("tighten", { c, h }, 2), nil)
+  eq(S.K.mode_unused("separation", { h }, 1), nil)
+end)
 
 -- Tests appended by later tasks go above this line.
 local failed = false

@@ -1445,6 +1445,7 @@ K.NOTE_CONTROLS = {
   { key = "tolerance",     merge = "first",    edited = "set" },        -- cents; inherits item -> global
   { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
   { key = "slide_in",      merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
+  { key = "correct_mode",  merge = "first",    edited = "set" },        -- 0 Natural, 1 Classic, 2 Hard; inherits item
 }
 
 --- The values a note cut from the note with `old_ctrl` keeps (Split, Trim): all of them, and its bypass.
@@ -1511,6 +1512,9 @@ K.controls_load = function(ctrl, saved)
   local lim = K.LIMITS.tolerance
   if ctrl.tighten then ctrl.tighten = (ctrl.tighten > 0) and math.min(1, ctrl.tighten) or nil end
   if ctrl.tolerance then ctrl.tolerance = math.max(lim[1], math.min(lim[2], ctrl.tolerance)) end
+  if ctrl.correct_mode and (ctrl.correct_mode % 1 ~= 0 or ctrl.correct_mode < 0 or ctrl.correct_mode > 2) then
+    ctrl.correct_mode = nil
+  end
 end
 
 local function extract_note_features(note, preserve_controls)
@@ -2659,6 +2663,55 @@ K.correction_build = function(notes, item_len)
   end
 
   return { points = all_points, spans = spans, ranges = merged }
+end
+
+-------------------------------------------------------------------------------
+-- 4b. MODES
+-------------------------------------------------------------------------------
+-- Mode picks how a note is corrected: 0 Natural (what K.correction_build does today), 1 Classic, 2 Hard. A note
+-- stores its own mode (controls.correct_mode) or inherits the item's (take overrides); anything but 1 or 2 is
+-- Natural. Classic and Hard are built beside Natural, never inside it: K.correction_build is not edited for them.
+-- Nothing calls these yet.
+-------------------------------------------------------------------------------
+K.MODE = { GLIDE_S = 0.100, OUTLIER_ST = 3, STEP_S = 0.0005 }
+K.MODES = { "Natural", "Classic", "Hard" }
+
+--- The mode in force for `note` (nil = the item): its own, else the item's; 0 (Natural), 1 or 2.
+K.mode_value = function(note)
+  local v = get_effective(note, "correct_mode")
+  if v == 1 or v == 2 then return v end
+  return 0
+end
+
+--- "classic" or "hard" when `note` is corrected by that mode; nil when Natural handles it (no controls, bypassed,
+--- not edited, or Natural).
+K.note_mode = function(note)
+  if not (note and note.controls) or note.controls.bypassed or not is_note_modified(note) then return nil end
+  local v = K.mode_value(note)
+  if v == 1 then return "classic" end
+  if v == 2 then return "hard" end
+  return nil
+end
+
+--- Why the control `key` does nothing for the `n` notes in `notes`: "mode" (the mode does not use it), "hard" or
+--- "classic" (Tighten only: that mode ignores it); nil when it works for at least one note.
+K.mode_unused = function(key, notes, n)
+  if n == 0 then return nil end
+  local all1, all2, none0 = true, true, true
+  for i = 1, n do
+    local v = K.mode_value(notes[i])
+    if v ~= 1 then all1 = false end
+    if v ~= 2 then all2 = false end
+    if v == 0 then none0 = false end
+  end
+  if key == "retune_speed" or key == "tolerance" or key == "slide_in" then
+    return none0 and "mode" or nil
+  end
+  if key == "tighten" then
+    if all2 then return "hard" end
+    if all1 then return "classic" end
+  end
+  return nil
 end
 
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
@@ -10926,6 +10979,7 @@ local function main()
 end
 
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
-  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features }
+  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
+           SCALE_DEFINITIONS = SCALE_DEFINITIONS }
 end
 main()
