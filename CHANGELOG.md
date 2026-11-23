@@ -4,6 +4,10 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.19.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Octave errors in the analysis:
+  - **No more spikes and drops**: a short stretch the analysis read one octave too high or too low (up to 150 ms, with the right octave around it) is put back in the octave of the singing around it.
+  - **Note blocks sit on the pitch line**: a note's centre leaves out any pitch reading still in the wrong octave, so the block is drawn where the note was sung and Quantize picks the right note.
+  - **Analyze again**: items analysed before keep their old readings until you analyze them again, and some of their notes may show as edited.
 - **Fancy Pitch Correct v2.19.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Mode: how an edited note is corrected:
   - **Three modes**: **Natural** is as before; nothing about it has changed. **Classic** is the auto-tuned effect: the pitch jumps between the notes of the scale, and Tighten sets how fast (0% glides, 100% steps at once). **Hard** is one flat note of the scale.
   - **Where to set it**: the Mode dropdown directly left of Tighten in the top bar changes this item when nothing is selected (every edited note without its own mode) and the selected notes otherwise; the note's right-click menu has a Mode row. Each choice is one undo step, and changing the item's mode says how many edited notes it changed.

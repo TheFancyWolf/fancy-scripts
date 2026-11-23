@@ -1,12 +1,10 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.19.0
+-- @version 2.19.1
 -- @changelog
---   Mode: how an edited note is corrected. Natural is as before (nothing about it has changed); Classic is the auto-tuned effect: the pitch jumps between the notes of the scale and Tighten sets how fast (0% glides, 100% steps at once); Hard is one flat note of the scale
---   Set the Mode in the dropdown directly left of Tighten (this item when nothing is selected, the selected notes otherwise) or in the Mode row of the note's right-click menu
---   Classic and Hard follow where a note was moved and the item's Key and Scale; a Key or Scale change rewrites them at once, as one undo step
---   Strength, Tolerance and Slide In are not used in Classic or Hard (nor Tighten in Hard): they are dimmed and say so. An untouched note is never corrected in any mode; analysing an item again puts its mode back to Natural
---   Each value has one colour everywhere (Tighten green, Strength blue, Tolerance yellow, Slide In orange): its bar in the top bar, the same bar on its row in the note's right-click menu, a bar under the readout while it is dragged on a note, and its highlight on the notes. The bar's colour no longer tells a note's own value from the default; the * mark and the tooltip still do
+--   Analysis: a short stretch read one octave too high or too low (a spike or a sudden drop in the pitch line) is put back in the octave of the singing around it
+--   A note's centre leaves out any pitch reading still in the wrong octave, so the note block sits on the pitch line and Quantize picks the right note
+--   Analyze an item again to get this; notes analysed before may show as edited
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
