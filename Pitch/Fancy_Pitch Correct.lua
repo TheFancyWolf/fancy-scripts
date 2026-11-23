@@ -1,10 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.18.0
+-- @version 2.19.0
 -- @changelog
---   The time ruler now looks like REAPER's own: it takes the timeline colours of your REAPER theme (background, grey ticks, labels) in both theme modes
---   The ruler follows REAPER's ruler unit: bars and beats (33.1) when REAPER's ruler shows measures, project time (0:52.5) otherwise, instead of seconds from the start of the item; tempo and time signature changes are followed
---   A faint light line runs along the top of the note column, the ruler and the side panel; the line under the ruler is gone
+--   Mode: how an edited note is corrected. Natural is as before (nothing about it has changed); Classic is the auto-tuned effect: the pitch jumps between the notes of the scale and Tighten sets how fast (0% glides, 100% steps at once); Hard is one flat note of the scale
+--   Set the Mode in the dropdown directly left of Tighten (this item when nothing is selected, the selected notes otherwise) or in the Mode row of the note's right-click menu
+--   Classic and Hard follow where a note was moved and the item's Key and Scale; a Key or Scale change rewrites them at once, as one undo step
+--   Strength, Tolerance and Slide In are not used in Classic or Hard (nor Tighten in Hard): they are dimmed and say so. An untouched note is never corrected in any mode; analysing an item again puts its mode back to Natural
+--   Each value has one colour everywhere (Tighten green, Strength blue, Tolerance yellow, Slide In orange): its bar in the top bar, the same bar on its row in the note's right-click menu, a bar under the readout while it is dragged on a note, and its highlight on the notes. The bar's colour no longer tells a note's own value from the default; the * mark and the tooltip still do
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -1445,6 +1447,7 @@ K.NOTE_CONTROLS = {
   { key = "tolerance",     merge = "first",    edited = "set" },        -- cents; inherits item -> global
   { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
   { key = "slide_in",      merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
+  { key = "correct_mode",  merge = "first",    edited = "set" },        -- 0 Natural, 1 Classic, 2 Hard; inherits item
 }
 
 --- The values a note cut from the note with `old_ctrl` keeps (Split, Trim): all of them, and its bypass.
@@ -1511,6 +1514,10 @@ K.controls_load = function(ctrl, saved)
   local lim = K.LIMITS.tolerance
   if ctrl.tighten then ctrl.tighten = (ctrl.tighten > 0) and math.min(1, ctrl.tighten) or nil end
   if ctrl.tolerance then ctrl.tolerance = math.max(lim[1], math.min(lim[2], ctrl.tolerance)) end
+  if ctrl.correct_mode and (type(saved.correct_mode) ~= "number" or ctrl.correct_mode % 1 ~= 0
+      or ctrl.correct_mode < 0 or ctrl.correct_mode > 2) then
+    ctrl.correct_mode = nil
+  end
 end
 
 local function extract_note_features(note, preserve_controls)
@@ -2420,7 +2427,8 @@ K.JOIN = { FADE_S = 0.030, MIN_S = 0.010, MAX_S = 0.120, MAX_PART = 0.4 }
 ---   ranges  { t0, t1 }, sorted and merged: the time ranges an edited, non-bypassed note corrects (with its
 ---           fades and joins)
 --- No timing setting: joins and fades follow K.JOIN.
-K.correction_build = function(notes, item_len)
+--- This is the Natural build, called by K.correction_build (4b. MODES).
+K.natural_build = function(notes, item_len)
   local all_points, spans, ranges = {}, {}, {}
   local num_notes = #notes
 
@@ -2661,6 +2669,308 @@ K.correction_build = function(notes, item_len)
   return { points = all_points, spans = spans, ranges = merged }
 end
 
+-------------------------------------------------------------------------------
+-- 4b. MODES
+-------------------------------------------------------------------------------
+-- Mode picks how a note is corrected: 0 Natural (K.natural_build), 1 Classic, 2 Hard. A note stores its own mode
+-- (controls.correct_mode) or inherits the item's (take overrides); anything but 1 or 2 is Natural. Classic and Hard
+-- are built beside Natural, never inside it: K.natural_build is not edited for them (K.correction_build chooses).
+-------------------------------------------------------------------------------
+K.MODE = { GLIDE_S = 0.100, OUTLIER_ST = 3, STEP_S = 0.0005 }
+K.MODES = { "Natural", "Classic", "Hard" }
+
+--- The mode in force for `note` (nil = the item): its own, else the item's; 0 (Natural), 1 or 2.
+K.mode_value = function(note)
+  local v = get_effective(note, "correct_mode")
+  if v == 1 or v == 2 then return v end
+  return 0
+end
+
+--- "classic" or "hard" when `note` is corrected by that mode; nil when Natural handles it (no controls, bypassed,
+--- not edited, or Natural).
+K.note_mode = function(note)
+  if not (note and note.controls) or note.controls.bypassed or not is_note_modified(note) then return nil end
+  local v = K.mode_value(note)
+  if v == 1 then return "classic" end
+  if v == 2 then return "hard" end
+  return nil
+end
+
+--- How many of `notes` are corrected by Classic or Hard (K.note_mode non-nil).
+K.mode_note_count = function(notes)
+  local n = 0
+  for _, note in ipairs(notes or {}) do
+    if K.note_mode(note) then n = n + 1 end
+  end
+  return n
+end
+
+--- How many of `notes` the item's mode reaches: edited, not bypassed, and without a mode of their own.
+K.mode_reach_count = function(notes)
+  local n = 0
+  for _, note in ipairs(notes or {}) do
+    local ctrl = note.controls
+    if ctrl and not ctrl.bypassed and ctrl.correct_mode == nil and is_note_modified(note) then n = n + 1 end
+  end
+  return n
+end
+
+--- The status message of a change of the item's mode to `mode` (0, 1 or 2) that reaches `count` edited notes.
+K.mode_item_status = function(mode, count)
+  local name = K.MODES[(mode or 0) + 1] or K.MODES[1]
+  if count == 0 then return string.format("Mode: %s for this item. Notes you edit will use it", name) end
+  return string.format("Mode: %s for this item (%d edited %s)", name, count, count == 1 and "note" or "notes")
+end
+
+--- Why the control `key` does nothing for the `n` notes in `notes`: "mode" (the mode does not use it), "hard" or
+--- "classic" (Tighten only: that mode ignores it); nil when it works for at least one note.
+K.mode_unused = function(key, notes, n)
+  if n == 0 then return nil end
+  local all1, all2, none0 = true, true, true
+  for i = 1, n do
+    local v = K.mode_value(notes[i])
+    if v ~= 1 then all1 = false end
+    if v ~= 2 then all2 = false end
+    if v == 0 then none0 = false end
+  end
+  if key == "retune_speed" or key == "tolerance" or key == "slide_in" then
+    return none0 and "mode" or nil
+  end
+  if key == "tighten" then
+    if all2 then return "hard" end
+    if all1 then return "classic" end
+  end
+  return nil
+end
+
+K.scale_pcs_memo = {}
+
+--- The pitch classes ({ [0..11] = true }) of scale `scale_idx` in key `key_idx` (1 = C); nil for an unknown scale.
+--- Memoised: the same (key, scale) always returns the same table, so K.mode_line's cache can compare it by identity.
+--- The returned set is shared: callers must not modify it.
+K.scale_pcs = function(key_idx, scale_idx)
+  local scale = SCALE_DEFINITIONS[scale_idx]
+  if not scale or type(key_idx) ~= "number" then return nil end
+  local root = (key_idx - 1) % 12
+  local mk = root .. ":" .. scale_idx
+  local pcs = K.scale_pcs_memo[mk]
+  if pcs then return pcs end
+  pcs = {}
+  for _, intv in ipairs(scale.intervals) do pcs[(root + intv) % 12] = true end
+  K.scale_pcs_memo[mk] = pcs
+  return pcs
+end
+
+--- Key and Scale of the take the build is for (its stored ones), each falling back to the combos' value.
+K.item_scale = function()
+  local td = state.target_take_guid and state.session_takes and state.session_takes[state.target_take_guid]
+  local key_idx = td and td.key_idx or state.key_idx
+  local scale_idx = td and td.scale_idx or state.scale_idx
+  return key_idx, scale_idx
+end
+
+K.item_scale_pcs = function()
+  return K.scale_pcs(K.item_scale())
+end
+
+--- The whole semitone nearest `pitch` whose pitch class is in `pcs` (nil or empty: every semitone). Searched 6 either
+--- side of the rounded pitch; a tie goes to the lower.
+K.nearest_scale_pitch = function(pitch, pcs)
+  local base = math.floor(pitch + 0.5)
+  local any = pcs == nil or next(pcs) == nil
+  local best, best_d = base, math.huge
+  for c = base - 6, base + 6 do
+    if any or pcs[c % 12] then
+      local d = math.abs(c - pitch)
+      if d < best_d then best, best_d = c, d end
+    end
+  end
+  return best
+end
+
+--- Classic or Hard correction of one note: shifts[i] (semitones, without pitch-point offsets) for each frame, and
+--- steps[i] = true where the pitch steps just before frame i. Cached on note.mode_cache.
+--- The returned shifts and steps tables are the cache itself: shared, read-only for callers.
+K.mode_line = function(note, mode, pcs)
+  local frames = note.frames or {}
+  local ctrl = note.controls or {}
+  local tighten = tonumber(ctrl.tighten) or 0
+  if tighten < 0 then tighten = 0 elseif tighten > 1 then tighten = 1 end
+  local avg = note.avg_note
+  local centre = type(ctrl.center_pitch) == "number" and ctrl.center_pitch or avg
+  local c = note.mode_cache
+  if c and c.frames == frames and c.tighten == tighten and c.mode == mode and c.centre == centre
+     and c.avg == avg and c.pcs == pcs then
+    return c.shifts, c.steps
+  end
+  local shifts, steps = {}, {}
+  if #frames > 0 and type(avg) == "number" and type(centre) == "number" then
+    local move = centre - avg
+    local target = K.nearest_scale_pitch(centre, pcs)
+    local last = target - avg
+    local tau = K.MODE.GLIDE_S * (1 - tighten)
+    local line, have_line = 0, false
+    for i = 1, #frames do
+      local sung = frames[i].note
+      if type(sung) == "number" and math.abs(sung - avg) <= K.MODE.OUTLIER_ST then
+        if mode == "hard" then
+          last = target - sung
+        else
+          local goal = K.nearest_scale_pitch(sung + move, pcs)
+          local dt = i > 1 and ((frames[i].time or 0) - (frames[i - 1].time or 0)) or 0
+          if not have_line then
+            line, have_line = goal, true
+          elseif tau * 3 <= dt then
+            if goal ~= line then steps[i] = true end
+            line = goal
+          else
+            line = line + (1 - math.exp(-dt / tau)) * (goal - line)
+          end
+          last = line - sung
+        end
+      end
+      shifts[i] = last
+    end
+  end
+  note.mode_cache = { frames = frames, tighten = tighten, mode = mode, centre = centre, avg = avg, pcs = pcs,
+                      shifts = shifts, steps = steps }
+  return shifts, steps
+end
+
+--- A stand-in for a Classic or Hard note, for K.natural_build: it reads everything from `note` except its controls,
+--- which read from the real controls except bypassed = true. Whatever the build writes (frame_shifts, the caches
+--- of K.note_body and the like) lands on the stand-in, never on the real note.
+K.mode_stand_in = function(note)
+  local ctrl = setmetatable({ bypassed = true }, { __index = note.controls })
+  return setmetatable({ controls = ctrl }, { __index = note })
+end
+
+--- The pitch correction of `notes`: K.natural_build's own result when no note is Classic or Hard. Otherwise
+--- Natural builds every note with each Classic or Hard note seen as bypassed, and those notes write their own
+--- points beside it (stepping in and out over K.MODE.STEP_S, held across to a touching Classic or Hard
+--- neighbour). Pure (no REAPER calls); returns { points, spans, ranges } as K.natural_build does.
+K.correction_build = function(notes, item_len)
+  local num_notes = #notes
+  local modes, any = {}, false
+  for i = 1, num_notes do
+    modes[i] = K.note_mode(notes[i])
+    if modes[i] then any = true end
+  end
+  if not any then return K.natural_build(notes, item_len) end
+
+  local stand = {}
+  for i = 1, num_notes do
+    stand[i] = modes[i] and K.mode_stand_in(notes[i]) or notes[i]
+  end
+  local A = K.natural_build(stand, item_len)
+
+  local STEP, J = K.MODE.STEP_S, K.JOIN
+  local pcs = K.item_scale_pcs()
+  local function clamp(t) return math.max(0.0, math.min(item_len, t)) end
+  local function has_frames(n) return n.frames ~= nil and #n.frames > 0 end
+  -- Notes i and i + 1 are both Classic or Hard (with frames) and close enough to be held across
+  local function held(i)
+    local na, nb = notes[i], notes[i + 1]
+    return nb ~= nil and modes[i] ~= nil and modes[i + 1] ~= nil and has_frames(na) and has_frames(nb)
+      and nb.start_time - na.end_time < 2 * J.FADE_S
+  end
+
+  -- blocks[k]: the points of one Classic or Hard note, in time order; blocks are in note order. A point is
+  -- never clamped onto another: a step in before the item start or a close after its end is not written.
+  local blocks, mode_ranges = {}, {}
+  local block
+  local function put(t, val) block[#block + 1] = { time = clamp(t), val = val } end
+  for idx = 1, num_notes do
+    local n = notes[idx]
+    if modes[idx] and not has_frames(n) then
+      n.frame_shifts = {}
+    elseif modes[idx] then
+      block = {}
+      local fr, nf = n.frames, #n.frames
+      local shifts, steps = K.mode_line(n, modes[idx], pcs)
+      local offsets = K.points_offsets(n)
+      local fs = {}
+      for i = 1, nf do fs[i] = (shifts[i] or 0) + (offsets and offsets[i] or 0) end
+      n.frame_shifts = fs
+
+      local t_first, t_last = fr[1].time, fr[nf].time
+      if t_first - STEP >= 0 then
+        if idx > 1 and held(idx - 1) then
+          local p = notes[idx - 1]
+          put(t_first - STEP, p.frame_shifts[#p.frames])
+        else
+          put(t_first - STEP, 0.0)
+        end
+      end
+      for i = 1, nf do
+        if i > 1 and steps[i] then put(fr[i].time - STEP, fs[i - 1]) end
+        put(fr[i].time, fs[i])
+      end
+      local range = { t0 = clamp(t_first - STEP) }
+      if held(idx) then
+        range.t1 = clamp(notes[idx + 1].frames[1].time)
+      else
+        local t_close = math.max(n.end_time, t_last + STEP)
+        if t_close - STEP > t_last and t_close - STEP <= item_len then put(t_close - STEP, fs[nf]) end
+        if t_close <= item_len then put(t_close, 0.0) end
+        range.t1 = clamp(t_close)
+      end
+      mode_ranges[#mode_ranges + 1] = range
+      blocks[#blocks + 1] = block
+    end
+  end
+
+  -- Natural's points outside every Classic or Hard range (closed at both ends), in Natural's own order; each
+  -- note's block goes just before the first of them that is later than the block's first point (the envelope
+  -- writer simplifies in list order, so the list must not go back in time)
+  local points, next_block = {}, 1
+  local function add_blocks_before(t)
+    while blocks[next_block] and (t == nil or t > blocks[next_block][1].time) do
+      for _, q in ipairs(blocks[next_block]) do points[#points + 1] = q end
+      next_block = next_block + 1
+    end
+  end
+  -- A time is inside a range when the latest end of the ranges starting at or before it is not before it: the
+  -- ranges sorted by start (a copy: notes need not be in time order, ranges may touch or overlap) and a binary
+  -- search for the last one starting at or before the time
+  local by_t0, reach = {}, {}
+  for i, r in ipairs(mode_ranges) do by_t0[i] = r end
+  table.sort(by_t0, function(a, b) return a.t0 < b.t0 end)
+  for i, r in ipairs(by_t0) do reach[i] = math.max(reach[i - 1] or r.t1, r.t1) end
+  local function in_mode_range(t)
+    local lo, hi = 0, #by_t0
+    while lo < hi do
+      local mid = (lo + hi + 1) // 2
+      if by_t0[mid].t0 <= t then lo = mid else hi = mid - 1 end
+    end
+    return lo > 0 and t <= reach[lo]
+  end
+  for _, p in ipairs(A.points) do
+    local inside = in_mode_range(p.time)
+    if not inside then
+      add_blocks_before(p.time)
+      points[#points + 1] = p
+    end
+  end
+  add_blocks_before(nil)
+
+  local all = {}
+  for _, r in ipairs(A.ranges) do all[#all + 1] = { t0 = r.t0, t1 = r.t1 } end
+  for _, r in ipairs(mode_ranges) do all[#all + 1] = r end
+  table.sort(all, function(a, b) return a.t0 < b.t0 end)
+  local merged = {}
+  for _, r in ipairs(all) do
+    local last = merged[#merged]
+    if last and r.t0 <= last.t1 then
+      last.t1 = math.max(last.t1, r.t1)
+    else
+      merged[#merged + 1] = r
+    end
+  end
+
+  return { points = points, spans = A.spans, ranges = merged }
+end
+
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
 --- keep_pitch_mode leaves the item's I_PITCHMODE untouched (used by re-analysis, which applies no correction); so does
 --- the Settings option "Keep each item's own pitch algorithm" (state.keep_pitch_mode).
@@ -2745,6 +3055,32 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   reaper.UpdateArrange()
   end_apply(take, undo_desc)
   return true
+end
+
+--- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). With no
+--- Classic or Hard note in the open item this is the plain save; otherwise the item's notes follow the new scale:
+--- its take data takes the new Key and Scale and the envelope is rewritten, all in the "Change Key/Scale" undo point.
+K.scale_changed = function()
+  update_scale_pitch_classes()
+  local data = state.target_take_guid and state.session_takes[state.target_take_guid]
+  local count = data and K.mode_note_count(state.notes or {}) or 0
+  if count == 0 then
+    save_current_scale_settings()
+    return
+  end
+  reaper.SetExtState("FancyScripts", "pitch_key_idx", tostring(state.key_idx), true)
+  reaper.SetExtState("FancyScripts", "pitch_scale_idx", tostring(state.scale_idx), true)
+  data.key_idx = state.key_idx
+  data.scale_idx = state.scale_idx
+  if apply_envelope_to_take("Change Key/Scale") then
+    local key_name = SCALE_KEYS[state.key_idx].display
+    local scale_name = SCALE_DEFINITIONS[state.scale_idx].name
+    if count == 1 then
+      set_status(string.format("Key changed: 1 Classic / Hard note follows %s %s", key_name, scale_name))
+    else
+      set_status(string.format("Key changed: %d Classic / Hard notes follow %s %s", count, key_name, scale_name))
+    end
+  end
 end
 
 --- Whether the pitch envelope of the session take `guid` differs from what its note model and today's settings
@@ -3988,6 +4324,53 @@ local function param_drag(pctx, id, label, value, lo, hi, fmt, speed)
   return rv == true, v, committed, false, false
 end
 
+--- The range fill of a value control (the top bar and the note menu), drawn on the item just submitted: a track
+--- along the bottom edge of the frame and, on it, the part from lo_frac to hi_frac (0..1 of the range) in `color`.
+--- frame_w (optional): the width of the control's frame, for a control with its label drawn right of it (the item's
+--- rectangle includes that label).
+K.value_fill = function(vctx, lo_frac, hi_frac, color, frame_w)
+  local x1, _ = reaper.ImGui_GetItemRectMin(vctx)
+  local x2, y2 = reaper.ImGui_GetItemRectMax(vctx)
+  if not (x1 and x2 and y2) then return end
+  if frame_w then x2 = x1 + frame_w end
+  K.value_track(reaper.ImGui_GetWindowDrawList(vctx), x1, x2, y2, lo_frac, hi_frac, color)
+end
+
+--- The track K.value_fill draws, on any draw list: along the bottom edge y2 of a box spanning x1 .. x2 (the value
+--- controls, and the readout of a value drag on the canvas, so they all look the same).
+K.value_track = function(dl, x1, x2, y2, lo_frac, hi_frac, color)
+  local L = Theme.layout
+  local w = x2 - x1
+  local top = y2 - L.xs
+  reaper.ImGui_DrawList_AddRectFilled(dl, x1, top, x2, y2, Theme.get_palette().outline)
+  lo_frac = math.max(0, math.min(1, lo_frac))
+  hi_frac = math.max(lo_frac, math.min(1, hi_frac))
+  local fx1, fx2 = x1 + w * lo_frac, x1 + w * hi_frac
+  if lo_frac > 0 and fx2 - fx1 < L.xs then   -- a mixed range too narrow to see: keep a visible mark
+    fx1 = math.max(x1, fx2 - L.xs)
+  end
+  if fx2 > fx1 then reaper.ImGui_DrawList_AddRectFilled(dl, fx1, top, fx2, y2, color) end
+end
+
+-- Parameter colours on the canvas (K.param_color): the wash of a highlighted span and of a hovered note zone
+K.PARAM_WASH = { span = 0.26, zone = 0.27 }
+--- The colour of the parameter `key`, the same wherever it shows: its value bar, its drag readout and its highlight
+--- on the canvas.
+K.PARAM_COLOR_KEYS = { tighten = "param_tighten", retune_speed = "param_strength", tolerance = "param_tolerance",
+                       slide_in = "param_slide_in" }
+K.param_color = function(key)
+  local P = Theme.get_palette()
+  return P.canvas[K.PARAM_COLOR_KEYS[key] or ""] or P.accent
+end
+--- The wash of the parameter `key` at `alpha` (a K.PARAM_WASH value): its palette hue itself, not the fitted edge
+--- colour of K.param_color (fitted to contrast, that one can be far lighter or darker than the hue, and the note's
+--- border and curves drawn over a wash of it would lose contrast).
+K.PARAM_HUE_KEYS = { tighten = "green", retune_speed = "accent", tolerance = "yellow", slide_in = "orange" }
+K.param_wash = function(key, alpha)
+  local P = Theme.get_palette()
+  return Theme.with_alpha(P[K.PARAM_HUE_KEYS[key] or ""] or P.accent, alpha)
+end
+
 --- For a param_drag caller that writes the value while it moves. Call right after param_drag with `raw`, the caller's
 --- own value as it read it before drawing the control: it is remembered when the press begins, and returned when the
 --- drag was cancelled (Esc) so the caller can put it back; nil otherwise. `raw` must not be nil.
@@ -4317,6 +4700,7 @@ end
 --- extent, arrays and body, its Tighten, Tolerance, Slide In and effective Strength, its pitch points),
 --- compared each frame without allocating; so a value dragged in the top bar shows on the next frame and a
 --- frame that changed nothing rebuilds nothing. `item` gives the length the points are clamped to.
+--- A note's mode and the item's Key and Scale also trigger a rebuild.
 K.correction_view = function(notes, item)
   local dc = state.draw_cache
   local cv = dc.corr
@@ -4345,7 +4729,13 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 13, is_note_modified(n)) or changed
     changed = set(sig, k + 14, n.points_rev or 0) or changed
     k = k + 14
+    changed = set(sig, k + 1, K.mode_value(n)) or changed
+    k = k + 1
   end
+  local key_idx, scale_idx = K.item_scale()
+  changed = set(sig, k + 1, key_idx) or changed
+  changed = set(sig, k + 2, scale_idx) or changed
+  k = k + 2
   if cv.n ~= k then
     cv.n = k
     changed = true
@@ -4523,6 +4913,10 @@ do
   for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
 end
 K.TOLERANCE_IDLE = " (used once Tighten is above 0%)"   -- appended where a note's Tolerance is shown while its Tighten is 0
+-- Appended where a value is shown on a note whose mode does not use it (K.zone_text): Tolerance and Slide In on a
+-- Classic or Hard note, Tighten on a Hard one
+K.MODE_IDLE = " (not used in Classic or Hard mode)"
+K.HARD_IDLE = " (not used in Hard mode)"
 
 --- The entry of K.ZONE_CONTROLS for a drag on `zone` with or without Shift, or nil (the pitch drag).
 K.zone_control = function(zone, shift)
@@ -4540,6 +4934,13 @@ end
 --- The text for the value `zc` edits on `note`: the drag readout, or the hover tooltip (hover = true).
 K.zone_text = function(zc, note, hover)
   local text = string.format(hover and zc.hover or zc.read, K.zone_value(zc, note) * (zc.show or 1))
+  local mode = K.mode_value(note)
+  if mode ~= 0 then
+    -- A Classic or Hard note: the mode says why a value does nothing (the Natural advice below does not apply)
+    if zc.key == "tolerance" or zc.key == "slide_in" then return text .. K.MODE_IDLE end
+    if zc.key == "tighten" and mode == 2 then return text .. K.HARD_IDLE end
+    return text
+  end
   if zc.key == "tolerance" and (tonumber(note.controls.tighten) or 0) <= 0 then text = text .. K.TOLERANCE_IDLE end
   return text
 end
@@ -4697,14 +5098,20 @@ K.HINT_KINDS = {
 --- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
 --- on every note Strength reaches, the Tolerance band of each tightened note, a span over each slide for Slide In.
 --- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
---- `build` is K.correction_view's result, C the canvas palette. Returns how many marks were drawn.
-K.draw_setting_hint = function(draw_list, hint, build, C)
+--- `build` is K.correction_view's result. Returns how many marks were drawn.
+--- Also returns `skipped`: how many notes in view the value reaches that got no mark because they are Classic or
+--- Hard (K.mode_value 1 or 2; for Tighten: Hard), 0 when a reached Natural note (Tighten: a non-Hard one) is in view.
+K.draw_setting_hint = function(draw_list, hint, build)
   local m = state.draw_cache.map
   local notes, key, set = state.notes, hint.key, hint.notes
   if not (m.w and m.h and m.range and m.vt1 and m.vt1 > m.vt0 and m.range > 0) then return 0 end
   local x_min, x_max, y_min, y_max = m.px, m.px + m.w, m.py, m.py + m.h
   local pad = Theme.layout.xs
   local drawn = 0
+  local skipped, natural = 0, 0
+  -- The parameter's own colour: an opaque edge (K.param_color) and a wash of its hue (K.param_wash)
+  local edge = K.param_color(key)
+  local wash = K.param_wash(key, K.PARAM_WASH.span)
 
   -- The note takes the value that is being changed. edited_only: it must also be corrected (edited, not bypassed)
   local function reached(idx, edited_only)
@@ -4713,6 +5120,13 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
     if set then return set[idx] ~= nil end
     if edited_only and (n.controls.bypassed or not is_note_modified(n)) then return false end
     return n.controls[key] == nil
+  end
+  -- A note in view the value reaches: is it one the mode leaves unmarked (counted in skipped) or a Natural one?
+  local function tally(idx, skip)
+    local n = notes[idx]
+    if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
+      if skip then skipped = skipped + 1 else natural = natural + 1 end
+    end
   end
   local function t_x(t) return m.px + (t - m.vt0) / (m.vt1 - m.vt0) * m.w end
   local function block_y(idx)
@@ -4723,23 +5137,27 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   if key == "retune_speed" then
     for idx = 1, #notes do
       local n = notes[idx]
-      if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
+      local skip = K.mode_value(n) ~= 0   -- a Classic or Hard note gets no outline
+      tally(idx, skip)
+      if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
         local top, bot = block_y(idx)
         if bot >= y_min and top <= y_max then
           reaper.ImGui_DrawList_AddRect(draw_list, math.max(x_min, t_x(n.start_time) - pad), math.max(y_min, top - pad),
-            math.min(x_max, t_x(n.end_time) + pad), math.min(y_max, bot + pad), C.span_edge)
+            math.min(x_max, t_x(n.end_time) + pad), math.min(y_max, bot + pad), edge)
           drawn = drawn + 1
         end
       end
     end
-    return drawn
+    return drawn, natural == 0 and skipped or 0
   end
 
   if key == "tolerance" then
     -- The band a tightened note may stray in untouched: centre - Tolerance .. centre + Tolerance across its block
     for idx = 1, #notes do
       local n = notes[idx]
-      if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
+      local skip = K.mode_value(n) ~= 0   -- a Classic or Hard note gets no band
+      tally(idx, skip)
+      if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
           and (tonumber(n.controls.tighten) or 0) > 0 then
         local cp = n.controls.center_pitch
         local tol = (tonumber(get_effective(n, "tolerance")) or 0) / 100
@@ -4748,14 +5166,25 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         local x0, x1 = math.max(x_min, t_x(n.start_time)), math.min(x_max, t_x(n.end_time))
         if bot >= y_min and top <= y_max and x1 > x0 then
           top, bot = math.max(y_min, top), math.min(y_max, bot)
-          if bot - top >= 2 then reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, C.span_fill) end
-          reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x1, top, C.span_edge)
-          reaper.ImGui_DrawList_AddLine(draw_list, x0, bot, x1, bot, C.span_edge)
+          if bot - top >= 2 then reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, wash) end
+          reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x1, top, edge)
+          reaper.ImGui_DrawList_AddLine(draw_list, x0, bot, x1, bot, edge)
           drawn = drawn + 1
         end
       end
     end
-    return drawn
+    return drawn, natural == 0 and skipped or 0
+  end
+
+  if key == "tighten" then
+    -- No marks of its own (as for any key without K.HINT_KINDS); a Hard note does not use it at all
+    for idx = 1, #notes do tally(idx, K.mode_value(notes[idx]) == 2) end
+    return 0, natural == 0 and skipped or 0
+  end
+
+  if key == "slide_in" then
+    -- A Classic or Hard note has no slide to shade
+    for idx = 1, #notes do tally(idx, K.mode_value(notes[idx]) ~= 0) end
   end
 
   local kinds = K.HINT_KINDS[key]
@@ -4764,6 +5193,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
     if kinds[sp.kind] and sp.t1 >= m.vt0 and sp.t0 <= m.vt1 then
       -- A slide belongs to the note it leads into
       local ok = reached(sp.a, true)
+      if ok and K.mode_value(notes[sp.a]) ~= 0 then ok = false end
       if ok and notes[sp.a] and notes[sp.a].controls and (not sp.b or (notes[sp.b] and notes[sp.b].controls)) then
         local top, bot = block_y(sp.a)
         if sp.b then
@@ -4776,18 +5206,18 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         if bot > top and x1 >= x0 then
           if x1 - x0 < 2 then
             local x = (x0 + x1) * 0.5
-            reaper.ImGui_DrawList_AddLine(draw_list, x, top, x, bot, C.span_edge)
+            reaper.ImGui_DrawList_AddLine(draw_list, x, top, x, bot, edge)
           else
-            reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, C.span_fill)
-            reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x0, bot, C.span_edge)
-            reaper.ImGui_DrawList_AddLine(draw_list, x1, top, x1, bot, C.span_edge)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, wash)
+            reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x0, bot, edge)
+            reaper.ImGui_DrawList_AddLine(draw_list, x1, top, x1, bot, edge)
           end
           drawn = drawn + 1
         end
       end
     end
   end
-  return drawn
+  return drawn, natural == 0 and skipped or 0
 end
 
 -------------------------------------------------------------------------------
@@ -5414,9 +5844,11 @@ local function draw_graph(draw_ctx, w, h)
   -- (C.pill_text, C.marquee_text) are fitted to >= 4.5:1 on the pill over every row and every note fill. The pill
   -- is kept inside the note area (below the ruler); with flip_dx it moves to the left of x when it would run past the right edge.
   -- `big`: the drag readout's pill, in the large font with more padding, centred on y.
-  local function pill_text(x, y, text, col, flip_dx, big)
+  local function pill_text(x, y, text, col, flip_dx, big, widest)
     local pushed = big and Theme.push_font(draw_ctx, fonts.large)
     local tw, th = reaper.ImGui_CalcTextSize(draw_ctx, text)
+    -- widest (optional): the longest text this pill can show, so its width stays put while the value changes
+    if widest then tw = math.max(tw, (reaper.ImGui_CalcTextSize(draw_ctx, widest))) end
     local pad_x, pad_y = L.sm, L.xs
     if big then pad_x, pad_y = L.md, L.sm end
     local pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
@@ -5427,6 +5859,7 @@ local function draw_graph(draw_ctx, w, h)
     reaper.ImGui_DrawList_AddRectFilled(draw_list, x, y, x + pill_w, y + pill_h, C.pill_bg, L.rounding)
     reaper.ImGui_DrawList_AddText(draw_list, x + pad_x, y + pad_y, col, text)
     Theme.pop_font(draw_ctx, pushed)
+    return x, y, pill_w, pill_h
   end
 
   --- True when `text` on a pill fits `room` pixels: the pill pill_text draws, plus the offset the zone labels start at.
@@ -6327,17 +6760,18 @@ local function draw_graph(draw_ctx, w, h)
 
           if has_shift then
             -- Shift + drag anywhere on the note adjusts Slide In: the whole block is its zone
-            reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y, C.zone_shift)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y,
+              K.param_wash("slide_in", K.PARAM_WASH.zone))
           elseif state.hovered_zone == "tighten" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, sx + zone_w, bot_y, C.zone_drift)
+              sx, top_y, sx + zone_w, bot_y, K.param_wash("tighten", K.PARAM_WASH.zone))
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
           elseif state.hovered_zone == "tolerance" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex - zone_w, bot_y, fill)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              ex - zone_w, top_y, ex, bot_y, C.zone_shift)
+              ex - zone_w, top_y, ex, bot_y, K.param_wash("tolerance", K.PARAM_WASH.zone))
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex, bot_y, fill)
@@ -6497,7 +6931,12 @@ local function draw_graph(draw_ctx, w, h)
     local hint = state.setting_hint
     local live = hint.key ~= nil and hint.frame >= (reaper.ImGui_GetFrameCount(draw_ctx) or 0) - 1
     if live and state.show_preview and not is_bypassed and state.notes and #state.notes > 0 then
-      local marks = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
+      local marks, skipped = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item))
+      if hint.dragging and marks == 0 and not hint.said and (skipped or 0) > 0 then
+        -- Every note in view the value reaches is one whose mode does not use it
+        hint.said = true
+        set_status(hint.key == "tighten" and "Not used in Hard mode" or "Not used in Classic or Hard mode")
+      end
       if hint.dragging and marks == 0 and not hint.said then
         hint.said = true
         set_status((hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first")
@@ -6753,6 +7192,7 @@ local function draw_graph(draw_ctx, w, h)
   -- DRAG READOUT (a pill on the canvas, drawn after the playhead so it sits in front of it) and HOVER HINT (a tooltip)
   ---------------------------------------------------------------------------
   local drag_tip = nil
+  local drag_gauge, drag_zone = nil, nil   -- the note and the K.ZONE_CONTROLS entry of a value drag: its readout carries the value's track
   if state.point_drag and state.point_drag.dirty then
     -- The point's own offset in whole cents, then the pitch the note aims for there (the note readout's format)
     local pd = state.point_drag
@@ -6777,6 +7217,7 @@ local function draw_graph(draw_ctx, w, h)
       local tip
       if zone_ctl then
         tip = K.zone_text(zone_ctl, d_note, false) .. count_suffix
+        drag_gauge, drag_zone = d_note, zone_ctl
       else
         local cp = d_note.controls.center_pitch
         local nearest = math.floor(cp + 0.5)
@@ -6832,7 +7273,20 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   -- The drag readout, beside the pointer, never outside the note area (nor over the note-name column or the ruler)
-  if drag_tip then pill_text(mx + L.xl, my, drag_tip, C.pill_text, L.xl * 2, true) end
+  if drag_tip then
+    -- A value drag: the readout carries the track of that value in the top bar (K.value_track), in the parameter's
+    -- colour; it keeps the width of its longest text so the track does not rescale (and is never narrower than the
+    -- text shown, which may carry a suffix).
+    local zc = drag_zone
+    local widest = zc and string.format(zc.read, zc.hi * (zc.show or 1)) or nil
+    local bx, by, bw, bh = pill_text(mx + L.xl, my, drag_tip, C.pill_text, L.xl * 2, true, widest)
+    if zc then
+      local v = math.max(zc.lo, math.min(zc.hi, K.zone_value(zc, drag_gauge)))
+      local frac = (v - zc.lo) / (zc.hi - zc.lo)
+      -- Inset by the pill's corner radius, so the square track stays inside its rounded bottom corners
+      K.value_track(draw_list, bx + L.rounding, bx + bw - L.rounding, by + bh, 0, frac, K.param_color(zc.key))
+    end
+  end
 
   reaper.ImGui_DrawList_PopClipRect(draw_list)   -- the note area
 
@@ -7032,7 +7486,15 @@ local function draw_graph(draw_ctx, w, h)
 
          -- param_drag tests the gestures right after the control (not after SameLine / TextDisabled, which would test the text)
          local name = PARAM_LABELS[key] or label
+         -- The note's mode may not use this value: its text is dim (as in the top bar)
+         local unused = K.mode_unused(key, { note }, 1)
+         local dim = (unused == "mode" or unused == "hard")
+         if dim then reaper.ImGui_PushStyleColor(draw_ctx, reaper.ImGui_Col_Text(), Theme.get_palette().text_dim) end
          local s_changed, new_val, committed, reset = param_drag(draw_ctx, "cm_" .. key, label, cur_val, min_v, max_v, fmt)
+         if dim then reaper.ImGui_PopStyleColor(draw_ctx) end
+         -- The top bar's range fill (K.value_fill), in the parameter's colour
+         K.value_fill(draw_ctx, 0, (cur_val - min_v) / (max_v - min_v), K.param_color(key),
+            reaper.ImGui_CalcItemWidth(draw_ctx))
          if K.drag_hot.hovered or K.drag_hot.active then
             -- The canvas shades where this value acts on the menu's note
             local set = state.setting_hint.menu_set
@@ -7097,6 +7559,39 @@ local function draw_graph(draw_ctx, w, h)
          end
       end
 
+      -- Mode: the note's mode in effect; a choice is written to the menu's note, or to every selected note when it
+      -- is one of several (as the value rows do), as one undo point. Choosing what every one already has does nothing
+      do
+        local choice, m_changed = Theme.combo(draw_ctx, "##cm_mode", K.MODES, K.mode_value(note) + 1,
+          { w = reaper.ImGui_CalcItemWidth(draw_ctx) })
+        -- The label sits where a value row's label does: the inner spacing right of the control
+        local inner = reaper.ImGui_GetStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing())
+        reaper.ImGui_SameLine(draw_ctx, 0, inner)
+        reaper.ImGui_Text(draw_ctx, "Mode")
+        reaper.ImGui_SameLine(draw_ctx)
+        reaper.ImGui_TextDisabled(draw_ctx, ctrl.correct_mode ~= nil and "[note]" or "[item]")
+        if spread_n > 1 then
+          reaper.ImGui_SameLine(draw_ctx)
+          reaper.ImGui_TextDisabled(draw_ctx, string.format("(%d notes)", spread_n))
+        end
+        if m_changed then
+          local targets = { note }
+          if spread_n > 1 then
+            for idx in pairs(state.selected_notes) do
+              local o = state.notes[idx]
+              if o and o ~= note and o.controls then targets[#targets + 1] = o end
+            end
+          end
+          local differs = false
+          for _, o in ipairs(targets) do
+            if K.mode_value(o) ~= choice - 1 then differs = true break end
+          end
+          if differs then
+            for _, o in ipairs(targets) do o.controls.correct_mode = choice - 1 end
+            apply_envelope_to_take("Change Mode")
+          end
+        end
+      end
       draw_cm_slider(PARAM_LABELS.tighten, "tighten", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.tolerance, "tolerance", K.LIMITS.tolerance[1], K.LIMITS.tolerance[2], "%.0f \xC2\xA2", nil, nil, true)
       draw_cm_slider(PARAM_LABELS.slide_in, "slide_in", 0, 100, "%.0f%%", 100, nil, true)
@@ -7745,6 +8240,7 @@ K.INFO_SECTIONS = {
     { "Drag Left Zone", string.format("Tighten: steady the note, slow drift first; 100%% is a flat line (%s = fine)", K.MOD_LABEL),
       panel = { "Edit", 10, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
+    { "Mode (top bar, note menu)", "Natural, Classic (the pitch jumps between scale notes; Tighten sets how fast) or Hard (one flat scale note)" },
     { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
     { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 11, "Slide In", "Shift + Drag" } },
     { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 12, "Trim note", "Drag edge" } },
@@ -9400,7 +9896,7 @@ do
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
-  local HDR_VALUES = { "pill", "tight", "strength", "tol", "slide", "sep" }
+  local HDR_VALUES = { "pill", "mode", "tight", "strength", "tol", "slide", "sep" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for _, id in ipairs(HDR_VALUES) do HDR_GROUP[id] = "values" end
@@ -9418,7 +9914,8 @@ do
     { rows = { hdr_row(HDR_CLIP, HDR_VALUES) } },
     { rows = { HDR_CLIP, HDR_VALUES } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "strength", "tol" }, { "slide", "sep" } } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "mode" }, { "tight", "strength" }, { "tol", "slide" },
+      { "sep" } } },
   }
   -- The plan a first-use window is sized for: two rows
   local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
@@ -9624,8 +10121,7 @@ do
         local is_sel = (state.key_idx == i)
         if Theme.selectable(ctx, k_info.name .. "##key_" .. i, is_sel, nil, s.key_list_w) and not is_sel then
           state.key_idx = i
-          update_scale_pitch_classes()
-          save_current_scale_settings()
+          K.scale_changed()
         end
         if is_sel then reaper.ImGui_SetItemDefaultFocus(ctx) end
       end
@@ -9644,8 +10140,7 @@ do
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
-      update_scale_pitch_classes()
-      save_current_scale_settings()
+      K.scale_changed()
     end
   end
 
@@ -9876,6 +10371,23 @@ do
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = "Used once Tighten is above 0%."
+  -- The Mode dropdown (see draw_mode): its tooltip, its scope line by what it changes, the text of a mixed selection,
+  -- and the line a value's tooltip gains when the selected notes' mode does not use it (key: K.mode_unused)
+  local BAR_MODE = {
+    tip = "Mode: how an edited note is corrected.\n"
+      .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n"
+      .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n"
+      .. "Hard: one flat note of the scale.",
+    scope_item = "Changes this item: every edited note without its own mode.",
+    scope_note = "Changes the selected note.",
+    scope_notes = "Changes the %d selected notes.",
+    mixed = "Mixed",
+    unused = {
+      mode = "Not used in Classic or Hard mode.",
+      hard = "Not used in Hard mode.",
+      classic = "In Classic mode: how fast the pitch jumps between scale notes. 0% glides, 100% steps at once.",
+    },
+  }
   -- Separation (see draw_separation): what letting go does, and its gestures (no right-click menu)
   local BAR_SEP_RESPLIT = "One value for every item. Letting go splits this item's notes again."
   local BAR_SEP_NEXT = "One value for every item. The next analysis uses it."
@@ -9943,6 +10455,10 @@ do
     end
     s.unit_w.pill = math.max(bar_text_w(bctx, BAR_PILL_NONE), bar_text_w(bctx, BAR_PILL_ONE),
       bar_text_w(bctx, string.format(BAR_PILL_MANY, 999))) + s.pad_x
+    -- The Mode dropdown: its longest text, the frame padding and the arrow (a square of the frame height)
+    local mode_text_w = bar_text_w(bctx, BAR_MODE.mixed)
+    for _, name in ipairs(K.MODES) do mode_text_w = math.max(mode_text_w, bar_text_w(bctx, name)) end
+    s.unit_w.mode = mode_text_w + s.pad_x + s.frame_h
     return s
   end
 
@@ -10018,26 +10534,6 @@ do
     for note, raw in pairs(edit.raws) do
       if raw == false then note.controls[key] = nil else note.controls[key] = raw end
     end
-  end
-
-  --- The range fill of a value control, drawn on the item just submitted: a track along the bottom edge of the
-  --- frame and, on it, the part from lo_frac to hi_frac (0..1 of the range) in `color`.
-  K.bar_value_fill = function(bctx, lo_frac, hi_frac, color)
-    local L = Theme.layout
-    local x1, _ = reaper.ImGui_GetItemRectMin(bctx)
-    local x2, y2 = reaper.ImGui_GetItemRectMax(bctx)
-    if not (x1 and x2 and y2) then return end
-    local dl = reaper.ImGui_GetWindowDrawList(bctx)
-    local w = x2 - x1
-    local top = y2 - L.xs
-    reaper.ImGui_DrawList_AddRectFilled(dl, x1, top, x2, y2, Theme.get_palette().outline)
-    lo_frac = math.max(0, math.min(1, lo_frac))
-    hi_frac = math.max(lo_frac, math.min(1, hi_frac))
-    local fx1, fx2 = x1 + w * lo_frac, x1 + w * hi_frac
-    if lo_frac > 0 and fx2 - fx1 < L.xs then   -- a mixed range too narrow to see: keep a visible mark
-      fx1 = math.max(x1, fx2 - L.xs)
-    end
-    if fx2 > fx1 then reaper.ImGui_DrawList_AddRectFilled(dl, fx1, top, fx2, y2, color) end
   end
 
   --- How many notes are selected, and the index of one of them (the note itself when exactly one is).
@@ -10328,9 +10824,15 @@ do
       local key, id = spec.key, "bv_" .. spec.id
       local name = PARAM_LABELS[key] or spec.label
 
+      -- The selected notes' mode may not use this value: its text is dim and its tooltip says why
+      local unused = K.mode_unused(key, sel_notes, sel_n)
+      local dim = (unused == "mode" or unused == "hard")
+
       reaper.ImGui_BeginDisabled(bctx, view.disabled == true)
       reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
+      if dim then reaper.ImGui_PushStyleColor(bctx, reaper.ImGui_Col_Text(), P.text_dim) end
       local changed, v, committed, reset, cancelled = param_drag(bctx, id, nil, view.lo_v, spec.lo, spec.hi, value_format(spec, view))
+      if dim then reaper.ImGui_PopStyleColor(bctx) end
       local back = K.drag_revert(id, view.lo_v / spec.scale, cancelled)
       local hovered, active, typed = K.drag_hot.hovered, K.drag_hot.active, K.drag_hot.typed
       local held, pressed = K.drag_hot.held, K.drag_hot.activated
@@ -10361,10 +10863,10 @@ do
         return
       end
 
-      -- The fill says where the value comes from as well (the mark and the tooltip say it without colour)
+      -- The fill is in the value's own colour; where the value comes from is said by the mark and the tooltip
       local span = spec.hi - spec.lo
-      K.bar_value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
-        (view.level == "note") and P.accent2 or P.accent)
+      K.value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
+        K.param_color(key))   -- one colour per parameter, the same on the canvas
 
       local scope = BAR_SCOPE_DEFAULT
       if view.target == "notes" then
@@ -10374,8 +10876,9 @@ do
           for i = 1, sel_n do
             if (tonumber(sel_notes[i].controls.tighten) or 0) > 0 then idle = false break end
           end
-          if idle then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
+          if idle and unused ~= "mode" then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
         end
+        if unused then scope = BAR_MODE.unused[unused] .. "\n" .. scope end
       elseif view.target == "item" then
         scope = BAR_SCOPE_ITEM
       end
@@ -10516,7 +11019,7 @@ do
         return
       end
       local span = spec.hi - spec.lo
-      K.bar_value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
+      K.value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
       bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_SEP_GESTURES)
 
       --- The edit is done: save the value and split again, once, only when it changed
@@ -10547,9 +11050,42 @@ do
       if not active then bar_sep_before = nil end   -- the press is over (a click that changed nothing)
     end
 
+    --- Mode: the selected notes' mode (Mixed when they differ), else the item's. A choice is stored on every
+    --- selected note, else as the item's mode (Natural removes it), as one undo point; the same choice does nothing.
+    local function draw_mode()
+      local idx
+      if sel_n == 0 then
+        idx = K.mode_value(nil) + 1
+      else
+        idx = K.mode_value(sel_notes[1]) + 1
+        for i = 2, sel_n do
+          if K.mode_value(sel_notes[i]) + 1 ~= idx then idx = 0 break end
+        end
+      end
+      local scope = (sel_n == 0) and BAR_MODE.scope_item or (sel_n == 1) and BAR_MODE.scope_note
+        or string.format(BAR_MODE.scope_notes, sel_n)
+      local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
+        w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
+        tooltip = BAR_MODE.tip .. "\n" .. (inspector_reason or scope),
+      })
+      if not changed or choice == idx or inspector_reason then return end
+      if sel_n > 0 then
+        for i = 1, sel_n do sel_notes[i].controls.correct_mode = choice - 1 end
+        apply_envelope_to_take("Change Mode")
+      elseif take_data then
+        take_data.overrides = take_data.overrides or {}
+        take_data.overrides.correct_mode = (choice > 1) and (choice - 1) or nil
+        if apply_envelope_to_take("Change Mode") then
+          set_status(K.mode_item_status(choice - 1, K.mode_reach_count(state.notes)))
+        end
+      end
+    end
+
     return function(id)
       if id == "pill" then
         draw_pill()
+      elseif id == "mode" then
+        draw_mode()
       elseif BAR_VALUE_BY_ID[id] then
         local spec = BAR_VALUE_BY_ID[id]
         if spec.levels == "analysis" then draw_separation(spec) else draw_value(spec) end
@@ -10926,6 +11462,7 @@ local function main()
 end
 
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
-  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features }
+  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
+           SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify }
 end
 main()

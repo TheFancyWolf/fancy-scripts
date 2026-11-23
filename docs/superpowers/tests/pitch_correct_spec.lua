@@ -849,6 +849,825 @@ test("note_actions_frame", function()
   st.results, st.notes, st.selected_notes, st.selected_note, st.is_analyzing = table.unpack(saved)
 end)
 
+-- Proof of Natural: the correction of v2.18.0 pinned to the number ---------------------------------------------
+-- natural_corpus() builds fresh notes on every call (a build mutates the notes and caches on them). The recorder
+-- (--record-natural) writes what K.correction_build gives on the unchanged v2.18.0 script; the tests compare to it.
+
+local NATURAL_REF = "810bc35"
+local NATURAL_FIXTURE = "docs/superpowers/tests/fixtures/natural_v2_18_0.lua"
+
+-- The sung pitch of the note's body wobbles +/-0.3 st at 5 Hz over a slow drift (so Tighten has something to take)
+local function wobbly(n, tighten, tolerance)
+  local first = S.K.note_body(n)
+  for i = first or 1, #n.frames do
+    local t = n.frames[i].time
+    local w = n.avg_note + 0.3 * math.sin(2 * math.pi * 5 * t) + 0.1 * math.sin(2 * math.pi * 0.7 * t)
+    n.frames[i].note, n.smooth[i] = w, w
+  end
+  n.controls.tighten, n.controls.tolerance = tighten, tolerance
+  return n
+end
+
+local function untouched_note(t0, dur, centre, slide)   -- a note nobody edited (a Strength of its own counts as one)
+  local n = join_note(t0, dur or 0.3, centre or 60, 0, slide)
+  n.controls.retune_speed = nil
+  return n
+end
+
+local function bypassed_note(t0, dur, centre, slide)
+  local n = join_note(t0, dur, centre, 0.5, slide)
+  n.controls.bypassed = true
+  return n
+end
+
+local function with_points(n, list)
+  n.controls.points = {}
+  for i, p in ipairs(list) do
+    n.controls.points[i] = { t = n.frames[p[1]].time, st = p[2], added = true }
+  end
+  return n
+end
+
+local function natural_corpus()
+  local cases = {}
+  local function add(name, notes, item_len, setup, teardown)
+    cases[#cases + 1] = { name = name, notes = notes, item_len = item_len, setup = setup, teardown = teardown }
+  end
+  local function solo(name, n, item_len) add(name, { n }, item_len or 10) end
+
+  solo("moved", join_note(0.1, 0.3, 60, 0.3))
+  solo("tighten_50_tol_8", wobbly(join_note(0.1, 0.4, 60, 0.3), 0.5, 8))
+  solo("tighten_100", wobbly(join_note(0.1, 0.4, 60, -0.2), 1, nil))
+  solo("tighten_50_tol_30", wobbly(join_note(0.1, 0.4, 60, 0.3), 0.5, 30))
+  for _, v in ipairs({ { 0, "slide_in_0" }, { 0.5, "slide_in_50" }, { 1, "slide_in_100" } }) do
+    solo(v[2], slide_note(2, v[1]), 1)
+  end
+  local half = join_note(0.1, 0.4, 60, 0.3)
+  half.controls.retune_speed = 0.5
+  solo("strength_50_note", wobbly(half, 0.5, 8))
+  local saved
+  add("strength_50_item", { wobbly(join_note(0.1, 0.4, 60, 0.3), 0.5, 8) }, 10,
+    function()
+      saved = { S.state.target_take_guid, S.state.session_takes["{T}"] }
+      S.state.target_take_guid = "{T}"
+      S.state.session_takes["{T}"] = { overrides = { retune_speed = 0.5 } }
+    end,
+    function()
+      S.state.target_take_guid, S.state.session_takes["{T}"] = saved[1], saved[2]
+    end)
+  cases[#cases].notes[1].controls.retune_speed = nil
+
+  local a, b = slid_pair(0.04)
+  add("joined_pair", { a, wobbly(b, 0.6, 8) }, 10)
+  a = join_note(0.1, 0.3, 60, 0.3)
+  add("short_gap", { a, join_note(a.end_time + 0.04, 0.3, 62, -0.2) }, 10)
+  a = join_note(0.1, 0.3, 60, 0.3)
+  add("unjoined_fades", { a, join_note(a.end_time + 0.2, 0.3, 62, -0.2) }, 10)
+
+  a = wobbly(join_note(0.1, 0.3, 60, 0.3), 0.6, 8)
+  add("edited_then_untouched", { a, untouched_note(a.end_time, 0.3, 62, { from = 60, dur = 0.04 }) }, 10)
+  a = join_note(0.1, 0.3, 60, 0.3)
+  add("edited_then_bypassed", { a, bypassed_note(a.end_time, 0.3, 62, { from = 60, dur = 0.04 }) }, 10)
+  a = bypassed_note(0.1, 0.3, 62)
+  add("bypassed_then_edited", { a, join_note(a.end_time, 0.3, 62, -0.2, { from = 60, dur = 0.04 }) }, 10)
+
+  solo("pitch_points", with_points(join_note(0.1, 0.4, 60, 0.2), { { 12, 0.5 }, { 40, -0.4 }, { 60, 0.25 } }))
+  a = join_note(0.1, 0.3, 60, 0.3)
+  b = join_note(a.end_time, 3 * JHOP, 62, -0.2)
+  for i = 1, 3 do b.frames[i].note, b.smooth[i] = 65, 65 end
+  add("bodiless_note", { a, b }, 10)
+  solo("note_at_item_start", join_note(0, 0.3, 60, 0.3))
+  solo("note_at_item_end", join_note(0.7, 0.3, 60, 0.3), 1)
+
+  -- A phrase of six: tightened, joined with Slide In, bypassed, untouched, with points (after a gap), joined at half Strength
+  local p1 = wobbly(join_note(0.1, 0.3, 60, 0.3), 0.5, 8)
+  local p2 = join_note(p1.end_time, 0.3, 62, -0.2, { from = 60, dur = 0.04 })
+  p2.controls.slide_in = 0.5
+  local p3 = bypassed_note(p2.end_time, 0.3, 64)
+  local p4 = untouched_note(p3.end_time + 0.02, 0.3, 65)
+  local p5 = with_points(join_note(p4.end_time + 0.2, 0.3, 67, 0.1), { { 10, 0.4 }, { 30, -0.3 } })
+  local p6 = join_note(p5.end_time, 0.3, 69, -0.15, { from = 67, dur = 0.04 })
+  p6.controls.retune_speed = 0.5
+  add("phrase_of_six", { p1, p2, p3, p4, p5, p6 }, 10)
+  return cases
+end
+
+local function natural_run(case)
+  if case.setup then case.setup() end
+  local got = S.K.correction_build(case.notes, case.item_len)
+  if case.teardown then case.teardown() end
+  return got
+end
+
+local function num(x) return string.format("%.17g", x) end
+
+-- The lines of one recorded case: what the build gave, and every note's frame shifts
+local function record_case(out, name, got, notes)
+  local function row(list)
+    local parts = {}
+    for i, x in ipairs(list) do parts[i] = num(x) end
+    return table.concat(parts, ", ")
+  end
+  out[#out + 1] = '    ["' .. name .. '"] = {'
+  out[#out + 1] = "      points = {"
+  for _, p in ipairs(got.points) do out[#out + 1] = "        { " .. num(p.time) .. ", " .. num(p.val) .. " }," end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "      spans = {"
+  for _, s in ipairs(got.spans) do
+    out[#out + 1] = string.format('        { "%s", %s, %s, %s, %s },', s.kind, num(s.t0), num(s.t1),
+      s.a and tostring(s.a) or "nil", s.b and tostring(s.b) or "nil")
+  end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "      ranges = {"
+  for _, r in ipairs(got.ranges) do out[#out + 1] = "        { " .. num(r.t0) .. ", " .. num(r.t1) .. " }," end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "      shifts = {"
+  for _, n in ipairs(notes) do out[#out + 1] = "        { " .. row(n.frame_shifts) .. " }," end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "    },"
+end
+
+-- The real vocal (this machine only): a take's saved model read the way the script reads it from a take
+local FIXTURE_DIR = (os.getenv("HOME") or "") .. "/.fancy-scripts-fixtures/"
+local function real_model()
+  local f = io.open(FIXTURE_DIR .. "pitch_real_model.json", "rb")
+  if not f then return nil end
+  local raw = f:read("a")
+  f:close()
+  local json = loadfile("_lib/json.lua")()
+  local data = json.decode(raw)
+  for _, note in ipairs(data.notes) do
+    note.count = #note.frames
+    local saved = note.controls
+    S.extract_note_features(note)
+    S.K.controls_load(note.controls, saved)
+    S.K.points_sanitize(note)
+  end
+  return data
+end
+
+local function natural_record()
+  local ok = os.execute('git diff --quiet ' .. NATURAL_REF .. ' -- "' .. SCRIPT .. '"')
+  if ok ~= true then
+    io.stderr:write("refusing to record: " .. SCRIPT .. " differs from " .. NATURAL_REF
+      .. " (the fixture is the v2.18.0 behaviour)\n")
+    os.exit(1)
+  end
+  local function write(path, name_of, items)
+    local out = { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-natural",
+      "-- Natural correction of Pitch Correct v2.18.0 (commit " .. NATURAL_REF .. "). Do not edit by hand.",
+      "return {", '  commit = "' .. NATURAL_REF .. '",', "  cases = {" }
+    for _, item in ipairs(items) do record_case(out, name_of(item), item.got, item.notes) end
+    out[#out + 1] = "  },"
+    out[#out + 1] = "}"
+    local f = assert(io.open(path, "wb"))
+    f:write(table.concat(out, "\n"), "\n")
+    f:close()
+    print("recorded " .. #items .. " cases to " .. path)
+  end
+  local items = {}
+  for _, case in ipairs(natural_corpus()) do
+    items[#items + 1] = { name = case.name, got = natural_run(case), notes = case.notes }
+  end
+  write(NATURAL_FIXTURE, function(it) return it.name end, items)
+  local data = real_model()
+  if data then
+    local got = S.K.correction_build(data.notes, data.item_len)
+    write(FIXTURE_DIR .. "pitch_real_expected.lua", function() return "real" end,
+      { { got = got, notes = data.notes } })
+  end
+end
+
+test("natural_same_numbers", function()
+  local fx = dofile(NATURAL_FIXTURE)
+  local seen = 0
+  for _, case in ipairs(natural_corpus()) do
+    local want = fx.cases[case.name]
+    if not want then error("no recorded case " .. case.name) end
+    seen = seen + 1
+    local got = natural_run(case)
+    -- exact: ==, never near()
+    eq(#got.points, #want.points, case.name .. " points")
+    for i, p in ipairs(got.points) do
+      eq(p.time, want.points[i][1], case.name .. " point time " .. i)
+      eq(p.val, want.points[i][2], case.name .. " point val " .. i)
+    end
+    eq(#got.spans, #want.spans, case.name .. " spans")
+    for i, s in ipairs(got.spans) do
+      local w = want.spans[i]
+      eq(s.kind, w[1], case.name .. " span kind " .. i)
+      eq(s.t0, w[2], case.name .. " span t0 " .. i)
+      eq(s.t1, w[3], case.name .. " span t1 " .. i)
+      eq(s.a, w[4], case.name .. " span a " .. i)
+      eq(s.b, w[5], case.name .. " span b " .. i)
+    end
+    eq(#got.ranges, #want.ranges, case.name .. " ranges")
+    for i, r in ipairs(got.ranges) do
+      eq(r.t0, want.ranges[i][1], case.name .. " range t0 " .. i)
+      eq(r.t1, want.ranges[i][2], case.name .. " range t1 " .. i)
+    end
+    eq(#case.notes, #want.shifts, case.name .. " notes")
+    for ni, n in ipairs(case.notes) do
+      eq(#n.frame_shifts, #want.shifts[ni], case.name .. " frames of note " .. ni)
+      for i, v in ipairs(n.frame_shifts) do
+        eq(v, want.shifts[ni][i], case.name .. " shift " .. ni .. "/" .. i)
+      end
+    end
+  end
+  local n_want = 0
+  for _ in pairs(fx.cases) do n_want = n_want + 1 end
+  eq(seen, n_want, "every recorded case is in the corpus")
+  if seen < 20 then error("only " .. seen .. " cases") end
+end)
+
+test("natural_same_numbers_real", function()
+  local data = real_model()
+  local f = io.open(FIXTURE_DIR .. "pitch_real_expected.lua", "rb")
+  if not data or not f then
+    if f then f:close() end
+    print("SKIP natural_same_numbers_real (no local fixture)")
+    return
+  end
+  f:close()
+  local want = dofile(FIXTURE_DIR .. "pitch_real_expected.lua").cases.real
+  local got = S.K.correction_build(data.notes, data.item_len)
+  eq(#got.points, #want.points, "points")
+  for i, p in ipairs(got.points) do
+    eq(p.time, want.points[i][1], "point time " .. i)
+    eq(p.val, want.points[i][2], "point val " .. i)
+  end
+  eq(#got.spans, #want.spans, "spans")
+  for i, sp in ipairs(got.spans) do
+    local w = want.spans[i]
+    eq(sp.kind, w[1], "span kind " .. i); eq(sp.t0, w[2], "span t0 " .. i); eq(sp.t1, w[3], "span t1 " .. i)
+    eq(sp.a, w[4], "span a " .. i); eq(sp.b, w[5], "span b " .. i)
+  end
+  eq(#got.ranges, #want.ranges, "ranges")
+  for i, r in ipairs(got.ranges) do
+    eq(r.t0, want.ranges[i][1], "range t0 " .. i); eq(r.t1, want.ranges[i][2], "range t1 " .. i)
+  end
+  eq(#data.notes, #want.shifts, "notes")
+  for ni, n in ipairs(data.notes) do
+    eq(#n.frame_shifts, #want.shifts[ni], "frames of note " .. ni)
+    for i, v in ipairs(n.frame_shifts) do eq(v, want.shifts[ni][i], "shift " .. ni .. "/" .. i) end
+  end
+end)
+
+-- Lines of the block that starts at the first line beginning with `prefix`: up to the first later line that is the
+-- prefix's own indentation followed by "end" or "}" (or "end," / "},"). Returns the lines, or nil.
+local function text_block(lines, prefix)
+  for i, l in ipairs(lines) do
+    if l:sub(1, #prefix) == prefix then
+      local indent = l:match("^(%s*)")
+      local out = { l }
+      for j = i + 1, #lines do
+        out[#out + 1] = lines[j]
+        local rest = lines[j]:match("^" .. indent .. "(.*)$")
+        if rest and (rest:match("^end%f[^%w_]") or rest:match("^}")) then return out end
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
+local function text_lines(s)
+  local lines = {}
+  for l in (s .. "\n"):gmatch("(.-)\r?\n") do lines[#lines + 1] = l end
+  return lines
+end
+
+local function text_same(ref, now, ref_prefix, now_prefix, skip_first, what)
+  local a, b = text_block(ref, ref_prefix), text_block(now, now_prefix)
+  if not a then error(what .. ": not found in " .. NATURAL_REF) end
+  if not b then error(what .. ": not found in the script") end
+  eq(#b, #a, what .. " length")
+  for i = skip_first and 2 or 1, #a do eq(b[i], a[i], what .. " line " .. i) end
+end
+
+local function text_single(ref, now, prefix, what)
+  local want
+  for _, l in ipairs(ref) do if l:sub(1, #prefix) == prefix then want = l break end end
+  if not want then error(what .. ": not found in " .. NATURAL_REF) end
+  for _, l in ipairs(now) do if l == want then return end end
+  error(what .. ": line changed: " .. want)
+end
+
+test("natural_same_text", function()
+  local p = io.popen('git show ' .. NATURAL_REF .. ':"' .. SCRIPT .. '" 2>/dev/null')
+  local ref_src = p and p:read("a") or ""
+  if p then p:close() end
+  if ref_src == "" then print("SKIP natural_same_text (" .. NATURAL_REF .. " not readable)") return end
+  local f = assert(io.open(SCRIPT, "rb"))
+  local now_src = f:read("a")
+  f:close()
+  local ref, now = text_lines(ref_src), text_lines(now_src)
+  for _, prefix in ipairs({ "K.tighten_line = function(", "K.note_body = function(", "K.points_offsets = function(",
+      "local function is_note_modified(", "K.controls_edited = function(", "K.ZONE_CONTROLS = {",
+      "local function param_drag(", "  local BAR_VALUES = {" }) do
+    text_same(ref, now, prefix, prefix, false, prefix)
+  end
+  -- The build may be renamed (natural_build) but not changed; its first line carries the name
+  local build = "K.correction_build = function(notes, item_len)"
+  local renamed = "K.natural_build = function(notes, item_len)"
+  local has_renamed = false
+  for _, l in ipairs(now) do if l:sub(1, #renamed) == renamed then has_renamed = true break end end
+  text_same(ref, now, build, has_renamed and renamed or build, true, "the build")
+  text_single(ref, now, "K.JOIN = {", "K.JOIN")
+  local loaded = text_block(now, "K.controls_load = function(")
+  local ref_loaded = text_block(ref, "K.controls_load = function(")
+  if not (loaded and ref_loaded) then error("K.controls_load not found") end
+  for _, prefix in ipairs({ "  if ctrl.tighten then", "  if ctrl.tolerance then" }) do
+    text_single(ref_loaded, loaded, prefix, "K.controls_load " .. prefix)
+  end
+end)
+
+if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
+
+local function with_item_mode(mode, fn)   -- runs fn with an open item whose mode is `mode` (nil = none)
+  local st = S.state
+  local saved_guid, saved_take = st.target_take_guid, st.session_takes["{M}"]
+  st.target_take_guid = "{M}"
+  st.session_takes["{M}"] = { overrides = { correct_mode = mode } }
+  local ok, err = pcall(fn)
+  st.target_take_guid, st.session_takes["{M}"] = saved_guid, saved_take
+  if not ok then error(err, 0) end
+end
+
+test("mode_load_holds_range", function()
+  for _, bad in ipairs({ 3, 1.5, -1, "x", "1", "2" }) do
+    local ctrl = {}
+    S.K.controls_load(ctrl, { correct_mode = bad })
+    eq(ctrl.correct_mode, nil, "bad " .. tostring(bad))
+  end
+  for _, good in ipairs({ 0, 1, 2 }) do
+    local ctrl = {}
+    S.K.controls_load(ctrl, { correct_mode = good })
+    eq(ctrl.correct_mode, good)
+  end
+end)
+
+test("mode_first_attempt_data_is_natural", function()
+  local ctrl = {}
+  S.K.controls_load(ctrl, { tighten = 1.4, tune_mode = 2 })
+  eq(ctrl.tighten, 1, "Tighten above 100% reads as 100%")
+  eq(ctrl.tune_mode, nil); eq(ctrl.correct_mode, nil)
+end)
+
+test("mode_value_and_note_mode", function()
+  local moved = join_note(0.1, 0.3, 60, 0.5)
+  local untouched = untouched_note(0.5)
+  eq(S.K.mode_value(moved), 0); eq(S.K.note_mode(moved), nil)
+  with_item_mode(1, function()
+    eq(S.K.mode_value(nil), 1, "the item's")
+    eq(S.K.note_mode(moved), "classic", "edited note takes the item's mode")
+    eq(S.K.note_mode(untouched), nil, "an untouched note is never corrected")
+    moved.controls.correct_mode = 0
+    eq(S.K.note_mode(moved), nil, "its own Natural wins")
+    moved.controls.correct_mode = 2
+    eq(S.K.note_mode(moved), "hard")
+    moved.controls.bypassed = true
+    eq(S.K.note_mode(moved), nil, "bypassed")
+  end)
+  with_item_mode(7, function() eq(S.K.mode_value(nil), 0, "a bad item mode is Natural") end)
+  with_item_mode("2", function() eq(S.K.mode_value(nil), 0, "an item mode stored as a string is Natural") end)
+  untouched.controls.correct_mode = 1
+  eq(S.K.note_mode(untouched), "classic", "choosing a mode is an edit")
+end)
+
+test("mode_carry_merge_clear", function()
+  local a, b = join_note(0.1, 0.3, 60, 0), join_note(0.4, 0.3, 62, 0)
+  a.controls.correct_mode, b.controls.correct_mode = 2, 1
+  eq(S.K.controls_carry(a.controls).correct_mode, 2)
+  eq(S.K.controls_merge({ a, b }).correct_mode, 2, "the first note's")
+  eq(S.K.controls_clear(a.controls), true); eq(a.controls.correct_mode, nil)
+end)
+
+test("mode_unused", function()
+  local c, h, n = { controls = { correct_mode = 1 } }, { controls = { correct_mode = 2 } }, { controls = {} }
+  eq(S.K.mode_unused("tolerance", { c, h }, 2), "mode")
+  eq(S.K.mode_unused("retune_speed", { c, n }, 2), nil)
+  eq(S.K.mode_unused("slide_in", {}, 0), nil)
+  eq(S.K.mode_unused("tighten", { h, h }, 2), "hard")
+  eq(S.K.mode_unused("tighten", { c }, 1), "classic")
+  eq(S.K.mode_unused("tighten", { c, h }, 2), nil)
+  eq(S.K.mode_unused("separation", { h }, 1), nil)
+end)
+
+-- A note from t0 lasting dur. sung: a number, or fn(local_time) -> number | nil. avg: its sung average.
+local function mode_note(t0, dur, sung, avg, ctrl)
+  local fr = {}
+  local nf = math.floor(dur / JHOP + 0.5)
+  for i = 1, nf do
+    local lt = (i - 1) * JHOP
+    local v = sung
+    if type(sung) == "function" then v = sung(lt) end
+    fr[i] = { time = t0 + lt, note = v }
+  end
+  local c = { center_pitch = avg, bypassed = false }
+  for k, v in pairs(ctrl or {}) do c[k] = v end
+  return { start_time = t0, end_time = t0 + nf * JHOP, frames = fr, avg_note = avg, controls = c }
+end
+local C_MAJOR = { [0] = true, [2] = true, [4] = true, [5] = true, [7] = true, [9] = true, [11] = true }
+
+test("mode_nearest_scale_pitch", function()
+  local f = S.K.nearest_scale_pitch
+  eq(f(60.4, nil), 60); eq(f(60.6, nil), 61)
+  eq(f(60.5, nil), 60, "a tie goes to the lower")
+  eq(f(61.4, C_MAJOR), 62); eq(f(61.0, C_MAJOR), 60, "tie in the scale"); eq(f(59.2, C_MAJOR), 59)
+  eq(f(61.4, {}), 61, "an empty scale is every semitone")
+end)
+
+test("mode_scale_pcs", function()
+  local major
+  for i, d in ipairs(S.SCALE_DEFINITIONS) do if d.name == "Major" then major = i end end
+  local pcs = S.K.scale_pcs(1, major)
+  for pc = 0, 11 do eq(pcs[pc] == true, C_MAJOR[pc] == true, "pc " .. pc) end
+  eq(S.K.scale_pcs(3, major)[2], true, "the root moves with the key")
+  eq(S.K.scale_pcs(1, 999), nil, "unknown scale")
+end)
+
+test("mode_line_hard", function()
+  local n = mode_note(0.5, 0.3, 60.3, 60.3)
+  local shifts, steps = S.K.mode_line(n, "hard", nil)
+  eq(#shifts, #n.frames)
+  for i = 1, #shifts do near(shifts[i], -0.3, 1e-9, "frame " .. i) end
+  eq(next(steps), nil)
+  n = mode_note(0.5, 0.3, 60.3, 60.3, { center_pitch = 62.4 })
+  near(S.K.mode_line(n, "hard", nil)[1], 62 - 60.3, 1e-9, "follows where the note was moved")
+  near(S.K.mode_line(n, "hard", C_MAJOR)[1], 62 - 60.3, 1e-9)
+end)
+
+test("mode_line_classic_step", function()
+  local n = mode_note(0, 0.2, function(lt) return lt < 0.0975 and 60.2 or 61.2 end, 60.7, { tighten = 1 })
+  local shifts, steps = S.K.mode_line(n, "classic", nil)
+  near(shifts[20], -0.2, 1e-9); near(shifts[21], -0.2, 1e-9)
+  eq(steps[21], true, "a step where the scale note changes")
+  eq(steps[20], nil); eq(steps[22], nil)
+end)
+
+test("mode_line_classic_glide", function()
+  local n = mode_note(0, 0.2, function(lt) return lt < 0.0975 and 60 or 61 end, 60.5)   -- Tighten 0: 100 ms
+  local shifts, steps = S.K.mode_line(n, "classic", nil)
+  local a = 1 - math.exp(-JHOP / 0.100)
+  near(shifts[20], 0, 1e-9)
+  near(shifts[21], (60 + a) - 61, 1e-9)
+  near(shifts[22], (60 + 1 - (1 - a) ^ 2) - 61, 1e-9)
+  eq(next(steps), nil, "a glide writes no step")
+end)
+
+test("mode_line_untrusted_frames", function()
+  local n = mode_note(0.5, 0.1, 60.3, 60.3)
+  n.frames[5].note = 72.3   -- a wrong-octave frame
+  n.frames[6].note = nil    -- no pitch
+  local shifts = S.K.mode_line(n, "hard", nil)
+  near(shifts[5], shifts[4], 1e-12); near(shifts[6], shifts[4], 1e-12)
+  local silent = mode_note(0.5, 0.1, nil, 60.3)
+  shifts = S.K.mode_line(silent, "classic", nil)
+  for i = 1, #shifts do near(shifts[i], 60 - 60.3, 1e-9, "no pitch at all: flat at the scale note") end
+  local empty = { start_time = 1, end_time = 1.2, frames = {}, avg_note = 60, controls = { center_pitch = 60 } }
+  eq(#(S.K.mode_line(empty, "hard", nil)), 0)
+end)
+
+test("mode_scale_pcs_memo_and_cache", function()
+  local major
+  for i, d in ipairs(S.SCALE_DEFINITIONS) do if d.name == "Major" then major = i end end
+  eq(S.K.scale_pcs(1, major), S.K.scale_pcs(1, major), "same table twice")
+  eq(S.K.scale_pcs(1, major) ~= S.K.scale_pcs(3, major), true, "a different key is a different table")
+  local st = S.state
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx }
+  st.target_take_guid, st.key_idx, st.scale_idx = nil, 1, major
+  local n = mode_note(0.5, 0.1, 60.3, 60.3)
+  local a = S.K.mode_line(n, "hard", S.K.item_scale_pcs())
+  local b = S.K.mode_line(n, "hard", S.K.item_scale_pcs())
+  st.target_take_guid, st.key_idx, st.scale_idx = saved[1], saved[2], saved[3]
+  eq(a, b, "the cache hits for the item's scale")
+  n.controls.center_pitch = 62.4
+  eq(a ~= S.K.mode_line(n, "hard", S.K.scale_pcs(1, major)), true, "a moved note rebuilds")
+end)
+
+local function hard_note(t0, sung, ctrl)
+  local c = { correct_mode = 2 }
+  for k, v in pairs(ctrl or {}) do c[k] = v end
+  return mode_note(t0, 0.3, sung, sung, c)
+end
+local function chromatic(fn)   -- runs fn with every item on the chromatic scale
+  local saved = S.K.item_scale_pcs
+  S.K.item_scale_pcs = function() return nil end
+  local ok, err = pcall(fn)
+  S.K.item_scale_pcs = saved
+  if not ok then error(err, 0) end
+end
+local STEP = 0.0005
+
+test("build_natural_only_is_handed_through", function()
+  local saved, seen = S.K.natural_build, nil
+  local sentinel = { points = {}, spans = {}, ranges = {} }
+  S.K.natural_build = function(notes, item_len) seen = { notes, item_len } return sentinel end
+  local notes = { join_note(0.1, 0.3, 60, 0.3) }
+  local got = S.K.correction_build(notes, 10)
+  S.K.natural_build = saved
+  eq(got, sentinel, "Natural's own result"); eq(seen[1], notes, "the same list"); eq(seen[2], 10)
+end)
+
+test("build_hard_note", function() chromatic(function()
+  local h = hard_note(0.5, 60.3)
+  local build = S.K.correction_build({ h }, 10)
+  eq(#h.frame_shifts, #h.frames)
+  for i = 1, #h.frames do near(h.frame_shifts[i], -0.3, 1e-9) end
+  local t1 = h.frames[1].time
+  near(point_at(build.points, t1 - STEP).val, 0, 1e-12, "steps in from no correction")
+  near(point_at(build.points, t1).val, -0.3, 1e-9)
+  near(point_at(build.points, h.end_time - STEP).val, -0.3, 1e-9, "held to the end")
+  near(point_at(build.points, h.end_time).val, 0, 1e-12, "steps out")
+  eq(#build.ranges, 1); near(build.ranges[1].t0, t1 - STEP, 1e-12); near(build.ranges[1].t1, h.end_time, 1e-12)
+  eq(#build.spans, 0)
+  eq(h.controls.bypassed, false, "the real note is not changed")
+end) end)
+
+test("build_classic_step_point", function() chromatic(function()
+  local n = mode_note(0.5, 0.2, function(lt) return lt < 0.0975 and 60.2 or 61.2 end, 60.7,
+    { correct_mode = 1, tighten = 1 })
+  local build = S.K.correction_build({ n }, 10)
+  local t = n.frames[21].time
+  near(point_at(build.points, t - STEP).val, n.frame_shifts[20], 1e-12, "holds the old value before the step")
+  near(point_at(build.points, t).val, n.frame_shifts[21], 1e-12)
+end) end)
+
+test("build_natural_neighbour_keeps_its_side", function() chromatic(function()
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local h = hard_note(a.end_time, 62.3)
+  local build = S.K.correction_build({ a, h }, 10)
+  -- What Natural writes next to a note that is not corrected, built by Natural alone
+  local a2, b = join_note(0.1, 0.3, 60, 0.3), hard_note(a.end_time, 62.3)
+  b.controls.correct_mode, b.controls.bypassed = nil, true
+  local ref = S.K.natural_build({ a2, b }, 10)
+  local edge = h.frames[1].time - STEP
+  local n_ref = 0
+  for _, p in ipairs(ref.points) do
+    if p.time < edge then
+      n_ref = n_ref + 1
+      local q = build.points[n_ref]
+      eq(q.time, p.time, "same time " .. n_ref); eq(q.val, p.val, "same value " .. n_ref)
+    end
+  end
+  if n_ref < 3 then error("the reference has no blend to compare") end
+  local g = spans_of(build, "glide")
+  eq(#g, 1); if g[1].t1 > a.end_time + 1e-9 then error("the blend crosses into the Hard note") end
+  eq(a.frame_shifts[1], a2.frame_shifts[1], "Natural's own shifts")
+end) end)
+
+test("build_adjacent_mode_notes_hold", function() chromatic(function()
+  local h1 = hard_note(0.5, 60.3)
+  local h2 = hard_note(h1.end_time, 62.4)
+  local build = S.K.correction_build({ h1, h2 }, 10)
+  local t2 = h2.frames[1].time
+  near(point_at(build.points, t2 - STEP).val, -0.3, 1e-9, "held across")
+  near(point_at(build.points, t2).val, 62 - 62.4, 1e-9, "one step")
+  for _, p in ipairs(build.points) do
+    if p.time > h1.frames[1].time and p.time < h2.end_time - STEP and math.abs(p.val) < 1e-9 then
+      error("returns to no correction between the notes at " .. p.time)
+    end
+  end
+  eq(#build.ranges, 1, "one merged range")
+end) end)
+
+test("build_mode_note_at_item_edges", function() chromatic(function()
+  local h = mode_note(0, 0.2, 60.3, 60.3, { correct_mode = 2 })
+  local build = S.K.correction_build({ h }, 0.2)
+  for _, p in ipairs(build.points) do
+    if p.time < 0 or p.time > 0.2 then error("point outside the item at " .. p.time) end
+  end
+  local empty = { start_time = 1, end_time = 1.2, frames = {}, avg_note = 60,
+                  controls = { center_pitch = 60, correct_mode = 2, bypassed = false } }
+  build = S.K.correction_build({ empty }, 10)
+  eq(#build.points, 0, "a note without frames writes nothing")
+end) end)
+
+test("build_item_mode_reaches_edited_notes_only", function() chromatic(function()
+  with_item_mode(2, function()
+    local moved, untouched = mode_note(0.1, 0.3, 60.3, 60.3, { center_pitch = 61.3 }), mode_note(1, 0.3, 60.3, 60.3)
+    local build = S.K.correction_build({ moved, untouched }, 10)
+    near(moved.frame_shifts[1], 61 - 60.3, 1e-9, "Hard, around where it was moved")
+    for _, p in ipairs(build.points) do
+      if p.time >= untouched.start_time - 0.05 and math.abs(p.val) > 1e-9 then error("the untouched note is corrected") end
+    end
+  end)
+end) end)
+
+local function sorted_by_time(points)
+  local p = {}
+  for i, q in ipairs(points) do p[i] = q end
+  table.sort(p, function(a, b) return a.time < b.time end)
+  return p
+end
+local function no_close_points(points, msg)
+  local p = sorted_by_time(points)
+  for i = 2, #p do
+    if p[i].time - p[i - 1].time < 0.0001 then error((msg or "") .. ": two points closer than 0.1 ms at " .. p[i].time) end
+  end
+end
+
+test("build_mode_then_later_natural_is_written_as_built", function() chromatic(function()
+  local build = S.K.correction_build({ hard_note(0.5, 60.3), join_note(2.0, 0.3, 60, 1) }, 10)
+  local simplified = sorted_by_time(S.rdp_simplify(build.points, 0.01))
+  near(simplified[1].val, 0, 1e-12, "starts with no correction")
+  near(simplified[1].time, 0.5 - STEP, 1e-9, "at the step in")
+  near(value_at(simplified, 0.25), 0, 1e-12, "nothing before the Hard note")
+  near(value_at(simplified, 0.6), -0.3, 1e-9, "the Hard note")
+end) end)
+
+test("build_points_keep_time_order", function() chromatic(function()
+  local function notes_of(bypass)
+    local list = { hard_note(0.5, 60.3), join_note(1.5, 0.3, 60, 1), hard_note(2.5, 62.4), join_note(3.5, 0.3, 64, -1) }
+    if bypass then
+      for _, i in ipairs({ 1, 3 }) do list[i].controls.correct_mode, list[i].controls.bypassed = nil, true end
+    end
+    return list
+  end
+  local notes = notes_of(false)
+  local build = S.K.correction_build(notes, 10)
+  for i = 2, #build.points do
+    if build.points[i].time < build.points[i - 1].time then error("time goes back at point " .. i) end
+  end
+  local ref = S.K.natural_build(notes_of(true), 10)
+  local function in_mode_note(t)
+    for _, i in ipairs({ 1, 3 }) do
+      if t >= notes[i].start_time - 0.01 and t <= notes[i].end_time + 0.01 then return true end
+    end
+    return false
+  end
+  local q, n_ref = 1, 0
+  for _, p in ipairs(ref.points) do
+    if not in_mode_note(p.time) then
+      n_ref = n_ref + 1
+      while build.points[q] and not (build.points[q].time == p.time and build.points[q].val == p.val) do q = q + 1 end
+      if not build.points[q] then error("Natural's point " .. n_ref .. " is missing or out of order") end
+      q = q + 1
+    end
+  end
+  if n_ref < 4 then error("the reference has no Natural points to compare") end
+end) end)
+
+test("build_mode_note_at_item_start_is_flat", function() chromatic(function()
+  local h = mode_note(0, 0.2, 60.3, 60.3, { correct_mode = 2 })
+  local build = S.K.correction_build({ h }, 0.2)
+  local simplified = sorted_by_time(S.rdp_simplify(build.points, 0.01))
+  for _, t in ipairs({ 0, 0.05, 0.1, 0.15 }) do near(value_at(simplified, t), -0.3, 1e-9, "flat at " .. t) end
+  no_close_points(build.points, "raw build")
+end) end)
+
+test("build_mode_note_at_item_end_has_no_shared_time", function() chromatic(function()
+  local h = hard_note(0.5, 60.3)
+  local build = S.K.correction_build({ h }, h.end_time)
+  no_close_points(build.points, "raw build")
+  build = S.K.correction_build({ h }, h.end_time - STEP - 0.0002)   -- the note runs just past the item end
+  no_close_points(build.points, "note past the item end")
+end) end)
+
+test("mode_note_count", function()
+  local a, b, c = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
+  a.controls.correct_mode = 1
+  eq(S.K.mode_note_count({ a, b, c }), 1)
+  with_item_mode(2, function() eq(S.K.mode_note_count({ a, b, c }), 2, "the item's mode reaches the edited note") end)
+  eq(S.K.mode_note_count({}), 0)
+end)
+
+test("mode_reach_and_status", function()
+  local own, moved, untouched = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
+  own.controls.correct_mode = 0
+  eq(S.K.mode_reach_count({ own, moved, untouched }), 1)
+  eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 edited notes)")
+  eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 edited note)")
+  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Notes you edit will use it")
+end)
+
+test("zone_text_mode_suffix", function()
+  local zc = S.K.ZONE_CONTROLS
+  local tol, tight, slide = zc.tolerance[false], zc.tighten[false], zc.tolerance[true]
+  local n = join_note(0.1, 0.3, 60, 0.3)
+  n.controls.tighten, n.controls.tolerance = 0.5, 8
+  local natural_tol, natural_tight = S.K.zone_text(tol, n, false), S.K.zone_text(tight, n, false)
+  n.controls.correct_mode = 1
+  eq(S.K.zone_text(tol, n, false), natural_tol .. " (not used in Classic or Hard mode)")
+  eq(S.K.zone_text(slide, n, false):sub(-#S.K.MODE_IDLE), " (not used in Classic or Hard mode)")
+  eq(S.K.zone_text(tight, n, false), natural_tight, "Tighten acts in Classic")
+  n.controls.correct_mode = 2
+  eq(S.K.zone_text(tight, n, false), natural_tight .. " (not used in Hard mode)")
+  n.controls.correct_mode, n.controls.tighten = 1, nil
+  eq(S.K.zone_text(tol, n, false):find("used once Tighten", 1, true), nil, "the Natural advice is not given")
+end)
+
+test("build_uses_the_takes_own_key_and_scale", function()
+  local st = S.state
+  local major
+  for i, sc in ipairs(S.SCALE_DEFINITIONS) do if sc.name == "Major" then major = i end end
+  local chrom = #S.SCALE_DEFINITIONS
+  eq(S.SCALE_DEFINITIONS[chrom].name, "Chromatic")
+  local saved = { st.target_take_guid, st.session_takes["{KS}"], st.key_idx, st.scale_idx }
+  local function shift_with(take_scale, combo_key, combo_scale)
+    st.target_take_guid = "{KS}"
+    st.session_takes["{KS}"] = { key_idx = 1, scale_idx = take_scale }
+    st.key_idx, st.scale_idx = combo_key, combo_scale
+    local h = hard_note(0.5, 61.4)
+    S.K.correction_build({ h }, 10)
+    return h.frame_shifts[1]
+  end
+  local ok, err = pcall(function()
+    near(shift_with(major, 3, chrom), 62 - 61.4, 1e-9, "the take's C Major, not the combos' Chromatic")
+    near(shift_with(chrom, 1, major), 61 - 61.4, 1e-9, "the take's Chromatic, not the combos' C Major")
+  end)
+  st.target_take_guid, st.session_takes["{KS}"], st.key_idx, st.scale_idx = saved[1], saved[2], saved[3], saved[4]
+  if not ok then error(err, 0) end
+end)
+
+test("build_written_equals_built", function() chromatic(function()
+  local seed = 20261123   -- a small LCG of its own: no math.random state is used or left behind
+  local function rand() seed = (seed * 1103515245 + 12345) % 2147483648 return seed / 2147483648 end
+  local function pick(list) return list[1 + math.floor(rand() * #list)] end
+  for case = 1, 200 do
+    local notes, t = {}, pick({ 0, 0.1, 0.3 })
+    for i = 1, 1 + math.floor(rand() * 6) do
+      local centre, kind = 55 + math.floor(rand() * 12) + 0.8 * rand() - 0.4, pick({ "natural", "classic", "classic", "hard" })
+      local n
+      if kind == "natural" then
+        n = join_note(t, pick({ 0.1, 0.3 }), centre, rand() - 0.5)
+      else
+        local wob, slide = 0.6 * rand(), pick({ 0, 0, 1.5, -2 })
+        local function sung(lt)
+          local v = centre + wob * math.sin(2 * math.pi * 5.5 * lt)
+          if slide ~= 0 and lt < 0.06 then v = v - slide * (1 - lt / 0.06) end
+          return v
+        end
+        local tighten = pick({ 0, 0.3, 0.8, 1 })
+        n = mode_note(t, pick({ 0.1, 0.25, 0.4 }), sung, centre, { correct_mode = kind == "classic" and 1 or 2,
+          tighten = tighten > 0 and tighten or nil, center_pitch = centre + pick({ 0, 0, 2 * rand() - 1 }) })
+      end
+      notes[i] = n
+      t = n.end_time + pick({ 0, 0, 0.02, 0.059, 0.2 })
+    end
+    local build = S.K.correction_build(notes, t + 1)
+    local written = sorted_by_time(S.rdp_simplify(build.points, 0.01))
+    local at = {}   -- raw values by time: Natural stacks its fade-in at 0 for a note at the item start (as on main)
+    for _, p in ipairs(build.points) do at[p.time] = at[p.time] or {}; table.insert(at[p.time], p.val) end
+    for i, p in ipairs(build.points) do
+      if i > 1 and p.time < build.points[i - 1].time then error("case " .. case .. ": time goes back at point " .. i) end
+      local got, hit = value_at(written, p.time), false
+      for _, v in ipairs(at[p.time]) do hit = hit or math.abs(got - v) <= 0.0101 end
+      if #at[p.time] == 1 then near(got, p.val, 0.0101, "case " .. case .. " at " .. p.time)
+      elseif not hit then error("case " .. case .. ": no built value of the stack at " .. p.time .. " is written") end
+    end
+  end
+end) end)
+
+-- Amendment 1: one colour per value (the script's Theme is the module its require() loaded)
+test("param_color_keys", function()
+  local P = package.loaded["theme"].get_palette()
+  local want = { tighten = "param_tighten", retune_speed = "param_strength", tolerance = "param_tolerance",
+                 slide_in = "param_slide_in" }
+  local seen = {}
+  for key, ckey in pairs(want) do
+    eq(S.K.PARAM_COLOR_KEYS[key], ckey, "colour key of " .. key)
+    local c = S.K.param_color(key)
+    eq(type(c), "number", "colour of " .. key)
+    eq(c, P.canvas[ckey], "colour of " .. key)
+    for other, oc in pairs(seen) do
+      if oc == c then error(key .. " and " .. other .. " share a colour") end
+    end
+    seen[key] = c
+  end
+  eq(S.K.param_color("separation"), P.accent, "an unknown key takes the accent")
+  -- The washes come from the palette hue itself, not the fitted edge colour
+  local Theme = package.loaded["theme"]
+  local hue = { tighten = P.green, retune_speed = P.accent, tolerance = P.yellow, slide_in = P.orange }
+  for key, c in pairs(hue) do eq(S.K.param_wash(key, 0.27), Theme.with_alpha(c, 0.27), "wash of " .. key) end
+  eq(S.K.param_wash("separation", 0.27), Theme.with_alpha(P.accent, 0.27), "an unknown key washes in the accent")
+end)
+
+test("value_track_draws_track_then_fill", function()
+  local orig = reaper.ImGui_DrawList_AddRectFilled
+  local rects = {}
+  reaper.ImGui_DrawList_AddRectFilled = function(_, x1, y1, x2, y2, col)
+    rects[#rects + 1] = { x1 = x1, y1 = y1, x2 = x2, y2 = y2, col = col }
+  end
+  local ok, err = pcall(function()
+    S.K.value_track("dl", 100, 200, 50, 0, 0.25, 0xFF)
+    eq(#rects, 2, "track and fill")
+    eq(rects[1].x1, 100, "track x1"); eq(rects[1].x2, 200, "track x2"); eq(rects[1].y2, 50, "track y2")
+    eq(rects[2].x1, 100, "fill x1"); eq(rects[2].x2, 125, "fill x2"); eq(rects[2].y2, 50, "fill y2")
+    eq(rects[2].col, 0xFF, "fill colour")
+    rects = {}
+    S.K.value_track("dl", 100, 200, 50, 0, 0, 0xFF)
+    eq(#rects, 1, "an empty value: the track only")
+    rects = {}
+    S.K.value_track("dl", 100, 200, 50, -0.5, 1.5, 0xFF)
+    eq(#rects, 2, "held: track and fill")
+    eq(rects[2].x1, 100, "held fill x1"); eq(rects[2].x2, 200, "held fill x2")
+  end)
+  reaper.ImGui_DrawList_AddRectFilled = orig
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
