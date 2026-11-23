@@ -996,6 +996,7 @@ K.SCRUB_FINE = 5   -- ... and this many times less with Ctrl/Cmd held (HC2)
 
 K.LEVEL_WINDOW_S = 0.010   -- the shortest short-level window
 K.LEVEL_PERIODS = 2        -- a voiced frame's window spans at least this many periods of its pitch
+K.CENTRE_OUTLIER_ST = 6    -- a frame further than this from a note's middle pitch is left out of the note's centre
 
 --- The short-level window (seconds) for a frame of pitch `freq` Hz (nil or 0: unvoiced): LEVEL_WINDOW_S, or
 --- LEVEL_PERIODS periods if that is longer. A window shorter than a period swings with where it lands in the period.
@@ -1557,17 +1558,25 @@ local function extract_note_features(note, preserve_controls)
     mod[i] = smooth_pitch[i] - trend[i]
   end
 
-  -- 4. Calculate robust pitch center (energy-weighted median/mean of sustained core)
-  --    Excludes initial onset scoop (first 12%) and release tail (last 12%)
+  -- 4. Calculate robust pitch center (energy-weighted mean of the sustained core)
+  --    Excludes initial onset scoop (first 12%) and release tail (last 12%), and any frame more than
+  --    K.CENTRE_OUTLIER_ST from the core's middle pitch: a pitch reading in the wrong octave must not move the centre.
+  --    The middle pitch is a frame's own (the lower of the two middle ones for an even count), so a frame always counts
   local total_w = 0
   local weighted_sum = 0
   local start_f = math.max(1, math.floor(#note.frames * 0.12))
   local end_f = math.min(#note.frames, math.ceil(#note.frames * 0.88))
+  local core = {}
+  for i = start_f, end_f do core[#core + 1] = note.frames[i].note end
+  table.sort(core)
+  local mid = core[(#core + 1) // 2]
   for i = start_f, end_f do
     local f = note.frames[i]
-    local w = math.max(0.0001, (f.rms or 0.05))
-    weighted_sum = weighted_sum + f.note * w
-    total_w = total_w + w
+    if math.abs(f.note - mid) <= K.CENTRE_OUTLIER_ST then
+      local w = math.max(0.0001, (f.rms or 0.05))
+      weighted_sum = weighted_sum + f.note * w
+      total_w = total_w + w
+    end
   end
   if total_w > 0 then
     note.avg_note = weighted_sum / total_w

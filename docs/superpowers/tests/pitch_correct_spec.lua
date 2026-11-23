@@ -1006,6 +1006,23 @@ local function real_model()
   return data
 end
 
+-- Writes recorded cases to `path` under the comment lines `head` (items: { got, notes }; name_of(item) names a case;
+-- commit: the commit whose behaviour was recorded, or nil)
+local function record_write(path, head, commit, name_of, items)
+  local out = {}
+  for i, line in ipairs(head) do out[i] = line end
+  out[#out + 1] = "return {"
+  if commit then out[#out + 1] = '  commit = "' .. commit .. '",' end
+  out[#out + 1] = "  cases = {"
+  for _, item in ipairs(items) do record_case(out, name_of(item), item.got, item.notes) end
+  out[#out + 1] = "  },"
+  out[#out + 1] = "}"
+  local f = assert(io.open(path, "wb"))
+  f:write(table.concat(out, "\n"), "\n")
+  f:close()
+  print("recorded " .. #items .. " cases to " .. path)
+end
+
 local function natural_record()
   local ok = os.execute('git diff --quiet ' .. NATURAL_REF .. ' -- "' .. SCRIPT .. '"')
   if ok ~= true then
@@ -1013,18 +1030,9 @@ local function natural_record()
       .. " (the fixture is the v2.18.0 behaviour)\n")
     os.exit(1)
   end
-  local function write(path, name_of, items)
-    local out = { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-natural",
-      "-- Natural correction of Pitch Correct v2.18.0 (commit " .. NATURAL_REF .. "). Do not edit by hand.",
-      "return {", '  commit = "' .. NATURAL_REF .. '",', "  cases = {" }
-    for _, item in ipairs(items) do record_case(out, name_of(item), item.got, item.notes) end
-    out[#out + 1] = "  },"
-    out[#out + 1] = "}"
-    local f = assert(io.open(path, "wb"))
-    f:write(table.concat(out, "\n"), "\n")
-    f:close()
-    print("recorded " .. #items .. " cases to " .. path)
-  end
+  local head = { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-natural",
+    "-- Natural correction of Pitch Correct v2.18.0 (commit " .. NATURAL_REF .. "). Do not edit by hand." }
+  local function write(path, name_of, items) record_write(path, head, NATURAL_REF, name_of, items) end
   local items = {}
   for _, case in ipairs(natural_corpus()) do
     items[#items + 1] = { name = case.name, got = natural_run(case), notes = case.notes }
@@ -1036,6 +1044,21 @@ local function natural_record()
     write(FIXTURE_DIR .. "pitch_real_expected.lua", function() return "real" end,
       { { got = got, notes = data.notes } })
   end
+end
+
+-- The real vocal's expected numbers again, from the script as it is now (no commit check): for a fix that changes
+-- them on purpose. The committed fixture is not touched.
+local function real_record()
+  local data = real_model()
+  if not data then
+    io.stderr:write("no local fixture\n")
+    os.exit(1)
+  end
+  local got = S.K.correction_build(data.notes, data.item_len)
+  record_write(FIXTURE_DIR .. "pitch_real_expected.lua",
+    { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-real",
+      "-- Natural correction of the real vocal, recorded after the note-centre fix (v2.19.1). Do not edit by hand." },
+    nil, function() return "real" end, { { got = got, notes = data.notes } })
 end
 
 test("natural_same_numbers", function()
@@ -1183,6 +1206,7 @@ test("natural_same_text", function()
 end)
 
 if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
+if arg and arg[1] == "--record-real" then real_record() os.exit(0) end
 
 local function with_item_mode(mode, fn)   -- runs fn with an open item whose mode is `mode` (nil = none)
   local st = S.state
@@ -1775,6 +1799,64 @@ test("octave_fix_real_items", function()   -- this machine only: the two takes o
   for _, f in ipairs(chorus.results) do
     if f.time > 0.30 and f.time < 3.19 then near(f.note, 66.3, 1.5, "chorus frame at " .. f.time) end
   end
+end)
+
+-- Note centre (extract_note_features step 4) ------------------------------------------------------
+
+local function centre_note(pitches, rms)
+  local fr = {}
+  for i, p in ipairs(pitches) do fr[i] = { time = (i - 1) * OHOP, note = p, rms = rms and rms[i] or 0.1 } end
+  return { start_time = 0, end_time = #fr * OHOP, frames = fr, count = #fr }
+end
+-- The centre as v2.19.0 computed it: the energy-weighted mean of the raw frames of the core
+local function old_centre(note)
+  local nf = #note.frames
+  local sum, w_sum = 0, 0
+  for i = math.max(1, math.floor(nf * 0.12)), math.min(nf, math.ceil(nf * 0.88)) do
+    local f = note.frames[i]
+    local w = math.max(0.0001, (f.rms or 0.05))
+    sum, w_sum = sum + f.note * w, w_sum + w
+  end
+  return sum / w_sum
+end
+
+test("centre_ignores_octave_frames", function()
+  local p = {}
+  for i = 1, 27 do p[i] = (i == 6 or i == 7) and 47.0 or 58.8 end
+  local note = centre_note(p)
+  S.extract_note_features(note)
+  near(note.avg_note, 58.8, 1e-9, "centre")
+  eq(note.display_note, 59, "display note")
+end)
+
+test("centre_clean_note_unchanged", function()
+  local p, rms = {}, {}
+  for i = 1, 40 do p[i], rms[i] = 60 + 0.3 * math.sin(i), 0.05 + 0.01 * i end
+  local note = centre_note(p, rms)
+  local want = old_centre(note)
+  S.extract_note_features(note)
+  eq(note.avg_note, want, "bit for bit the old centre")
+end)
+
+test("centre_split_core_stays_finite", function()
+  local note = centre_note({ 47, 47, 59.2, 59.2 })
+  S.extract_note_features(note)
+  near(note.avg_note, 47, 1e-9, "the lower of the two middle pitches decides")
+end)
+
+test("centre_real_only_outlier_notes_move", function()   -- this machine only
+  local f = io.open(FIXTURE_DIR .. "pitch_real_model.json", "rb")
+  if not f then print("SKIP centre_real_only_outlier_notes_move (no local fixture)") return end
+  local data = loadfile("_lib/json.lua")().decode(f:read("a"))
+  f:close()
+  local moved = 0
+  for _, note in ipairs(data.notes) do
+    note.count = #note.frames
+    local want = old_centre(note)
+    S.extract_note_features(note)
+    if note.avg_note ~= want then moved = moved + 1 end
+  end
+  eq(moved, 4, "notes whose centre moved (2, 4, 17 and 32 hold octave-wrong frames)")
 end)
 
 -- Tests appended by later tasks go above this line.
