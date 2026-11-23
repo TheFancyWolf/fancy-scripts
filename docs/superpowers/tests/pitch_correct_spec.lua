@@ -1006,6 +1006,23 @@ local function real_model()
   return data
 end
 
+-- Writes recorded cases to `path` under the comment lines `head` (items: { got, notes }; name_of(item) names a case;
+-- commit: the commit whose behaviour was recorded, or nil)
+local function record_write(path, head, commit, name_of, items)
+  local out = {}
+  for i, line in ipairs(head) do out[i] = line end
+  out[#out + 1] = "return {"
+  if commit then out[#out + 1] = '  commit = "' .. commit .. '",' end
+  out[#out + 1] = "  cases = {"
+  for _, item in ipairs(items) do record_case(out, name_of(item), item.got, item.notes) end
+  out[#out + 1] = "  },"
+  out[#out + 1] = "}"
+  local f = assert(io.open(path, "wb"))
+  f:write(table.concat(out, "\n"), "\n")
+  f:close()
+  print("recorded " .. #items .. " cases to " .. path)
+end
+
 local function natural_record()
   local ok = os.execute('git diff --quiet ' .. NATURAL_REF .. ' -- "' .. SCRIPT .. '"')
   if ok ~= true then
@@ -1013,18 +1030,9 @@ local function natural_record()
       .. " (the fixture is the v2.18.0 behaviour)\n")
     os.exit(1)
   end
-  local function write(path, name_of, items)
-    local out = { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-natural",
-      "-- Natural correction of Pitch Correct v2.18.0 (commit " .. NATURAL_REF .. "). Do not edit by hand.",
-      "return {", '  commit = "' .. NATURAL_REF .. '",', "  cases = {" }
-    for _, item in ipairs(items) do record_case(out, name_of(item), item.got, item.notes) end
-    out[#out + 1] = "  },"
-    out[#out + 1] = "}"
-    local f = assert(io.open(path, "wb"))
-    f:write(table.concat(out, "\n"), "\n")
-    f:close()
-    print("recorded " .. #items .. " cases to " .. path)
-  end
+  local head = { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-natural",
+    "-- Natural correction of Pitch Correct v2.18.0 (commit " .. NATURAL_REF .. "). Do not edit by hand." }
+  local function write(path, name_of, items) record_write(path, head, NATURAL_REF, name_of, items) end
   local items = {}
   for _, case in ipairs(natural_corpus()) do
     items[#items + 1] = { name = case.name, got = natural_run(case), notes = case.notes }
@@ -1036,6 +1044,21 @@ local function natural_record()
     write(FIXTURE_DIR .. "pitch_real_expected.lua", function() return "real" end,
       { { got = got, notes = data.notes } })
   end
+end
+
+-- The real vocal's expected numbers again, from the script as it is now (no commit check): for a fix that changes
+-- them on purpose. The committed fixture is not touched.
+local function real_record()
+  local data = real_model()
+  if not data then
+    io.stderr:write("no local fixture\n")
+    os.exit(1)
+  end
+  local got = S.K.correction_build(data.notes, data.item_len)
+  record_write(FIXTURE_DIR .. "pitch_real_expected.lua",
+    { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-real",
+      "-- Natural correction of the real vocal, recorded after the note-centre fix (v2.19.1). Do not edit by hand." },
+    nil, function() return "real" end, { { got = got, notes = data.notes } })
 end
 
 test("natural_same_numbers", function()
@@ -1183,6 +1206,7 @@ test("natural_same_text", function()
 end)
 
 if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
+if arg and arg[1] == "--record-real" then real_record() os.exit(0) end
 
 local function with_item_mode(mode, fn)   -- runs fn with an open item whose mode is `mode` (nil = none)
   local st = S.state
@@ -1665,6 +1689,244 @@ test("value_track_draws_track_then_fill", function()
     eq(rects[2].x1, 100, "held fill x1"); eq(rects[2].x2, 200, "held fill x2")
   end)
   reaper.ImGui_DrawList_AddRectFilled = orig
+  if not ok then error(err, 0) end
+end)
+
+-- Octave errors (K.octave_fix) ------------------------------------------------------------------
+
+local OHOP = 512 / 48000
+-- list: runs of { frame count, pitch | nil }; returns result frames (freq follows the pitch)
+local function oct_frames(list, hop)
+  local out = {}
+  for _, r in ipairs(list) do
+    for _ = 1, r[1] do
+      local note = r[2]
+      out[#out + 1] = { time = #out * (hop or OHOP), note = note, rms = 0.1, lvl = 0.1,
+        freq = note and 440 * 2 ^ ((note - 69) / 12) or nil }
+    end
+  end
+  return out
+end
+local function all_near(fr, want, tol, msg)
+  for i, f in ipairs(fr) do if f.note then near(f.note, want, tol, msg .. " frame " .. i) end end
+end
+
+test("octave_fix_drop_in_note", function()   -- the verse: 2 of 27 frames one octave down
+  local fr = oct_frames({ { 5, 58.8 }, { 2, 47.0 }, { 20, 58.8 } })
+  eq(S.K.octave_fix(fr), 2, "frames changed")
+  all_near(fr, 58.8, 0.21, "pitch")
+  near(fr[6].note, 59.0, 1e-9, "moved by exactly 12")
+  near(fr[6].freq, 440 * 2 ^ ((59.0 - 69) / 12), 1e-6, "freq follows")
+end)
+
+test("octave_fix_spikes_in_held_note", function()   -- the chorus: many short runs one octave up
+  local fr = oct_frames({ { 7, 66.3 }, { 4, 78.3 }, { 9, 66.3 }, { 8, 78.4 }, { 19, 66.3 }, { 5, 78.4 }, { 26, 66.3 },
+    { 4, 78.4 }, { 2, 66.3 }, { 1, 78.4 }, { 5, 66.3 }, { 2, 78.4 }, { 30, 66.3 } })
+  eq(S.K.octave_fix(fr), 24, "frames changed")
+  all_near(fr, 66.3, 0.11, "pitch")
+end)
+
+test("octave_fix_spike_on_a_slide", function()
+  local fr = oct_frames({ { 30, 60 } })
+  for i, f in ipairs(fr) do f.note = 64.5 + 1.8 * (i - 1) / 29 end
+  for i = 12, 15 do fr[i].note = fr[i].note + 12 end
+  eq(S.K.octave_fix(fr), 4, "frames changed")
+  for i, f in ipairs(fr) do near(f.note, 64.5 + 1.8 * (i - 1) / 29, 1e-9, "on the slide, frame " .. i) end
+end)
+
+test("octave_fix_at_phrase_start_and_end", function()
+  local fr = oct_frames({ { 3, nil }, { 2, 48 }, { 30, 60 }, { 3, 72 }, { 3, nil } })
+  eq(S.K.octave_fix(fr), 5, "frames changed")
+  all_near(fr, 60, 1e-9, "pitch")
+end)
+
+test("octave_fix_two_octaves", function()
+  local fr = oct_frames({ { 20, 60 }, { 3, 84 }, { 20, 60 } })
+  eq(S.K.octave_fix(fr), 3, "frames changed")
+  all_near(fr, 60, 1e-9, "pitch")
+end)
+
+test("octave_fix_keeps_real_leaps", function()
+  local held = oct_frames({ { 40, 60 }, { 40, 72 } })
+  eq(S.K.octave_fix(held), 0, "a held octave leap")
+  local visit = oct_frames({ { 40, 60 }, { 16, 72 }, { 40, 60 } })   -- 16 frames = 171 ms, longer than MAX_RUN_S
+  eq(S.K.octave_fix(visit), 0, "an octave held for 171 ms")
+  eq(visit[45].note, 72, "untouched")
+  local fifth = oct_frames({ { 20, 60 }, { 3, 67 }, { 20, 60 } })
+  eq(S.K.octave_fix(fifth), 0, "a jump that is not an octave")
+  local gap = oct_frames({ { 20, 60 }, { 2, nil }, { 3, 72 }, { 2, nil }, { 20, 60 } })
+  eq(S.K.octave_fix(gap), 0, "a stretch between two unvoiced gaps is judged alone")
+  local tie = oct_frames({ { 5, 60 }, { 5, 72 } })
+  eq(S.K.octave_fix(tie), 0, "equal halves: no way to tell, nothing changes")
+end)
+
+test("octave_fix_any_hop_and_idempotent", function()
+  for _, hop in ipairs({ 256 / 48000, 512 / 48000, 256 / 44100 }) do
+    local wrong = math.floor(0.06 / hop)   -- 60 ms one octave up inside a 0.5 s note
+    local side = math.floor(0.22 / hop)
+    local fr = oct_frames({ { side, 60 }, { wrong, 72 }, { side, 60 } }, hop)
+    eq(S.K.octave_fix(fr), wrong, "frames changed at hop " .. hop)
+    all_near(fr, 60, 1e-9, "pitch at hop " .. hop)
+    eq(S.K.octave_fix(fr), 0, "a second run changes nothing at hop " .. hop)
+  end
+end)
+
+test("octave_fix_degenerate", function()
+  eq(S.K.octave_fix({}), 0, "no frames")
+  eq(S.K.octave_fix(oct_frames({ { 1, 60 } })), 0, "one frame")
+  eq(S.K.octave_fix(oct_frames({ { 20, nil } })), 0, "no pitch at all")
+  local same = oct_frames({ { 10, 60 }, { 2, 72 }, { 10, 60 } })
+  for _, f in ipairs(same) do f.time = 0 end
+  eq(S.K.octave_fix(same), 0, "equal times")
+end)
+
+test("octave_fix_only_moves_frames_that_get_closer", function()
+  -- A note onset: only 52.2 is an octave off. It is reached by a jump that is not an octave, so the two frames before
+  -- it share its octave class; they must stay where they are
+  local onset = oct_frames({ { 3, nil }, { 1, 69.2 }, { 1, 68.2 }, { 1, 52.2 }, { 17, 64.0 }, { 2, nil } })
+  eq(S.K.octave_fix(onset), 1, "onset: frames changed")
+  eq(onset[4].note, 69.2, "onset: first frame untouched")
+  eq(onset[5].note, 68.2, "onset: second frame untouched")
+  near(onset[6].note, 64.2, 1e-9, "onset: the octave-off frame is put back")
+  -- A right pickup before a wrong stretch that is left by a jump that is not an octave: the pickup stays
+  local pickup = oct_frames({ { 1, nil }, { 10, 60 }, { 4, 72 }, { 60, 62.5 } })
+  eq(S.K.octave_fix(pickup), 0, "pickup: frames changed")
+  eq(pickup[2].note, 60, "pickup: untouched")
+  -- A wrong stretch followed by a right tail in the same class: the stretch moves, the tail stays
+  local tail = oct_frames({ { 40, 60 }, { 4, 72 }, { 8, 62.5 }, { 1, nil } })
+  eq(S.K.octave_fix(tail), 4, "tail: frames changed")
+  near(tail[41].note, 60, 1e-9, "tail: the wrong stretch is put back")
+  eq(tail[45].note, 62.5, "tail: untouched")
+end)
+
+test("octave_fix_needs_enough_frames_to_trust", function()
+  -- A three-frame scrap (the verse at 17.6 s): two frames are no majority to move the third by
+  local scrap = oct_frames({ { 2, nil }, { 1, 58.4 }, { 1, 45.0 }, { 1, 56.6 }, { 2, nil } })
+  eq(S.K.octave_fix(scrap), 0, "scrap: frames changed")
+  -- Three frames (32 ms at this hop) are enough
+  local enough = oct_frames({ { 2, nil }, { 3, 60 }, { 1, 72 }, { 2, nil } })
+  eq(S.K.octave_fix(enough), 1, "enough: frames changed")
+  near(enough[6].note, 60, 1e-9, "enough: put back")
+end)
+
+test("octave_fix_real_items", function()   -- this machine only: the two takes of the 2026-11-23 report
+  local json = loadfile("_lib/json.lua")()
+  local function model(name)
+    local f = io.open(FIXTURE_DIR .. name, "rb")
+    if not f then return nil end
+    local data = json.decode(f:read("a"))
+    f:close()
+    return data
+  end
+  local verse, chorus = model("octave_verse_model.json"), model("octave_chorus_model.json")
+  if not verse or not chorus then print("SKIP octave_fix_real_items (no local fixture)") return end
+  -- No changed frame may end further from the frames around it (the middle pitch of up to 5 voiced frames each side,
+  -- after the fix) than it started
+  local function fix_checked(results, what)
+    local before = {}
+    for i, f in ipairs(results) do before[i] = f.note end
+    local changed = S.K.octave_fix(results)
+    for i, f in ipairs(results) do
+      if f.note ~= before[i] then
+        local around = {}
+        for d = 1, 5 do
+          for _, x in ipairs({ i - d, i + d }) do
+            if results[x] and results[x].note then around[#around + 1] = results[x].note end
+          end
+        end
+        table.sort(around)
+        local mid = around[(#around + 1) // 2]
+        if mid and math.abs(f.note - mid) > math.abs(before[i] - mid) then
+          error(string.format("%s frame at %.3f moved away from its neighbours: %.1f -> %.1f (around %.1f)",
+            what, f.time, before[i], f.note, mid), 0)
+        end
+      end
+    end
+    return changed
+  end
+  fix_checked(verse.results, "verse")
+  for _, f in ipairs(verse.results) do
+    if f.time > 0.90 and f.time < 0.92 then near(f.note, 59.0, 0.5, "verse frame at " .. f.time) end
+    -- the onset at 11.79 s: 69.2 and 68.2 are right and stay; 52.2 is an octave off
+    if f.time > 11.78 and f.time < 11.80 then near(f.note, 68.7, 0.6, "verse onset frame at " .. f.time) end
+    if f.time > 11.80 and f.time < 11.81 then near(f.note, 64.2, 0.1, "verse onset frame at " .. f.time) end
+  end
+  eq(fix_checked(chorus.results, "chorus"), 40, "chorus frames changed")
+  for _, f in ipairs(chorus.results) do
+    if f.time > 0.30 and f.time < 3.19 then near(f.note, 66.3, 1.5, "chorus frame at " .. f.time) end
+  end
+end)
+
+-- Note centre (extract_note_features step 4) ------------------------------------------------------
+
+local function centre_note(pitches, rms)
+  local fr = {}
+  for i, p in ipairs(pitches) do fr[i] = { time = (i - 1) * OHOP, note = p, rms = rms and rms[i] or 0.1 } end
+  return { start_time = 0, end_time = #fr * OHOP, frames = fr, count = #fr }
+end
+-- The centre as v2.19.0 computed it: the energy-weighted mean of the raw frames of the core
+local function old_centre(note)
+  local nf = #note.frames
+  local sum, w_sum = 0, 0
+  for i = math.max(1, math.floor(nf * 0.12)), math.min(nf, math.ceil(nf * 0.88)) do
+    local f = note.frames[i]
+    local w = math.max(0.0001, (f.rms or 0.05))
+    sum, w_sum = sum + f.note * w, w_sum + w
+  end
+  return sum / w_sum
+end
+
+test("centre_ignores_octave_frames", function()
+  local p = {}
+  for i = 1, 27 do p[i] = (i == 6 or i == 7) and 47.0 or 58.8 end
+  local note = centre_note(p)
+  S.extract_note_features(note)
+  near(note.avg_note, 58.8, 1e-9, "centre")
+  eq(note.display_note, 59, "display note")
+end)
+
+test("centre_clean_note_unchanged", function()
+  local p, rms = {}, {}
+  for i = 1, 40 do p[i], rms[i] = 60 + 0.3 * math.sin(i), 0.05 + 0.01 * i end
+  local note = centre_note(p, rms)
+  local want = old_centre(note)
+  S.extract_note_features(note)
+  eq(note.avg_note, want, "bit for bit the old centre")
+end)
+
+test("centre_split_core_stays_finite", function()
+  local note = centre_note({ 47, 47, 59.2, 59.2 })
+  S.extract_note_features(note)
+  near(note.avg_note, 47, 1e-9, "the lower of the two middle pitches decides")
+end)
+
+test("centre_real_only_outlier_notes_move", function()   -- this machine only
+  local f = io.open(FIXTURE_DIR .. "pitch_real_model.json", "rb")
+  if not f then print("SKIP centre_real_only_outlier_notes_move (no local fixture)") return end
+  local data = loadfile("_lib/json.lua")().decode(f:read("a"))
+  f:close()
+  local moved = 0
+  for _, note in ipairs(data.notes) do
+    note.count = #note.frames
+    local want = old_centre(note)
+    S.extract_note_features(note)
+    if note.avg_note ~= want then moved = moved + 1 end
+  end
+  eq(moved, 4, "notes whose centre moved (2, 4, 17 and 32 hold octave-wrong frames)")
+end)
+
+test("analysis_fixes_octaves_before_splitting", function()   -- what an analysis runs when its last frame is read
+  local st = S.state
+  local saved = { st.results, st.notes, st.split_points, st.separation }
+  st.results = oct_frames({ { 3, nil }, { 5, 58.8 }, { 2, 47.0 }, { 40, 58.8 }, { 3, nil } })
+  st.separation = 0.5
+  local ok, err = pcall(function()
+    S.run_hybrid_segmentation()
+    near(st.results[9].note, 59.0, 1e-9, "the stored frames are fixed")
+    eq(#st.notes, 1, "notes")
+    near(st.notes[1].avg_note, 58.8, 0.05, "the note's centre")
+  end)
+  st.results, st.notes, st.split_points, st.separation = table.unpack(saved, 1, 4)
   if not ok then error(err, 0) end
 end)
 

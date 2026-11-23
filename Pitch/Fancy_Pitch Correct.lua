@@ -1,12 +1,10 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.19.0
+-- @version 2.19.1
 -- @changelog
---   Mode: how an edited note is corrected. Natural is as before (nothing about it has changed); Classic is the auto-tuned effect: the pitch jumps between the notes of the scale and Tighten sets how fast (0% glides, 100% steps at once); Hard is one flat note of the scale
---   Set the Mode in the dropdown directly left of Tighten (this item when nothing is selected, the selected notes otherwise) or in the Mode row of the note's right-click menu
---   Classic and Hard follow where a note was moved and the item's Key and Scale; a Key or Scale change rewrites them at once, as one undo step
---   Strength, Tolerance and Slide In are not used in Classic or Hard (nor Tighten in Hard): they are dimmed and say so. An untouched note is never corrected in any mode; analysing an item again puts its mode back to Natural
---   Each value has one colour everywhere (Tighten green, Strength blue, Tolerance yellow, Slide In orange): its bar in the top bar, the same bar on its row in the note's right-click menu, a bar under the readout while it is dragged on a note, and its highlight on the notes. The bar's colour no longer tells a note's own value from the default; the * mark and the tooltip still do
+--   Analysis: a short stretch read one octave too high or too low (a spike or a sudden drop in the pitch line) is put back in the octave of the singing around it
+--   A note's centre leaves out any pitch reading still in the wrong octave, so the note block sits on the pitch line and Quantize picks the right note
+--   Analyze an item again to get this; notes analysed before may show as edited
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -996,6 +994,7 @@ K.SCRUB_FINE = 5   -- ... and this many times less with Ctrl/Cmd held (HC2)
 
 K.LEVEL_WINDOW_S = 0.010   -- the shortest short-level window
 K.LEVEL_PERIODS = 2        -- a voiced frame's window spans at least this many periods of its pitch
+K.CENTRE_OUTLIER_ST = 6    -- a frame further than this from a note's middle pitch is left out of the note's centre
 
 --- The short-level window (seconds) for a frame of pitch `freq` Hz (nil or 0: unvoiced): LEVEL_WINDOW_S, or
 --- LEVEL_PERIODS periods if that is longer. A window shorter than a period swings with where it lands in the period.
@@ -1557,17 +1556,25 @@ local function extract_note_features(note, preserve_controls)
     mod[i] = smooth_pitch[i] - trend[i]
   end
 
-  -- 4. Calculate robust pitch center (energy-weighted median/mean of sustained core)
-  --    Excludes initial onset scoop (first 12%) and release tail (last 12%)
+  -- 4. Calculate robust pitch center (energy-weighted mean of the sustained core)
+  --    Excludes initial onset scoop (first 12%) and release tail (last 12%), and any frame more than
+  --    K.CENTRE_OUTLIER_ST from the core's middle pitch: a pitch reading in the wrong octave must not move the centre.
+  --    The middle pitch is a frame's own (the lower of the two middle ones for an even count), so a frame always counts
   local total_w = 0
   local weighted_sum = 0
   local start_f = math.max(1, math.floor(#note.frames * 0.12))
   local end_f = math.min(#note.frames, math.ceil(#note.frames * 0.88))
+  local core = {}
+  for i = start_f, end_f do core[#core + 1] = note.frames[i].note end
+  table.sort(core)
+  local mid = core[(#core + 1) // 2]
   for i = start_f, end_f do
     local f = note.frames[i]
-    local w = math.max(0.0001, (f.rms or 0.05))
-    weighted_sum = weighted_sum + f.note * w
-    total_w = total_w + w
+    if math.abs(f.note - mid) <= K.CENTRE_OUTLIER_ST then
+      local w = math.max(0.0001, (f.rms or 0.05))
+      weighted_sum = weighted_sum + f.note * w
+      total_w = total_w + w
+    end
   end
   if total_w > 0 then
     note.avg_note = weighted_sum / total_w
@@ -3719,6 +3726,81 @@ K.frame_step = function(results)
   return (steps[m / 2] + steps[m / 2 + 1]) * 0.5
 end
 
+--- Octave errors of the pitch detection (K.octave_fix): JUMP_TOL_ST = how far from a whole number of octaves a
+--- frame-to-frame jump may be and still count as an octave jump; MAX_RUN_S = the longest stretch that is put back (a
+--- longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames are in;
+--- MIN_MAJORITY_S = how much of that window those frames must fill to be trusted (fewer are no majority).
+K.OCTAVE = { JUMP_TOL_ST = 1.0, MAX_RUN_S = 0.15, WINDOW_S = 0.25, MIN_MAJORITY_S = 0.03 }
+
+--- Puts short octave-off stretches of analysed frames back (`results`: time-ordered { time, note | nil, freq | nil }).
+--- Within each stretch of frames that all have a pitch, a frame-to-frame jump of a whole number of octaves (within
+--- JUMP_TOL_ST) starts a new octave class. A run of one class no longer than MAX_RUN_S belongs to the class that
+--- strictly most frames within WINDOW_S of it are in (with no such class, or one of fewer frames than MIN_MAJORITY_S,
+--- it stays). Each frame of the run then moves
+--- by the octaves between the two classes only when that brings it closer to the middle pitch of that majority's
+--- frames: a run can hold right frames too, when it was entered or left by a jump that is not an octave. Changes note
+--- and freq in place and returns how many frames changed.
+K.octave_fix = function(results)
+  local O, n = K.OCTAVE, #results
+  if n < 2 then return 0 end
+  local hop = K.frame_step(results)
+  if not (hop > 0) then return 0 end   -- luacheck: ignore 581 (also catches NaN)
+  local changed, i = 0, 1
+  while i <= n do
+    if not results[i].note then
+      i = i + 1
+    else
+      local j = i   -- the stretch i..j
+      while j + 1 <= n and results[j + 1].note do j = j + 1 end
+      local class = { [i] = 0 }
+      for q = i + 1, j do
+        local d = results[q].note - results[q - 1].note
+        local k = math.floor(d / 12 + 0.5)
+        class[q] = class[q - 1] + ((k ~= 0 and math.abs(d - 12 * k) <= O.JUMP_TOL_ST) and k or 0)
+      end
+      local moves, q = {}, i   -- decided on the classes as detected, applied afterwards
+      while q <= j do
+        local e = q
+        while e + 1 <= j and class[e + 1] == class[q] do e = e + 1 end
+        if results[e].time - results[q].time + hop <= O.MAX_RUN_S then
+          -- lo..hi: the frames of the stretch within WINDOW_S of the run (the run included)
+          local lo, hi = q, e
+          while lo - 1 >= i and results[lo - 1].time >= results[q].time - O.WINDOW_S do lo = lo - 1 end
+          while hi + 1 <= j and results[hi + 1].time <= results[e].time + O.WINDOW_S do hi = hi + 1 end
+          local count, best, best_n, tied = {}, nil, 0, false
+          for x = lo, hi do count[class[x]] = (count[class[x]] or 0) + 1 end
+          for c, cn in pairs(count) do
+            if cn > best_n then best, best_n, tied = c, cn, false
+            elseif cn == best_n then tied = true end
+          end
+          if not tied and best ~= class[q] and best_n * hop >= O.MIN_MAJORITY_S then
+            local ref = {}   -- the majority's pitches; their middle one is where the run's frames should end up near
+            for x = lo, hi do
+              if class[x] == best then ref[#ref + 1] = results[x].note end
+            end
+            table.sort(ref)
+            moves[#moves + 1] = { q, e, class[q] - best, ref[(#ref + 1) // 2] }
+          end
+        end
+        q = e + 1
+      end
+      for _, mv in ipairs(moves) do
+        for x = mv[1], mv[2] do
+          local f = results[x]
+          local moved = f.note - 12 * mv[3]
+          if math.abs(moved - mv[4]) < math.abs(f.note - mv[4]) then
+            f.note = moved
+            if f.freq then f.freq = f.freq / 2 ^ mv[3] end
+            changed = changed + 1
+          end
+        end
+      end
+      i = j + 1
+    end
+  end
+  return changed
+end
+
 --- Splits analysed frames (`results`: time-ordered { time, note | nil, rms, lvl }) into notes at Separation `sep`.
 --- Returns notes { start_time, end_time, frames, sum_note, count } (frames: the original result frames, voiced only)
 --- and split_points { time, reason } (one per note, reason "Onset" / "Pitch change" / "Level dip"). Every time constant
@@ -4095,6 +4177,7 @@ K.resplit_match = function(old_notes, new_notes, tol_s, is_modified)
 end
 
 local function run_hybrid_segmentation()
+  K.octave_fix(state.results or {})   -- before the split: the notes and their centres are made from the fixed frames
   state.notes, state.split_points = K.segment(state.results or {}, state.separation)
 
   -- Anchor pitch
@@ -11463,6 +11546,7 @@ end
 
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
-           SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify }
+           SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
+           run_hybrid_segmentation = run_hybrid_segmentation }
 end
 main()
