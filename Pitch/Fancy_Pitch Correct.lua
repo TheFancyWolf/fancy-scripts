@@ -1513,7 +1513,8 @@ K.controls_load = function(ctrl, saved)
   local lim = K.LIMITS.tolerance
   if ctrl.tighten then ctrl.tighten = (ctrl.tighten > 0) and math.min(1, ctrl.tighten) or nil end
   if ctrl.tolerance then ctrl.tolerance = math.max(lim[1], math.min(lim[2], ctrl.tolerance)) end
-  if ctrl.correct_mode and (ctrl.correct_mode % 1 ~= 0 or ctrl.correct_mode < 0 or ctrl.correct_mode > 2) then
+  if ctrl.correct_mode and (type(saved.correct_mode) ~= "number" or ctrl.correct_mode % 1 ~= 0
+      or ctrl.correct_mode < 0 or ctrl.correct_mode > 2) then
     ctrl.correct_mode = nil
   end
 end
@@ -2928,11 +2929,23 @@ K.correction_build = function(notes, item_len)
       next_block = next_block + 1
     end
   end
-  for _, p in ipairs(A.points) do
-    local inside = false
-    for _, r in ipairs(mode_ranges) do
-      if p.time >= r.t0 and p.time <= r.t1 then inside = true break end
+  -- A time is inside a range when the latest end of the ranges starting at or before it is not before it: the
+  -- ranges sorted by start (a copy: notes need not be in time order, ranges may touch or overlap) and a binary
+  -- search for the last one starting at or before the time
+  local by_t0, reach = {}, {}
+  for i, r in ipairs(mode_ranges) do by_t0[i] = r end
+  table.sort(by_t0, function(a, b) return a.t0 < b.t0 end)
+  for i, r in ipairs(by_t0) do reach[i] = math.max(reach[i - 1] or r.t1, r.t1) end
+  local function in_mode_range(t)
+    local lo, hi = 0, #by_t0
+    while lo < hi do
+      local mid = (lo + hi + 1) // 2
+      if by_t0[mid].t0 <= t then lo = mid else hi = mid - 1 end
     end
+    return lo > 0 and t <= reach[lo]
+  end
+  for _, p in ipairs(A.points) do
+    local inside = in_mode_range(p.time)
     if not inside then
       add_blocks_before(p.time)
       points[#points + 1] = p
@@ -4639,6 +4652,7 @@ end
 --- extent, arrays and body, its Tighten, Tolerance, Slide In and effective Strength, its pitch points),
 --- compared each frame without allocating; so a value dragged in the top bar shows on the next frame and a
 --- frame that changed nothing rebuilds nothing. `item` gives the length the points are clamped to.
+--- A note's mode and the item's Key and Scale also trigger a rebuild.
 K.correction_view = function(notes, item)
   local dc = state.draw_cache
   local cv = dc.corr

@@ -1195,7 +1195,7 @@ local function with_item_mode(mode, fn)   -- runs fn with an open item whose mod
 end
 
 test("mode_load_holds_range", function()
-  for _, bad in ipairs({ 3, 1.5, -1, "x" }) do
+  for _, bad in ipairs({ 3, 1.5, -1, "x", "1", "2" }) do
     local ctrl = {}
     S.K.controls_load(ctrl, { correct_mode = bad })
     eq(ctrl.correct_mode, nil, "bad " .. tostring(bad))
@@ -1230,6 +1230,7 @@ test("mode_value_and_note_mode", function()
     eq(S.K.note_mode(moved), nil, "bypassed")
   end)
   with_item_mode(7, function() eq(S.K.mode_value(nil), 0, "a bad item mode is Natural") end)
+  with_item_mode("2", function() eq(S.K.mode_value(nil), 0, "an item mode stored as a string is Natural") end)
   untouched.controls.correct_mode = 1
   eq(S.K.note_mode(untouched), "classic", "choosing a mode is an edit")
 end)
@@ -1556,6 +1557,68 @@ test("zone_text_mode_suffix", function()
   n.controls.correct_mode, n.controls.tighten = 1, nil
   eq(S.K.zone_text(tol, n, false):find("used once Tighten", 1, true), nil, "the Natural advice is not given")
 end)
+
+test("build_uses_the_takes_own_key_and_scale", function()
+  local st = S.state
+  local major
+  for i, sc in ipairs(S.SCALE_DEFINITIONS) do if sc.name == "Major" then major = i end end
+  local chrom = #S.SCALE_DEFINITIONS
+  eq(S.SCALE_DEFINITIONS[chrom].name, "Chromatic")
+  local saved = { st.target_take_guid, st.session_takes["{KS}"], st.key_idx, st.scale_idx }
+  local function shift_with(take_scale, combo_key, combo_scale)
+    st.target_take_guid = "{KS}"
+    st.session_takes["{KS}"] = { key_idx = 1, scale_idx = take_scale }
+    st.key_idx, st.scale_idx = combo_key, combo_scale
+    local h = hard_note(0.5, 61.4)
+    S.K.correction_build({ h }, 10)
+    return h.frame_shifts[1]
+  end
+  local ok, err = pcall(function()
+    near(shift_with(major, 3, chrom), 62 - 61.4, 1e-9, "the take's C Major, not the combos' Chromatic")
+    near(shift_with(chrom, 1, major), 61 - 61.4, 1e-9, "the take's Chromatic, not the combos' C Major")
+  end)
+  st.target_take_guid, st.session_takes["{KS}"], st.key_idx, st.scale_idx = saved[1], saved[2], saved[3], saved[4]
+  if not ok then error(err, 0) end
+end)
+
+test("build_written_equals_built", function() chromatic(function()
+  local seed = 20261123   -- a small LCG of its own: no math.random state is used or left behind
+  local function rand() seed = (seed * 1103515245 + 12345) % 2147483648 return seed / 2147483648 end
+  local function pick(list) return list[1 + math.floor(rand() * #list)] end
+  for case = 1, 200 do
+    local notes, t = {}, pick({ 0, 0.1, 0.3 })
+    for i = 1, 1 + math.floor(rand() * 6) do
+      local centre, kind = 55 + math.floor(rand() * 12) + 0.8 * rand() - 0.4, pick({ "natural", "classic", "classic", "hard" })
+      local n
+      if kind == "natural" then
+        n = join_note(t, pick({ 0.1, 0.3 }), centre, rand() - 0.5)
+      else
+        local wob, slide = 0.6 * rand(), pick({ 0, 0, 1.5, -2 })
+        local function sung(lt)
+          local v = centre + wob * math.sin(2 * math.pi * 5.5 * lt)
+          if slide ~= 0 and lt < 0.06 then v = v - slide * (1 - lt / 0.06) end
+          return v
+        end
+        local tighten = pick({ 0, 0.3, 0.8, 1 })
+        n = mode_note(t, pick({ 0.1, 0.25, 0.4 }), sung, centre, { correct_mode = kind == "classic" and 1 or 2,
+          tighten = tighten > 0 and tighten or nil, center_pitch = centre + pick({ 0, 0, 2 * rand() - 1 }) })
+      end
+      notes[i] = n
+      t = n.end_time + pick({ 0, 0, 0.02, 0.059, 0.2 })
+    end
+    local build = S.K.correction_build(notes, t + 1)
+    local written = sorted_by_time(S.rdp_simplify(build.points, 0.01))
+    local at = {}   -- raw values by time: Natural stacks its fade-in at 0 for a note at the item start (as on main)
+    for _, p in ipairs(build.points) do at[p.time] = at[p.time] or {}; table.insert(at[p.time], p.val) end
+    for i, p in ipairs(build.points) do
+      if i > 1 and p.time < build.points[i - 1].time then error("case " .. case .. ": time goes back at point " .. i) end
+      local got, hit = value_at(written, p.time), false
+      for _, v in ipairs(at[p.time]) do hit = hit or math.abs(got - v) <= 0.0101 end
+      if #at[p.time] == 1 then near(got, p.val, 0.0101, "case " .. case .. " at " .. p.time)
+      elseif not hit then error("case " .. case .. ": no built value of the stack at " .. p.time .. " is written") end
+    end
+  end
+end) end)
 
 -- Tests appended by later tasks go above this line.
 local failed = false
