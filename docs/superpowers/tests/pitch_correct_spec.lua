@@ -2740,6 +2740,49 @@ test("confirm_carries_the_list", function()
   st.confirm = nil
 end)
 
+-- Undo takes a batch's items out of the list; redo must bring every one of them back, not only the open item
+test("sync_brings_back_a_redone_analysis", function()
+  local K, st = S.K, S.state
+  local data = { guid = "{a}", name = "A", results = { { time = 0, note = 60 } }, notes = {}, item_len = 1, sample_rate = 48000 }
+  local json = K.take_json(data)
+  local raw, changes = json, 1
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.last_change_count, #st.session_order }
+  st.target_take_guid = "{other}"
+  st.session_takes["{a}"], st.raw_cache["{a}"] = data, json
+  st.session_order[#st.session_order + 1] = "{a}"
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    raw, changes = "", 2           -- the batch was undone: the take holds no analysis
+    st.last_change_count = 1
+    S.sync_with_project()
+    eq(st.session_takes["{a}"], nil, "undone: out of the list")
+    K.drop_project_cache()
+    raw, changes = json, 3         -- and redone
+    S.sync_with_project()
+    eq(type(st.session_takes["{a}"]), "table", "redone: back in the list")
+    eq(st.session_order[#st.session_order], "{a}")
+    K.drop_project_cache()
+    changes = 4                    -- a later change does not list it twice
+    S.sync_with_project()
+    local listed = 0
+    for _, g in ipairs(st.session_order) do if g == "{a}" then listed = listed + 1 end end
+    eq(listed, 1)
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"] = nil, nil, nil
+  while #st.session_order > saved[3] do table.remove(st.session_order) end
+  st.target_take_guid, st.last_change_count = saved[1], saved[2]
+  if st.undone_takes then st.undone_takes["{a}"] = nil end
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

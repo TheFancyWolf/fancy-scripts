@@ -437,6 +437,7 @@ local state = {
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
   raw_cache = {},           -- [guid] = raw P_EXT string last written or loaded by this script
   missing_takes = {},       -- [guid] = true when the take no longer resolves (row is kept in the sidebar)
+  undone_takes = {},        -- [guid] = true: an undo took the take's analysis away; a redo may bring it back (sync_with_project)
   stale_takes = {},         -- [guid] = true: the take's pitch envelope is not what today's settings and its notes would write (K.envelope_check)
   stale_env = {},           -- [guid] = { points }: the envelope a stale take really holds, for the preview curve of the open item
   stale_queue = {},         -- guids whose envelope is still to be compared (one per frame, K.stale_check_step)
@@ -2879,10 +2880,12 @@ local function sync_with_project()
           end
           i = i + 1
         elseif raw == "" then
-          -- The analysis was undone away: the take has no pitch data any more
+          -- The analysis was undone away: the take has no pitch data any more. It is remembered, so a redo
+          -- brings it back into the list (below)
           state.session_takes[guid] = nil
           state.stale_takes[guid] = nil
           table.remove(state.session_order, i)
+          state.undone_takes[guid] = true
           if is_active then
             clear_interaction_state()
             state.results = {}
@@ -2908,6 +2911,26 @@ local function sync_with_project()
       if raw ~= (state.raw_cache[guid] or "") then
         local data = load_take_data(take, raw)
         if data then
+          state.session_takes[guid] = data
+          table.insert(state.session_order, guid)
+          if guid == state.target_take_guid then adopt_take_data(guid, data) end
+        end
+      end
+    end
+  end
+
+  -- Items whose analysis an undo took away: a redo may have put it back. One undo can take away many (a batch), and
+  -- only one of them is the open item, so each is looked at again whenever the project changes.
+  for guid in pairs(state.undone_takes) do
+    if state.session_takes[guid] then
+      state.undone_takes[guid] = nil   -- analysed again since
+    else
+      local take = resolve_take_by_guid(guid, true)
+      local raw = take and read_take_raw(take) or ""
+      if raw ~= "" then
+        local data = load_take_data(take, raw)
+        if data then
+          state.undone_takes[guid] = nil
           state.session_takes[guid] = data
           table.insert(state.session_order, guid)
           if guid == state.target_take_guid then adopt_take_data(guid, data) end
@@ -12391,6 +12414,6 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
-           request_confirm = request_confirm }
+           request_confirm = request_confirm, sync_with_project = sync_with_project }
 end
 main()
