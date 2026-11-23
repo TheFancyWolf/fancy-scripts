@@ -1157,6 +1157,51 @@ K.release_analysis = function()
   if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
 end
 
+--- Developer switch (no interface): ExtState FancyScripts / pitch_dev_dump holds a folder, empty by default. While it
+--- is set, every analysis also writes what the detector saw, one text file per item, so a change to the detector can
+--- be judged again without reading the audio again (docs/superpowers/tests/pitch_correct_spec.lua reads the files).
+
+--- The file name of an item's dump: the take's name (anything but letters, digits and "-" becomes "_") and its GUID.
+K.dump_name = function(take_name, guid)
+  local name = tostring(take_name or ""):gsub("[^%w%-]", "_")
+  if name == "" then name = "item" end
+  return "diag_" .. name .. "_" .. tostring(guid or ""):gsub("[{}]", "") .. ".tsv"
+end
+
+--- The dump of one analysis: a header line with the engine values, a line of column names, then one line per frame
+--- (its time, the block's own reading or -1, rms, voiced / unvoiced, the short level, and every candidate period as
+--- tau:d). `results` must still hold the candidates: K.pitch_track removes them.
+K.dump_text = function(params, sample_rate, results)
+  local lines = {
+    string.format("# sr=%g block=%g hop=%g th=%g min=%g max=%g", sample_rate, params.block_size, params.hop_size,
+      params.threshold, params.min_freq, params.max_freq),
+    "time\tfreq\trms\thow\tlvl\tdips",
+  }
+  for _, f in ipairs(results) do
+    local dips = {}
+    for _, c in ipairs(f.cands or {}) do dips[#dips + 1] = string.format("%.3f:%.4f", c.tau, c.d) end
+    lines[#lines + 1] = string.format("%.6f\t%.3f\t%.5f\t%s\t%.5f\t%s", f.time or 0, f.freq or -1, f.rms or 0,
+      f.cands and "voiced" or "unvoiced", f.lvl or 0, table.concat(dips, " "))
+  end
+  return table.concat(lines, "\n") .. "\n"
+end
+
+--- Write an item's dump when the developer switch is set. Returns the file's path, or nil (the switch is empty, or
+--- the folder could not be written: the status line says so).
+K.dev_dump = function(take_name, guid, params, sample_rate, results)
+  local folder = reaper.GetExtState("FancyScripts", "pitch_dev_dump")
+  if not folder or folder == "" then return nil end
+  local path = folder:gsub("[/\\]+$", "") .. "/" .. K.dump_name(take_name, guid)
+  local file = io.open(path, "wb")
+  if not file then
+    set_status("Dev dump: couldn't write to " .. folder)
+    return nil
+  end
+  file:write(K.dump_text(params, sample_rate, results))
+  file:close()
+  return path
+end
+
 --- The Monitoring FX chain's host: the master track (nil if REAPER gives none).
 local function tone_master()
   return reaper.GetMasterTrack(0)
@@ -4420,6 +4465,8 @@ local function process_analysis_step()
     state.is_analyzing = false
     state.analysis_params = nil
     state.progress = 1.0
+    -- The developer switch: the frames as the detector left them, before the candidates are chosen from and dropped
+    pcall(K.dev_dump, state.target_take_name, state.target_take_guid, params, state.sample_rate, state.results)
     run_hybrid_segmentation()
     state.analysis_empty = (not state.notes or #state.notes == 0)
     K.reset_view()   -- the new model is shown whole

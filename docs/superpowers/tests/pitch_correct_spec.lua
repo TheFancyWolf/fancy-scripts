@@ -2026,26 +2026,41 @@ test("track_any_hop", function()
   end
 end)
 
+-- Reads what the detector had to choose from, per frame: the recordings of 2026-11-23 and the files the developer
+-- switch writes (K.dump_text). Columns are found by the names in the header line; a file without a "lvl" column has
+-- the frame's rms as its level. Returns the frames { time, rms, lvl, cands = { { tau, d } ... } | nil }
+local function diag_parse(text)
+  local out, col = {}, nil
+  for line in text:gmatch("[^\n]+") do
+    if not line:match("^#") then
+      local cols = {}
+      for cell in (line .. "\t"):gmatch("(.-)\t") do cols[#cols + 1] = cell end
+      if not col then
+        col = {}
+        for i, name in ipairs(cols) do col[name] = i end
+      else
+        local fr = { time = tonumber(cols[col.time]), rms = tonumber(cols[col.rms]) }
+        fr.lvl = col.lvl and tonumber(cols[col.lvl]) or fr.rms
+        if cols[col.how] ~= "unvoiced" then
+          fr.cands = {}
+          for tau, d in (cols[col.dips] or ""):gmatch("([%d%.]+):([%d%.]+)") do
+            fr.cands[#fr.cands + 1] = { tau = tonumber(tau), d = tonumber(d) }
+          end
+        end
+        out[#out + 1] = fr
+      end
+    end
+  end
+  return out
+end
 -- This machine only: what the detector had to choose from on the two reported items, recorded in real REAPER on
 -- 2026-11-23 (per frame: every dip of the difference function). Returns the frames, or nil
 local function diag_frames(name)
   local f = io.open(FIXTURE_DIR .. "detector-diag-2026-11-23/" .. name, "rb")
   if not f then return nil end
-  local out = {}
-  for line in f:lines() do
-    if not line:match("^#") and not line:match("^time") then
-      local cols = {}
-      for col in (line .. "\t"):gmatch("(.-)\t") do cols[#cols + 1] = col end
-      local fr = { time = tonumber(cols[1]), rms = tonumber(cols[3]), lvl = tonumber(cols[3]) }
-      if cols[4] ~= "unvoiced" then
-        fr.cands = {}
-        for tau, d in (cols[10] or ""):gmatch("(%d+):([%d%.]+)") do fr.cands[#fr.cands + 1] = { tau = tonumber(tau), d = tonumber(d) } end
-      end
-      out[#out + 1] = fr
-    end
-  end
+  local text = f:read("a")
   f:close()
-  return out
+  return diag_parse(text)
 end
 -- How many frames read more than 6 st from the middle pitch of the 12 frames each side (octave errors, mostly)
 local function frames_off(fr)
@@ -2324,6 +2339,59 @@ test("analysis_begin_refuses_offline_media", function()
   reaper.GetMediaSourceSampleRate, reaper.CreateTakeAudioAccessor = nil, nil
   eq(ok, false); eq(reason, "offline"); eq(st.is_analyzing == true, false, "not analysing")
   eq(created, false, "nothing was opened")
+end)
+
+-- The developer switch (ExtState FancyScripts / pitch_dev_dump): what the detector saw, one file per item
+local DUMP_PARAMS = { block_size = 1024, hop_size = 512, threshold = 0.08, min_freq = 65, max_freq = 1000 }
+local function dump_results()
+  return {
+    { time = 0.010667, rms = 0.0007, lvl = 0.0006 },
+    { time = 0.064, freq = 337.22, rms = 0.02487, lvl = 0.0231,
+      cands = { { tau = 142.337, d = 0.0182 }, { tau = 284.5, d = 0.0507 } } },
+  }
+end
+
+test("dump_name", function()
+  eq(S.K.dump_name("V Main: Verse/1", "{AB12-CD}"), "diag_V_Main__Verse_1_AB12-CD.tsv")
+  eq(S.K.dump_name("", "{X}"), "diag_item_X.tsv")
+end)
+
+test("dump_text_format", function()
+  local lines = {}
+  for line in S.K.dump_text(DUMP_PARAMS, 48000, dump_results()):gmatch("[^\n]+") do lines[#lines + 1] = line end
+  eq(lines[1], "# sr=48000 block=1024 hop=512 th=0.08 min=65 max=1000")
+  eq(lines[2], "time\tfreq\trms\thow\tlvl\tdips")
+  eq(lines[3], "0.010667\t-1.000\t0.00070\tunvoiced\t0.00060\t")
+  eq(lines[4], "0.064000\t337.220\t0.02487\tvoiced\t0.02310\t142.337:0.0182 284.500:0.0507")
+  eq(#lines, 4)
+end)
+
+test("dump_round_trip", function()
+  local fr = diag_parse(S.K.dump_text(DUMP_PARAMS, 48000, dump_results()))
+  eq(#fr, 2)
+  eq(fr[1].cands, nil, "an unvoiced frame has no candidates")
+  near(fr[2].time, 0.064, 1e-6); near(fr[2].rms, 0.02487, 1e-5); near(fr[2].lvl, 0.0231, 1e-5)
+  eq(#fr[2].cands, 2); near(fr[2].cands[1].tau, 142.337, 1e-3); near(fr[2].cands[2].d, 0.0507, 1e-4)
+end)
+
+test("dump_reader_still_reads_the_recordings_of_2026_11_23", function()
+  local fr = diag_parse("# sr=48000 block=1024 hop=512 th=0.08 min=65 max=1000\n"
+    .. "time\tfreq\trms\thow\ttau\tW\tmin_tau\tmax_tau\tedge\tdips\n"
+    .. "0.000000\t-1.000\t0.00027\tunvoiced\t487\t512\t48\t512\t1.0127\t487:0.7824\n"
+    .. "0.053333\t333.208\t0.01981\tglobal\t144\t512\t48\t512\t1.1187\t116:0.5025 144:0.0912\n")
+  eq(#fr, 2); eq(fr[1].cands, nil); near(fr[2].rms, 0.01981, 1e-9); near(fr[2].lvl, 0.01981, 1e-9, "no lvl column: rms")
+  eq(#fr[2].cands, 2); eq(fr[2].cands[2].tau, 144); near(fr[2].cands[2].d, 0.0912, 1e-9)
+end)
+
+test("dev_dump_off_by_default_and_on", function()
+  eq(S.K.dev_dump("Take", "{G}", DUMP_PARAMS, 48000, dump_results()), nil, "off: the switch is empty")
+  local dir = os.tmpname(); os.remove(dir); os.execute('mkdir "' .. dir .. '"')
+  reaper.GetExtState = function(_, key) return key == "pitch_dev_dump" and dir or "" end
+  local path = S.K.dev_dump("Take", "{G}", DUMP_PARAMS, 48000, dump_results())
+  reaper.GetExtState = function() return "" end   -- the harness's own stub
+  eq(path, dir .. "/diag_Take_G.tsv")
+  local f = io.open(path, "rb"); local body = f:read("a"); f:close(); os.remove(path); os.remove(dir)
+  eq(body, S.K.dump_text(DUMP_PARAMS, 48000, dump_results()))
 end)
 
 -- Tests appended by later tasks go above this line.
