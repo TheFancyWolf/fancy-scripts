@@ -4850,6 +4850,10 @@ do
   for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
 end
 K.TOLERANCE_IDLE = " (used once Tighten is above 0%)"   -- appended where a note's Tolerance is shown while its Tighten is 0
+-- Appended where a value is shown on a note whose mode does not use it (K.zone_text): Tolerance and Slide In on a
+-- Classic or Hard note, Tighten on a Hard one
+K.MODE_IDLE = " (not used in Classic or Hard mode)"
+K.HARD_IDLE = " (not used in Hard mode)"
 
 --- The entry of K.ZONE_CONTROLS for a drag on `zone` with or without Shift, or nil (the pitch drag).
 K.zone_control = function(zone, shift)
@@ -4867,6 +4871,13 @@ end
 --- The text for the value `zc` edits on `note`: the drag readout, or the hover tooltip (hover = true).
 K.zone_text = function(zc, note, hover)
   local text = string.format(hover and zc.hover or zc.read, K.zone_value(zc, note) * (zc.show or 1))
+  local mode = K.mode_value(note)
+  if mode ~= 0 then
+    -- A Classic or Hard note: the mode says why a value does nothing (the Natural advice below does not apply)
+    if zc.key == "tolerance" or zc.key == "slide_in" then return text .. K.MODE_IDLE end
+    if zc.key == "tighten" and mode == 2 then return text .. K.HARD_IDLE end
+    return text
+  end
   if zc.key == "tolerance" and (tonumber(note.controls.tighten) or 0) <= 0 then text = text .. K.TOLERANCE_IDLE end
   return text
 end
@@ -5025,6 +5036,8 @@ K.HINT_KINDS = {
 --- on every note Strength reaches, the Tolerance band of each tightened note, a span over each slide for Slide In.
 --- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
 --- `build` is K.correction_view's result, C the canvas palette. Returns how many marks were drawn.
+--- Also returns `skipped`: how many notes in view the value reaches that got no mark because they are Classic or
+--- Hard (K.mode_value 1 or 2; for Tighten: Hard), 0 when a reached Natural note (Tighten: a non-Hard one) is in view.
 K.draw_setting_hint = function(draw_list, hint, build, C)
   local m = state.draw_cache.map
   local notes, key, set = state.notes, hint.key, hint.notes
@@ -5032,6 +5045,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   local x_min, x_max, y_min, y_max = m.px, m.px + m.w, m.py, m.py + m.h
   local pad = Theme.layout.xs
   local drawn = 0
+  local skipped, natural = 0, 0
 
   -- The note takes the value that is being changed. edited_only: it must also be corrected (edited, not bypassed)
   local function reached(idx, edited_only)
@@ -5040,6 +5054,13 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
     if set then return set[idx] ~= nil end
     if edited_only and (n.controls.bypassed or not is_note_modified(n)) then return false end
     return n.controls[key] == nil
+  end
+  -- A note in view the value reaches: is it one the mode leaves unmarked (counted in skipped) or a Natural one?
+  local function tally(idx, skip)
+    local n = notes[idx]
+    if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
+      if skip then skipped = skipped + 1 else natural = natural + 1 end
+    end
   end
   local function t_x(t) return m.px + (t - m.vt0) / (m.vt1 - m.vt0) * m.w end
   local function block_y(idx)
@@ -5050,7 +5071,9 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   if key == "retune_speed" then
     for idx = 1, #notes do
       local n = notes[idx]
-      if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
+      local skip = K.mode_value(n) ~= 0   -- a Classic or Hard note gets no outline
+      tally(idx, skip)
+      if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
         local top, bot = block_y(idx)
         if bot >= y_min and top <= y_max then
           reaper.ImGui_DrawList_AddRect(draw_list, math.max(x_min, t_x(n.start_time) - pad), math.max(y_min, top - pad),
@@ -5059,14 +5082,16 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         end
       end
     end
-    return drawn
+    return drawn, natural == 0 and skipped or 0
   end
 
   if key == "tolerance" then
     -- The band a tightened note may stray in untouched: centre - Tolerance .. centre + Tolerance across its block
     for idx = 1, #notes do
       local n = notes[idx]
-      if n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
+      local skip = K.mode_value(n) ~= 0   -- a Classic or Hard note gets no band
+      tally(idx, skip)
+      if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
           and (tonumber(n.controls.tighten) or 0) > 0 then
         local cp = n.controls.center_pitch
         local tol = (tonumber(get_effective(n, "tolerance")) or 0) / 100
@@ -5082,7 +5107,18 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         end
       end
     end
-    return drawn
+    return drawn, natural == 0 and skipped or 0
+  end
+
+  if key == "tighten" then
+    -- No marks of its own (as for any key without K.HINT_KINDS); a Hard note does not use it at all
+    for idx = 1, #notes do tally(idx, K.mode_value(notes[idx]) == 2) end
+    return 0, natural == 0 and skipped or 0
+  end
+
+  if key == "slide_in" then
+    -- A Classic or Hard note has no slide to shade
+    for idx = 1, #notes do tally(idx, K.mode_value(notes[idx]) ~= 0) end
   end
 
   local kinds = K.HINT_KINDS[key]
@@ -5091,6 +5127,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
     if kinds[sp.kind] and sp.t1 >= m.vt0 and sp.t0 <= m.vt1 then
       -- A slide belongs to the note it leads into
       local ok = reached(sp.a, true)
+      if ok and K.mode_value(notes[sp.a]) ~= 0 then ok = false end
       if ok and notes[sp.a] and notes[sp.a].controls and (not sp.b or (notes[sp.b] and notes[sp.b].controls)) then
         local top, bot = block_y(sp.a)
         if sp.b then
@@ -5114,7 +5151,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
       end
     end
   end
-  return drawn
+  return drawn, natural == 0 and skipped or 0
 end
 
 -------------------------------------------------------------------------------
@@ -6824,7 +6861,12 @@ local function draw_graph(draw_ctx, w, h)
     local hint = state.setting_hint
     local live = hint.key ~= nil and hint.frame >= (reaper.ImGui_GetFrameCount(draw_ctx) or 0) - 1
     if live and state.show_preview and not is_bypassed and state.notes and #state.notes > 0 then
-      local marks = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
+      local marks, skipped = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
+      if hint.dragging and marks == 0 and not hint.said and (skipped or 0) > 0 then
+        -- Every note in view the value reaches is one whose mode does not use it
+        hint.said = true
+        set_status(hint.key == "tighten" and "Not used in Hard mode" or "Not used in Classic or Hard mode")
+      end
       if hint.dragging and marks == 0 and not hint.said then
         hint.said = true
         set_status((hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first")
@@ -7359,7 +7401,12 @@ local function draw_graph(draw_ctx, w, h)
 
          -- param_drag tests the gestures right after the control (not after SameLine / TextDisabled, which would test the text)
          local name = PARAM_LABELS[key] or label
+         -- The note's mode may not use this value: its text is dim (as in the top bar)
+         local unused = K.mode_unused(key, { note }, 1)
+         local dim = (unused == "mode" or unused == "hard")
+         if dim then reaper.ImGui_PushStyleColor(draw_ctx, reaper.ImGui_Col_Text(), Theme.get_palette().text_dim) end
          local s_changed, new_val, committed, reset = param_drag(draw_ctx, "cm_" .. key, label, cur_val, min_v, max_v, fmt)
+         if dim then reaper.ImGui_PopStyleColor(draw_ctx) end
          if K.drag_hot.hovered or K.drag_hot.active then
             -- The canvas shades where this value acts on the menu's note
             local set = state.setting_hint.menu_set
@@ -7424,6 +7471,39 @@ local function draw_graph(draw_ctx, w, h)
          end
       end
 
+      -- Mode: the note's mode in effect; a choice is written to the menu's note, or to every selected note when it
+      -- is one of several (as the value rows do), as one undo point. Choosing what every one already has does nothing
+      do
+        local choice, m_changed = Theme.combo(draw_ctx, "##cm_mode", K.MODES, K.mode_value(note) + 1,
+          { w = reaper.ImGui_CalcItemWidth(draw_ctx) })
+        -- The label sits where a value row's label does: the inner spacing right of the control
+        local inner = reaper.ImGui_GetStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing())
+        reaper.ImGui_SameLine(draw_ctx, 0, inner)
+        reaper.ImGui_Text(draw_ctx, "Mode")
+        reaper.ImGui_SameLine(draw_ctx)
+        reaper.ImGui_TextDisabled(draw_ctx, ctrl.correct_mode ~= nil and "[note]" or "[item]")
+        if spread_n > 1 then
+          reaper.ImGui_SameLine(draw_ctx)
+          reaper.ImGui_TextDisabled(draw_ctx, string.format("(%d notes)", spread_n))
+        end
+        if m_changed then
+          local targets = { note }
+          if spread_n > 1 then
+            for idx in pairs(state.selected_notes) do
+              local o = state.notes[idx]
+              if o and o ~= note and o.controls then targets[#targets + 1] = o end
+            end
+          end
+          local differs = false
+          for _, o in ipairs(targets) do
+            if K.mode_value(o) ~= choice - 1 then differs = true break end
+          end
+          if differs then
+            for _, o in ipairs(targets) do o.controls.correct_mode = choice - 1 end
+            apply_envelope_to_take("Change Mode")
+          end
+        end
+      end
       draw_cm_slider(PARAM_LABELS.tighten, "tighten", 0, 100, "%.0f%%", 100, nil, true)
       draw_cm_slider(PARAM_LABELS.tolerance, "tolerance", K.LIMITS.tolerance[1], K.LIMITS.tolerance[2], "%.0f \xC2\xA2", nil, nil, true)
       draw_cm_slider(PARAM_LABELS.slide_in, "slide_in", 0, 100, "%.0f%%", 100, nil, true)
@@ -8072,6 +8152,7 @@ K.INFO_SECTIONS = {
     { "Drag Left Zone", string.format("Tighten: steady the note, slow drift first; 100%% is a flat line (%s = fine)", K.MOD_LABEL),
       panel = { "Edit", 10, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
+    { "Mode (top bar, note menu)", "Natural, Classic (the pitch jumps between scale notes; Tighten sets how fast) or Hard (one flat scale note)" },
     { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
     { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 11, "Slide In", "Shift + Drag" } },
     { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 12, "Trim note", "Drag edge" } },
@@ -10727,7 +10808,7 @@ do
           for i = 1, sel_n do
             if (tonumber(sel_notes[i].controls.tighten) or 0) > 0 then idle = false break end
           end
-          if idle then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
+          if idle and unused ~= "mode" then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
         end
         if unused then scope = BAR_MODE.unused[unused] .. "\n" .. scope end
       elseif view.target == "item" then

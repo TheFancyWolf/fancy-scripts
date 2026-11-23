@@ -1541,6 +1541,22 @@ test("mode_reach_and_status", function()
   eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Notes you edit will use it")
 end)
 
+test("zone_text_mode_suffix", function()
+  local zc = S.K.ZONE_CONTROLS
+  local tol, tight, slide = zc.tolerance[false], zc.tighten[false], zc.tolerance[true]
+  local n = join_note(0.1, 0.3, 60, 0.3)
+  n.controls.tighten, n.controls.tolerance = 0.5, 8
+  local natural_tol, natural_tight = S.K.zone_text(tol, n, false), S.K.zone_text(tight, n, false)
+  n.controls.correct_mode = 1
+  eq(S.K.zone_text(tol, n, false), natural_tol .. " (not used in Classic or Hard mode)")
+  eq(S.K.zone_text(slide, n, false):sub(-#S.K.MODE_IDLE), " (not used in Classic or Hard mode)")
+  eq(S.K.zone_text(tight, n, false), natural_tight, "Tighten acts in Classic")
+  n.controls.correct_mode = 2
+  eq(S.K.zone_text(tight, n, false), natural_tight .. " (not used in Hard mode)")
+  n.controls.correct_mode, n.controls.tighten = 1, nil
+  eq(S.K.zone_text(tol, n, false):find("used once Tighten", 1, true), nil, "the Natural advice is not given")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
