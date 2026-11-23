@@ -849,6 +849,341 @@ test("note_actions_frame", function()
   st.results, st.notes, st.selected_notes, st.selected_note, st.is_analyzing = table.unpack(saved)
 end)
 
+-- Proof of Natural: the correction of v2.18.0 pinned to the number ---------------------------------------------
+-- natural_corpus() builds fresh notes on every call (a build mutates the notes and caches on them). The recorder
+-- (--record-natural) writes what K.correction_build gives on the unchanged v2.18.0 script; the tests compare to it.
+
+local NATURAL_REF = "810bc35"
+local NATURAL_FIXTURE = "docs/superpowers/tests/fixtures/natural_v2_18_0.lua"
+
+-- The sung pitch of the note's body wobbles +/-0.3 st at 5 Hz over a slow drift (so Tighten has something to take)
+local function wobbly(n, tighten, tolerance)
+  local first = S.K.note_body(n)
+  for i = first or 1, #n.frames do
+    local t = n.frames[i].time
+    local w = n.avg_note + 0.3 * math.sin(2 * math.pi * 5 * t) + 0.1 * math.sin(2 * math.pi * 0.7 * t)
+    n.frames[i].note, n.smooth[i] = w, w
+  end
+  n.controls.tighten, n.controls.tolerance = tighten, tolerance
+  return n
+end
+
+local function untouched_note(t0, dur, centre, slide)
+  local n = join_note(t0, dur, centre, 0, slide)
+  n.controls.retune_speed = nil
+  return n
+end
+
+local function bypassed_note(t0, dur, centre, slide)
+  local n = join_note(t0, dur, centre, 0.5, slide)
+  n.controls.bypassed = true
+  return n
+end
+
+local function with_points(n, list)
+  n.controls.points = {}
+  for i, p in ipairs(list) do
+    n.controls.points[i] = { t = n.frames[p[1]].time, st = p[2], added = true }
+  end
+  return n
+end
+
+local function natural_corpus()
+  local cases = {}
+  local function add(name, notes, item_len, setup, teardown)
+    cases[#cases + 1] = { name = name, notes = notes, item_len = item_len, setup = setup, teardown = teardown }
+  end
+  local function solo(name, n, item_len) add(name, { n }, item_len or 10) end
+
+  solo("moved", join_note(0.1, 0.3, 60, 0.3))
+  solo("tighten_50_tol_8", wobbly(join_note(0.1, 0.4, 60, 0.3), 0.5, 8))
+  solo("tighten_100", wobbly(join_note(0.1, 0.4, 60, -0.2), 1, nil))
+  solo("tighten_50_tol_30", wobbly(join_note(0.1, 0.4, 60, 0.3), 0.5, 30))
+  for _, v in ipairs({ { 0, "slide_in_0" }, { 0.5, "slide_in_50" }, { 1, "slide_in_100" } }) do
+    solo(v[2], slide_note(2, v[1]), 1)
+  end
+  local half = join_note(0.1, 0.4, 60, 0.3)
+  half.controls.retune_speed = 0.5
+  solo("strength_50_note", wobbly(half, 0.5, 8))
+  local saved
+  add("strength_50_item", { wobbly(join_note(0.1, 0.4, 60, 0.3), 0.5, 8) }, 10,
+    function()
+      saved = { S.state.target_take_guid, S.state.session_takes["{T}"] }
+      S.state.target_take_guid = "{T}"
+      S.state.session_takes["{T}"] = { overrides = { retune_speed = 0.5 } }
+    end,
+    function()
+      S.state.target_take_guid, S.state.session_takes["{T}"] = saved[1], saved[2]
+    end)
+  cases[#cases].notes[1].controls.retune_speed = nil
+
+  local a, b = slid_pair(0.04)
+  add("joined_pair", { a, wobbly(b, 0.6, 8) }, 10)
+  a = join_note(0.1, 0.3, 60, 0.3)
+  add("short_gap", { a, join_note(a.end_time + 0.04, 0.3, 62, -0.2) }, 10)
+  a = join_note(0.1, 0.3, 60, 0.3)
+  add("unjoined_fades", { a, join_note(a.end_time + 0.2, 0.3, 62, -0.2) }, 10)
+
+  a = wobbly(join_note(0.1, 0.3, 60, 0.3), 0.6, 8)
+  add("edited_then_untouched", { a, untouched_note(a.end_time, 0.3, 62, { from = 60, dur = 0.04 }) }, 10)
+  a = join_note(0.1, 0.3, 60, 0.3)
+  add("edited_then_bypassed", { a, bypassed_note(a.end_time, 0.3, 62, { from = 60, dur = 0.04 }) }, 10)
+  a = bypassed_note(0.1, 0.3, 62)
+  add("bypassed_then_edited", { a, join_note(a.end_time, 0.3, 62, -0.2, { from = 60, dur = 0.04 }) }, 10)
+
+  solo("pitch_points", with_points(join_note(0.1, 0.4, 60, 0.2), { { 12, 0.5 }, { 40, -0.4 }, { 60, 0.25 } }))
+  a = join_note(0.1, 0.3, 60, 0.3)
+  b = join_note(a.end_time, 3 * JHOP, 62, -0.2)
+  for i = 1, 3 do b.frames[i].note, b.smooth[i] = 65, 65 end
+  add("bodiless_note", { a, b }, 10)
+  solo("note_at_item_start", join_note(0, 0.3, 60, 0.3))
+  solo("note_at_item_end", join_note(0.7, 0.3, 60, 0.3), 1)
+
+  -- A phrase of six: tightened, joined with Slide In, bypassed, untouched, with points (after a gap), joined at half Strength
+  local p1 = wobbly(join_note(0.1, 0.3, 60, 0.3), 0.5, 8)
+  local p2 = join_note(p1.end_time, 0.3, 62, -0.2, { from = 60, dur = 0.04 })
+  p2.controls.slide_in = 0.5
+  local p3 = bypassed_note(p2.end_time, 0.3, 64)
+  local p4 = untouched_note(p3.end_time + 0.02, 0.3, 65)
+  local p5 = with_points(join_note(p4.end_time + 0.2, 0.3, 67, 0.1), { { 10, 0.4 }, { 30, -0.3 } })
+  local p6 = join_note(p5.end_time, 0.3, 69, -0.15, { from = 67, dur = 0.04 })
+  p6.controls.retune_speed = 0.5
+  add("phrase_of_six", { p1, p2, p3, p4, p5, p6 }, 10)
+  return cases
+end
+
+local function natural_run(case)
+  if case.setup then case.setup() end
+  local got = S.K.correction_build(case.notes, case.item_len)
+  if case.teardown then case.teardown() end
+  return got
+end
+
+local function num(x) return string.format("%.17g", x) end
+
+-- The lines of one recorded case: what the build gave, and every note's frame shifts
+local function record_case(out, name, got, notes)
+  local function row(list)
+    local parts = {}
+    for i, x in ipairs(list) do parts[i] = num(x) end
+    return table.concat(parts, ", ")
+  end
+  out[#out + 1] = '    ["' .. name .. '"] = {'
+  out[#out + 1] = "      points = {"
+  for _, p in ipairs(got.points) do out[#out + 1] = "        { " .. num(p.time) .. ", " .. num(p.val) .. " }," end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "      spans = {"
+  for _, s in ipairs(got.spans) do
+    out[#out + 1] = string.format('        { "%s", %s, %s, %s, %s },', s.kind, num(s.t0), num(s.t1),
+      s.a and tostring(s.a) or "nil", s.b and tostring(s.b) or "nil")
+  end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "      ranges = {"
+  for _, r in ipairs(got.ranges) do out[#out + 1] = "        { " .. num(r.t0) .. ", " .. num(r.t1) .. " }," end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "      shifts = {"
+  for _, n in ipairs(notes) do out[#out + 1] = "        { " .. row(n.frame_shifts) .. " }," end
+  out[#out + 1] = "      },"
+  out[#out + 1] = "    },"
+end
+
+-- The real vocal (this machine only): a take's saved model read the way the script reads it from a take
+local FIXTURE_DIR = (os.getenv("HOME") or "") .. "/.fancy-scripts-fixtures/"
+local function real_model()
+  local f = io.open(FIXTURE_DIR .. "pitch_real_model.json", "rb")
+  if not f then return nil end
+  local raw = f:read("a")
+  f:close()
+  local json = loadfile("_lib/json.lua")()
+  local data = json.decode(raw)
+  for _, note in ipairs(data.notes) do
+    note.count = #note.frames
+    local saved = note.controls
+    S.extract_note_features(note)
+    S.K.controls_load(note.controls, saved)
+    S.K.points_sanitize(note)
+  end
+  return data
+end
+
+local function natural_record()
+  local ok = os.execute('git diff --quiet ' .. NATURAL_REF .. ' -- "' .. SCRIPT .. '"')
+  if ok ~= true then
+    io.stderr:write("refusing to record: " .. SCRIPT .. " differs from " .. NATURAL_REF
+      .. " (the fixture is the v2.18.0 behaviour)\n")
+    os.exit(1)
+  end
+  local function write(path, name_of, items)
+    local out = { "-- Recorded by: lua docs/superpowers/tests/pitch_correct_spec.lua --record-natural",
+      "-- Natural correction of Pitch Correct v2.18.0 (commit " .. NATURAL_REF .. "). Do not edit by hand.",
+      "return {", '  commit = "' .. NATURAL_REF .. '",', "  cases = {" }
+    for _, item in ipairs(items) do record_case(out, name_of(item), item.got, item.notes) end
+    out[#out + 1] = "  },"
+    out[#out + 1] = "}"
+    local f = assert(io.open(path, "wb"))
+    f:write(table.concat(out, "\n"), "\n")
+    f:close()
+    print("recorded " .. #items .. " cases to " .. path)
+  end
+  local items = {}
+  for _, case in ipairs(natural_corpus()) do
+    items[#items + 1] = { name = case.name, got = natural_run(case), notes = case.notes }
+  end
+  write(NATURAL_FIXTURE, function(it) return it.name end, items)
+  local data = real_model()
+  if data then
+    local got = S.K.correction_build(data.notes, data.item_len)
+    write(FIXTURE_DIR .. "pitch_real_expected.lua", function() return "real" end,
+      { { got = got, notes = data.notes } })
+  end
+end
+
+test("natural_same_numbers", function()
+  local fx = dofile(NATURAL_FIXTURE)
+  local seen = 0
+  for _, case in ipairs(natural_corpus()) do
+    local want = fx.cases[case.name]
+    if not want then error("no recorded case " .. case.name) end
+    seen = seen + 1
+    local got = natural_run(case)
+    -- exact: ==, never near()
+    eq(#got.points, #want.points, case.name .. " points")
+    for i, p in ipairs(got.points) do
+      eq(p.time, want.points[i][1], case.name .. " point time " .. i)
+      eq(p.val, want.points[i][2], case.name .. " point val " .. i)
+    end
+    eq(#got.spans, #want.spans, case.name .. " spans")
+    for i, s in ipairs(got.spans) do
+      local w = want.spans[i]
+      eq(s.kind, w[1], case.name .. " span kind " .. i)
+      eq(s.t0, w[2], case.name .. " span t0 " .. i)
+      eq(s.t1, w[3], case.name .. " span t1 " .. i)
+      eq(s.a, w[4], case.name .. " span a " .. i)
+      eq(s.b, w[5], case.name .. " span b " .. i)
+    end
+    eq(#got.ranges, #want.ranges, case.name .. " ranges")
+    for i, r in ipairs(got.ranges) do
+      eq(r.t0, want.ranges[i][1], case.name .. " range t0 " .. i)
+      eq(r.t1, want.ranges[i][2], case.name .. " range t1 " .. i)
+    end
+    eq(#case.notes, #want.shifts, case.name .. " notes")
+    for ni, n in ipairs(case.notes) do
+      eq(#n.frame_shifts, #want.shifts[ni], case.name .. " frames of note " .. ni)
+      for i, v in ipairs(n.frame_shifts) do
+        eq(v, want.shifts[ni][i], case.name .. " shift " .. ni .. "/" .. i)
+      end
+    end
+  end
+  local n_want = 0
+  for _ in pairs(fx.cases) do n_want = n_want + 1 end
+  eq(seen, n_want, "every recorded case is in the corpus")
+  if seen < 20 then error("only " .. seen .. " cases") end
+end)
+
+test("natural_same_numbers_real", function()
+  local data = real_model()
+  local f = io.open(FIXTURE_DIR .. "pitch_real_expected.lua", "rb")
+  if not data or not f then
+    if f then f:close() end
+    print("SKIP natural_same_numbers_real (no local fixture)")
+    return
+  end
+  f:close()
+  local want = dofile(FIXTURE_DIR .. "pitch_real_expected.lua").cases.real
+  local got = S.K.correction_build(data.notes, data.item_len)
+  eq(#got.points, #want.points, "points")
+  for i, p in ipairs(got.points) do
+    eq(p.time, want.points[i][1], "point time " .. i)
+    eq(p.val, want.points[i][2], "point val " .. i)
+  end
+  eq(#got.spans, #want.spans, "spans")
+  for i, sp in ipairs(got.spans) do
+    local w = want.spans[i]
+    eq(sp.kind, w[1], "span kind " .. i); eq(sp.t0, w[2], "span t0 " .. i); eq(sp.t1, w[3], "span t1 " .. i)
+    eq(sp.a, w[4], "span a " .. i); eq(sp.b, w[5], "span b " .. i)
+  end
+  eq(#got.ranges, #want.ranges, "ranges")
+  for i, r in ipairs(got.ranges) do
+    eq(r.t0, want.ranges[i][1], "range t0 " .. i); eq(r.t1, want.ranges[i][2], "range t1 " .. i)
+  end
+  eq(#data.notes, #want.shifts, "notes")
+  for ni, n in ipairs(data.notes) do
+    eq(#n.frame_shifts, #want.shifts[ni], "frames of note " .. ni)
+    for i, v in ipairs(n.frame_shifts) do eq(v, want.shifts[ni][i], "shift " .. ni .. "/" .. i) end
+  end
+end)
+
+-- Lines of the block that starts at the first line beginning with `prefix`: up to the first later line that is the
+-- prefix's own indentation followed by "end" or "}" (or "end," / "},"). Returns the lines, or nil.
+local function text_block(lines, prefix)
+  for i, l in ipairs(lines) do
+    if l:sub(1, #prefix) == prefix then
+      local indent = l:match("^(%s*)")
+      local out = { l }
+      for j = i + 1, #lines do
+        out[#out + 1] = lines[j]
+        local rest = lines[j]:match("^" .. indent .. "(.*)$")
+        if rest and (rest:match("^end%f[^%w_]") or rest:match("^}")) then return out end
+      end
+      return nil
+    end
+  end
+  return nil
+end
+
+local function text_lines(s)
+  local lines = {}
+  for l in (s .. "\n"):gmatch("(.-)\r?\n") do lines[#lines + 1] = l end
+  return lines
+end
+
+local function text_same(ref, now, ref_prefix, now_prefix, skip_first, what)
+  local a, b = text_block(ref, ref_prefix), text_block(now, now_prefix)
+  if not a then error(what .. ": not found in " .. NATURAL_REF) end
+  if not b then error(what .. ": not found in the script") end
+  eq(#b, #a, what .. " length")
+  for i = skip_first and 2 or 1, #a do eq(b[i], a[i], what .. " line " .. i) end
+end
+
+local function text_single(ref, now, prefix, what)
+  local want
+  for _, l in ipairs(ref) do if l:sub(1, #prefix) == prefix then want = l break end end
+  if not want then error(what .. ": not found in " .. NATURAL_REF) end
+  for _, l in ipairs(now) do if l == want then return end end
+  error(what .. ": line changed: " .. want)
+end
+
+test("natural_same_text", function()
+  local p = io.popen('git show ' .. NATURAL_REF .. ':"' .. SCRIPT .. '" 2>/dev/null')
+  local ref_src = p and p:read("a") or ""
+  if p then p:close() end
+  if ref_src == "" then print("SKIP natural_same_text (" .. NATURAL_REF .. " not readable)") return end
+  local f = assert(io.open(SCRIPT, "rb"))
+  local now_src = f:read("a")
+  f:close()
+  local ref, now = text_lines(ref_src), text_lines(now_src)
+  for _, prefix in ipairs({ "K.tighten_line = function(", "K.note_body = function(", "K.points_offsets = function(",
+      "local function is_note_modified(", "K.controls_edited = function(", "K.ZONE_CONTROLS = {",
+      "local function param_drag(", "  local BAR_VALUES = {" }) do
+    text_same(ref, now, prefix, prefix, false, prefix)
+  end
+  -- The build may be renamed (natural_build) but not changed; its first line carries the name
+  local build = "K.correction_build = function(notes, item_len)"
+  local renamed = "K.natural_build = function(notes, item_len)"
+  local has_renamed = false
+  for _, l in ipairs(now) do if l:sub(1, #renamed) == renamed then has_renamed = true break end end
+  text_same(ref, now, build, has_renamed and renamed or build, true, "the build")
+  text_single(ref, now, "K.JOIN = {", "K.JOIN")
+  local loaded = text_block(now, "K.controls_load = function(")
+  local ref_loaded = text_block(ref, "K.controls_load = function(")
+  if not (loaded and ref_loaded) then error("K.controls_load not found") end
+  for _, prefix in ipairs({ "  if ctrl.tighten then", "  if ctrl.tolerance then" }) do
+    text_single(ref_loaded, loaded, prefix, "K.controls_load " .. prefix)
+  end
+end)
+
+if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
