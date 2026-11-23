@@ -2504,6 +2504,203 @@ test("batch_summary_copy", function()
   eq(sum({ total = 12, written = 0, empty = 0, failed = 12 }), "None of the 12 items could be analyzed. Nothing was changed.")
 end)
 
+-- The queue of a batch and its single write
+-- A batch with the analysis itself and the write replaced by recorders. fn(rec) runs with takes "a".."c" selected.
+local function with_batch(fn)
+  local K, st = S.K, S.state
+  local saved = { K.analysis_begin, K.batch_write, st.target_take_guid, st.target_take_name }
+  local rec = { begun = {}, writes = {} }
+  K.analysis_begin = function(take, _, opts)
+    rec.begun[#rec.begun + 1] = { take = take, sr = opts and opts.sample_rate, defer = opts and opts.defer_envelope }
+    if rec.refuse and rec.refuse[take] then return false, "accessor" end
+    st.is_analyzing = true
+    return true
+  end
+  K.batch_write = function(done) rec.writes[#rec.writes + 1] = done; return done end
+  K.drop_project_cache()
+  st.status.text, st.status.hold = "", nil
+  reaper.GetMediaItemTakeByGUID = function(_, guid) if rec.gone and rec.gone[guid] then return nil end return (guid:gsub("[{}]", "")) end
+  reaper.GetMediaItemTake_Item = function(take) return "item_" .. take end
+  local ok, err = pcall(fn, rec)
+  K.analysis_begin, K.batch_write, st.target_take_guid, st.target_take_name = table.unpack(saved, 1, 4)
+  K.batch, st.is_analyzing = nil, false
+  st.status.text, st.status.hold = "", nil
+  reaper.GetMediaItemTakeByGUID, reaper.GetMediaItemTake_Item = nil, nil
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+local function entries3()
+  local out = {}
+  for i, id in ipairs({ "a", "b", "c" }) do
+    out[i] = { guid = "{" .. id .. "}", take = id, item = "item_" .. id, name = id:upper(), len = 10, sample_rate = 48000, has_notes = false }
+  end
+  return out
+end
+local function model(guid, notes) return { guid = guid, name = guid, results = { {} }, notes = notes or { { frames = {} } } } end
+
+test("batch_runs_queue_in_order", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3())
+  eq(#rec.begun, 1); eq(rec.begun[1].take, "a"); eq(rec.begun[1].sr, 48000); eq(rec.begun[1].defer, true)
+  eq(S.state.target_take_guid, "{a}", "the canvas follows the item in progress")
+  K.batch_item_done(model("{a}")); K.batch_item_done(model("{b}")); eq(#rec.writes, 0, "nothing is written while it runs")
+  near(K.analysis_progress(), 20 / 30, 1e-12)
+  K.batch_item_done(model("{c}"))
+  eq(#rec.writes, 1, "one write"); eq(#rec.writes[1], 3)
+  eq(rec.writes[1][1].guid, "{a}"); eq(rec.writes[1][3].guid, "{c}"); eq(type(rec.writes[1][1].json), "string")
+  eq(K.batch, nil); eq(S.state.is_analyzing, false)
+  eq(S.state.status.text, "Analyzed 3 items. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_skips_missing_and_offline", function() with_batch(function(rec)
+  local K = S.K
+  rec.gone = { ["{a}"] = true }
+  local e = entries3(); e[2].sample_rate = 0
+  K.batch_start(e)
+  eq(#rec.begun, 1); eq(rec.begun[1].take, "c", "the deleted and the offline item never start")
+  K.batch_item_done(model("{c}"))
+  eq(S.state.status.text, "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_uses_rates_from_the_click", function() with_batch(function(rec)
+  reaper.GetMediaSourceSampleRate = function() return 0 end   -- REAPER went to the background
+  S.K.batch_start(entries3()); S.K.batch_item_done(model("{a}"))
+  reaper.GetMediaSourceSampleRate = nil
+  eq(rec.begun[2].take, "b"); eq(rec.begun[2].sr, 48000)
+end) end)
+
+test("batch_item_failure_carries_on", function() with_batch(function(rec)
+  local K = S.K
+  rec.refuse = { b = true }
+  K.batch_start(entries3()); K.batch_item_done(model("{a}"))
+  eq(rec.begun[#rec.begun].take, "c", "b was refused, c is running")
+  K.batch_item_failed(nil)
+  eq(#rec.writes, 1); eq(#rec.writes[1], 1)
+  eq(S.state.status.text, "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_counts_items_without_notes", function() with_batch(function()
+  local K = S.K
+  K.batch_start(entries3())
+  K.batch_item_done(model("{a}", {})); K.batch_item_done(model("{b}")); K.batch_item_done(model("{c}"))
+  eq(S.state.status.text, "Analyzed 3 items (1 has no pitched notes). " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_cancel_keeps_finished", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3()); K.batch_item_done(model("{a}"))
+  eq(K.cancel_analysis(), true)
+  eq(#rec.writes, 1); eq(#rec.writes[1], 1); eq(K.batch, nil); eq(S.state.is_analyzing, false)
+  eq(S.state.status.text, "Batch cancelled. 1 of 3 items was analyzed and kept. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_cancel_before_any_item", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  st.target_take_guid, st.target_take_name = "{prev}", "Prev"
+  K.batch_start(entries3())
+  K.cancel_analysis()
+  eq(#rec.writes == 0 or #rec.writes[1] == 0, true, "nothing to write")
+  eq(st.target_take_guid, "{prev}", "the item that was open comes back")
+  eq(st.status.text, "Batch cancelled. Nothing was changed.")
+end) end)
+
+test("batch_queue_is_frozen", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3())
+  reaper.CountSelectedMediaItems = function() return 0 end   -- the user deselects everything
+  K.batch_item_done(model("{a}")); K.batch_item_done(model("{b}"))
+  reaper.CountSelectedMediaItems = nil
+  eq(rec.begun[3].take, "c")
+end) end)
+
+test("batch_tick_turns_an_error_into_a_failed_item", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local saved_msg = reaper.ShowConsoleMsg
+  reaper.ShowConsoleMsg = function() end
+  K.batch_start(entries3())
+  st.is_analyzing, st.analysis_params = true, setmetatable({}, { __index = function() error("bad frame") end })
+  K.analysis_tick()
+  reaper.ShowConsoleMsg = saved_msg
+  eq(rec.begun[#rec.begun].take, "b", "the batch moved on"); eq(K.batch.failed, 1)
+end) end)
+
+test("batch_tick_does_not_swallow_a_failed_write", function() with_batch(function()
+  local K, st = S.K, S.state
+  local saved = { st.results, st.notes, st.sample_rate, st.end_time, st.current_time }
+  K.batch_write = function() error("disk full") end
+  local e = entries3()
+  K.batch_start({ e[1] })
+  -- the item's last frame: nothing left to read, so this tick completes it and the batch ends by writing
+  st.results, st.sample_rate, st.end_time, st.current_time = {}, 48000, 0, 0
+  st.analysis_params = { block_size = 1024, hop_size = 512, threshold = 0.1, min_freq = 65, max_freq = 1000 }
+  local ok, err = pcall(K.analysis_tick)
+  st.results, st.notes, st.sample_rate, st.end_time, st.current_time = table.unpack(saved, 1, 5)
+  st.analysis_params = nil
+  eq(ok, false, "the window's own error handling must see it (it closes the undo block)")
+  eq(tostring(err):find("disk full", 1, true) ~= nil, true); eq(K.batch, nil)
+end) end)
+
+local function with_write_stubs(gone, fn)
+  local st = S.state
+  local rec = { begin = 0, labels = {}, stored = {} }
+  reaper.Undo_BeginBlock = function() rec.begin = rec.begin + 1 end
+  reaper.Undo_EndBlock = function(label) rec.labels[#rec.labels + 1] = label end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) if gone[guid] then return nil end return (guid:gsub("[{}]", "")) end
+  reaper.GetMediaItemTake_Item = function(take) return "item_" .. take end
+  reaper.GetTakeEnvelopeByName = function() return nil end
+  reaper.NamedCommandLookup = function() return 0 end
+  reaper.CountSelectedMediaItems = function() return 0 end
+  reaper.GetSetMediaItemTakeInfo_String = function(take, key, value, set)
+    if key == "GUID" then return true, "{" .. take .. "}" end
+    if set then rec.stored[take] = value end
+    return true, rec.stored[take] or ""
+  end
+  local order = #st.session_order
+  local ok, err = pcall(fn, rec)
+  for _, name in ipairs({ "Undo_BeginBlock", "Undo_EndBlock", "GetMediaItemTakeByGUID", "GetMediaItemTake_Item",
+    "GetTakeEnvelopeByName", "NamedCommandLookup", "CountSelectedMediaItems", "GetSetMediaItemTakeInfo_String" }) do reaper[name] = nil end
+  for _, g in ipairs({ "{a}", "{b}" }) do st.session_takes[g], st.raw_cache[g] = nil, nil end
+  while #st.session_order > order do table.remove(st.session_order) end
+  S.K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+local function done2()
+  local out = {}
+  for i, g in ipairs({ "{a}", "{b}" }) do
+    local data = { guid = g, name = g, results = {}, notes = {}, item_len = 1, sample_rate = 48000 }
+    out[i] = { guid = g, data = data, json = S.K.take_json(data), empty = true }
+  end
+  return out
+end
+
+test("batch_write_is_one_undo_block", function() with_write_stubs({}, function(rec)
+  local done = done2()
+  local written = S.K.batch_write(done)
+  eq(#written, 2); eq(rec.begin, 1, "one undo block"); eq(#rec.labels, 1); eq(rec.labels[1], "Analyze Pitch (2 items)")
+  eq(rec.stored.a, done[1].json); eq(rec.stored.b, done[2].json)
+  eq(S.state.session_takes["{a}"], done[1].data); eq(S.state.undo_open, false)
+end) end)
+
+test("batch_write_skips_gone_takes", function()
+  with_write_stubs({ ["{a}"] = true }, function(rec)
+    local written = S.K.batch_write(done2())
+    eq(#written, 1); eq(written[1].guid, "{b}"); eq(rec.labels[1], "Analyze Pitch (1 item)")
+  end)
+  with_write_stubs({ ["{a}"] = true, ["{b}"] = true }, function(rec)
+    eq(#S.K.batch_write(done2()), 0); eq(rec.begin, 0, "nothing to write: no undo point")
+  end)
+end)
+
+test("take_json_is_what_save_writes", function() with_write_stubs({}, function(rec)
+  local data = { guid = "{a}", name = "A", results = { { time = 0, note = 60 } }, item_len = 2, sample_rate = 48000,
+    notes = { { start_time = 0, end_time = 1, avg_note = 60, display_note = 60, controls = { center_pitch = 60 }, frames = { 1 } } } }
+  S.K.batch_write({ { guid = "{a}", data = data, json = S.K.take_json(data) } })
+  local direct = rec.stored.a
+  rec.stored.a = nil
+  S.K.batch_write({ { guid = "{a}", data = data } })   -- no json given: encoded at the write
+  eq(rec.stored.a, direct)
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

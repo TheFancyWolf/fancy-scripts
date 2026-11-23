@@ -536,6 +536,21 @@ end
 local function set_status(msg)
   state.status.text = msg or ""
   state.status.until_time = reaper.time_precise() + K.STATUS_SECONDS
+  state.status.hold = nil
+end
+
+--- Show a message on the status pill until the user's next input in the window (K.status_release), not for
+--- STATUS_SECONDS: the outcome of long work that may end while nobody is looking (a batch).
+K.status_hold = function(msg)
+  state.status.text = msg or ""
+  state.status.until_time = math.huge
+  state.status.hold = true
+end
+
+--- The user did something in the window: a message held by K.status_hold goes. Any other message keeps its time.
+K.status_release = function()
+  if not state.status.hold then return end
+  state.status.text, state.status.until_time, state.status.hold = "", 0, nil
 end
 
 --- Ask the user to confirm a destructive action. draw_confirm_modal() shows the modal.
@@ -2169,8 +2184,8 @@ local flush_nudge_burst -- commits a pending arrow-key nudge as one undo point (
 -- MULTI-ITEM SESSION & PROJECT PERSISTENCE
 -------------------------------------------------------------------------------
 
-local function save_take_data(take, data)
-  if not take or not data then return end
+--- The text save_take_data stores on a take for the model `data`.
+K.take_json = function(data)
   local save_data = {
     guid = data.guid,
     name = data.name,
@@ -2197,8 +2212,14 @@ local function save_take_data(take, data)
       })
     end
   end
-  local json_str = JSON.encode(save_data)
-  reaper.GetSetMediaItemTakeInfo_String(take, K.TAKE_DATA_KEY, json_str, true)
+  return JSON.encode(save_data)
+end
+
+--- Store the model `data` on `take`. json: its text when the caller prepared it already (K.take_json), so a write
+--- of many items does not encode them all in one frame.
+local function save_take_data(take, data, json)
+  if not take or not data then return end
+  reaper.GetSetMediaItemTakeInfo_String(take, K.TAKE_DATA_KEY, json or K.take_json(data), true)
 
   -- Remember what is now stored (read back) so the resync never treats our own write as external; what was stored
   -- before (readable or not) is replaced
@@ -2368,6 +2389,10 @@ end
 --- when it completes) and no undo block is open between frames, so there is nothing to close or undo.
 --- Returns true when an analysis was running.
 K.cancel_analysis = function()
+  if K.batch then   -- a batch: the finished items are kept, written as its one undo step (K.batch_finish)
+    K.batch_finish(true)
+    return true
+  end
   if not state.is_analyzing and not state.accessor then return false end
   K.release_analysis()
   state.progress = 0
@@ -2568,6 +2593,164 @@ K.batch_summary = function(r)
   return text .. undo
 end
 
+--- Write the finished items of a batch: `done` = { { guid, data, json | nil, empty } ... }. Everything goes into
+--- ONE undo block: per item, its Pitch envelope is created and shown where it was missing and cleared of points (a
+--- fresh analysis corrects nothing), and its model is stored on the take; the take's pitch mode is left alone. An
+--- item that is no longer in the project is left out. With nothing to write no undo block is opened.
+--- Returns the entries of `done` that were written.
+K.batch_write = function(done)
+  local ready = {}
+  for _, entry in ipairs(done) do
+    local take = resolve_take_by_guid(entry.guid, true)
+    local item = take and K.take_item(take) or nil
+    if take and item then ready[#ready + 1] = { entry = entry, take = take, item = item } end
+  end
+  if #ready == 0 then return {} end
+
+  local written = {}
+  reaper.Undo_BeginBlock()
+  state.undo_open = true
+  for _, r in ipairs(ready) do
+    local guid, data = r.entry.guid, r.entry.data
+    local env = ensure_take_pitch_envelope(r.take, r.item, true)
+    if env then
+      local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(r.item, "D_LENGTH") or 0)
+      reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
+      reaper.Envelope_SortPointsEx(env, -1)
+    end
+    save_take_data(r.take, data, r.entry.json)
+    state.session_takes[guid] = data
+    local listed = false
+    for _, g in ipairs(state.session_order) do
+      if g == guid then listed = true; break end
+    end
+    if not listed then table.insert(state.session_order, guid) end
+    state.stale_takes[guid], state.stale_env[guid], state.missing_takes[guid] = nil, nil, nil
+    written[#written + 1] = r.entry
+  end
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock(K.batch_undo_label(#written), -1)
+  state.undo_open = false
+  K.frame_view_memo.frame = nil   -- the canvas fetches the correction again
+  note_own_write()
+  return written
+end
+
+--- End the running batch, however it ends (its queue is done, Cancel, the window closes, a frame failed): the
+--- finished items are written as one undo step, the item in progress and the items not started are left as they
+--- were, the first written item is opened (or the item that was open before comes back) and one closing message
+--- says what happened. cancelled: it was stopped before its end.
+K.batch_finish = function(cancelled)
+  local batch = K.batch
+  if not batch then return end
+  K.batch = nil
+  K.release_analysis()
+  state.progress = 0
+
+  local written = K.batch_write(batch.done)
+  local empty = 0
+  for _, entry in ipairs(written) do
+    if entry.empty then empty = empty + 1 end
+  end
+
+  local first = written[1]
+  local open_guid = first and state.session_takes[first.guid] and first.guid or nil
+  if not open_guid and batch.prev_guid and state.session_takes[batch.prev_guid] then open_guid = batch.prev_guid end
+  if open_guid then
+    adopt_take_data(open_guid, state.session_takes[open_guid])
+  else
+    -- Nothing written and the item that was open has no analysis: back to it, not analysed
+    reset_analysis_model()
+    state.target_take_guid, state.target_take_name = batch.prev_guid, batch.prev_name
+    local take = batch.prev_guid and resolve_take_by_guid(batch.prev_guid, true) or nil
+    local item = take and K.take_item(take) or nil
+    state.start_time = 0
+    state.item_len = item and reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0
+    state.end_time = state.item_len
+  end
+
+  -- REAPER's selection was not followed while the batch ran: what is selected now is not a change to react to
+  local sel_item = reaper.GetSelectedMediaItem(0, 0)
+  local sel_take = sel_item and reaper.GetActiveTake(sel_item) or nil
+  state.last_seen_sel_guid = (sel_take and not reaper.TakeIsMIDI(sel_take)) and get_take_guid(sel_take) or nil
+  -- Nor was the project (undo, redo, deleted items): the next frame reads it again
+  state.last_change_count = nil
+
+  K.status_hold(K.batch_summary({
+    total = #batch.queue, written = #written, empty = empty, failed = #batch.queue - #written,
+    cancelled = cancelled and true or false,
+  }))
+end
+
+--- Start the next entry of the running batch that can be analysed; entries that cannot (the item left the project,
+--- its media has no sample rate, REAPER gave no accessor) are counted as failed. With no entry left the batch ends.
+K.batch_next = function()
+  local batch = K.batch
+  if not batch then return end
+  while true do
+    batch.index = batch.index + 1
+    local entry = batch.queue[batch.index]
+    if not entry then
+      K.batch_finish(false)
+      return
+    end
+    local take = resolve_take_by_guid(entry.guid, true)
+    local item = take and K.take_item(take) or nil
+    if take and item and (entry.sample_rate or 0) > 0 then
+      -- The canvas follows the item in progress: it becomes the open item, with nothing analysed yet
+      reset_analysis_model()
+      state.target_take_guid, state.target_take_name = entry.guid, entry.name
+      if K.analysis_begin(take, item, { sample_rate = entry.sample_rate, defer_envelope = true }) then return end
+    end
+    batch.failed = batch.failed + 1
+    batch.done_len = batch.done_len + (entry.len or 0)
+  end
+end
+
+--- The entry in progress finished: its model (what process_analysis_step built) is held until the batch is written.
+--- Its text is made now, one item at a time, so the write at the end does not encode every item in one frame.
+K.batch_item_done = function(take_data)
+  local batch = K.batch
+  if not batch then return end
+  local entry = batch.queue[batch.index]
+  batch.done[#batch.done + 1] = {
+    guid = take_data.guid, data = take_data, json = K.take_json(take_data),
+    empty = (take_data.notes == nil or #take_data.notes == 0),
+  }
+  batch.done_len = batch.done_len + (entry and entry.len or 0)
+  K.batch_next()
+end
+
+--- The entry in progress could not be analysed (err: what was raised, for the console): it is left as it was and
+--- the batch carries on with the next one.
+K.batch_item_failed = function(err)
+  local batch = K.batch
+  if not batch then return end
+  K.release_analysis()
+  if err then
+    reaper.ShowConsoleMsg("Fancy Pitch Correct: an item could not be analyzed: " .. tostring(err) .. "\n")
+  end
+  local entry = batch.queue[batch.index]
+  batch.failed = batch.failed + 1
+  batch.done_len = batch.done_len + (entry and entry.len or 0)
+  K.batch_next()
+end
+
+--- Start a batch over `entries` (K.batch_selection's takes, read when the user asked for it).
+K.batch_start = function(entries)
+  if K.batch or state.is_analyzing or #entries == 0 then return end
+  if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge belongs to the item being left
+  K.batch = K.batch_new(entries, state.target_take_guid)
+  K.batch.prev_name = state.target_take_name
+  K.batch_next()
+end
+
+--- How far the running analysis is, 0 .. 1: the whole batch when one runs, else the item.
+K.analysis_progress = function()
+  if K.batch then return K.batch_progress(K.batch, state.progress) end
+  return state.progress or 0
+end
+
 local function switch_active_target(guid, take_obj)
   -- A pending arrow-key nudge belongs to the take being left: commit it first
   flush_nudge_burst()
@@ -2622,7 +2805,7 @@ end
 --- stored P_EXT differs from what this script last wrote or loaded (state.raw_cache), so the
 --- script's own edits never trigger a reload.
 local function sync_with_project()
-  if state.is_analyzing then return end
+  if state.is_analyzing or K.batch then return end
   local count = reaper.GetProjectStateChangeCount(0)
   if state.last_change_count == count then return end
   state.last_change_count = count
@@ -4657,7 +4840,6 @@ local function process_analysis_step()
 
     -- Store into multi-item session cache, then persist inside ONE named undo block
     if state.target_take_guid then
-      state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       local take_data = {
         guid = state.target_take_guid,
         name = state.target_take_name or "Item",
@@ -4671,6 +4853,12 @@ local function process_analysis_step()
         scale_idx = state.scale_idx,
         separation = state.separation,
       }
+      if K.batch then
+        -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item
+        K.batch_item_done(take_data)
+        return
+      end
+      state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       state.session_takes[state.target_take_guid] = take_data
 
       local found = false
@@ -4692,6 +4880,21 @@ local function process_analysis_step()
   elseif state.item_len > 0 then
     state.progress = state.current_time / state.item_len
   end
+end
+
+--- One frame of the running analysis (loop_body). In a batch, an error raised while an item is analysed does not
+--- end the batch: that item is counted as failed (K.batch_item_failed) and the next one starts. An error raised
+--- while the batch itself ended (its write) is not an item's: it is passed on to the window's error handling, which
+--- also closes an undo block left open.
+K.analysis_tick = function()
+  if not K.batch then
+    process_analysis_step()
+    return
+  end
+  local ok, err = xpcall(process_analysis_step, debug.traceback)
+  if ok then return end
+  if not K.batch then error(err, 0) end
+  K.batch_item_failed(err)
 end
 
 -------------------------------------------------------------------------------
@@ -11587,7 +11790,7 @@ local function loop_body()
 
   -- Follow REAPER's undo / redo / project changes (one cheap count check per frame)
   sync_with_project()
-  process_analysis_step()
+  K.analysis_tick()
   K.stale_check_step(ctx)
 
   local P = Theme.get_palette()
@@ -11636,7 +11839,8 @@ local function loop_body()
     -- Automatic selection tracking from REAPER (edge-triggered): switch target only when the first
     -- selected audio item CHANGES (or the current target no longer exists). A sidebar click sets the
     -- target without touching REAPER's selection, so it must not be overridden by the old selection.
-    if not state.is_analyzing then
+    -- A batch owns the target while it runs.
+    if not state.is_analyzing and not K.batch then
       local cur_sel_item = reaper.GetSelectedMediaItem(0, 0)
       local cur_sel_take = cur_sel_item and reaper.GetActiveTake(cur_sel_item)
       local cur_guid = nil
@@ -11900,6 +12104,7 @@ local function main()
   local Utils = require("utils")
   local release_toolbar = Utils.init_toolbar_toggle()
   reaper.atexit(function()
+    if K.batch then pcall(K.batch_finish, true) end   -- ended mid-batch: the finished items are kept
     K.release_analysis()
     K.tone_kill()
     release_toolbar()
