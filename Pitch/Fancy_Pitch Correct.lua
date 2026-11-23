@@ -2714,13 +2714,21 @@ K.mode_unused = function(key, notes, n)
   return nil
 end
 
+K.scale_pcs_memo = {}
+
 --- The pitch classes ({ [0..11] = true }) of scale `scale_idx` in key `key_idx` (1 = C); nil for an unknown scale.
+--- Memoised: the same (key, scale) always returns the same table, so K.mode_line's cache can compare it by identity.
+--- The returned set is shared: callers must not modify it.
 K.scale_pcs = function(key_idx, scale_idx)
   local scale = SCALE_DEFINITIONS[scale_idx]
   if not scale or type(key_idx) ~= "number" then return nil end
   local root = (key_idx - 1) % 12
-  local pcs = {}
+  local mk = root .. ":" .. scale_idx
+  local pcs = K.scale_pcs_memo[mk]
+  if pcs then return pcs end
+  pcs = {}
   for _, intv in ipairs(scale.intervals) do pcs[(root + intv) % 12] = true end
+  K.scale_pcs_memo[mk] = pcs
   return pcs
 end
 
@@ -2753,6 +2761,7 @@ end
 
 --- Classic or Hard correction of one note: shifts[i] (semitones, without pitch-point offsets) for each frame, and
 --- steps[i] = true where the pitch steps just before frame i. Cached on note.mode_cache.
+--- The returned shifts and steps tables are the cache itself: shared, read-only for callers.
 K.mode_line = function(note, mode, pcs)
   local frames = note.frames or {}
   local ctrl = note.controls or {}
@@ -2779,7 +2788,7 @@ K.mode_line = function(note, mode, pcs)
           last = target - sung
         else
           local goal = K.nearest_scale_pitch(sung + move, pcs)
-          local dt = i > 1 and (frames[i].time - frames[i - 1].time) or 0
+          local dt = i > 1 and ((frames[i].time or 0) - (frames[i - 1].time or 0)) or 0
           if not have_line then
             line, have_line = goal, true
           elseif tau * 3 <= dt then

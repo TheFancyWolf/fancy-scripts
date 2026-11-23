@@ -1328,6 +1328,23 @@ test("mode_line_untrusted_frames", function()
   eq(#(S.K.mode_line(empty, "hard", nil)), 0)
 end)
 
+test("mode_scale_pcs_memo_and_cache", function()
+  local major
+  for i, d in ipairs(S.SCALE_DEFINITIONS) do if d.name == "Major" then major = i end end
+  eq(S.K.scale_pcs(1, major), S.K.scale_pcs(1, major), "same table twice")
+  eq(S.K.scale_pcs(1, major) ~= S.K.scale_pcs(3, major), true, "a different key is a different table")
+  local st = S.state
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx }
+  st.target_take_guid, st.key_idx, st.scale_idx = nil, 1, major
+  local n = mode_note(0.5, 0.1, 60.3, 60.3)
+  local a = S.K.mode_line(n, "hard", S.K.item_scale_pcs())
+  local b = S.K.mode_line(n, "hard", S.K.item_scale_pcs())
+  st.target_take_guid, st.key_idx, st.scale_idx = saved[1], saved[2], saved[3]
+  eq(a, b, "the cache hits for the item's scale")
+  n.controls.center_pitch = 62.4
+  eq(a ~= S.K.mode_line(n, "hard", S.K.scale_pcs(1, major)), true, "a moved note rebuilds")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
