@@ -2693,6 +2693,15 @@ K.note_mode = function(note)
   return nil
 end
 
+--- How many of `notes` are corrected by Classic or Hard (K.note_mode non-nil).
+K.mode_note_count = function(notes)
+  local n = 0
+  for _, note in ipairs(notes or {}) do
+    if K.note_mode(note) then n = n + 1 end
+  end
+  return n
+end
+
 --- Why the control `key` does nothing for the `n` notes in `notes`: "mode" (the mode does not use it), "hard" or
 --- "classic" (Tighten only: that mode ignores it); nil when it works for at least one note.
 K.mode_unused = function(key, notes, n)
@@ -3014,6 +3023,32 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   reaper.UpdateArrange()
   end_apply(take, undo_desc)
   return true
+end
+
+--- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). With no
+--- Classic or Hard note in the open item this is the plain save; otherwise the item's notes follow the new scale:
+--- its take data takes the new Key and Scale and the envelope is rewritten, all in the "Change Key/Scale" undo point.
+K.scale_changed = function()
+  update_scale_pitch_classes()
+  local data = state.target_take_guid and state.session_takes[state.target_take_guid]
+  local count = data and K.mode_note_count(state.notes or {}) or 0
+  if count == 0 then
+    save_current_scale_settings()
+    return
+  end
+  reaper.SetExtState("FancyScripts", "pitch_key_idx", tostring(state.key_idx), true)
+  reaper.SetExtState("FancyScripts", "pitch_scale_idx", tostring(state.scale_idx), true)
+  data.key_idx = state.key_idx
+  data.scale_idx = state.scale_idx
+  if apply_envelope_to_take("Change Key/Scale") then
+    local key_name = SCALE_KEYS[state.key_idx].display
+    local scale_name = SCALE_DEFINITIONS[state.scale_idx].name
+    if count == 1 then
+      set_status(string.format("Key changed: 1 Classic / Hard note follows %s %s", key_name, scale_name))
+    else
+      set_status(string.format("Key changed: %d Classic / Hard notes follow %s %s", count, key_name, scale_name))
+    end
+  end
 end
 
 --- Whether the pitch envelope of the session take `guid` differs from what its note model and today's settings
@@ -9899,8 +9934,7 @@ do
         local is_sel = (state.key_idx == i)
         if Theme.selectable(ctx, k_info.name .. "##key_" .. i, is_sel, nil, s.key_list_w) and not is_sel then
           state.key_idx = i
-          update_scale_pitch_classes()
-          save_current_scale_settings()
+          K.scale_changed()
         end
         if is_sel then reaper.ImGui_SetItemDefaultFocus(ctx) end
       end
@@ -9919,8 +9953,7 @@ do
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
-      update_scale_pitch_classes()
-      save_current_scale_settings()
+      K.scale_changed()
     end
   end
 

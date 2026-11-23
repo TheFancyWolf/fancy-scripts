@@ -1524,6 +1524,14 @@ test("build_mode_note_at_item_end_has_no_shared_time", function() chromatic(func
   no_close_points(build.points, "note past the item end")
 end) end)
 
+test("mode_note_count", function()
+  local a, b, c = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
+  a.controls.correct_mode = 1
+  eq(S.K.mode_note_count({ a, b, c }), 1)
+  with_item_mode(2, function() eq(S.K.mode_note_count({ a, b, c }), 2, "the item's mode reaches the edited note") end)
+  eq(S.K.mode_note_count({}), 0)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
