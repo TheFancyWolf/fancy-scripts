@@ -10258,7 +10258,9 @@ K.confirm_list = function(c)
     local _, line_h = reaper.ImGui_CalcTextSize(ctx, line, nil, nil, false, avail_w)
     below = below + (L.sm + spacing_y) + (line_h or 0) + spacing_y
   end
-  local pad = L.sm * 2
+  -- The region's own padding, above and below its rows: a list that fits must not get a scrollbar
+  local _, pad_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+  local pad = (pad_y or L.sm) * 2
   local list_h = math.max(row_h * 3 + pad, math.min(#c.list * row_h + pad, avail_h - below))
 
   reaper.ImGui_Dummy(ctx, 0, L.xs)
