@@ -1,10 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.19.1
+-- @version 2.20.0
 -- @changelog
---   Analysis: a short stretch read one octave too high or too low (a spike or a sudden drop in the pitch line) is put back in the octave of the singing around it
---   A note's centre leaves out any pitch reading still in the wrong octave, so the note block sits on the pitch line and Quantize picks the right note
---   Analyze an item again to get this; notes analysed before may show as edited
+--   Pitch detection: each moment's pitch is now chosen together with the moments around it, not on its own. A note read an octave too high (a strong overtone) or too low (a shaky note start) is now read right, without relying on the repair added in 2.19.1
+--   The Detection setting now only decides what counts as a pitched sound; it no longer changes which octave a note is read in
+--   The pitch line and the notes sit about 10 ms later, where the sound actually is (they were drawn early)
+--   No more false low reading at the very end of an item; the last few milliseconds of an item are no longer analysed
+--   Analyze an item again to get this
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
