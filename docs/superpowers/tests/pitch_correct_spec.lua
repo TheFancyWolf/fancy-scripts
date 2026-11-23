@@ -2701,6 +2701,45 @@ test("take_json_is_what_save_writes", function() with_write_stubs({}, function(r
   eq(rec.stored.a, direct)
 end) end)
 
+-- The window: the held closing message, the batch's status line, the confirm's list
+test("status_hold_stays_until_released", function()
+  local K, st = S.K, S.state
+  local now = 100
+  reaper.time_precise = function() return now end
+  st.frame.take, st.target_take_name = nil, nil
+  K.status_hold("Analyzed 12 items.")
+  now = 10000
+  eq(K.status_line(false), "Analyzed 12 items.", "still there long after the usual four seconds")
+  K.status_release()
+  eq(K.status_line(false) ~= "Analyzed 12 items.", true, "gone after the next input")
+  st.status.text, st.status.until_time, st.status.hold = "plain", now + 4, nil
+  K.status_release()
+  eq(st.status.text, "plain", "releasing does not touch an ordinary message")
+  reaper.time_precise = nil
+  st.status.text = ""
+end)
+
+test("batch_status_line", function()
+  local K, st = S.K, S.state
+  reaper.time_precise = function() return 0 end
+  st.status.text, st.status.hold = "", nil
+  K.batch = K.batch_new({ { len = 10, name = "A" }, { len = 30, name = "V Main Verse 3" } })
+  K.batch.index, K.batch.done_len, st.is_analyzing, st.progress = 2, 10, true, 0.5
+  eq(K.status_line(false), "Analyzing 2 of 2: V Main Verse 3… 62%")
+  K.batch, st.is_analyzing, st.progress = nil, false, 0
+  reaper.time_precise = nil
+end)
+
+test("confirm_carries_the_list", function()
+  local st = S.state
+  local req = S.K.batch_confirm({ { guid = "{a}", name = "A", track = "Vox", pos = 1, has_notes = true }, { guid = "{b}", name = "B", has_notes = false } })
+  req.id, req.on_confirm = "batch", function() end
+  S.request_confirm(req)
+  eq(st.confirm.id, "batch"); eq(#st.confirm.list, 1); eq(st.confirm.list[1].name, "A")
+  eq(st.confirm.after_lines[1], MOD .. "+Z restores all 2 items in one step once the batch has finished.")
+  st.confirm = nil
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

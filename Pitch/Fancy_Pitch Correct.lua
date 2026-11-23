@@ -245,6 +245,10 @@ local K = {
 
   -- Analysis Cancel: More's Analyze item turns into this while an analysis runs (see hdr_draw_more)
   CANCEL_FMT = "Cancel %d%%",
+  CANCEL_BATCH_FMT = "Cancel Batch %d%%",   -- ... and into this while a batch runs
+  CANCEL_BATCH_TIP = "Stops the batch. Items already finished are kept.",
+  REASON_ANALYZING = "Wait for the analysis to finish",   -- why the Pitched Items rows and the batch entry are locked
+  REASON_BATCH_FEW = "Select 2 or more audio items",
   CANCELLED_TEXT = "Analysis cancelled.",
 
   -- Error recovery (see loop): the window shows this, with Retry and Close, instead of disappearing
@@ -553,16 +557,56 @@ K.status_release = function()
   state.status.text, state.status.until_time, state.status.hold = "", 0, nil
 end
 
+-- A held message is not released by input that came before it could be read (seconds)
+K.STATUS_HOLD_MIN_S = 0.5
+-- The keys that count as input for releasing a held message (letters and digits arrive as typed characters)
+K.STATUS_KEYS = {
+  reaper.ImGui_Key_Escape(), reaper.ImGui_Key_Enter(), reaper.ImGui_Key_KeypadEnter(), reaper.ImGui_Key_Space(),
+  reaper.ImGui_Key_Delete(), reaper.ImGui_Key_Backspace(), reaper.ImGui_Key_Tab(), reaper.ImGui_Key_LeftArrow(),
+  reaper.ImGui_Key_RightArrow(), reaper.ImGui_Key_UpArrow(), reaper.ImGui_Key_DownArrow(),
+}
+
+--- Once per frame, inside the window: release a held message on the user's next input in the window: a click or
+--- wheel move over it, or a key while it has the focus. The keys are only looked at (IsKeyDown), never taken:
+--- Esc, Space and the others keep doing what they do.
+K.status_watch = function(wctx)
+  local status = state.status
+  if not status.hold then
+    status.held_since = nil
+    return
+  end
+  local now = reaper.time_precise()
+  status.held_since = status.held_since or now
+  if now - status.held_since < K.STATUS_HOLD_MIN_S then return end
+  local input = false
+  if reaper.ImGui_IsWindowHovered(wctx, reaper.ImGui_HoveredFlags_RootAndChildWindows()) then
+    input = reaper.ImGui_IsMouseClicked(wctx, 0) or reaper.ImGui_IsMouseClicked(wctx, 1)
+      or (reaper.ImGui_GetMouseWheel(wctx) or 0) ~= 0
+  end
+  if not input and reaper.ImGui_IsWindowFocused(wctx, reaper.ImGui_FocusedFlags_RootAndChildWindows()) then
+    input = (reaper.ImGui_GetInputQueueCharacter(wctx, 0)) == true
+    for _, key in ipairs(K.STATUS_KEYS) do
+      if input then break end
+      input = reaper.ImGui_IsKeyDown(wctx, key)
+    end
+  end
+  if input then K.status_release() end
+end
+
 --- Ask the user to confirm a destructive action. draw_confirm_modal() shows the modal.
---- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function, on_cancel = function | nil }
+--- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function, on_cancel = function | nil,
+---         list = { { name, where } ... } | nil, after_lines = { string... } | nil }
 --- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once, or on_cancel once when
---- the modal closes without confirming.
+--- the modal closes without confirming. list: the things the action replaces, shown under body_lines in a region
+--- that scrolls (K.confirm_list); after_lines follow it.
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
   state.confirm = {
     id = req.id or "action",
     title = req.title or "Are you sure?",
     body_lines = req.body_lines or {},
+    list = req.list,
+    after_lines = req.after_lines or {},
     confirm_label = req.confirm_label or "Confirm",
     on_confirm = req.on_confirm,
     on_cancel = req.on_cancel,
@@ -6171,15 +6215,20 @@ local function draw_graph(draw_ctx, w, h)
   local target_take, target_item = K.frame_target()
   local is_bypassed = is_take_pitch_bypassed(target_take)
 
-  -- The one button the canvas draws (Analyze Item, Open Settings, Enable): a real Button on the large preset,
-  -- centred on cx with its top edge at y (its height is Theme.layout.btn_lg.h), hand cursor and tooltip.
+  -- The one button the canvas draws (Analyze Item / Analyze All Selected Items, Open Settings, Enable): a real Button
+  -- on the large preset, centred on cx with its top edge at y (its height is Theme.layout.btn_lg.h), hand cursor and tooltip.
   -- Returns true when it was clicked (never while it is disabled). It moves the layout cursor into the canvas:
   -- whoever used it calls restore_canvas_layout() before leaving draw_graph.
   local buttons_used = false
-  local function canvas_button(label, id, cx, y, enabled, tip)
+  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label)
     buttons_used = true
     local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, "lg")
     local btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + L.btn_lg.pad_x * 2
+    -- narrow_label: what the button reads when the canvas is narrower than its label (a narrow docker)
+    if narrow_label and btn_w > full_w - L.sm * 2 then
+      label = narrow_label
+      btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + L.btn_lg.pad_x * 2
+    end
     reaper.ImGui_SetCursorScreenPos(draw_ctx, cx - btn_w * 0.5, y)
     if not enabled then reaper.ImGui_BeginDisabled(draw_ctx) end
     local clicked = reaper.ImGui_Button(draw_ctx, label .. "###" .. id, btn_w, 0)
@@ -6211,19 +6260,45 @@ local function draw_graph(draw_ctx, w, h)
     local gap = L.lg
 
     if #state.results == 0 then
-      local msg = "No data. Select an item and click Analyze."
-      local text_w, text_h = reaper.ImGui_CalcTextSize(draw_ctx, msg)
-      local start_y = cy - (L.btn_lg.h + gap + text_h) * 0.5
+      -- With two or more audio items selected in REAPER the button analyses them all (a batch); the lines under it
+      -- say what it will take, or that several items can be analysed at once. Each line is wrapped to the canvas
+      -- and centred; in a canvas too short for the button and the lines, the lines go, the last one first.
+      local peek = K.batch_peek(reaper.time_precise())
+      local is_batch = peek.n >= 2
+      local _, text_h = reaper.ImGui_CalcTextSize(draw_ctx, "Ag")
+      local shown = {}
+      for _, line in ipairs({ K.batch_lines(peek) }) do
+        shown[#shown + 1] = K.wrap_lines(draw_ctx, line, full_w - L.sm * 2)
+      end
+      local function block_h()
+        local total = L.btn_lg.h
+        for i, rows in ipairs(shown) do
+          total = total + (i == 1 and gap or L.xs) + #rows * text_h
+        end
+        return total
+      end
+      while #shown > 0 and block_h() > h do shown[#shown] = nil end
+      local start_y = cy - block_h() * 0.5
 
-      local can_analyze = (target_take ~= nil and not state.is_analyzing)
-      local tip = can_analyze and "Detect the pitch of the selected audio item"
-        or (state.is_analyzing and "Analysis in progress" or "Select an audio item in REAPER to analyze it.")
-      if canvas_button("Analyze Item", "cv_analyze", cx, start_y, can_analyze, tip) then
-        start_analysis()
+      local can_analyze = (is_batch or target_take ~= nil) and not state.is_analyzing
+      local tip = state.is_analyzing and "Analysis in progress"
+        or (is_batch and K.batch_tip(peek.n))
+        or (target_take ~= nil and "Detect the pitch of the selected audio item"
+          or "Select an audio item in REAPER to analyze it.")
+      if canvas_button(K.batch_label(peek.n, false), "cv_analyze", cx, start_y, can_analyze, tip,
+          K.batch_label(peek.n, true)) then
+        if is_batch then K.batch_request() else start_analysis() end
       end
 
-      -- Centered text below the button
-      reaper.ImGui_DrawList_AddText(draw_list, cx - text_w * 0.5, start_y + L.btn_lg.h + gap, P.text_dim, msg)
+      -- Centred text below the button
+      local y = start_y + L.btn_lg.h
+      for i, rows in ipairs(shown) do
+        y = y + (i == 1 and gap or L.xs)
+        for _, row in ipairs(rows) do
+          reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
+          y = y + text_h
+        end
+      end
     else
       local title = "No pitched notes found"
       local hint = "Try another Vocal Range or Detection Mode in Settings."
@@ -8970,7 +9045,7 @@ K.INFO_SECTIONS = {
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
   { title = "Icons", rows = {
-    { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
+    { "… (top right)", "More: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help" },
     { "× (top right)", "Close the window (Esc when floating)" },
     { "> / <", "Hide / show the Pitched Items panel" },
     { "▾ / ▸ (section header)", "Collapse / expand the section" },
@@ -9015,6 +9090,9 @@ K.draw_items_body = function(sidebar_ctx)
   -- Row geometry: a card as tall as a table row (or a frame, when the font is larger, or the Remove target), L.xs of
   -- air above and below it, and every element centred on the card
   local to_remove = nil
+  -- While an analysis runs (one item or a batch) the list is read-only: the analysis owns the open item, and an
+  -- item's envelope and stored analysis must not change under it. The reason is in each row's tooltip.
+  local rows_locked = state.is_analyzing or K.batch ~= nil
   local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
   local frame_h = reaper.ImGui_GetFrameHeight(sidebar_ctx)
   local del_sz = L.icon_target.size + L.icon_target.pad * 2   -- Remove is destructive: the 24 px minimum target (WCAG 2.5.8)
@@ -9105,21 +9183,22 @@ K.draw_items_body = function(sidebar_ctx)
         -- Bypass checkbox: default frame padding; disabled (and unchecked) when the item no longer exists
         local is_enabled = (not is_missing) and not is_take_pitch_bypassed(take_obj)
         Theme.vcenter(sidebar_ctx, frame_h, card_h, line_y)
-        if is_missing then reaper.ImGui_BeginDisabled(sidebar_ctx) end
+        local cb_off = is_missing or rows_locked
+        if cb_off then reaper.ImGui_BeginDisabled(sidebar_ctx) end
         -- The panel's surface is the recessed one, so the box takes the button face to keep its boundary visible
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBg(), P.btn)
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBgActive(), P.btn_a)
         local cb_changed, new_en = reaper.ImGui_Checkbox(sidebar_ctx, "##bp", is_enabled)
         reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
-        if is_missing then reaper.ImGui_EndDisabled(sidebar_ctx) end
+        if cb_off then reaper.ImGui_EndDisabled(sidebar_ctx) end
         local cb_w = reaper.ImGui_GetItemRectSize(sidebar_ctx)
-        if cb_changed and not is_missing then
+        if cb_changed and not cb_off then
           toggle_take_pitch_bypass(take_obj)
         end
-        if is_missing then
+        if cb_off then
           if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-            Theme.tooltip(sidebar_ctx, BODY.tip_missing)
+            Theme.tooltip(sidebar_ctx, is_missing and BODY.tip_missing or K.REASON_ANALYZING)
           end
         elseif reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           Theme.tooltip(sidebar_ctx, new_en and "Envelope Active — click to bypass it" or "Envelope Bypassed — click to enable it")
@@ -9161,14 +9240,21 @@ K.draw_items_body = function(sidebar_ctx)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_ItemSpacing(), 0, 0)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_SelectableTextAlign(), 0, 0.5)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
-        if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h) then
+        if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
+        if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h)
+           and not rows_locked then
           switch_active_target(guid, take_obj)
         end
+        if rows_locked then reaper.ImGui_EndDisabled(sidebar_ctx) end
         reaper.ImGui_PopStyleVar(sidebar_ctx, 2)
         reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
         if name_font then Theme.pop_font(sidebar_ctx, name_font) end
 
-        if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        if rows_locked then
+          if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+            Theme.tooltip(sidebar_ctx, string.format("Item: %s\n%s", full_name, K.REASON_ANALYZING))
+          end
+        elseif reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           local lines = { string.format("Item: %s", full_name) }
           if is_missing then
             lines[#lines + 1] = state_tip
@@ -9197,6 +9283,7 @@ K.draw_items_body = function(sidebar_ctx)
         reaper.ImGui_SameLine(sidebar_ctx, del_x)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
         Theme.vcenter(sidebar_ctx, del_sz, card_h, line_y)
+        if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
         if Theme.icon_btn(sidebar_ctx, "##del", Theme.icons.close, {
           preset = L.icon_target,
           icon_size = L.icon_md.size,   -- the glyph matches the other icons; only the click target is 24 px
@@ -9204,8 +9291,15 @@ K.draw_items_body = function(sidebar_ctx)
           color = P.text_dim,
           hover_color = P.red,
           tooltip = "Remove from Pitched Items and clear its envelope and saved analysis (asks to confirm)"
-        }) then
+        }) and not rows_locked then
           to_remove = guid
+        end
+        if rows_locked then
+          reaper.ImGui_EndDisabled(sidebar_ctx)
+          -- A theme widget's own tooltip does not show on a disabled item: the reason is given here
+          if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+            Theme.tooltip(sidebar_ctx, K.REASON_ANALYZING)
+          end
         end
 
         -- End of row: one item spanning it, so the next row starts below and the list's extent is valid
@@ -10081,6 +10175,64 @@ end
 
 --- The one confirm modal (see request_confirm): consequence and count in the body, Cancel first,
 --- Esc = Cancel, danger-styled confirm button. Called inside the main window's `if visible` block.
+--- The list of a confirm dialog (request_confirm's `list`): one row per thing the action replaces, its name and,
+--- dimmed at the right, where it is (`where`, e.g. track and position). The region takes the room the dialog has
+--- left above its closing lines and buttons, three rows at least, and scrolls; only the rows in view are drawn. A
+--- name that does not fit is shortened (its row's tooltip has it in full), and `where` gives way first.
+K.confirm_list = function(c)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local row_h = reaper.ImGui_GetTextLineHeightWithSpacing(ctx)
+  local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
+  -- What comes below the list: the closing lines (wrapped to the dialog's width) and the button row
+  local below = reaper.ImGui_GetFrameHeight(ctx) + L.lg
+  for _, line in ipairs(c.after_lines) do
+    local _, line_h = reaper.ImGui_CalcTextSize(ctx, line, nil, nil, false, avail_w)
+    below = below + L.sm + (line_h or 0)
+  end
+  local pad = L.sm * 2
+  local list_h = math.max(row_h * 3 + pad, math.min(#c.list * row_h + pad, avail_h - below - L.sm))
+
+  reaper.ImGui_Dummy(ctx, 0, L.xs)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.well)
+  if reaper.ImGui_BeginChild(ctx, "##confirm_list", 0, list_h, reaper.ImGui_ChildFlags_Borders()) then
+    -- A clipper of its own, attached to the context (see the Pitched Items list for why)
+    if not K.confirm_clipper or not reaper.ImGui_ValidatePtr(K.confirm_clipper, "ImGui_ListClipper*") then
+      K.confirm_clipper = reaper.ImGui_CreateListClipper(ctx)
+      reaper.ImGui_Attach(ctx, K.confirm_clipper)
+    end
+    local clipper = K.confirm_clipper
+    local inner_w = reaper.ImGui_GetContentRegionAvail(ctx)
+    local start_x = reaper.ImGui_GetCursorPosX(ctx)
+    reaper.ImGui_ListClipper_Begin(clipper, #c.list, row_h)
+    while reaper.ImGui_ListClipper_Step(clipper) do
+      local first_row, end_row = reaper.ImGui_ListClipper_GetDisplayRange(clipper)   -- 0-based, end exclusive
+      for index = first_row + 1, end_row do
+        local row = c.list[index]
+        local name = row.name or "Item"
+        local where = row.where or ""
+        local where_w = where ~= "" and (reaper.ImGui_CalcTextSize(ctx, where)) or 0
+        local name_w = reaper.ImGui_CalcTextSize(ctx, name)
+        -- `where` shows only while the name keeps half of the row (or fits whole beside it)
+        local room = inner_w - where_w - L.md
+        local show_where = where_w > 0 and room >= math.min(name_w, inner_w * 0.5)
+        local shown = fit_text(ctx, name, show_where and room or inner_w, "regular")
+        reaper.ImGui_Text(ctx, shown)
+        if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+          Theme.tooltip(ctx, where ~= "" and (name .. "\n" .. where) or name)
+        end
+        if show_where then
+          reaper.ImGui_SameLine(ctx)
+          reaper.ImGui_SetCursorPosX(ctx, start_x + inner_w - where_w)
+          reaper.ImGui_TextColored(ctx, P.text_dim, where)
+        end
+      end
+    end
+    reaper.ImGui_EndChild(ctx)
+  end
+  reaper.ImGui_PopStyleColor(ctx, 1)
+end
+
 local function draw_confirm_modal()
   local c = state.confirm
   if not c then return end
@@ -10107,6 +10259,11 @@ local function draw_confirm_modal()
 
     for i, line in ipairs(c.body_lines) do
       if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.sm) end
+      reaper.ImGui_TextWrapped(ctx, line)
+    end
+    if c.list and #c.list > 0 then K.confirm_list(c) end
+    for _, line in ipairs(c.after_lines) do
+      reaper.ImGui_Dummy(ctx, 0, L.sm)
       reaper.ImGui_TextWrapped(ctx, line)
     end
 
@@ -10303,6 +10460,57 @@ local function request_analyze()
       end
     end,
   })
+end
+
+--- Analyze All Selected Items (the canvas button with two or more audio items selected, "…" > Analyze Selected
+--- Items): the selection is read now and frozen; when any of its items holds notes the user is asked once, with
+--- those items listed, before anything starts.
+K.batch_request = function()
+  if state.is_analyzing or K.batch then return end
+  local sel = K.batch_selection()
+  if #sel.takes == 0 then
+    set_status("Select an audio item first")
+    return
+  end
+  local req = K.batch_confirm(sel.takes)
+  if not req then
+    K.batch_start(sel.takes)
+    return
+  end
+  for _, row in ipairs(req.list) do
+    -- Where the item is: its track and its start as REAPER's ruler shows it (items often share a name)
+    local at = reaper.format_timestr_pos(row.pos or 0, "", -1) or ""
+    row.where = (row.track ~= nil and row.track ~= "") and (row.track .. " · " .. at) or at
+  end
+  req.id = "batch"
+  req.on_confirm = function() K.batch_start(sel.takes) end
+  request_confirm(req)
+end
+
+--- `text` broken into rows at most max_w wide in the font pushed now, at spaces: { { text, w } ... }. A word wider
+--- than max_w gets a row of its own. The last answer per text is kept (the empty canvas asks every frame).
+K.wrap_lines = function(wctx, text, max_w)
+  K.wrap_cache = K.wrap_cache or {}
+  local hit = K.wrap_cache[text]
+  if hit and hit.max_w == max_w then return hit.rows end
+  local rows, current, current_w = {}, nil, 0
+  for word in text:gmatch("%S+") do
+    local candidate = current and (current .. " " .. word) or word
+    local w = reaper.ImGui_CalcTextSize(wctx, candidate) or 0
+    if current and w > max_w then
+      rows[#rows + 1] = { text = current, w = current_w }
+      current, current_w = word, reaper.ImGui_CalcTextSize(wctx, word) or 0
+    else
+      current, current_w = candidate, w
+    end
+  end
+  if current then rows[#rows + 1] = { text = current, w = current_w } end
+  if not hit then
+    K.wrap_cache_n = (K.wrap_cache_n or 0) + 1
+    if K.wrap_cache_n > 32 then K.wrap_cache, K.wrap_cache_n = {}, 1 end   -- the count lines change with the selection
+  end
+  K.wrap_cache[text] = { max_w = max_w, rows = rows }
+  return rows
 end
 
 K.RESPLIT_UNDO = "Change Note Separation"   -- the undo label of K.resplit
@@ -10580,7 +10788,7 @@ do
   -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = "Select an audio item"
   local HDR_REASON_NO_NOTES = "Analyze an item first"
-  local HDR_MORE_TIP = "Menu: Analyze, Reset, Layers, Note Tone, Settings, Help"
+  local HDR_MORE_TIP = "Menu: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help"
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
@@ -10866,30 +11074,49 @@ do
     end
   end
 
-  --- "…" (More) and its popup: Analyze / Re-Analyze and Reset (with the reason beside a disabled one), then
-  --- Layers, Settings and Help. While analysing the button reads the progress ("42%") and the popup offers
-  --- Cancel in place of Analyze (Esc is not bound to Cancel: on a floating window Esc closes the window, which
+  --- "…" (More) and its popup: Analyze / Re-Analyze, Analyze Selected Items and Reset (with the reason beside a
+  --- disabled one), then Layers, Settings and Help. While analysing the button reads the progress ("42%") and the
+  --- popup offers Cancel (Cancel Batch for a batch) in place of Analyze (Esc is not bound to Cancel: on a floating window Esc closes the window, which
   --- cancels too).
   local function hdr_draw_more(hs)
     local s = hs.s
-    local analyzing = state.is_analyzing
-    local pct = math.floor(state.progress * 100)
+    local batch = K.batch
+    local analyzing = state.is_analyzing or batch ~= nil
+    -- One number for a batch, here and in the status line: the share of its audio that is analysed
+    local pct = math.floor(K.analysis_progress() * 100)
     if reaper.ImGui_Button(ctx, (analyzing and string.format("%d%%", pct) or HDR_ELLIPSIS) .. "###hdr_more", s.more_w, 0) then
       reaper.ImGui_OpenPopup(ctx, "##hdr_more_popup")
     end
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, analyzing and "Analyzing. Open to cancel" or HDR_MORE_TIP)
+      local tip = HDR_MORE_TIP
+      if batch then
+        tip = string.format("Analyzing %d of %d. Open to cancel", math.min(batch.index, #batch.queue), #batch.queue)
+      elseif analyzing then
+        tip = "Analyzing. Open to cancel"
+      end
+      Theme.tooltip(ctx, tip)
     end
     if reaper.ImGui_BeginPopup(ctx, "##hdr_more_popup") then
       -- HC5: Esc closes this popup (innermost); the window-level handler ignores Esc while a popup is open
       if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
       if analyzing then
-        if reaper.ImGui_MenuItem(ctx, string.format(K.CANCEL_FMT, pct) .. "###more_analyze") then
+        if reaper.ImGui_MenuItem(ctx, string.format(batch and K.CANCEL_BATCH_FMT or K.CANCEL_FMT, pct) .. "###more_analyze") then
           K.cancel_analysis()
+        end
+        if batch and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+          Theme.tooltip(ctx, K.CANCEL_BATCH_TIP)
         end
       elseif reaper.ImGui_MenuItem(ctx, hs.analyze_label .. "###more_analyze",
           (not hs.has_target) and HDR_REASON_NO_TARGET or nil, false, hs.has_target) then
         request_analyze()
+      end
+      -- Analyze Selected Items: always in the menu; with fewer than two audio items selected in REAPER, or while
+      -- an analysis runs, it is disabled with the reason beside it
+      local peek = K.batch_peek(reaper.time_precise())
+      local batch_reason = analyzing and K.REASON_ANALYZING or (peek.n < 2 and K.REASON_BATCH_FEW or nil)
+      local batch_label = batch_reason and "Analyze Selected Items" or string.format("Analyze Selected Items (%d)", peek.n)
+      if reaper.ImGui_MenuItem(ctx, batch_label .. "###more_batch", batch_reason, false, batch_reason == nil) then
+        K.batch_request()
       end
       if reaper.ImGui_MenuItem(ctx, hs.reset_label .. "###more_reset",
           (not hs.has_notes) and HDR_REASON_NO_NOTES or nil, false, hs.has_notes) then
@@ -11301,6 +11528,12 @@ do
   K.status_line = function(editing)
     if state.status.text ~= "" and reaper.time_precise() < state.status.until_time then
       return state.status.text
+    end
+    local batch = K.batch
+    if batch then
+      local entry = batch.queue[batch.index]
+      return string.format("Analyzing %d of %d: %s… %d%%", math.min(batch.index, #batch.queue), #batch.queue,
+        entry and entry.name or "item", math.floor(K.analysis_progress() * 100))
     end
     if state.is_analyzing then
       return string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor((state.progress or 0) * 100))
@@ -11890,6 +12123,8 @@ local function loop_body()
       end
     end
 
+    K.status_watch(ctx)   -- a held closing message (a batch's) goes on the user's next input
+
     -- The target, asked once per frame: the top bar, canvas and sidebar read it from state.frame
     local target_take, target_item = get_target_take()
     state.frame.guid, state.frame.take, state.frame.item = state.target_take_guid, target_take, target_item
@@ -12081,6 +12316,7 @@ local function loop()
       end
       K.drop_project_cache()    -- what the failed frame asked REAPER is not trusted any more
       state.clipper = nil       -- nor is a list clipper it may have left begun (a new one is made when needed)
+      K.confirm_clipper = nil
       state.error_streak = state.error_streak + 1
       state.fatal = { message = K.FATAL_TEXT, count = state.error_streak }
       open = true
@@ -12154,6 +12390,7 @@ end
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
-           run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block }
+           run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
+           request_confirm = request_confirm }
 end
 main()
