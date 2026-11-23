@@ -2424,7 +2424,8 @@ K.JOIN = { FADE_S = 0.030, MIN_S = 0.010, MAX_S = 0.120, MAX_PART = 0.4 }
 ---   ranges  { t0, t1 }, sorted and merged: the time ranges an edited, non-bypassed note corrects (with its
 ---           fades and joins)
 --- No timing setting: joins and fades follow K.JOIN.
-K.correction_build = function(notes, item_len)
+--- This is the Natural build, called by K.correction_build (4b. MODES).
+K.natural_build = function(notes, item_len)
   local all_points, spans, ranges = {}, {}, {}
   local num_notes = #notes
 
@@ -2668,10 +2669,9 @@ end
 -------------------------------------------------------------------------------
 -- 4b. MODES
 -------------------------------------------------------------------------------
--- Mode picks how a note is corrected: 0 Natural (what K.correction_build does today), 1 Classic, 2 Hard. A note
--- stores its own mode (controls.correct_mode) or inherits the item's (take overrides); anything but 1 or 2 is
--- Natural. Classic and Hard are built beside Natural, never inside it: K.correction_build is not edited for them.
--- Nothing calls these yet.
+-- Mode picks how a note is corrected: 0 Natural (K.natural_build), 1 Classic, 2 Hard. A note stores its own mode
+-- (controls.correct_mode) or inherits the item's (take overrides); anything but 1 or 2 is Natural. Classic and Hard
+-- are built beside Natural, never inside it: K.natural_build is not edited for them (K.correction_build chooses).
 -------------------------------------------------------------------------------
 K.MODE = { GLIDE_S = 0.100, OUTLIER_ST = 3, STEP_S = 0.0005 }
 K.MODES = { "Natural", "Classic", "Hard" }
@@ -2806,6 +2806,108 @@ K.mode_line = function(note, mode, pcs)
   note.mode_cache = { frames = frames, tighten = tighten, mode = mode, centre = centre, avg = avg, pcs = pcs,
                       shifts = shifts, steps = steps }
   return shifts, steps
+end
+
+--- A stand-in for a Classic or Hard note, for K.natural_build: it reads everything from `note` except its controls,
+--- which read from the real controls except bypassed = true. Whatever the build writes (frame_shifts, the caches
+--- of K.note_body and the like) lands on the stand-in, never on the real note.
+K.mode_stand_in = function(note)
+  local ctrl = setmetatable({ bypassed = true }, { __index = note.controls })
+  return setmetatable({ controls = ctrl }, { __index = note })
+end
+
+--- The pitch correction of `notes`: K.natural_build's own result when no note is Classic or Hard. Otherwise
+--- Natural builds every note with each Classic or Hard note seen as bypassed, and those notes write their own
+--- points beside it (stepping in and out over K.MODE.STEP_S, held across to a touching Classic or Hard
+--- neighbour). Pure (no REAPER calls); returns { points, spans, ranges } as K.natural_build does.
+K.correction_build = function(notes, item_len)
+  local num_notes = #notes
+  local modes, any = {}, false
+  for i = 1, num_notes do
+    modes[i] = K.note_mode(notes[i])
+    if modes[i] then any = true end
+  end
+  if not any then return K.natural_build(notes, item_len) end
+
+  local stand = {}
+  for i = 1, num_notes do
+    stand[i] = modes[i] and K.mode_stand_in(notes[i]) or notes[i]
+  end
+  local A = K.natural_build(stand, item_len)
+
+  local STEP, J = K.MODE.STEP_S, K.JOIN
+  local pcs = K.item_scale_pcs()
+  local function clamp(t) return math.max(0.0, math.min(item_len, t)) end
+  local function has_frames(n) return n.frames ~= nil and #n.frames > 0 end
+  -- Notes i and i + 1 are both Classic or Hard (with frames) and close enough to be held across
+  local function held(i)
+    local na, nb = notes[i], notes[i + 1]
+    return nb ~= nil and modes[i] ~= nil and modes[i + 1] ~= nil and has_frames(na) and has_frames(nb)
+      and nb.start_time - na.end_time < 2 * J.FADE_S
+  end
+
+  local mode_points, mode_ranges = {}, {}
+  local function put(t, val) mode_points[#mode_points + 1] = { time = clamp(t), val = val } end
+  for idx = 1, num_notes do
+    local n = notes[idx]
+    if modes[idx] and has_frames(n) then
+      local fr, nf = n.frames, #n.frames
+      local shifts, steps = K.mode_line(n, modes[idx], pcs)
+      local offsets = K.points_offsets(n)
+      local fs = {}
+      for i = 1, nf do fs[i] = (shifts[i] or 0) + (offsets and offsets[i] or 0) end
+      n.frame_shifts = fs
+
+      local t_first, t_last = fr[1].time, fr[nf].time
+      if idx > 1 and held(idx - 1) then
+        local p = notes[idx - 1]
+        put(t_first - STEP, p.frame_shifts[#p.frames])
+      else
+        put(t_first - STEP, 0.0)
+      end
+      for i = 1, nf do
+        if i > 1 and steps[i] then put(fr[i].time - STEP, fs[i - 1]) end
+        put(fr[i].time, fs[i])
+      end
+      local range = { t0 = clamp(t_first - STEP) }
+      if held(idx) then
+        range.t1 = clamp(notes[idx + 1].frames[1].time)
+      else
+        local t_close = math.max(n.end_time, t_last + STEP)
+        if t_close - STEP > t_last then put(t_close - STEP, fs[nf]) end
+        put(t_close, 0.0)
+        range.t1 = clamp(t_close)
+      end
+      mode_ranges[#mode_ranges + 1] = range
+    end
+  end
+
+  -- Natural's points outside every Classic or Hard range (closed at both ends), then the mode points
+  local points = {}
+  for _, p in ipairs(A.points) do
+    local inside = false
+    for _, r in ipairs(mode_ranges) do
+      if p.time >= r.t0 and p.time <= r.t1 then inside = true break end
+    end
+    if not inside then points[#points + 1] = p end
+  end
+  for _, p in ipairs(mode_points) do points[#points + 1] = p end
+
+  local all = {}
+  for _, r in ipairs(A.ranges) do all[#all + 1] = { t0 = r.t0, t1 = r.t1 } end
+  for _, r in ipairs(mode_ranges) do all[#all + 1] = r end
+  table.sort(all, function(a, b) return a.t0 < b.t0 end)
+  local merged = {}
+  for _, r in ipairs(all) do
+    local last = merged[#merged]
+    if last and r.t0 <= last.t1 then
+      last.t1 = math.max(last.t1, r.t1)
+    else
+      merged[#merged + 1] = r
+    end
+  end
+
+  return { points = points, spans = A.spans, ranges = merged }
 end
 
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
@@ -4492,7 +4594,13 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 13, is_note_modified(n)) or changed
     changed = set(sig, k + 14, n.points_rev or 0) or changed
     k = k + 14
+    changed = set(sig, k + 1, K.mode_value(n)) or changed
+    k = k + 1
   end
+  local key_idx, scale_idx = K.item_scale()
+  changed = set(sig, k + 1, key_idx) or changed
+  changed = set(sig, k + 2, scale_idx) or changed
+  k = k + 2
   if cv.n ~= k then
     cv.n = k
     changed = true

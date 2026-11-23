@@ -1345,6 +1345,115 @@ test("mode_scale_pcs_memo_and_cache", function()
   eq(a ~= S.K.mode_line(n, "hard", S.K.scale_pcs(1, major)), true, "a moved note rebuilds")
 end)
 
+local function hard_note(t0, sung, ctrl)
+  local c = { correct_mode = 2 }
+  for k, v in pairs(ctrl or {}) do c[k] = v end
+  return mode_note(t0, 0.3, sung, sung, c)
+end
+local function chromatic(fn)   -- runs fn with every item on the chromatic scale
+  local saved = S.K.item_scale_pcs
+  S.K.item_scale_pcs = function() return nil end
+  local ok, err = pcall(fn)
+  S.K.item_scale_pcs = saved
+  if not ok then error(err, 0) end
+end
+local STEP = 0.0005
+
+test("build_natural_only_is_handed_through", function()
+  local saved, seen = S.K.natural_build, nil
+  local sentinel = { points = {}, spans = {}, ranges = {} }
+  S.K.natural_build = function(notes, item_len) seen = { notes, item_len } return sentinel end
+  local notes = { join_note(0.1, 0.3, 60, 0.3) }
+  local got = S.K.correction_build(notes, 10)
+  S.K.natural_build = saved
+  eq(got, sentinel, "Natural's own result"); eq(seen[1], notes, "the same list"); eq(seen[2], 10)
+end)
+
+test("build_hard_note", function() chromatic(function()
+  local h = hard_note(0.5, 60.3)
+  local build = S.K.correction_build({ h }, 10)
+  eq(#h.frame_shifts, #h.frames)
+  for i = 1, #h.frames do near(h.frame_shifts[i], -0.3, 1e-9) end
+  local t1 = h.frames[1].time
+  near(point_at(build.points, t1 - STEP).val, 0, 1e-12, "steps in from no correction")
+  near(point_at(build.points, t1).val, -0.3, 1e-9)
+  near(point_at(build.points, h.end_time - STEP).val, -0.3, 1e-9, "held to the end")
+  near(point_at(build.points, h.end_time).val, 0, 1e-12, "steps out")
+  eq(#build.ranges, 1); near(build.ranges[1].t0, t1 - STEP, 1e-12); near(build.ranges[1].t1, h.end_time, 1e-12)
+  eq(#build.spans, 0)
+  eq(h.controls.bypassed, false, "the real note is not changed")
+end) end)
+
+test("build_classic_step_point", function() chromatic(function()
+  local n = mode_note(0.5, 0.2, function(lt) return lt < 0.0975 and 60.2 or 61.2 end, 60.7,
+    { correct_mode = 1, tighten = 1 })
+  local build = S.K.correction_build({ n }, 10)
+  local t = n.frames[21].time
+  near(point_at(build.points, t - STEP).val, n.frame_shifts[20], 1e-12, "holds the old value before the step")
+  near(point_at(build.points, t).val, n.frame_shifts[21], 1e-12)
+end) end)
+
+test("build_natural_neighbour_keeps_its_side", function() chromatic(function()
+  local a = join_note(0.1, 0.3, 60, 0.3)
+  local h = hard_note(a.end_time, 62.3)
+  local build = S.K.correction_build({ a, h }, 10)
+  -- What Natural writes next to a note that is not corrected, built by Natural alone
+  local a2, b = join_note(0.1, 0.3, 60, 0.3), hard_note(a.end_time, 62.3)
+  b.controls.correct_mode, b.controls.bypassed = nil, true
+  local ref = S.K.natural_build({ a2, b }, 10)
+  local edge = h.frames[1].time - STEP
+  local n_ref = 0
+  for _, p in ipairs(ref.points) do
+    if p.time < edge then
+      n_ref = n_ref + 1
+      local q = build.points[n_ref]
+      eq(q.time, p.time, "same time " .. n_ref); eq(q.val, p.val, "same value " .. n_ref)
+    end
+  end
+  if n_ref < 3 then error("the reference has no blend to compare") end
+  local g = spans_of(build, "glide")
+  eq(#g, 1); if g[1].t1 > a.end_time + 1e-9 then error("the blend crosses into the Hard note") end
+  eq(a.frame_shifts[1], a2.frame_shifts[1], "Natural's own shifts")
+end) end)
+
+test("build_adjacent_mode_notes_hold", function() chromatic(function()
+  local h1 = hard_note(0.5, 60.3)
+  local h2 = hard_note(h1.end_time, 62.4)
+  local build = S.K.correction_build({ h1, h2 }, 10)
+  local t2 = h2.frames[1].time
+  near(point_at(build.points, t2 - STEP).val, -0.3, 1e-9, "held across")
+  near(point_at(build.points, t2).val, 62 - 62.4, 1e-9, "one step")
+  for _, p in ipairs(build.points) do
+    if p.time > h1.frames[1].time and p.time < h2.end_time - STEP and math.abs(p.val) < 1e-9 then
+      error("returns to no correction between the notes at " .. p.time)
+    end
+  end
+  eq(#build.ranges, 1, "one merged range")
+end) end)
+
+test("build_mode_note_at_item_edges", function() chromatic(function()
+  local h = mode_note(0, 0.2, 60.3, 60.3, { correct_mode = 2 })
+  local build = S.K.correction_build({ h }, 0.2)
+  for _, p in ipairs(build.points) do
+    if p.time < 0 or p.time > 0.2 then error("point outside the item at " .. p.time) end
+  end
+  local empty = { start_time = 1, end_time = 1.2, frames = {}, avg_note = 60,
+                  controls = { center_pitch = 60, correct_mode = 2, bypassed = false } }
+  build = S.K.correction_build({ empty }, 10)
+  eq(#build.points, 0, "a note without frames writes nothing")
+end) end)
+
+test("build_item_mode_reaches_edited_notes_only", function() chromatic(function()
+  with_item_mode(2, function()
+    local moved, untouched = mode_note(0.1, 0.3, 60.3, 60.3, { center_pitch = 61.3 }), mode_note(1, 0.3, 60.3, 60.3)
+    local build = S.K.correction_build({ moved, untouched }, 10)
+    near(moved.frame_shifts[1], 61 - 60.3, 1e-9, "Hard, around where it was moved")
+    for _, p in ipairs(build.points) do
+      if p.time >= untouched.start_time - 0.05 and math.abs(p.val) > 1e-9 then error("the untouched note is corrected") end
+    end
+  end)
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
