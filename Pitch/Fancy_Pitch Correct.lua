@@ -2702,6 +2702,23 @@ K.mode_note_count = function(notes)
   return n
 end
 
+--- How many of `notes` the item's mode reaches: edited, not bypassed, and without a mode of their own.
+K.mode_reach_count = function(notes)
+  local n = 0
+  for _, note in ipairs(notes or {}) do
+    local ctrl = note.controls
+    if ctrl and not ctrl.bypassed and ctrl.correct_mode == nil and is_note_modified(note) then n = n + 1 end
+  end
+  return n
+end
+
+--- The status message of a change of the item's mode to `mode` (0, 1 or 2) that reaches `count` edited notes.
+K.mode_item_status = function(mode, count)
+  local name = K.MODES[(mode or 0) + 1] or K.MODES[1]
+  if count == 0 then return string.format("Mode: %s for this item. Notes you edit will use it", name) end
+  return string.format("Mode: %s for this item (%d edited %s)", name, count, count == 1 and "note" or "notes")
+end
+
 --- Why the control `key` does nothing for the `n` notes in `notes`: "mode" (the mode does not use it), "hard" or
 --- "classic" (Tighten only: that mode ignores it); nil when it works for at least one note.
 K.mode_unused = function(key, notes, n)
@@ -9710,7 +9727,7 @@ do
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
-  local HDR_VALUES = { "pill", "tight", "strength", "tol", "slide", "sep" }
+  local HDR_VALUES = { "pill", "tight", "mode", "strength", "tol", "slide", "sep" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for _, id in ipairs(HDR_VALUES) do HDR_GROUP[id] = "values" end
@@ -9728,7 +9745,8 @@ do
     { rows = { hdr_row(HDR_CLIP, HDR_VALUES) } },
     { rows = { HDR_CLIP, HDR_VALUES } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "strength", "tol" }, { "slide", "sep" } } },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "mode", "strength" }, { "tol", "slide" },
+      { "sep" } } },
   }
   -- The plan a first-use window is sized for: two rows
   local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
@@ -10184,6 +10202,23 @@ do
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = "Used once Tighten is above 0%."
+  -- The Mode dropdown (see draw_mode): its tooltip, its scope line by what it changes, the text of a mixed selection,
+  -- and the line a value's tooltip gains when the selected notes' mode does not use it (key: K.mode_unused)
+  local BAR_MODE = {
+    tip = "Mode: how an edited note is corrected.\n"
+      .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n"
+      .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n"
+      .. "Hard: one flat note of the scale.",
+    scope_item = "Changes this item: every edited note without its own mode.",
+    scope_note = "Changes the selected note.",
+    scope_notes = "Changes the %d selected notes.",
+    mixed = "Mixed",
+    unused = {
+      mode = "Not used in Classic or Hard mode.",
+      hard = "Not used in Hard mode.",
+      classic = "In Classic mode: how fast the pitch jumps between scale notes. 0% glides, 100% steps at once.",
+    },
+  }
   -- Separation (see draw_separation): what letting go does, and its gestures (no right-click menu)
   local BAR_SEP_RESPLIT = "One value for every item. Letting go splits this item's notes again."
   local BAR_SEP_NEXT = "One value for every item. The next analysis uses it."
@@ -10251,6 +10286,10 @@ do
     end
     s.unit_w.pill = math.max(bar_text_w(bctx, BAR_PILL_NONE), bar_text_w(bctx, BAR_PILL_ONE),
       bar_text_w(bctx, string.format(BAR_PILL_MANY, 999))) + s.pad_x
+    -- The Mode dropdown: its longest text, the frame padding and the arrow (a square of the frame height)
+    local mode_text_w = bar_text_w(bctx, BAR_MODE.mixed)
+    for _, name in ipairs(K.MODES) do mode_text_w = math.max(mode_text_w, bar_text_w(bctx, name)) end
+    s.unit_w.mode = mode_text_w + s.pad_x + s.frame_h
     return s
   end
 
@@ -10636,9 +10675,15 @@ do
       local key, id = spec.key, "bv_" .. spec.id
       local name = PARAM_LABELS[key] or spec.label
 
+      -- The selected notes' mode may not use this value: its text is dim and its tooltip says why
+      local unused = K.mode_unused(key, sel_notes, sel_n)
+      local dim = (unused == "mode" or unused == "hard")
+
       reaper.ImGui_BeginDisabled(bctx, view.disabled == true)
       reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
+      if dim then reaper.ImGui_PushStyleColor(bctx, reaper.ImGui_Col_Text(), P.text_dim) end
       local changed, v, committed, reset, cancelled = param_drag(bctx, id, nil, view.lo_v, spec.lo, spec.hi, value_format(spec, view))
+      if dim then reaper.ImGui_PopStyleColor(bctx) end
       local back = K.drag_revert(id, view.lo_v / spec.scale, cancelled)
       local hovered, active, typed = K.drag_hot.hovered, K.drag_hot.active, K.drag_hot.typed
       local held, pressed = K.drag_hot.held, K.drag_hot.activated
@@ -10684,6 +10729,7 @@ do
           end
           if idle then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
         end
+        if unused then scope = BAR_MODE.unused[unused] .. "\n" .. scope end
       elseif view.target == "item" then
         scope = BAR_SCOPE_ITEM
       end
@@ -10855,9 +10901,42 @@ do
       if not active then bar_sep_before = nil end   -- the press is over (a click that changed nothing)
     end
 
+    --- Mode: the selected notes' mode (Mixed when they differ), else the item's. A choice is stored on every
+    --- selected note, else as the item's mode (Natural removes it), as one undo point; the same choice does nothing.
+    local function draw_mode()
+      local idx
+      if sel_n == 0 then
+        idx = K.mode_value(nil) + 1
+      else
+        idx = K.mode_value(sel_notes[1]) + 1
+        for i = 2, sel_n do
+          if K.mode_value(sel_notes[i]) + 1 ~= idx then idx = 0 break end
+        end
+      end
+      local scope = (sel_n == 0) and BAR_MODE.scope_item or (sel_n == 1) and BAR_MODE.scope_note
+        or string.format(BAR_MODE.scope_notes, sel_n)
+      local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
+        w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
+        tooltip = BAR_MODE.tip .. "\n" .. (inspector_reason or scope),
+      })
+      if not changed or choice == idx or inspector_reason then return end
+      if sel_n > 0 then
+        for i = 1, sel_n do sel_notes[i].controls.correct_mode = choice - 1 end
+        apply_envelope_to_take("Change Mode")
+      elseif take_data then
+        take_data.overrides = take_data.overrides or {}
+        take_data.overrides.correct_mode = (choice > 1) and (choice - 1) or nil
+        if apply_envelope_to_take("Change Mode") then
+          set_status(K.mode_item_status(choice - 1, K.mode_reach_count(state.notes)))
+        end
+      end
+    end
+
     return function(id)
       if id == "pill" then
         draw_pill()
+      elseif id == "mode" then
+        draw_mode()
       elseif BAR_VALUE_BY_ID[id] then
         local spec = BAR_VALUE_BY_ID[id]
         if spec.levels == "analysis" then draw_separation(spec) else draw_value(spec) end

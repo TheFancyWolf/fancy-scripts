@@ -1532,6 +1532,15 @@ test("mode_note_count", function()
   eq(S.K.mode_note_count({}), 0)
 end)
 
+test("mode_reach_and_status", function()
+  local own, moved, untouched = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
+  own.controls.correct_mode = 0
+  eq(S.K.mode_reach_count({ own, moved, untouched }), 1)
+  eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 edited notes)")
+  eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 edited note)")
+  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Notes you edit will use it")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
