@@ -1,10 +1,11 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.18.0
+-- @version 2.19.0
 -- @changelog
---   The time ruler now looks like REAPER's own: it takes the timeline colours of your REAPER theme (background, grey ticks, labels) in both theme modes
---   The ruler follows REAPER's ruler unit: bars and beats (33.1) when REAPER's ruler shows measures, project time (0:52.5) otherwise, instead of seconds from the start of the item; tempo and time signature changes are followed
---   A faint light line runs along the top of the note column, the ruler and the side panel; the line under the ruler is gone
+--   Mode: how an edited note is corrected. Natural is as before (nothing about it has changed); Classic is the auto-tuned effect: the pitch jumps between the notes of the scale and Tighten sets how fast (0% glides, 100% steps at once); Hard is one flat note of the scale
+--   Set the Mode in the dropdown next to Tighten (this item when nothing is selected, the selected notes otherwise) or in the Mode row of the note's right-click menu
+--   Classic and Hard follow where a note was moved and the item's Key and Scale; a Key or Scale change rewrites them at once, as one undo step
+--   Strength, Tolerance and Slide In are not used in Classic or Hard (nor Tighten in Hard): they are dimmed and say so. An untouched note is never corrected in any mode; analysing an item again puts its mode back to Natural
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
