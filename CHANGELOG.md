@@ -10,11 +10,12 @@ All notable changes to Fancy Scripts will be documented here.
   - **Asks once**: when some of the selected items already have notes, one dialog lists those items (name, track and position) before anything starts. With nothing to replace it starts at once.
   - **One undo step**: the whole batch is a single undo step, "Analyze Pitch (N items)". Redo brings every item back, also in the Pitched Items list.
   - **Progress and Cancel**: the "…" button and the status line show one percentage for the whole batch, and the status line says which item of how many. "Cancel Batch" in the "…" menu stops and keeps the items already finished; closing the window does the same.
-  - **What happened**: a closing message says how many items were analysed, how many have no pitched notes and how many could not be analysed. It stays until your next click or key in the window, or until the project changes.
+  - **What happened**: a closing message says how many items were analysed, how many have no pitched notes and how many could not be analysed. It stays until your next click or key in the window, or until an undo or redo changes one of the items.
   - **Carries on**: an item that cannot be analysed (deleted meanwhile, media offline) is left as it was and the batch goes on with the next one.
+  - **Key and Scale**: an item that was analysed before keeps its own Key and Scale through a batch.
   - **Re-Analyze reads the true pitch**: an item that had corrections was analysed as corrected, so an edited note came out shifted by its old correction. Every analysis now reads the uncorrected audio; nothing is heard and the corrections stay exactly as they were if you cancel.
   - **Offline media**: an item whose media is offline is no longer stored as "no pitched notes"; the status line says its audio could not be read.
-  - **Pitched Items is read-only while an analysis runs**: rows cannot be switched, bypassed or removed until it ends (a click on a row used to switch the item under a running analysis).
+  - **Pitched Items is read-only while an analysis runs**: rows cannot be switched, bypassed or removed until it ends (a click on a row used to switch the item under a running analysis) Clear and Wipe in Settings wait for it too.
   - **For development**: when the ExtState `FancyScripts` / `pitch_dev_dump` holds a folder, every analysis also writes what the detector saw to a text file there, one per item. It is empty by default and has no control in the window.
 - **Fancy Pitch Correct v2.20.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Pitch detection chooses across moments:
   - **Octaves read right**: each moment's pitch is now chosen together with the moments around it, not on its own. A note read an octave too high (a strong overtone) or too low (a shaky note start) is now read right at the source; the repair added in 2.19.1 stays as a second line.

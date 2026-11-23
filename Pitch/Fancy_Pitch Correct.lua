@@ -2641,8 +2641,8 @@ end
 --- Write the finished items of a batch: `done` = { { guid, data, json | nil, empty } ... }. Everything goes into
 --- ONE undo block: per item, its Pitch envelope is created and shown where it was missing and cleared of points (a
 --- fresh analysis corrects nothing), and its model is stored on the take; the take's pitch mode is left alone. An
---- item that is no longer in the project is left out. With nothing to write no undo block is opened.
---- Returns the entries of `done` that were written.
+--- item that is no longer in the project, or whose Pitch envelope cannot be made, is left out and stays as it was.
+--- With no item left in the project no undo block is opened. Returns the entries of `done` that were written.
 K.batch_write = function(done)
   local ready = {}
   for _, entry in ipairs(done) do
@@ -2658,20 +2658,21 @@ K.batch_write = function(done)
   for _, r in ipairs(ready) do
     local guid, data = r.entry.guid, r.entry.data
     local env = ensure_take_pitch_envelope(r.take, r.item, true)
-    if env then
+    if env then   -- without its Pitch envelope the item cannot be corrected: it is left as it was (not written)
       local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(r.item, "D_LENGTH") or 0)
       reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
       reaper.Envelope_SortPointsEx(env, -1)
+      save_take_data(r.take, data, r.entry.json)
+      state.session_takes[guid] = data
+      local listed = false
+      for _, g in ipairs(state.session_order) do
+        if g == guid then listed = true; break end
+      end
+      if not listed then table.insert(state.session_order, guid) end
+      state.stale_takes[guid], state.stale_env[guid], state.missing_takes[guid] = nil, nil, nil
+      state.undone_takes[guid] = nil
+      written[#written + 1] = r.entry
     end
-    save_take_data(r.take, data, r.entry.json)
-    state.session_takes[guid] = data
-    local listed = false
-    for _, g in ipairs(state.session_order) do
-      if g == guid then listed = true; break end
-    end
-    if not listed then table.insert(state.session_order, guid) end
-    state.stale_takes[guid], state.stale_env[guid], state.missing_takes[guid] = nil, nil, nil
-    written[#written + 1] = r.entry
   end
   reaper.UpdateArrange()
   reaper.Undo_EndBlock(K.batch_undo_label(#written), -1)
@@ -2758,11 +2759,24 @@ K.batch_item_done = function(take_data)
   local batch = K.batch
   if not batch then return end
   local entry = batch.queue[batch.index]
+  -- The model must be the entry's own. When the item in progress leaves the project, the window's target falls
+  -- back to whatever is selected (get_target_take): frames read from one item must never be stored on another.
+  if not entry or take_data.guid ~= entry.guid then
+    K.batch_item_failed(nil)
+    return
+  end
+  -- An item analysed before keeps its own Key and Scale (the model was built with those of the item that was
+  -- open when the batch started); an item analysed for the first time takes the current ones, as a single analysis does
+  local before = state.session_takes[entry.guid]
+  if before then
+    take_data.key_idx = before.key_idx or take_data.key_idx
+    take_data.scale_idx = before.scale_idx or take_data.scale_idx
+  end
   batch.done[#batch.done + 1] = {
     guid = take_data.guid, data = take_data, json = K.take_json(take_data),
     empty = (take_data.notes == nil or #take_data.notes == 0),
   }
-  batch.done_len = batch.done_len + (entry and entry.len or 0)
+  batch.done_len = batch.done_len + (entry.len or 0)
   K.batch_next()
 end
 
@@ -2853,12 +2867,12 @@ local function sync_with_project()
   if state.is_analyzing or K.batch then return end
   local count = reaper.GetProjectStateChangeCount(0)
   if state.last_change_count == count then return end
-  -- A change that is not this script's own (undo, redo, an edit in REAPER): a held closing message ("Analyzed 3
-  -- items") no longer describes the project. A count this script forgot on purpose (nil) is not such a change.
-  if state.last_change_count ~= nil then K.status_release() end
   state.last_change_count = count
   K.queue_stale_checks()   -- an undo, a redo or an edit in REAPER may have changed an envelope
 
+  -- Whether an item's stored analysis is not what this window last saw (undo, redo): a held closing message
+  -- ("Analyzed 3 items") then no longer describes the items and goes. Any other change in REAPER leaves it.
+  local analyses_changed = false
   local i = 1
   while i <= #state.session_order do
     local guid = state.session_order[i]
@@ -2873,6 +2887,7 @@ local function sync_with_project()
       if raw == (state.raw_cache[guid] or "") then
         i = i + 1
       else
+        analyses_changed = true
         local data = load_take_data(take, raw)
         local is_active = (guid == state.target_take_guid)
         if data then
@@ -2915,6 +2930,7 @@ local function sync_with_project()
       if raw ~= (state.raw_cache[guid] or "") then
         local data = load_take_data(take, raw)
         if data then
+          analyses_changed = true
           state.session_takes[guid] = data
           table.insert(state.session_order, guid)
           if guid == state.target_take_guid then adopt_take_data(guid, data) end
@@ -2937,6 +2953,7 @@ local function sync_with_project()
       if raw ~= "" then
         local data = load_take_data(take, raw)
         if data then
+          analyses_changed = true
           state.undone_takes[guid] = nil
           state.session_takes[guid] = data
           table.insert(state.session_order, guid)
@@ -2955,6 +2972,7 @@ local function sync_with_project()
       if raw ~= "" and raw ~= (state.raw_cache[target_guid] or "") then
         local data = load_take_data(take, raw)
         if data then
+          analyses_changed = true
           state.session_takes[target_guid] = data
           table.insert(state.session_order, target_guid)
           adopt_take_data(target_guid, data)
@@ -2962,6 +2980,7 @@ local function sync_with_project()
       end
     end
   end
+  if analyses_changed then K.status_release() end
 end
 
 --- Persist the target's note model to its take (P_EXT) so it lands inside the caller's open undo block.
@@ -4928,8 +4947,14 @@ local function process_analysis_step()
         separation = state.separation,
       }
       if K.batch then
-        -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item
-        K.batch_item_done(take_data)
+        -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item.
+        -- An item long enough to be read that gave no frame at all was not read (its media went away): it is not
+        -- stored as "no pitched notes" over what the item had
+        if #take_data.results == 0 and K.block_fits(0, params, state.sample_rate, state.end_time) then
+          K.batch_item_failed(nil)
+        else
+          K.batch_item_done(take_data)
+        end
         return
       end
       state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
@@ -4963,6 +4988,12 @@ end
 K.analysis_tick = function()
   if not K.batch then
     process_analysis_step()
+    return
+  end
+  -- A batch always has an item in progress. If something dropped the running analysis, that item counts as failed
+  -- and the batch goes on: it must never sit there with nothing to do
+  if not state.is_analyzing then
+    K.batch_item_failed(nil)
     return
   end
   local ok, err = xpcall(process_analysis_step, debug.traceback)
@@ -10071,6 +10102,9 @@ local function draw_settings_modal()
     local btn_w = math.max(text_w(clear_text), text_w(wipe_text)) + L.md * 2
     local clear_reason = (not state.notes or #state.notes == 0) and "No analysis to clear" or nil
     local wipe_reason = (session_n == 0) and "Pitched Items is empty" or nil
+    if locked or K.batch then   -- an analysis owns the open item and, in a batch, holds models of others
+      clear_reason, wipe_reason = K.REASON_ANALYZING, K.REASON_ANALYZING
+    end
 
     Theme.align(ctx)
     reaper.ImGui_BeginDisabled(ctx, clear_reason ~= nil)
@@ -10214,14 +10248,18 @@ K.confirm_list = function(c)
   local L = Theme.layout
   local row_h = reaper.ImGui_GetTextLineHeightWithSpacing(ctx)
   local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-  -- What comes below the list: the closing lines (wrapped to the dialog's width) and the button row
-  local below = reaper.ImGui_GetFrameHeight(ctx) + L.lg
+  -- What comes below the list, with the spacing ImGui puts after every item: the closing lines (a gap, then the
+  -- line wrapped to the dialog's width) and the button row with the gap above it. The gap drawn above the list and
+  -- the spacing after it count too, or the buttons are pushed out of a dialog that cannot grow
+  local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+  spacing_y = spacing_y or 0
+  local below = (L.xs + spacing_y) + spacing_y + (L.lg + spacing_y) + reaper.ImGui_GetFrameHeight(ctx)
   for _, line in ipairs(c.after_lines) do
     local _, line_h = reaper.ImGui_CalcTextSize(ctx, line, nil, nil, false, avail_w)
-    below = below + L.sm + (line_h or 0)
+    below = below + (L.sm + spacing_y) + (line_h or 0) + spacing_y
   end
   local pad = L.sm * 2
-  local list_h = math.max(row_h * 3 + pad, math.min(#c.list * row_h + pad, avail_h - below - L.sm))
+  local list_h = math.max(row_h * 3 + pad, math.min(#c.list * row_h + pad, avail_h - below))
 
   reaper.ImGui_Dummy(ctx, 0, L.xs)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.well)
@@ -10501,6 +10539,13 @@ K.batch_request = function()
   if #sel.takes == 0 then
     set_status("Select an audio item first")
     return
+  end
+  -- An item can hold an analysis this window has not loaded (pasted, duplicated or its project opened after the
+  -- script started): it is asked about as well. Checked once, here, not while the window only counts
+  for _, entry in ipairs(sel.takes) do
+    if not entry.has_notes and not state.session_takes[entry.guid] and read_take_raw(entry.take) ~= "" then
+      entry.has_notes = true
+    end
   end
   local req = K.batch_confirm(sel.takes)
   if not req then
@@ -12339,13 +12384,17 @@ local function loop()
       state.error_streak = 0
     else
       reaper.ShowConsoleMsg("Fancy Pitch Correct Error: " .. tostring(open) .. "\n")
-      pcall(K.cancel_analysis)
-      pcall(K.tone_kill)
-      if state.undo_open then   -- the frame failed inside apply_envelope_to_take: close its undo block
+      if state.undo_open then   -- the frame failed inside an undo block (a note edit, a batch's write): close it
         state.undo_open = false
         pcall(reaper.Undo_EndBlock, "Apply Pitch Correction (interrupted)", -1)
       end
       K.drop_project_cache()    -- what the failed frame asked REAPER is not trusted any more
+      pcall(K.cancel_analysis)  -- a batch writes its finished items here, in an undo block of its own
+      pcall(K.tone_kill)
+      if state.undo_open then   -- that write failed as well
+        state.undo_open = false
+        pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
+      end
       state.clipper = nil       -- nor is a list clipper it may have left begun (a new one is made when needed)
       K.confirm_clipper = nil
       state.error_streak = state.error_streak + 1
@@ -12371,7 +12420,16 @@ local function main()
   local Utils = require("utils")
   local release_toolbar = Utils.init_toolbar_toggle()
   reaper.atexit(function()
-    if K.batch then pcall(K.batch_finish, true) end   -- ended mid-batch: the finished items are kept
+    if K.batch then
+      -- Ended mid-batch: the finished items are kept. What the last frame asked REAPER is not trusted here (the
+      -- project may be closing), and a write that fails must not leave its undo block open
+      K.drop_project_cache()
+      pcall(K.batch_finish, true)
+      if state.undo_open then
+        state.undo_open = false
+        pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
+      end
+    end
     K.release_analysis()
     K.tone_kill()
     release_toolbar()

@@ -344,9 +344,10 @@ Calls made in this doc, for you to check:
 
 Changed during the build (2026-11-23, found while testing in real REAPER; reported to the user with the build):
 
-- **The closing message also ends when the project changes or another item is opened,** not only on the next click or key in the window. After Cmd+Z in REAPER, "Analyzed 3 items" stayed on screen over items that were no longer analysed.
+- **The closing message also ends when an undo or redo changes an analysed item, or another item is opened,** not only on the next click or key in the window. After Cmd+Z in REAPER, "Analyzed 3 items" stayed on screen over items that were no longer analysed. Other changes in REAPER (moving the edit cursor, mixing) leave it.
 - **Redo lists every item of the batch again.** The Pitched Items list only re-read the open item after a redo; items an undo removed are now looked at again whenever the project changes.
 - **The Re-Analyze fix switches nothing off audibly.** The audio accessor keeps the take state it was made with, so the Pitch envelope is bypassed, the accessor made and the envelope put back inside one call (measured: 0.3 ms, the envelope identical afterwards, no undo point).
+- **Found by the review of the branch and fixed:** an item's own Key and Scale survive a batch (every item was given those of the item open at the start); the confirm also covers items that hold notes this window has not loaded yet (pasted or duplicated after the script started); Clear and Wipe in Settings are disabled while an analysis runs, with the reason beside them; an item that gives no audio at all in a batch counts as "could not be analyzed" and keeps what it had; an item whose pitch envelope cannot be made is left as it was, as this doc says.
 - **An item's sample rate is read when the batch starts,** because REAPER reports none for every source while it is in the background ("Set media items offline when application is not active"). An item with no sample rate even then counts as "could not be analyzed"; a single analysis of such an item says its audio could not be read instead of storing an analysis without notes.
 
 HC6 conflicts: None.
