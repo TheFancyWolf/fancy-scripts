@@ -3719,6 +3719,67 @@ K.frame_step = function(results)
   return (steps[m / 2] + steps[m / 2 + 1]) * 0.5
 end
 
+--- Octave errors of the pitch detection (K.octave_fix): JUMP_TOL_ST = how far from a whole number of octaves a
+--- frame-to-frame jump may be and still count as an octave jump; MAX_RUN_S = the longest stretch that is put back (a
+--- longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames are in.
+K.OCTAVE = { JUMP_TOL_ST = 1.0, MAX_RUN_S = 0.15, WINDOW_S = 0.25 }
+
+--- Puts short octave-off stretches of analysed frames back (`results`: time-ordered { time, note | nil, freq | nil }).
+--- Within each stretch of frames that all have a pitch, a frame-to-frame jump of a whole number of octaves (within
+--- JUMP_TOL_ST) starts a new octave class. A run of one class no longer than MAX_RUN_S moves to the class that
+--- strictly most frames within WINDOW_S of it are in; with no such class it stays. Changes note and freq in place and
+--- returns how many frames changed. A second call changes nothing.
+K.octave_fix = function(results)
+  local O, n = K.OCTAVE, #results
+  if n < 2 then return 0 end
+  local hop = K.frame_step(results)
+  if not (hop > 0) then return 0 end   -- luacheck: ignore 581 (also catches NaN)
+  local changed, i = 0, 1
+  while i <= n do
+    if not results[i].note then
+      i = i + 1
+    else
+      local j = i   -- the stretch i..j
+      while j + 1 <= n and results[j + 1].note do j = j + 1 end
+      local class = { [i] = 0 }
+      for q = i + 1, j do
+        local d = results[q].note - results[q - 1].note
+        local k = math.floor(d / 12 + 0.5)
+        class[q] = class[q - 1] + ((k ~= 0 and math.abs(d - 12 * k) <= O.JUMP_TOL_ST) and k or 0)
+      end
+      local moves, q = {}, i   -- decided on the classes as detected, applied afterwards
+      while q <= j do
+        local e = q
+        while e + 1 <= j and class[e + 1] == class[q] do e = e + 1 end
+        if results[e].time - results[q].time + hop <= O.MAX_RUN_S then
+          local count, best, best_n, tied = {}, nil, 0, false
+          for x = i, j do
+            if results[x].time >= results[q].time - O.WINDOW_S and results[x].time <= results[e].time + O.WINDOW_S then
+              count[class[x]] = (count[class[x]] or 0) + 1
+            end
+          end
+          for c, cn in pairs(count) do
+            if cn > best_n then best, best_n, tied = c, cn, false
+            elseif cn == best_n then tied = true end
+          end
+          if not tied and best ~= class[q] then moves[#moves + 1] = { q, e, class[q] - best } end
+        end
+        q = e + 1
+      end
+      for _, mv in ipairs(moves) do
+        for x = mv[1], mv[2] do
+          local f = results[x]
+          f.note = f.note - 12 * mv[3]
+          if f.freq then f.freq = f.freq / 2 ^ mv[3] end
+          changed = changed + 1
+        end
+      end
+      i = j + 1
+    end
+  end
+  return changed
+end
+
 --- Splits analysed frames (`results`: time-ordered { time, note | nil, rms, lvl }) into notes at Separation `sep`.
 --- Returns notes { start_time, end_time, frames, sum_note, count } (frames: the original result frames, voiced only)
 --- and split_points { time, reason } (one per note, reason "Onset" / "Pitch change" / "Level dip"). Every time constant
@@ -4095,6 +4156,7 @@ K.resplit_match = function(old_notes, new_notes, tol_s, is_modified)
 end
 
 local function run_hybrid_segmentation()
+  K.octave_fix(state.results or {})   -- before the split: the notes and their centres are made from the fixed frames
   state.notes, state.split_points = K.segment(state.results or {}, state.separation)
 
   -- Anchor pitch

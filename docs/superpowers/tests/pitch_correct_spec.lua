@@ -1668,6 +1668,115 @@ test("value_track_draws_track_then_fill", function()
   if not ok then error(err, 0) end
 end)
 
+-- Octave errors (K.octave_fix) ------------------------------------------------------------------
+
+local OHOP = 512 / 48000
+-- list: runs of { frame count, pitch | nil }; returns result frames (freq follows the pitch)
+local function oct_frames(list, hop)
+  local out = {}
+  for _, r in ipairs(list) do
+    for _ = 1, r[1] do
+      local note = r[2]
+      out[#out + 1] = { time = #out * (hop or OHOP), note = note, rms = 0.1, lvl = 0.1,
+        freq = note and 440 * 2 ^ ((note - 69) / 12) or nil }
+    end
+  end
+  return out
+end
+local function all_near(fr, want, tol, msg)
+  for i, f in ipairs(fr) do if f.note then near(f.note, want, tol, msg .. " frame " .. i) end end
+end
+
+test("octave_fix_drop_in_note", function()   -- the verse: 2 of 27 frames one octave down
+  local fr = oct_frames({ { 5, 58.8 }, { 2, 47.0 }, { 20, 58.8 } })
+  eq(S.K.octave_fix(fr), 2, "frames changed")
+  all_near(fr, 58.8, 0.21, "pitch")
+  near(fr[6].note, 59.0, 1e-9, "moved by exactly 12")
+  near(fr[6].freq, 440 * 2 ^ ((59.0 - 69) / 12), 1e-6, "freq follows")
+end)
+
+test("octave_fix_spikes_in_held_note", function()   -- the chorus: many short runs one octave up
+  local fr = oct_frames({ { 7, 66.3 }, { 4, 78.3 }, { 9, 66.3 }, { 8, 78.4 }, { 19, 66.3 }, { 5, 78.4 }, { 26, 66.3 },
+    { 4, 78.4 }, { 2, 66.3 }, { 1, 78.4 }, { 5, 66.3 }, { 2, 78.4 }, { 30, 66.3 } })
+  eq(S.K.octave_fix(fr), 24, "frames changed")
+  all_near(fr, 66.3, 0.11, "pitch")
+end)
+
+test("octave_fix_spike_on_a_slide", function()
+  local fr = oct_frames({ { 30, 60 } })
+  for i, f in ipairs(fr) do f.note = 64.5 + 1.8 * (i - 1) / 29 end
+  for i = 12, 15 do fr[i].note = fr[i].note + 12 end
+  eq(S.K.octave_fix(fr), 4, "frames changed")
+  for i, f in ipairs(fr) do near(f.note, 64.5 + 1.8 * (i - 1) / 29, 1e-9, "on the slide, frame " .. i) end
+end)
+
+test("octave_fix_at_phrase_start_and_end", function()
+  local fr = oct_frames({ { 3, nil }, { 2, 48 }, { 30, 60 }, { 3, 72 }, { 3, nil } })
+  eq(S.K.octave_fix(fr), 5, "frames changed")
+  all_near(fr, 60, 1e-9, "pitch")
+end)
+
+test("octave_fix_two_octaves", function()
+  local fr = oct_frames({ { 20, 60 }, { 3, 84 }, { 20, 60 } })
+  eq(S.K.octave_fix(fr), 3, "frames changed")
+  all_near(fr, 60, 1e-9, "pitch")
+end)
+
+test("octave_fix_keeps_real_leaps", function()
+  local held = oct_frames({ { 40, 60 }, { 40, 72 } })
+  eq(S.K.octave_fix(held), 0, "a held octave leap")
+  local visit = oct_frames({ { 40, 60 }, { 16, 72 }, { 40, 60 } })   -- 16 frames = 171 ms, longer than MAX_RUN_S
+  eq(S.K.octave_fix(visit), 0, "an octave held for 171 ms")
+  eq(visit[45].note, 72, "untouched")
+  local fifth = oct_frames({ { 20, 60 }, { 3, 67 }, { 20, 60 } })
+  eq(S.K.octave_fix(fifth), 0, "a jump that is not an octave")
+  local gap = oct_frames({ { 20, 60 }, { 2, nil }, { 3, 72 }, { 2, nil }, { 20, 60 } })
+  eq(S.K.octave_fix(gap), 0, "a stretch between two unvoiced gaps is judged alone")
+  local tie = oct_frames({ { 5, 60 }, { 5, 72 } })
+  eq(S.K.octave_fix(tie), 0, "equal halves: no way to tell, nothing changes")
+end)
+
+test("octave_fix_any_hop_and_idempotent", function()
+  for _, hop in ipairs({ 256 / 48000, 512 / 48000, 256 / 44100 }) do
+    local wrong = math.floor(0.06 / hop)   -- 60 ms one octave up inside a 0.5 s note
+    local side = math.floor(0.22 / hop)
+    local fr = oct_frames({ { side, 60 }, { wrong, 72 }, { side, 60 } }, hop)
+    eq(S.K.octave_fix(fr), wrong, "frames changed at hop " .. hop)
+    all_near(fr, 60, 1e-9, "pitch at hop " .. hop)
+    eq(S.K.octave_fix(fr), 0, "a second run changes nothing at hop " .. hop)
+  end
+end)
+
+test("octave_fix_degenerate", function()
+  eq(S.K.octave_fix({}), 0, "no frames")
+  eq(S.K.octave_fix(oct_frames({ { 1, 60 } })), 0, "one frame")
+  eq(S.K.octave_fix(oct_frames({ { 20, nil } })), 0, "no pitch at all")
+  local same = oct_frames({ { 10, 60 }, { 2, 72 }, { 10, 60 } })
+  for _, f in ipairs(same) do f.time = 0 end
+  eq(S.K.octave_fix(same), 0, "equal times")
+end)
+
+test("octave_fix_real_items", function()   -- this machine only: the two takes of the 2026-11-23 report
+  local json = loadfile("_lib/json.lua")()
+  local function model(name)
+    local f = io.open(FIXTURE_DIR .. name, "rb")
+    if not f then return nil end
+    local data = json.decode(f:read("a"))
+    f:close()
+    return data
+  end
+  local verse, chorus = model("octave_verse_model.json"), model("octave_chorus_model.json")
+  if not verse or not chorus then print("SKIP octave_fix_real_items (no local fixture)") return end
+  S.K.octave_fix(verse.results)
+  for _, f in ipairs(verse.results) do
+    if f.time > 0.90 and f.time < 0.92 then near(f.note, 59.0, 0.5, "verse frame at " .. f.time) end
+  end
+  eq(S.K.octave_fix(chorus.results), 40, "chorus frames changed")
+  for _, f in ipairs(chorus.results) do
+    if f.time > 0.30 and f.time < 3.19 then near(f.note, 66.3, 1.5, "chorus frame at " .. f.time) end
+  end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
