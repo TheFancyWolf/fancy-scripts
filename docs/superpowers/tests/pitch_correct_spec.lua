@@ -2026,26 +2026,41 @@ test("track_any_hop", function()
   end
 end)
 
+-- Reads what the detector had to choose from, per frame: the recordings of 2026-11-23 and the files the developer
+-- switch writes (K.dump_text). Columns are found by the names in the header line; a file without a "lvl" column has
+-- the frame's rms as its level. Returns the frames { time, rms, lvl, cands = { { tau, d } ... } | nil }
+local function diag_parse(text)
+  local out, col = {}, nil
+  for line in text:gmatch("[^\n]+") do
+    if not line:match("^#") then
+      local cols = {}
+      for cell in (line .. "\t"):gmatch("(.-)\t") do cols[#cols + 1] = cell end
+      if not col then
+        col = {}
+        for i, name in ipairs(cols) do col[name] = i end
+      else
+        local fr = { time = tonumber(cols[col.time]), rms = tonumber(cols[col.rms]) }
+        fr.lvl = col.lvl and tonumber(cols[col.lvl]) or fr.rms
+        if cols[col.how] ~= "unvoiced" then
+          fr.cands = {}
+          for tau, d in (cols[col.dips] or ""):gmatch("([%d%.]+):([%d%.]+)") do
+            fr.cands[#fr.cands + 1] = { tau = tonumber(tau), d = tonumber(d) }
+          end
+        end
+        out[#out + 1] = fr
+      end
+    end
+  end
+  return out
+end
 -- This machine only: what the detector had to choose from on the two reported items, recorded in real REAPER on
 -- 2026-11-23 (per frame: every dip of the difference function). Returns the frames, or nil
 local function diag_frames(name)
   local f = io.open(FIXTURE_DIR .. "detector-diag-2026-11-23/" .. name, "rb")
   if not f then return nil end
-  local out = {}
-  for line in f:lines() do
-    if not line:match("^#") and not line:match("^time") then
-      local cols = {}
-      for col in (line .. "\t"):gmatch("(.-)\t") do cols[#cols + 1] = col end
-      local fr = { time = tonumber(cols[1]), rms = tonumber(cols[3]), lvl = tonumber(cols[3]) }
-      if cols[4] ~= "unvoiced" then
-        fr.cands = {}
-        for tau, d in (cols[10] or ""):gmatch("(%d+):([%d%.]+)") do fr.cands[#fr.cands + 1] = { tau = tonumber(tau), d = tonumber(d) } end
-      end
-      out[#out + 1] = fr
-    end
-  end
+  local text = f:read("a")
   f:close()
-  return out
+  return diag_parse(text)
 end
 -- How many frames read more than 6 st from the middle pitch of the 12 frames each side (octave errors, mostly)
 local function frames_off(fr)
@@ -2270,6 +2285,654 @@ test("analysis_pitch_range_follows_the_final_choice", function()
     near(low, want, 1e-6, "lowest pitch after the choice"); near(high, want, 1e-6, "highest pitch after the choice")
   end)
   st.results, st.notes, st.split_points, st.separation, st.sample_rate = table.unpack(saved, 1, 5)
+  if not ok then error(err, 0) end
+end)
+
+-- Analyze All Selected Items (docs/design/pitch-correct-analyze-selected.md) ----------------------------------------
+
+-- Every analysis reads the uncorrected audio: the accessor is made while the take's Pitch envelope is bypassed
+local ENV_CHUNK = "<PITCHENV\nEGUID {E}\nACT 1 -1\nVIS 1 1 1\nPT 0 0 0\nPT 0.5 0.244 5 0\n>"
+local function with_envelope(chunk, create, fn)   -- runs fn(log) with the envelope and accessor calls recorded
+  local log = {}
+  reaper.GetTakeEnvelopeByName = function() return chunk and "ENV" or nil end
+  reaper.GetEnvelopeStateChunk = function() return true, chunk end
+  reaper.SetEnvelopeStateChunk = function(_, c) log[#log + 1] = "set:" .. c; return true end
+  reaper.CreateTakeAudioAccessor = function() log[#log + 1] = "create"; return create() end
+  local ok, err = pcall(fn, log)
+  reaper.GetTakeEnvelopeByName, reaper.GetEnvelopeStateChunk, reaper.SetEnvelopeStateChunk,
+    reaper.CreateTakeAudioAccessor = nil, nil, nil, nil
+  if not ok then error(err, 0) end
+end
+
+test("open_accessor_reads_around_the_envelope", function()
+  with_envelope(ENV_CHUNK, function() return "ACC" end, function(log)
+    eq(S.K.open_accessor("TAKE"), "ACC")
+    eq(#log, 3, "calls")
+    eq(log[1], "set:" .. (ENV_CHUNK:gsub("ACT 1", "ACT 0", 1)), "bypassed first")
+    eq(log[2], "create")
+    eq(log[3], "set:" .. ENV_CHUNK, "put back byte for byte")
+  end)
+end)
+
+test("open_accessor_restores_when_creation_fails", function()
+  with_envelope(ENV_CHUNK, function() error("boom") end, function(log)
+    eq(S.K.open_accessor("TAKE"), nil)
+    eq(log[#log], "set:" .. ENV_CHUNK, "envelope put back")
+  end)
+end)
+
+test("open_accessor_leaves_other_envelopes_alone", function()
+  for _, chunk in ipairs({ false, (ENV_CHUNK:gsub("ACT 1", "ACT 0", 1)), "<PITCHENV\nACT 1 -1\nVIS 1 1 1\n>" }) do
+    with_envelope(chunk, function() return "ACC" end, function(log)
+      eq(S.K.open_accessor("TAKE"), "ACC")
+      eq(#log, 1, "only the accessor is created"); eq(log[1], "create")
+    end)
+  end
+end)
+
+test("analysis_begin_refuses_offline_media", function()
+  local st = S.state
+  local asked = false
+  reaper.GetMediaItemTake_Source = function() return "SRC" end
+  reaper.GetMediaSourceSampleRate = function(src) asked = (src == "SRC"); return 0 end
+  local created = false
+  reaper.CreateTakeAudioAccessor = function() created = true; return "ACC" end
+  local ok, reason = S.K.analysis_begin("TAKE", "ITEM")
+  reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate, reaper.CreateTakeAudioAccessor = nil, nil, nil
+  eq(asked, true, "the source was asked for its rate")
+  eq(ok, false); eq(reason, "offline"); eq(st.is_analyzing == true, false, "not analysing")
+  eq(created, false, "nothing was opened")
+end)
+
+test("analysis_begin_uses_the_rate_it_is_given", function()
+  local st = S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.results, st.sample_rate, st.item_len, st.end_time }
+  reaper.GetMediaItemTake_Source = function() return "SRC" end
+  reaper.GetMediaSourceSampleRate = function() return 0 end   -- REAPER in the background: no rate to be had
+  reaper.CreateTakeAudioAccessor = function() return "ACC" end
+  reaper.GetMediaItemInfo_Value = function() return 3 end
+  local undo_blocks = 0
+  reaper.Undo_BeginBlock = function() undo_blocks = undo_blocks + 1 end
+  local ok = S.K.analysis_begin("TAKE", "ITEM", { sample_rate = 44100, defer_envelope = true })
+  local got = { ok, st.sample_rate, st.is_analyzing, st.accessor, st.item_len }
+  S.K.release_analysis()
+  reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate, reaper.CreateTakeAudioAccessor,
+    reaper.GetMediaItemInfo_Value, reaper.Undo_BeginBlock = nil, nil, nil, nil, nil
+  st.target_take_guid, st.target_take_name, st.results, st.sample_rate, st.item_len, st.end_time = table.unpack(saved, 1, 6)
+  eq(got[1], true); eq(got[2], 44100); eq(got[3], true); eq(got[4], "ACC"); eq(got[5], 3)
+  eq(undo_blocks, 0, "defer_envelope: no undo point of its own")
+end)
+
+-- The developer switch (ExtState FancyScripts / pitch_dev_dump): what the detector saw, one file per item
+local DUMP_PARAMS = { block_size = 1024, hop_size = 512, threshold = 0.08, min_freq = 65, max_freq = 1000 }
+local function dump_results()
+  return {
+    { time = 0.010667, rms = 0.0007, lvl = 0.0006 },
+    { time = 0.064, freq = 337.22, rms = 0.02487, lvl = 0.0231,
+      cands = { { tau = 142.337, d = 0.0182 }, { tau = 284.5, d = 0.0507 } } },
+  }
+end
+
+test("dump_name", function()
+  eq(S.K.dump_name("V Main: Verse/1", "{AB12-CD}"), "diag_V_Main__Verse_1_AB12-CD.tsv")
+  eq(S.K.dump_name("", "{X}"), "diag_item_X.tsv")
+end)
+
+test("dump_text_format", function()
+  local lines = {}
+  for line in S.K.dump_text(DUMP_PARAMS, 48000, dump_results()):gmatch("[^\n]+") do lines[#lines + 1] = line end
+  eq(lines[1], "# sr=48000 block=1024 hop=512 th=0.08 min=65 max=1000")
+  eq(lines[2], "time\tfreq\trms\thow\tlvl\tdips")
+  eq(lines[3], "0.010667\t-1.000\t0.00070\tunvoiced\t0.00060\t")
+  eq(lines[4], "0.064000\t337.220\t0.02487\tvoiced\t0.02310\t142.337:0.0182 284.500:0.0507")
+  eq(#lines, 4)
+end)
+
+test("dump_round_trip", function()
+  local fr = diag_parse(S.K.dump_text(DUMP_PARAMS, 48000, dump_results()))
+  eq(#fr, 2)
+  eq(fr[1].cands, nil, "an unvoiced frame has no candidates")
+  near(fr[2].time, 0.064, 1e-6); near(fr[2].rms, 0.02487, 1e-5); near(fr[2].lvl, 0.0231, 1e-5)
+  eq(#fr[2].cands, 2); near(fr[2].cands[1].tau, 142.337, 1e-3); near(fr[2].cands[2].d, 0.0507, 1e-4)
+end)
+
+test("dump_reader_still_reads_the_recordings_of_2026_11_23", function()
+  local fr = diag_parse("# sr=48000 block=1024 hop=512 th=0.08 min=65 max=1000\n"
+    .. "time\tfreq\trms\thow\ttau\tW\tmin_tau\tmax_tau\tedge\tdips\n"
+    .. "0.000000\t-1.000\t0.00027\tunvoiced\t487\t512\t48\t512\t1.0127\t487:0.7824\n"
+    .. "0.053333\t333.208\t0.01981\tglobal\t144\t512\t48\t512\t1.1187\t116:0.5025 144:0.0912\n")
+  eq(#fr, 2); eq(fr[1].cands, nil); near(fr[2].rms, 0.01981, 1e-9); near(fr[2].lvl, 0.01981, 1e-9, "no lvl column: rms")
+  eq(#fr[2].cands, 2); eq(fr[2].cands[2].tau, 144); near(fr[2].cands[2].d, 0.0912, 1e-9)
+end)
+
+test("dev_dump_off_by_default_and_on", function()
+  eq(S.K.dev_dump("Take", "{G}", DUMP_PARAMS, 48000, dump_results()), nil, "off: the switch is empty")
+  local dir = os.tmpname(); os.remove(dir); os.execute('mkdir "' .. dir .. '"')
+  reaper.GetExtState = function(_, key) return key == "pitch_dev_dump" and dir or "" end
+  local path = S.K.dev_dump("Take", "{G}", DUMP_PARAMS, 48000, dump_results())
+  reaper.GetExtState = function() return "" end   -- the harness's own stub
+  eq(path, dir .. "/diag_Take_G.tsv")
+  local f = io.open(path, "rb"); local body = f:read("a"); f:close(); os.remove(path); os.remove(dir)
+  eq(body, S.K.dump_text(DUMP_PARAMS, 48000, dump_results()))
+end)
+
+-- What a batch is made of: the selection, the counts, the copy
+local MOD = S.K.MOD_LABEL
+
+local function with_selection(items, fn)   -- items: { { take = id | nil, midi = bool, name, len, sr, track, pos } }
+  reaper.CountSelectedMediaItems = function() return #items end
+  reaper.GetSelectedMediaItem = function(_, i) return items[i + 1] end
+  reaper.GetActiveTake = function(it) return it.take end
+  reaper.TakeIsMIDI = function(tk) for _, it in ipairs(items) do if it.take == tk then return it.midi == true end end end
+  reaper.GetSetMediaItemTakeInfo_String = function(tk, key) if key == "GUID" then return true, "{" .. tk .. "}" end return false, "" end
+  reaper.GetTakeName = function(tk) for _, it in ipairs(items) do if it.take == tk then return it.name end end end
+  reaper.GetMediaItemInfo_Value = function(it, key) return key == "D_LENGTH" and (it.len or 1) or (it.pos or 0) end
+  reaper.GetMediaItemTake_Source = function(tk) return tk end
+  reaper.GetMediaSourceSampleRate = function(tk) for _, it in ipairs(items) do if it.take == tk then return it.sr or 48000 end end end
+  reaper.GetMediaItemTrack = function(it) return it end
+  reaper.GetTrackName = function(it) return true, it.track or "Vox" end
+  local ok, err = pcall(fn)
+  for _, name in ipairs({ "CountSelectedMediaItems", "GetSelectedMediaItem", "GetActiveTake", "TakeIsMIDI",
+    "GetSetMediaItemTakeInfo_String", "GetTakeName", "GetMediaItemInfo_Value", "GetMediaItemTake_Source",
+    "GetMediaSourceSampleRate", "GetMediaItemTrack", "GetTrackName", "GetProjectStateChangeCount" }) do reaper[name] = nil end
+  S.K.batch_peek_cache = nil
+  if not ok then error(err, 0) end
+end
+
+test("batch_selection_audio_only", function()
+  local st = S.state
+  st.session_takes["{b}"] = { notes = { {} }, results = { {} } }
+  st.session_takes["{d}"] = { notes = {}, results = { {} } }
+  with_selection({ { take = "a", name = "A", len = 10, pos = 4 }, { take = "m", midi = true }, { name = "empty" },
+      { take = "b", name = "B", len = 20, sr = 44100, track = "Dbl" }, { take = "d", name = "D" } }, function()
+    local sel = S.K.batch_selection()
+    eq(#sel.takes, 3); eq(sel.skipped, 2)
+    eq(sel.takes[1].guid, "{a}"); eq(sel.takes[1].name, "A"); eq(sel.takes[1].len, 10); eq(sel.takes[1].pos, 4)
+    eq(sel.takes[1].has_notes, false)
+    eq(sel.takes[2].guid, "{b}"); eq(sel.takes[2].sample_rate, 44100); eq(sel.takes[2].track, "Dbl"); eq(sel.takes[2].has_notes, true)
+    eq(sel.takes[3].has_notes, false, "analysed without notes: nothing to lose")
+  end)
+  st.session_takes["{b}"], st.session_takes["{d}"] = nil, nil
+end)
+
+test("batch_peek_is_cached", function()
+  local calls = 0
+  with_selection({ { take = "a" }, { take = "b" } }, function()
+    local get = reaper.GetSelectedMediaItem
+    reaper.GetSelectedMediaItem = function(...) calls = calls + 1; return get(...) end
+    reaper.GetProjectStateChangeCount = function() return 7 end
+    eq(S.K.batch_peek(10).n, 2); local first = calls
+    S.K.batch_peek(10.1); eq(calls, first, "same selection, same project state, under 0.25 s: no walk")
+    S.K.batch_peek(10.3); eq(calls > first, true, "walked again after 0.25 s")
+  end)
+end)
+
+test("batch_copy", function()
+  local K = S.K
+  eq(K.batch_label(1), "Analyze Item"); eq(K.batch_label(0), "Analyze Item")
+  eq(K.batch_label(2), "Analyze All Selected Items"); eq(K.batch_label(12, true), "Analyze All")
+  local a, b = K.batch_lines({ n = 1, skipped = 0, with_notes = 0, target_in = true })
+  eq(a, "No data. Select an item and click Analyze."); eq(b, "Select several items in REAPER to analyze them all at once.")
+  a, b = K.batch_lines({ n = 12, skipped = 0, with_notes = 0, target_in = true })
+  eq(a, "12 audio items selected."); eq(b, nil)
+  a, b = K.batch_lines({ n = 12, skipped = 2, with_notes = 3, target_in = false })
+  eq(a, "12 audio items selected (2 other items are skipped). This item is not one of them.")
+  eq(b, "3 already have notes. You will be asked before they are replaced.")
+  a, b = K.batch_lines({ n = 2, skipped = 1, with_notes = 1, target_in = true })
+  eq(a, "2 audio items selected (1 other item is skipped)."); eq(b, "1 already has notes. You will be asked before it is replaced.")
+  eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another. One undo step for all of them.")
+  eq(K.batch_undo_label(12), "Analyze Pitch (12 items)"); eq(K.batch_undo_label(1), "Analyze Pitch (1 item)")
+end)
+
+test("batch_confirm_copy", function()
+  local K = S.K
+  local function entries(n, with)
+    local out = {}
+    for i = 1, n do out[i] = { guid = "{" .. i .. "}", name = "N" .. i, track = "T", pos = i, has_notes = i <= with } end
+    return out
+  end
+  eq(K.batch_confirm(entries(3, 0)), nil, "nothing to replace: no confirm")
+  local c = K.batch_confirm(entries(12, 3))
+  eq(c.title, "Analyze 12 items?"); eq(c.confirm_label, "Analyze 12 Items")
+  eq(c.body_lines[1], "3 of them already have notes. Analyzing replaces their notes and any edits:")
+  eq(#c.list, 3); eq(c.list[2].name, "N2"); eq(c.list[2].track, "T"); eq(c.list[2].pos, 2)
+  eq(c.after_lines[1], MOD .. "+Z restores all 12 items in one step once the batch has finished.")
+  eq(K.batch_confirm(entries(12, 1)).body_lines[1], "1 of them already has notes. Analyzing replaces its notes and any edits:")
+  eq(K.batch_confirm(entries(12, 12)).body_lines[1], "All 12 already have notes. Analyzing replaces their notes and any edits:")
+end)
+
+test("batch_progress_by_audio_length", function()
+  local K = S.K
+  local b = K.batch_new({ { len = 10 }, { len = 30 }, { len = 0 } }, "{p}")
+  eq(b.total_len, 40); eq(b.prev_guid, "{p}"); eq(K.batch_progress(b, 0), 0)
+  b.index = 1; near(K.batch_progress(b, 0.5), 0.125, 1e-12)
+  b.index, b.done_len = 2, 10; near(K.batch_progress(b, 0.5), 0.625, 1e-12)
+  eq(K.batch_progress(K.batch_new({ { len = 0 } }), 0.5), 0, "no audio at all")
+end)
+
+test("batch_summary_copy", function()
+  local sum = S.K.batch_summary
+  eq(sum({ total = 12, written = 12, empty = 0, failed = 0 }), "Analyzed 12 items. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 1, written = 1, empty = 0, failed = 0 }), "Analyzed 1 item. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 11, empty = 1, failed = 1 }),
+    "Analyzed 11 of 12 items (1 has no pitched notes). 1 could not be analyzed. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 12, empty = 2, failed = 0 }), "Analyzed 12 items (2 have no pitched notes). " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 2, empty = 0, failed = 0, cancelled = true }),
+    "Batch cancelled. 2 of 12 items were analyzed and kept. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 1, empty = 0, failed = 0, cancelled = true }),
+    "Batch cancelled. 1 of 12 items was analyzed and kept. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 0, empty = 0, failed = 0, cancelled = true }), "Batch cancelled. Nothing was changed.")
+  eq(sum({ total = 12, written = 0, empty = 0, failed = 12 }), "None of the 12 items could be analyzed. Nothing was changed.")
+end)
+
+-- The queue of a batch and its single write
+-- A batch with the analysis itself and the write replaced by recorders. fn(rec) runs with takes "a".."c" selected.
+local function with_batch(fn)
+  local K, st = S.K, S.state
+  local saved = { K.analysis_begin, K.batch_write, st.target_take_guid, st.target_take_name }
+  local saved_model = { st.results, st.notes, st.split_points, st.analysis_empty, st.progress }
+  local rec = { begun = {}, writes = {} }
+  K.analysis_begin = function(take, _, opts)
+    rec.begun[#rec.begun + 1] = { take = take, sr = opts and opts.sample_rate, defer = opts and opts.defer_envelope }
+    if rec.refuse and rec.refuse[take] then return false, "accessor" end
+    st.is_analyzing = true
+    return true
+  end
+  K.batch_write = function(done) rec.writes[#rec.writes + 1] = done; return done end
+  K.drop_project_cache()
+  st.status.text, st.status.hold = "", nil
+  reaper.GetMediaItemTakeByGUID = function(_, guid) if rec.gone and rec.gone[guid] then return nil end return (guid:gsub("[{}]", "")) end
+  reaper.GetMediaItemTake_Item = function(take) return "item_" .. take end
+  local ok, err = pcall(fn, rec)
+  K.analysis_begin, K.batch_write, st.target_take_guid, st.target_take_name = table.unpack(saved, 1, 4)
+  st.results, st.notes, st.split_points, st.analysis_empty, st.progress = table.unpack(saved_model, 1, 5)
+  K.batch, st.is_analyzing = nil, false
+  st.status.text, st.status.hold = "", nil
+  reaper.GetMediaItemTakeByGUID, reaper.GetMediaItemTake_Item = nil, nil
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+local function entries3()
+  local out = {}
+  for i, id in ipairs({ "a", "b", "c" }) do
+    out[i] = { guid = "{" .. id .. "}", take = id, item = "item_" .. id, name = id:upper(), len = 10, sample_rate = 48000, has_notes = false }
+  end
+  return out
+end
+local function model(guid, notes) return { guid = guid, name = guid, results = { {} }, notes = notes or { { frames = {} } } } end
+
+test("batch_runs_queue_in_order", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3())
+  eq(#rec.begun, 1); eq(rec.begun[1].take, "a"); eq(rec.begun[1].sr, 48000); eq(rec.begun[1].defer, true)
+  eq(S.state.target_take_guid, "{a}", "the canvas follows the item in progress")
+  K.batch_item_done(model("{a}")); K.batch_item_done(model("{b}")); eq(#rec.writes, 0, "nothing is written while it runs")
+  near(K.analysis_progress(), 20 / 30, 1e-12)
+  K.batch_item_done(model("{c}"))
+  eq(#rec.writes, 1, "one write"); eq(#rec.writes[1], 3)
+  eq(rec.writes[1][1].guid, "{a}"); eq(rec.writes[1][3].guid, "{c}"); eq(type(rec.writes[1][1].json), "string")
+  eq(K.batch, nil); eq(S.state.is_analyzing, false)
+  eq(S.state.status.text, "Analyzed 3 items. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_skips_missing_and_offline", function() with_batch(function(rec)
+  local K = S.K
+  rec.gone = { ["{a}"] = true }
+  local e = entries3(); e[2].sample_rate = 0
+  K.batch_start(e)
+  eq(#rec.begun, 1); eq(rec.begun[1].take, "c", "the deleted and the offline item never start")
+  K.batch_item_done(model("{c}"))
+  eq(S.state.status.text, "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_uses_rates_from_the_click", function() with_batch(function(rec)
+  reaper.GetMediaSourceSampleRate = function() return 0 end   -- REAPER went to the background
+  S.K.batch_start(entries3()); S.K.batch_item_done(model("{a}"))
+  reaper.GetMediaSourceSampleRate = nil
+  eq(rec.begun[2].take, "b"); eq(rec.begun[2].sr, 48000)
+end) end)
+
+test("batch_item_failure_carries_on", function() with_batch(function(rec)
+  local K = S.K
+  rec.refuse = { b = true }
+  K.batch_start(entries3()); K.batch_item_done(model("{a}"))
+  eq(rec.begun[#rec.begun].take, "c", "b was refused, c is running")
+  K.batch_item_failed(nil)
+  eq(#rec.writes, 1); eq(#rec.writes[1], 1)
+  eq(S.state.status.text, "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_counts_items_without_notes", function() with_batch(function()
+  local K = S.K
+  K.batch_start(entries3())
+  K.batch_item_done(model("{a}", {})); K.batch_item_done(model("{b}")); K.batch_item_done(model("{c}"))
+  eq(S.state.status.text, "Analyzed 3 items (1 has no pitched notes). " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_cancel_keeps_finished", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3()); K.batch_item_done(model("{a}"))
+  eq(K.cancel_analysis(), true)
+  eq(#rec.writes, 1); eq(#rec.writes[1], 1); eq(K.batch, nil); eq(S.state.is_analyzing, false)
+  eq(S.state.status.text, "Batch cancelled. 1 of 3 items was analyzed and kept. " .. MOD .. "+Z to undo.")
+end) end)
+
+test("batch_cancel_before_any_item", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  st.target_take_guid, st.target_take_name = "{prev}", "Prev"
+  K.batch_start(entries3())
+  K.cancel_analysis()
+  eq(#rec.writes == 0 or #rec.writes[1] == 0, true, "nothing to write")
+  eq(st.target_take_guid, "{prev}", "the item that was open comes back")
+  eq(st.status.text, "Batch cancelled. Nothing was changed.")
+end) end)
+
+test("batch_queue_is_frozen", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3())
+  reaper.CountSelectedMediaItems = function() return 0 end   -- the user deselects everything
+  K.batch_item_done(model("{a}")); K.batch_item_done(model("{b}"))
+  reaper.CountSelectedMediaItems = nil
+  eq(rec.begun[3].take, "c")
+end) end)
+
+test("batch_tick_turns_an_error_into_a_failed_item", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local said = nil
+  reaper.ShowConsoleMsg = function(msg) said = msg end
+  K.batch_start(entries3())
+  st.is_analyzing, st.analysis_params = true, setmetatable({}, { __index = function() error("bad frame") end })
+  local ok, err = pcall(K.analysis_tick)
+  reaper.ShowConsoleMsg, st.analysis_params = nil, nil
+  if not ok then error(err, 0) end
+  eq(tostring(said):find("bad frame", 1, true) ~= nil, true, "the console has what was raised")
+  eq(rec.begun[#rec.begun].take, "b", "the batch moved on"); eq(K.batch.failed, 1)
+end) end)
+
+test("batch_tick_does_not_swallow_a_failed_write", function() with_batch(function()
+  local K, st = S.K, S.state
+  local saved = { st.results, st.notes, st.sample_rate, st.end_time, st.current_time }
+  K.batch_write = function() error("disk full") end
+  local e = entries3()
+  K.batch_start({ e[1] })
+  -- the item's last frame: nothing left to read, so this tick completes it and the batch ends by writing
+  st.results, st.sample_rate, st.end_time, st.current_time = {}, 48000, 0, 0
+  st.analysis_params = { block_size = 1024, hop_size = 512, threshold = 0.1, min_freq = 65, max_freq = 1000 }
+  local ok, err = pcall(K.analysis_tick)
+  st.results, st.notes, st.sample_rate, st.end_time, st.current_time = table.unpack(saved, 1, 5)
+  st.analysis_params = nil
+  eq(ok, false, "the window's own error handling must see it (it closes the undo block)")
+  eq(tostring(err):find("disk full", 1, true) ~= nil, true); eq(K.batch, nil)
+end) end)
+
+local function with_write_stubs(gone, fn, no_env)
+  local st = S.state
+  local rec = { begin = 0, labels = {}, stored = {}, cleared = {} }
+  reaper.Undo_BeginBlock = function() rec.begin = rec.begin + 1 end
+  reaper.Undo_EndBlock = function(label) rec.labels[#rec.labels + 1] = label end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) if gone[guid] then return nil end return (guid:gsub("[{}]", "")) end
+  reaper.GetMediaItemTake_Item = function(take) return "item_" .. take end
+  reaper.GetTakeEnvelopeByName = function(take) if no_env and no_env[take] then return nil end return "env_" .. take end
+  reaper.DeleteEnvelopePointRange = function(env) rec.cleared[#rec.cleared + 1] = env end
+  reaper.NamedCommandLookup = function() return 0 end
+  reaper.CountSelectedMediaItems = function() return 0 end
+  reaper.GetSetMediaItemTakeInfo_String = function(take, key, value, set)
+    if key == "GUID" then return true, "{" .. take .. "}" end
+    if set then rec.stored[take] = value end
+    return true, rec.stored[take] or ""
+  end
+  local order = #st.session_order
+  local ok, err = pcall(fn, rec)
+  for _, name in ipairs({ "Undo_BeginBlock", "Undo_EndBlock", "GetMediaItemTakeByGUID", "GetMediaItemTake_Item",
+    "GetTakeEnvelopeByName", "DeleteEnvelopePointRange", "NamedCommandLookup", "CountSelectedMediaItems",
+    "GetSetMediaItemTakeInfo_String" }) do reaper[name] = nil end
+  for _, g in ipairs({ "{a}", "{b}" }) do st.session_takes[g], st.raw_cache[g] = nil, nil end
+  while #st.session_order > order do table.remove(st.session_order) end
+  S.K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+local function done2()
+  local out = {}
+  for i, g in ipairs({ "{a}", "{b}" }) do
+    local data = { guid = g, name = g, results = {}, notes = {}, item_len = 1, sample_rate = 48000 }
+    out[i] = { guid = g, data = data, json = S.K.take_json(data), empty = true }
+  end
+  return out
+end
+
+test("batch_write_is_one_undo_block", function() with_write_stubs({}, function(rec)
+  local done = done2()
+  local written = S.K.batch_write(done)
+  eq(#written, 2); eq(rec.begin, 1, "one undo block"); eq(#rec.labels, 1); eq(rec.labels[1], "Analyze Pitch (2 items)")
+  eq(rec.stored.a, done[1].json); eq(rec.stored.b, done[2].json)
+  eq(#rec.cleared, 2, "each item's envelope is cleared of points"); eq(rec.cleared[1], "env_a")
+  eq(S.state.session_takes["{a}"], done[1].data); eq(S.state.undo_open, false)
+end) end)
+
+test("batch_write_skips_gone_takes", function()
+  with_write_stubs({ ["{a}"] = true }, function(rec)
+    local written = S.K.batch_write(done2())
+    eq(#written, 1); eq(written[1].guid, "{b}"); eq(rec.labels[1], "Analyze Pitch (1 item)")
+  end)
+  with_write_stubs({ ["{a}"] = true, ["{b}"] = true }, function(rec)
+    eq(#S.K.batch_write(done2()), 0); eq(rec.begin, 0, "nothing to write: no undo point")
+  end)
+end)
+
+test("take_json_is_what_save_writes", function() with_write_stubs({}, function(rec)
+  local data = { guid = "{a}", name = "A", results = { { time = 0, note = 60 } }, item_len = 2, sample_rate = 48000,
+    notes = { { start_time = 0, end_time = 1, avg_note = 60, display_note = 61, controls = { center_pitch = 62 }, frames = { 1 },
+      count = 99 } } }
+  local json = S.K.take_json(data)
+  for _, part in ipairs({ '"guid":"{a}"', '"name":"A"', '"sample_rate":48000', '"display_note":61', '"center_pitch":62' }) do
+    eq(json:find(part, 1, true) ~= nil, true, "stored text holds " .. part)
+  end
+  eq(json:find('"count"', 1, true), nil, "only what a note needs to be loaded again is stored")
+  S.K.batch_write({ { guid = "{a}", data = data } })   -- no text prepared: made at the write
+  eq(rec.stored.a, json)
+end) end)
+
+test("batch_write_leaves_an_item_whose_envelope_cannot_be_made", function() with_write_stubs({}, function(rec)
+  local written = S.K.batch_write(done2())
+  eq(#written, 1); eq(written[1].guid, "{b}"); eq(rec.stored.a, nil, "left as it was")
+  eq(S.state.session_takes["{a}"], nil); eq(rec.labels[1], "Analyze Pitch (1 item)")
+end, { a = true }) end)
+
+test("batch_opens_the_first_written_item", function() with_write_stubs({}, function()
+  local K, st = S.K, S.state
+  local saved = { K.analysis_begin, st.target_take_guid, st.target_take_name, st.results, st.notes }
+  K.analysis_begin = function() st.is_analyzing = true; return true end
+  local e = entries3()
+  local a, b = model("{a}", {}), model("{b}", {})
+  local ok, err = pcall(function()
+    K.batch_start({ e[1], e[2] })
+    K.batch_item_done(a); K.batch_item_done(b)
+    eq(K.batch, nil); eq(st.target_take_guid, "{a}", "the first item of the batch is open"); eq(st.results, a.results)
+    eq(st.status.text, "Analyzed 2 items (2 have no pitched notes). " .. MOD .. "+Z to undo.")
+  end)
+  K.analysis_begin, st.target_take_guid, st.target_take_name, st.results, st.notes = table.unpack(saved, 1, 5)
+  K.batch, st.is_analyzing, st.status.text, st.status.hold = nil, false, "", nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("batch_refuses_a_model_of_another_item", function() with_batch(function(rec)
+  local K = S.K
+  K.batch_start(entries3())
+  -- the item in progress left the project and the open item was re-pointed at whatever is selected: its frames
+  -- must never be stored under that other item
+  K.batch_item_done(model("{x}"))
+  eq(#K.batch.done, 0); eq(K.batch.failed, 1); eq(rec.begun[#rec.begun].take, "b", "the batch moved on")
+end) end)
+
+test("batch_moves_on_when_its_analysis_was_dropped", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  K.batch_start(entries3())
+  K.release_analysis()   -- something else in the window dropped the running analysis
+  K.analysis_tick()
+  eq(K.batch.failed, 1); eq(rec.begun[#rec.begun].take, "b"); eq(st.is_analyzing, true)
+end) end)
+
+test("batch_keeps_each_items_key_and_scale", function() with_batch(function()
+  local K, st = S.K, S.state
+  st.session_takes["{a}"] = { key_idx = 5, scale_idx = 3, notes = {}, results = {} }
+  local ok, err = pcall(function()
+    K.batch_start(entries3())
+    local m = model("{a}"); m.key_idx, m.scale_idx = 1, 1   -- what the open item had when the batch started
+    K.batch_item_done(m)
+    eq(K.batch.done[1].data.key_idx, 5, "the item's own key"); eq(K.batch.done[1].data.scale_idx, 3)
+    local n = model("{b}"); n.key_idx, n.scale_idx = 1, 1
+    K.batch_item_done(n)
+    eq(K.batch.done[2].data.key_idx, 1, "an item analysed for the first time takes the current key")
+  end)
+  st.session_takes["{a}"] = nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("batch_fails_a_long_item_that_gave_no_audio", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  K.batch_start(entries3())
+  st.results, st.sample_rate, st.end_time, st.current_time = {}, 48000, 5, 6   -- five seconds, read to the end, no frame
+  st.analysis_params = { block_size = 1024, hop_size = 512, threshold = 0.1, min_freq = 65, max_freq = 1000 }
+  K.analysis_tick()
+  st.analysis_params = nil
+  eq(#K.batch.done, 0, "never stored as an analysis without notes"); eq(K.batch.failed, 1)
+  eq(rec.begun[#rec.begun].take, "b")
+end) end)
+
+test("batch_request_asks_about_notes_the_list_does_not_know", function()
+  local st = S.state
+  with_selection({ { take = "a", name = "A" }, { take = "b", name = "B", track = "Dbl" } }, function()
+    -- b holds a stored analysis the script has not loaded (pasted after the script started)
+    reaper.GetSetMediaItemTakeInfo_String = function(tk, key)
+      if key == "GUID" then return true, "{" .. tk .. "}" end
+      return true, tk == "b" and "{stored}" or ""
+    end
+    S.K.batch_request()
+    local c = st.confirm
+    st.confirm = nil
+    eq(type(c), "table", "asked first"); eq(c.id, "batch"); eq(#c.list, 1); eq(c.list[1].name, "B")
+  end)
+end)
+
+-- The window: the held closing message, the batch's status line, the confirm's list
+test("status_hold_stays_until_released", function()
+  local K, st = S.K, S.state
+  local now = 100
+  reaper.time_precise = function() return now end
+  st.frame.take, st.target_take_name = nil, nil
+  K.status_hold("Analyzed 12 items.")
+  now = 10000
+  eq(K.status_line(false), "Analyzed 12 items.", "still there long after the usual four seconds")
+  K.status_release()
+  eq(K.status_line(false) ~= "Analyzed 12 items.", true, "gone after the next input")
+  st.status.text, st.status.until_time, st.status.hold = "plain", now + 4, nil
+  K.status_release()
+  eq(st.status.text, "plain", "releasing does not touch an ordinary message")
+  reaper.time_precise = nil
+  st.status.text = ""
+end)
+
+test("batch_status_line", function()
+  local K, st = S.K, S.state
+  reaper.time_precise = function() return 0 end
+  st.status.text, st.status.hold = "", nil
+  K.batch = K.batch_new({ { len = 10, name = "A" }, { len = 30, name = "V Main Verse 3" } })
+  K.batch.index, K.batch.done_len, st.is_analyzing, st.progress = 2, 10, true, 0.5
+  eq(K.status_line(false), "Analyzing 2 of 2: V Main Verse 3… 62%")
+  K.batch, st.is_analyzing, st.progress = nil, false, 0
+  reaper.time_precise = nil
+end)
+
+test("confirm_carries_the_list", function()
+  local st = S.state
+  local req = S.K.batch_confirm({ { guid = "{a}", name = "A", track = "Vox", pos = 1, has_notes = true }, { guid = "{b}", name = "B", has_notes = false } })
+  req.id, req.on_confirm = "batch", function() end
+  S.request_confirm(req)
+  eq(st.confirm.id, "batch"); eq(#st.confirm.list, 1); eq(st.confirm.list[1].name, "A")
+  eq(st.confirm.after_lines[1], MOD .. "+Z restores all 2 items in one step once the batch has finished.")
+  st.confirm = nil
+end)
+
+-- Undo takes a batch's items out of the list; redo must bring every one of them back, not only the open item
+test("sync_brings_back_a_redone_analysis", function()
+  local K, st = S.K, S.state
+  local data = { guid = "{a}", name = "A", results = { { time = 0, note = 60 } }, notes = {}, item_len = 1, sample_rate = 48000 }
+  local json = K.take_json(data)
+  local raw, changes = json, 1
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.last_change_count, #st.session_order }
+  st.target_take_guid = "{other}"
+  st.session_takes["{a}"], st.raw_cache["{a}"] = data, json
+  st.session_order[#st.session_order + 1] = "{a}"
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    raw, changes = "", 2           -- the batch was undone: the take holds no analysis
+    st.last_change_count = 1
+    S.sync_with_project()
+    eq(st.session_takes["{a}"], nil, "undone: out of the list")
+    K.drop_project_cache()
+    raw, changes = json, 3         -- and redone
+    S.sync_with_project()
+    eq(type(st.session_takes["{a}"]), "table", "redone: back in the list")
+    eq(st.session_order[#st.session_order], "{a}")
+    K.drop_project_cache()
+    changes = 4                    -- a later change does not list it twice
+    S.sync_with_project()
+    local listed = 0
+    for _, g in ipairs(st.session_order) do if g == "{a}" then listed = listed + 1 end end
+    eq(listed, 1)
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"] = nil, nil, nil
+  while #st.session_order > saved[3] do table.remove(st.session_order) end
+  st.target_take_guid, st.last_change_count = saved[1], saved[2]
+  if st.undone_takes then st.undone_takes["{a}"] = nil end
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
+-- A held closing message describes the analyses as the batch left them: it ends when an undo or a redo changes one,
+-- not on any other change in REAPER
+test("held_message_goes_when_an_analysis_changes", function()
+  local K, st = S.K, S.state
+  local data = { guid = "{a}", name = "A", results = { { time = 0, note = 60 } }, notes = {}, item_len = 1, sample_rate = 48000 }
+  local json = K.take_json(data)
+  local raw, changes = json, 5
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.last_change_count, #st.session_order }
+  st.target_take_guid = "{other}"
+  st.session_takes["{a}"], st.raw_cache["{a}"] = data, json
+  st.session_order[#st.session_order + 1] = "{a}"
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    K.status_hold("Analyzed 3 items.")
+    st.last_change_count = nil     -- as a batch leaves it: the next frame reads the project again
+    S.sync_with_project()
+    eq(st.status.text, "Analyzed 3 items.", "the batch's own resync keeps it")
+    K.drop_project_cache()
+    changes = 6                    -- the edit cursor moved, a fader was touched: no analysis changed
+    S.sync_with_project()
+    eq(st.status.text, "Analyzed 3 items.", "another change in REAPER keeps it")
+    K.drop_project_cache()
+    raw, changes = "", 7           -- Cmd+Z: the item is not analysed any more
+    S.sync_with_project()
+    eq(st.status.text, "", "gone once an analysis changed")
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"], st.undone_takes["{a}"] = nil, nil, nil, nil
+  while #st.session_order > saved[3] do table.remove(st.session_order) end
+  st.target_take_guid, st.last_change_count, st.status.text, st.status.hold = saved[1], saved[2], "", nil
+  K.drop_project_cache()
   if not ok then error(err, 0) end
 end)
 

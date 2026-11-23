@@ -1,12 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.20.0
+-- @version 2.21.0
 -- @changelog
---   Pitch detection: each moment's pitch is now chosen together with the moments around it, not on its own. A note read an octave too high (a strong overtone) or too low (a shaky note start) is now read right, without relying on the repair added in 2.19.1
---   The Detection setting now only decides what counts as a pitched sound; it no longer changes which octave a note is read in
---   The pitch line and the notes sit half an analysis block later (about 10 ms at Standard quality), where the sound actually is; they were drawn early. The line now starts and ends that far inside the item
---   No more false low reading at the very end of an item
---   Analyze an item again to get this
+--   Analyze All Selected Items: with two or more audio items selected in REAPER, the button on an empty item analyzes all of them, one after another, as one undo step. The same command is in the "…" menu as "Analyze Selected Items (N)"
+--   Before a batch replaces notes you already have, it asks once and lists those items
+--   Cancel during a batch keeps the items already finished; a closing message says how many were analyzed
+--   Re-Analyze now reads the true pitch of an item that has corrections (it used to read the corrected sound)
+--   The Pitched Items list cannot be changed while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -245,6 +245,10 @@ local K = {
 
   -- Analysis Cancel: More's Analyze item turns into this while an analysis runs (see hdr_draw_more)
   CANCEL_FMT = "Cancel %d%%",
+  CANCEL_BATCH_FMT = "Cancel Batch %d%%",   -- ... and into this while a batch runs
+  CANCEL_BATCH_TIP = "Stops the batch. Items already finished are kept.",
+  REASON_ANALYZING = "Wait for the analysis to finish",   -- why the Pitched Items rows and the batch entry are locked
+  REASON_BATCH_FEW = "Select 2 or more audio items",
   CANCELLED_TEXT = "Analysis cancelled.",
 
   -- Error recovery (see loop): the window shows this, with Retry and Close, instead of disappearing
@@ -433,6 +437,7 @@ local state = {
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
   raw_cache = {},           -- [guid] = raw P_EXT string last written or loaded by this script
   missing_takes = {},       -- [guid] = true when the take no longer resolves (row is kept in the sidebar)
+  undone_takes = {},        -- [guid] = n: an undo took the take's analysis away (n: in which order); a redo may bring it back (sync_with_project)
   stale_takes = {},         -- [guid] = true: the take's pitch envelope is not what today's settings and its notes would write (K.envelope_check)
   stale_env = {},           -- [guid] = { points }: the envelope a stale take really holds, for the preview curve of the open item
   stale_queue = {},         -- guids whose envelope is still to be compared (one per frame, K.stale_check_step)
@@ -536,18 +541,73 @@ end
 local function set_status(msg)
   state.status.text = msg or ""
   state.status.until_time = reaper.time_precise() + K.STATUS_SECONDS
+  state.status.hold = nil
+end
+
+--- Show a message on the status pill until the user's next input in the window (K.status_release), not for
+--- STATUS_SECONDS: the outcome of long work that may end while nobody is looking (a batch).
+K.status_hold = function(msg)
+  state.status.text = msg or ""
+  state.status.until_time = math.huge
+  state.status.hold = true
+end
+
+--- The user did something in the window: a message held by K.status_hold goes. Any other message keeps its time.
+K.status_release = function()
+  if not state.status.hold then return end
+  state.status.text, state.status.until_time, state.status.hold = "", 0, nil
+end
+
+-- A held message is not released by input that came before it could be read (seconds)
+K.STATUS_HOLD_MIN_S = 0.5
+-- The keys that count as input for releasing a held message (letters and digits arrive as typed characters)
+K.STATUS_KEYS = {
+  reaper.ImGui_Key_Escape(), reaper.ImGui_Key_Enter(), reaper.ImGui_Key_KeypadEnter(), reaper.ImGui_Key_Space(),
+  reaper.ImGui_Key_Delete(), reaper.ImGui_Key_Backspace(), reaper.ImGui_Key_Tab(), reaper.ImGui_Key_LeftArrow(),
+  reaper.ImGui_Key_RightArrow(), reaper.ImGui_Key_UpArrow(), reaper.ImGui_Key_DownArrow(),
+}
+
+--- Once per frame, inside the window: release a held message on the user's next input in the window: a click or
+--- wheel move over it, or a key while it has the focus. The keys are only looked at (IsKeyDown), never taken:
+--- Esc, Space and the others keep doing what they do.
+K.status_watch = function(wctx)
+  local status = state.status
+  if not status.hold then
+    status.held_since = nil
+    return
+  end
+  local now = reaper.time_precise()
+  status.held_since = status.held_since or now
+  if now - status.held_since < K.STATUS_HOLD_MIN_S then return end
+  local input = false
+  if reaper.ImGui_IsWindowHovered(wctx, reaper.ImGui_HoveredFlags_RootAndChildWindows()) then
+    input = reaper.ImGui_IsMouseClicked(wctx, 0) or reaper.ImGui_IsMouseClicked(wctx, 1)
+      or (reaper.ImGui_GetMouseWheel(wctx) or 0) ~= 0
+  end
+  if not input and reaper.ImGui_IsWindowFocused(wctx, reaper.ImGui_FocusedFlags_RootAndChildWindows()) then
+    input = (reaper.ImGui_GetInputQueueCharacter(wctx, 0)) == true
+    for _, key in ipairs(K.STATUS_KEYS) do
+      if input then break end
+      input = reaper.ImGui_IsKeyDown(wctx, key)
+    end
+  end
+  if input then K.status_release() end
 end
 
 --- Ask the user to confirm a destructive action. draw_confirm_modal() shows the modal.
---- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function, on_cancel = function | nil }
+--- req = { id, title, body_lines = { string... }, confirm_label, on_confirm = function, on_cancel = function | nil,
+---         list = { { name, where } ... } | nil, after_lines = { string... } | nil }
 --- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once, or on_cancel once when
---- the modal closes without confirming.
+--- the modal closes without confirming. list: the things the action replaces, shown under body_lines in a region
+--- that scrolls (K.confirm_list); after_lines follow it.
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
   state.confirm = {
     id = req.id or "action",
     title = req.title or "Are you sure?",
     body_lines = req.body_lines or {},
+    list = req.list,
+    after_lines = req.after_lines or {},
     confirm_label = req.confirm_label or "Confirm",
     on_confirm = req.on_confirm,
     on_cancel = req.on_cancel,
@@ -1157,6 +1217,51 @@ K.release_analysis = function()
   if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
 end
 
+--- Developer switch (no interface): ExtState FancyScripts / pitch_dev_dump holds a folder, empty by default. While it
+--- is set, every analysis also writes what the detector saw, one text file per item, so a change to the detector can
+--- be judged again without reading the audio again (docs/superpowers/tests/pitch_correct_spec.lua reads the files).
+
+--- The file name of an item's dump: the take's name (anything but letters, digits and "-" becomes "_") and its GUID.
+K.dump_name = function(take_name, guid)
+  local name = tostring(take_name or ""):gsub("[^%w%-]", "_")
+  if name == "" then name = "item" end
+  return "diag_" .. name .. "_" .. tostring(guid or ""):gsub("[{}]", "") .. ".tsv"
+end
+
+--- The dump of one analysis: a header line with the engine values, a line of column names, then one line per frame
+--- (its time, the block's own reading or -1, rms, voiced / unvoiced, the short level, and every candidate period as
+--- tau:d). `results` must still hold the candidates: K.pitch_track removes them.
+K.dump_text = function(params, sample_rate, results)
+  local lines = {
+    string.format("# sr=%g block=%g hop=%g th=%g min=%g max=%g", sample_rate, params.block_size, params.hop_size,
+      params.threshold, params.min_freq, params.max_freq),
+    "time\tfreq\trms\thow\tlvl\tdips",
+  }
+  for _, f in ipairs(results) do
+    local dips = {}
+    for _, c in ipairs(f.cands or {}) do dips[#dips + 1] = string.format("%.3f:%.4f", c.tau, c.d) end
+    lines[#lines + 1] = string.format("%.6f\t%.3f\t%.5f\t%s\t%.5f\t%s", f.time or 0, f.freq or -1, f.rms or 0,
+      f.cands and "voiced" or "unvoiced", f.lvl or 0, table.concat(dips, " "))
+  end
+  return table.concat(lines, "\n") .. "\n"
+end
+
+--- Write an item's dump when the developer switch is set. Returns the file's path, or nil (the switch is empty, or
+--- the folder could not be written: the status line says so).
+K.dev_dump = function(take_name, guid, params, sample_rate, results)
+  local folder = reaper.GetExtState("FancyScripts", "pitch_dev_dump")
+  if not folder or folder == "" then return nil end
+  local path = folder:gsub("[/\\]+$", "") .. "/" .. K.dump_name(take_name, guid)
+  local file = io.open(path, "wb")
+  if not file then
+    set_status("Dev dump: couldn't write to " .. folder)
+    return nil
+  end
+  file:write(K.dump_text(params, sample_rate, results))
+  file:close()
+  return path
+end
+
 --- The Monitoring FX chain's host: the master track (nil if REAPER gives none).
 local function tone_master()
   return reaper.GetMasterTrack(0)
@@ -1331,15 +1436,49 @@ local function pitch_envelope_needs_setup(take)
   return chunk:match("ACT%s+0") ~= nil or chunk:match("VIS%s+0") ~= nil
 end
 
-local function start_analysis()
-  -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
-  -- get_target_take() falls back to the selected audio item only when there is no usable target.
-  local take, item = get_target_take()
-
-  if not item or not take then
-    set_status("Select an audio item first")
-    return
+--- An audio accessor that reads the take without its pitch correction. REAPER's take accessor returns the audio with
+--- the take's active Pitch envelope applied (seen 2026-11-23: a note quantized by -0.59 st was read 0.59 st low), and
+--- it keeps the take state it was made with until AudioAccessorValidateState / AudioAccessorUpdate is called, which
+--- this script never does. So the envelope is bypassed, the accessor made and the envelope's chunk put back byte for
+--- byte, all in this one call: nothing is heard, no undo point is added, and the envelope is as it was whatever
+--- happens to the analysis afterwards. An envelope that is bypassed already or holds no points is left alone.
+--- Returns the accessor, or nil when REAPER gave none.
+K.open_accessor = function(take)
+  local env = reaper.GetTakeEnvelopeByName(take, "Pitch")
+  local chunk = nil
+  if env then
+    local ok, text = reaper.GetEnvelopeStateChunk(env, "", false)
+    if ok and text and text:match("ACT%s+1") and text:match("\nPT ") then chunk = text end
   end
+  if chunk then reaper.SetEnvelopeStateChunk(env, (chunk:gsub("ACT%s+1", "ACT 0", 1)), false) end
+  local ok, accessor = pcall(reaper.CreateTakeAudioAccessor, take)
+  if chunk then
+    reaper.SetEnvelopeStateChunk(env, chunk, false)
+    note_own_write()   -- the two chunk writes moved the project's change count: they are this script's own
+  end
+  if ok and accessor then return accessor end
+  return nil
+end
+
+--- Start analysing `take` (in `item`): it becomes the target and its audio is read slice by slice from the next
+--- frame on (process_analysis_step). opts (optional):
+---   sample_rate     the rate to read at, when the caller already knows it (a batch records it when it starts:
+---                   REAPER can report 0 for every source while it is in the background, see K.batch_selection)
+---   defer_envelope  do not create or show the take's Pitch envelope now (a batch does it in its one undo block)
+--- Returns true, or false and why: "offline" (the source has no sample rate: its media is offline) or "accessor"
+--- (REAPER gave no audio accessor). Nothing is changed when it returns false.
+K.analysis_begin = function(take, item, opts)
+  opts = opts or {}
+  local sample_rate = opts.sample_rate
+  if not sample_rate then
+    local source = reaper.GetMediaItemTake_Source(take)
+    sample_rate = source and reaper.GetMediaSourceSampleRate(source)
+  end
+  -- Without a rate nothing can be read; analysing anyway would store an analysis with no notes
+  if not sample_rate or sample_rate <= 0 then return false, "offline" end
+
+  local accessor = K.open_accessor(take)
+  if not accessor then return false, "accessor" end
 
   local guid = get_take_guid(take)
   if guid then state.target_take_guid = guid end
@@ -1349,9 +1488,7 @@ local function start_analysis()
   state.item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
   state.end_time = state.item_len
   state.current_time = 0
-
-  local source = reaper.GetMediaItemTake_Source(take)
-  state.sample_rate = reaper.GetMediaSourceSampleRate(source)
+  state.sample_rate = sample_rate
 
   -- A bad engine value must never crash (negative array size) or hang (a hop of 0 never advances the
   -- analysis time) an analysis: clamp to 64 <= block, 1 <= hop <= block before anything is allocated
@@ -1367,7 +1504,7 @@ local function start_analysis()
     min_freq = state.min_freq, max_freq = state.max_freq,
   }
 
-  state.accessor = reaper.CreateTakeAudioAccessor(take)
+  state.accessor = accessor
   state.buffer = reaper.new_array(state.analysis_params.block_size)
 
   state.results = {}
@@ -1379,11 +1516,27 @@ local function start_analysis()
 
   -- Ensure take pitch envelope is created and active on the take upfront (own named undo point,
   -- and only when it actually changes something)
-  if pitch_envelope_needs_setup(take) then
+  if not opts.defer_envelope and pitch_envelope_needs_setup(take) then
     reaper.Undo_BeginBlock()
     ensure_take_pitch_envelope(take, item, true)
     reaper.Undo_EndBlock("Show Pitch Envelope", -1)
     note_own_write()
+  end
+  return true
+end
+
+--- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected).
+local function start_analysis()
+  -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
+  -- get_target_take() falls back to the selected audio item only when there is no usable target.
+  local take, item = get_target_take()
+
+  if not item or not take then
+    set_status("Select an audio item first")
+    return
+  end
+  if not K.analysis_begin(take, item) then
+    set_status("Couldn't read this item's audio. Check that its media is online, then try again.")
   end
 end
 
@@ -2076,8 +2229,8 @@ local flush_nudge_burst -- commits a pending arrow-key nudge as one undo point (
 -- MULTI-ITEM SESSION & PROJECT PERSISTENCE
 -------------------------------------------------------------------------------
 
-local function save_take_data(take, data)
-  if not take or not data then return end
+--- The text save_take_data stores on a take for the model `data`.
+K.take_json = function(data)
   local save_data = {
     guid = data.guid,
     name = data.name,
@@ -2104,8 +2257,14 @@ local function save_take_data(take, data)
       })
     end
   end
-  local json_str = JSON.encode(save_data)
-  reaper.GetSetMediaItemTakeInfo_String(take, K.TAKE_DATA_KEY, json_str, true)
+  return JSON.encode(save_data)
+end
+
+--- Store the model `data` on `take`. json: its text when the caller prepared it already (K.take_json), so a write
+--- of many items does not encode them all in one frame.
+local function save_take_data(take, data, json)
+  if not take or not data then return end
+  reaper.GetSetMediaItemTakeInfo_String(take, K.TAKE_DATA_KEY, json or K.take_json(data), true)
 
   -- Remember what is now stored (read back) so the resync never treats our own write as external; what was stored
   -- before (readable or not) is replaced
@@ -2275,6 +2434,10 @@ end
 --- when it completes) and no undo block is open between frames, so there is nothing to close or undo.
 --- Returns true when an analysis was running.
 K.cancel_analysis = function()
+  if K.batch then   -- a batch: the finished items are kept, written as its one undo step (K.batch_finish)
+    K.batch_finish(true)
+    return true
+  end
   if not state.is_analyzing and not state.accessor then return false end
   K.release_analysis()
   state.progress = 0
@@ -2289,6 +2452,362 @@ K.cancel_analysis = function()
   if state.last_change_count ~= reaper.GetProjectStateChangeCount(0) then state.last_change_count = nil end
   set_status(K.CANCELLED_TEXT)
   return true
+end
+
+-------------------------------------------------------------------------------
+-- 3b. BATCH ANALYSIS (Analyze All Selected Items)
+-------------------------------------------------------------------------------
+-- Design: docs/design/pitch-correct-analyze-selected.md. A batch analyses the audio items selected in REAPER's
+-- arrange view one after another. The models of finished items are held in memory and written together, in one
+-- undo block, when the batch ends (an undo block cannot stay open between frames).
+
+--- The items a batch would analyse now: every selected item whose active take is audio, in REAPER's order of the
+--- selection. Returns { takes = { entry ... }, skipped = how many other selected items there are }, with
+--- entry = { guid, take, item, name, len (seconds), pos (project seconds), track (its name), sample_rate,
+--- has_notes (it holds notes that a new analysis would replace) }. REAPER's selection is only read.
+--- sample_rate is asked here, when the user has just clicked in the window: REAPER can report 0 for every source
+--- while it is in the background ("Set media items offline when application is not active"), and a batch runs on
+--- while the user works elsewhere.
+K.batch_selection = function()
+  local out = { takes = {}, skipped = 0 }
+  local count = reaper.CountSelectedMediaItems(0) or 0
+  for i = 0, count - 1 do
+    local item = reaper.GetSelectedMediaItem(0, i)
+    local take = item and reaper.GetActiveTake(item) or nil
+    local guid = nil
+    if take and not reaper.TakeIsMIDI(take) then guid = get_take_guid(take) end
+    if guid then
+      local source = reaper.GetMediaItemTake_Source(take)
+      local track = reaper.GetMediaItemTrack(item)
+      local track_name = ""
+      if track then
+        local ok, name = reaper.GetTrackName(track)
+        if ok and name then track_name = name end
+      end
+      local data = state.session_takes[guid]
+      out.takes[#out.takes + 1] = {
+        guid = guid, take = take, item = item,
+        name = reaper.GetTakeName(take) or "Item",
+        len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0,
+        pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION") or 0,
+        track = track_name,
+        sample_rate = source and reaper.GetMediaSourceSampleRate(source) or 0,
+        has_notes = (data ~= nil and data.notes ~= nil and #data.notes > 0),
+      }
+    elseif item then
+      out.skipped = out.skipped + 1
+    end
+  end
+  return out
+end
+
+-- How long K.batch_peek's answer is kept while the selection and the project state stay the same (seconds)
+K.BATCH_PEEK_S = 0.25
+
+--- What the window says about a possible batch: { n = audio items selected, skipped = other selected items,
+--- with_notes = how many of the n hold notes, target_in = the open item is one of them }. The selection is not
+--- walked every frame: the answer is kept until the number of selected items, the project state or the open item
+--- changes, and for K.BATCH_PEEK_S at most (a selection change need not move the project's change count).
+--- A batch never uses this: it reads the selection afresh when it starts (K.batch_request).
+K.batch_peek = function(now)
+  local sel_n = reaper.CountSelectedMediaItems(0) or 0
+  local count = reaper.GetProjectStateChangeCount(0)
+  local cache = K.batch_peek_cache
+  if cache and cache.sel_n == sel_n and cache.count == count and cache.target == state.target_take_guid
+     and now - cache.at < K.BATCH_PEEK_S then
+    return cache.peek
+  end
+  local sel = K.batch_selection()
+  local peek = { n = #sel.takes, skipped = sel.skipped, with_notes = 0, target_in = false }
+  for _, entry in ipairs(sel.takes) do
+    if entry.has_notes then peek.with_notes = peek.with_notes + 1 end
+    if entry.guid == state.target_take_guid then peek.target_in = true end
+  end
+  K.batch_peek_cache = { sel_n = sel_n, count = count, target = state.target_take_guid, at = now, peek = peek }
+  return peek
+end
+
+--- The canvas button's label for n selected audio items. narrow: the canvas has no room for the full batch label.
+K.batch_label = function(n, narrow)
+  if n < 2 then return "Analyze Item" end
+  return narrow and "Analyze All" or "Analyze All Selected Items"
+end
+
+--- The canvas button's tooltip for a batch of n items.
+K.batch_tip = function(n)
+  return string.format("Detect the pitch of the %d selected audio items, one after another. One undo step for all of them.", n)
+end
+
+--- The lines under the canvas button for what K.batch_peek returned: the first, and the second or nil.
+K.batch_lines = function(peek)
+  if peek.n < 2 then
+    return "No data. Select an item and click Analyze.", "Select several items in REAPER to analyze them all at once."
+  end
+  local first = string.format("%d audio items selected", peek.n)
+  if peek.skipped == 1 then
+    first = first .. " (1 other item is skipped)"
+  elseif peek.skipped > 1 then
+    first = first .. string.format(" (%d other items are skipped)", peek.skipped)
+  end
+  first = first .. "."
+  if not peek.target_in then first = first .. " This item is not one of them." end
+  local second = nil
+  if peek.with_notes == 1 then
+    second = "1 already has notes. You will be asked before it is replaced."
+  elseif peek.with_notes > 1 then
+    second = string.format("%d already have notes. You will be asked before they are replaced.", peek.with_notes)
+  end
+  return first, second
+end
+
+--- What to ask before a batch over `entries` (K.batch_selection's takes) replaces existing notes: the fields of a
+--- request_confirm request ({ title, body_lines, list, after_lines, confirm_label }; list = the items that hold
+--- notes, in order, as { name, track, pos }), or nil when no item holds notes: then nothing is asked.
+K.batch_confirm = function(entries)
+  local total, list = #entries, {}
+  for _, entry in ipairs(entries) do
+    if entry.has_notes then list[#list + 1] = { name = entry.name, track = entry.track, pos = entry.pos } end
+  end
+  if #list == 0 then return nil end
+  local body
+  if total == 1 then
+    body = "This item already has notes. Analyzing replaces its notes and any edits:"
+  elseif #list == total then
+    body = string.format("All %d already have notes. Analyzing replaces their notes and any edits:", total)
+  elseif #list == 1 then
+    body = "1 of them already has notes. Analyzing replaces its notes and any edits:"
+  else
+    body = string.format("%d of them already have notes. Analyzing replaces their notes and any edits:", #list)
+  end
+  local after = total == 1 and string.format("%s+Z restores it once the batch has finished.", K.MOD_LABEL)
+    or string.format("%s+Z restores all %d items in one step once the batch has finished.", K.MOD_LABEL, total)
+  return {
+    title = total == 1 and "Analyze 1 item?" or string.format("Analyze %d items?", total),
+    body_lines = { body }, list = list, after_lines = { after },
+    confirm_label = total == 1 and "Analyze 1 Item" or string.format("Analyze %d Items", total),
+  }
+end
+
+--- A batch over `entries`, not started yet. queue = the entries, frozen (a later selection change does not reach
+--- it); index = the entry being analysed (0 = none yet); done = { { guid, data, json, empty } ... } of the finished
+--- ones; failed = entries that could not be analysed; total_len / done_len = seconds of audio in the queue / in the
+--- entries that are behind; prev_guid = the item that was open when it started.
+K.batch_new = function(entries, prev_guid)
+  local total_len = 0
+  for _, entry in ipairs(entries) do total_len = total_len + (entry.len or 0) end
+  return { queue = entries, index = 0, done = {}, failed = 0, total_len = total_len, done_len = 0,
+    prev_guid = prev_guid }
+end
+
+--- How far a batch is, 0 .. 1: the share of its audio that has been analysed. item_progress = how far the entry in
+--- progress is (0 .. 1). The one number the "…" button and the status line both show.
+K.batch_progress = function(batch, item_progress)
+  if batch.total_len <= 0 then return 0 end
+  local entry = batch.queue[batch.index]
+  local part = entry and (entry.len or 0) * (item_progress or 0) or 0
+  return math.max(0, math.min(1, (batch.done_len + part) / batch.total_len))
+end
+
+--- The undo label of a batch that wrote n items.
+K.batch_undo_label = function(n)
+  return string.format("Analyze Pitch (%d %s)", n, n == 1 and "item" or "items")
+end
+
+--- The closing message of a batch. r = { total = items in the batch, written = items analysed and stored,
+--- empty = how many of the written hold no pitched notes, failed = items that could not be analysed,
+--- cancelled = it was stopped before its end }.
+K.batch_summary = function(r)
+  local function items(n) return n == 1 and "1 item" or string.format("%d items", n) end
+  local undo = string.format(" %s+Z to undo.", K.MOD_LABEL)
+  if r.cancelled then
+    if r.written == 0 then return "Batch cancelled. Nothing was changed." end
+    return string.format("Batch cancelled. %d of %s %s analyzed and kept.", r.written, items(r.total),
+      r.written == 1 and "was" or "were") .. undo
+  end
+  if r.written == 0 then
+    if r.total == 1 then return "The item could not be analyzed. Nothing was changed." end
+    return string.format("None of the %s could be analyzed. Nothing was changed.", items(r.total))
+  end
+  local text = r.written == r.total and ("Analyzed " .. items(r.total))
+    or string.format("Analyzed %d of %s", r.written, items(r.total))
+  if r.empty > 0 then
+    text = text .. string.format(" (%d %s no pitched notes)", r.empty, r.empty == 1 and "has" or "have")
+  end
+  text = text .. "."
+  if r.failed > 0 then text = text .. string.format(" %d could not be analyzed.", r.failed) end
+  return text .. undo
+end
+
+--- Write the finished items of a batch: `done` = { { guid, data, json | nil, empty } ... }. Everything goes into
+--- ONE undo block: per item, its Pitch envelope is created and shown where it was missing and cleared of points (a
+--- fresh analysis corrects nothing), and its model is stored on the take; the take's pitch mode is left alone. An
+--- item that is no longer in the project, or whose Pitch envelope cannot be made, is left out and stays as it was.
+--- With no item left in the project no undo block is opened. Returns the entries of `done` that were written.
+K.batch_write = function(done)
+  local ready = {}
+  for _, entry in ipairs(done) do
+    local take = resolve_take_by_guid(entry.guid, true)
+    local item = take and K.take_item(take) or nil
+    if take and item then ready[#ready + 1] = { entry = entry, take = take, item = item } end
+  end
+  if #ready == 0 then return {} end
+
+  local written = {}
+  reaper.Undo_BeginBlock()
+  state.undo_open = true
+  for _, r in ipairs(ready) do
+    local guid, data = r.entry.guid, r.entry.data
+    local env = ensure_take_pitch_envelope(r.take, r.item, true)
+    if env then   -- without its Pitch envelope the item cannot be corrected: it is left as it was (not written)
+      local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(r.item, "D_LENGTH") or 0)
+      reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
+      reaper.Envelope_SortPointsEx(env, -1)
+      save_take_data(r.take, data, r.entry.json)
+      state.session_takes[guid] = data
+      local listed = false
+      for _, g in ipairs(state.session_order) do
+        if g == guid then listed = true; break end
+      end
+      if not listed then table.insert(state.session_order, guid) end
+      state.stale_takes[guid], state.stale_env[guid], state.missing_takes[guid] = nil, nil, nil
+      state.undone_takes[guid] = nil
+      written[#written + 1] = r.entry
+    end
+  end
+  reaper.UpdateArrange()
+  reaper.Undo_EndBlock(K.batch_undo_label(#written), -1)
+  state.undo_open = false
+  K.frame_view_memo.frame = nil   -- the canvas fetches the correction again
+  note_own_write()
+  return written
+end
+
+--- End the running batch, however it ends (its queue is done, Cancel, the window closes, a frame failed): the
+--- finished items are written as one undo step, the item in progress and the items not started are left as they
+--- were, the first written item is opened (or the item that was open before comes back) and one closing message
+--- says what happened. cancelled: it was stopped before its end.
+K.batch_finish = function(cancelled)
+  local batch = K.batch
+  if not batch then return end
+  K.batch = nil
+  K.release_analysis()
+  state.progress = 0
+
+  local written = K.batch_write(batch.done)
+  local empty = 0
+  for _, entry in ipairs(written) do
+    if entry.empty then empty = empty + 1 end
+  end
+
+  local first = written[1]
+  local open_guid = first and state.session_takes[first.guid] and first.guid or nil
+  if not open_guid and batch.prev_guid and state.session_takes[batch.prev_guid] then open_guid = batch.prev_guid end
+  if open_guid then
+    adopt_take_data(open_guid, state.session_takes[open_guid])
+  else
+    -- Nothing written and the item that was open has no analysis: back to it, not analysed
+    reset_analysis_model()
+    state.target_take_guid, state.target_take_name = batch.prev_guid, batch.prev_name
+    local take = batch.prev_guid and resolve_take_by_guid(batch.prev_guid, true) or nil
+    local item = take and K.take_item(take) or nil
+    state.start_time = 0
+    state.item_len = item and reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0
+    state.end_time = state.item_len
+  end
+
+  -- REAPER's selection was not followed while the batch ran: what is selected now is not a change to react to
+  local sel_item = reaper.GetSelectedMediaItem(0, 0)
+  local sel_take = sel_item and reaper.GetActiveTake(sel_item) or nil
+  state.last_seen_sel_guid = (sel_take and not reaper.TakeIsMIDI(sel_take)) and get_take_guid(sel_take) or nil
+  -- Nor was the project (undo, redo, deleted items): the next frame reads it again
+  state.last_change_count = nil
+
+  K.status_hold(K.batch_summary({
+    total = #batch.queue, written = #written, empty = empty, failed = #batch.queue - #written,
+    cancelled = cancelled and true or false,
+  }))
+end
+
+--- Start the next entry of the running batch that can be analysed; entries that cannot (the item left the project,
+--- its media has no sample rate, REAPER gave no accessor) are counted as failed. With no entry left the batch ends.
+K.batch_next = function()
+  local batch = K.batch
+  if not batch then return end
+  while true do
+    batch.index = batch.index + 1
+    local entry = batch.queue[batch.index]
+    if not entry then
+      K.batch_finish(false)
+      return
+    end
+    local take = resolve_take_by_guid(entry.guid, true)
+    local item = take and K.take_item(take) or nil
+    if take and item and (entry.sample_rate or 0) > 0 then
+      -- The canvas follows the item in progress: it becomes the open item, with nothing analysed yet
+      reset_analysis_model()
+      state.target_take_guid, state.target_take_name = entry.guid, entry.name
+      if K.analysis_begin(take, item, { sample_rate = entry.sample_rate, defer_envelope = true }) then return end
+    end
+    batch.failed = batch.failed + 1
+    batch.done_len = batch.done_len + (entry.len or 0)
+  end
+end
+
+--- The entry in progress finished: its model (what process_analysis_step built) is held until the batch is written.
+--- Its text is made now, one item at a time, so the write at the end does not encode every item in one frame.
+K.batch_item_done = function(take_data)
+  local batch = K.batch
+  if not batch then return end
+  local entry = batch.queue[batch.index]
+  -- The model must be the entry's own. When the item in progress leaves the project, the window's target falls
+  -- back to whatever is selected (get_target_take): frames read from one item must never be stored on another.
+  if not entry or take_data.guid ~= entry.guid then
+    K.batch_item_failed(nil)
+    return
+  end
+  -- An item analysed before keeps its own Key and Scale (the model was built with those of the item that was
+  -- open when the batch started); an item analysed for the first time takes the current ones, as a single analysis does
+  local before = state.session_takes[entry.guid]
+  if before then
+    take_data.key_idx = before.key_idx or take_data.key_idx
+    take_data.scale_idx = before.scale_idx or take_data.scale_idx
+  end
+  batch.done[#batch.done + 1] = {
+    guid = take_data.guid, data = take_data, json = K.take_json(take_data),
+    empty = (take_data.notes == nil or #take_data.notes == 0),
+  }
+  batch.done_len = batch.done_len + (entry.len or 0)
+  K.batch_next()
+end
+
+--- The entry in progress could not be analysed (err: what was raised, for the console): it is left as it was and
+--- the batch carries on with the next one.
+K.batch_item_failed = function(err)
+  local batch = K.batch
+  if not batch then return end
+  K.release_analysis()
+  if err then
+    reaper.ShowConsoleMsg("Fancy Pitch Correct: an item could not be analyzed: " .. tostring(err) .. "\n")
+  end
+  local entry = batch.queue[batch.index]
+  batch.failed = batch.failed + 1
+  batch.done_len = batch.done_len + (entry and entry.len or 0)
+  K.batch_next()
+end
+
+--- Start a batch over `entries` (K.batch_selection's takes, read when the user asked for it).
+K.batch_start = function(entries)
+  if K.batch or state.is_analyzing or #entries == 0 then return end
+  if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge belongs to the item being left
+  K.batch = K.batch_new(entries, state.target_take_guid)
+  K.batch.prev_name = state.target_take_name
+  K.batch_next()
+end
+
+--- How far the running analysis is, 0 .. 1: the whole batch when one runs, else the item.
+K.analysis_progress = function()
+  if K.batch then return K.batch_progress(K.batch, state.progress) end
+  return state.progress or 0
 end
 
 local function switch_active_target(guid, take_obj)
@@ -2345,12 +2864,15 @@ end
 --- stored P_EXT differs from what this script last wrote or loaded (state.raw_cache), so the
 --- script's own edits never trigger a reload.
 local function sync_with_project()
-  if state.is_analyzing then return end
+  if state.is_analyzing or K.batch then return end
   local count = reaper.GetProjectStateChangeCount(0)
   if state.last_change_count == count then return end
   state.last_change_count = count
   K.queue_stale_checks()   -- an undo, a redo or an edit in REAPER may have changed an envelope
 
+  -- Whether an item's stored analysis is not what this window last saw (undo, redo): a held closing message
+  -- ("Analyzed 3 items") then no longer describes the items and goes. Any other change in REAPER leaves it.
+  local analyses_changed = false
   local i = 1
   while i <= #state.session_order do
     local guid = state.session_order[i]
@@ -2365,6 +2887,7 @@ local function sync_with_project()
       if raw == (state.raw_cache[guid] or "") then
         i = i + 1
       else
+        analyses_changed = true
         local data = load_take_data(take, raw)
         local is_active = (guid == state.target_take_guid)
         if data then
@@ -2375,10 +2898,13 @@ local function sync_with_project()
           end
           i = i + 1
         elseif raw == "" then
-          -- The analysis was undone away: the take has no pitch data any more
+          -- The analysis was undone away: the take has no pitch data any more. It is remembered, so a redo
+          -- brings it back into the list (below)
           state.session_takes[guid] = nil
           state.stale_takes[guid] = nil
           table.remove(state.session_order, i)
+          K.undone_seq = (K.undone_seq or 0) + 1
+          state.undone_takes[guid] = K.undone_seq   -- in the order of the list, so a redo lists them as before
           if is_active then
             clear_interaction_state()
             state.results = {}
@@ -2404,6 +2930,31 @@ local function sync_with_project()
       if raw ~= (state.raw_cache[guid] or "") then
         local data = load_take_data(take, raw)
         if data then
+          analyses_changed = true
+          state.session_takes[guid] = data
+          table.insert(state.session_order, guid)
+          if guid == state.target_take_guid then adopt_take_data(guid, data) end
+        end
+      end
+    end
+  end
+
+  -- Items whose analysis an undo took away: a redo may have put it back. One undo can take away many (a batch), and
+  -- only one of them is the open item, so each is looked at again whenever the project changes.
+  local undone = {}
+  for guid in pairs(state.undone_takes) do undone[#undone + 1] = guid end
+  table.sort(undone, function(a, b) return state.undone_takes[a] < state.undone_takes[b] end)
+  for _, guid in ipairs(undone) do
+    if state.session_takes[guid] then
+      state.undone_takes[guid] = nil   -- analysed again since
+    else
+      local take = resolve_take_by_guid(guid, true)
+      local raw = take and read_take_raw(take) or ""
+      if raw ~= "" then
+        local data = load_take_data(take, raw)
+        if data then
+          analyses_changed = true
+          state.undone_takes[guid] = nil
           state.session_takes[guid] = data
           table.insert(state.session_order, guid)
           if guid == state.target_take_guid then adopt_take_data(guid, data) end
@@ -2421,6 +2972,7 @@ local function sync_with_project()
       if raw ~= "" and raw ~= (state.raw_cache[target_guid] or "") then
         local data = load_take_data(take, raw)
         if data then
+          analyses_changed = true
           state.session_takes[target_guid] = data
           table.insert(state.session_order, target_guid)
           adopt_take_data(target_guid, data)
@@ -2428,6 +2980,7 @@ local function sync_with_project()
       end
     end
   end
+  if analyses_changed then K.status_release() end
 end
 
 --- Persist the target's note model to its take (P_EXT) so it lands inside the caller's open undo block.
@@ -4372,13 +4925,14 @@ local function process_analysis_step()
     state.is_analyzing = false
     state.analysis_params = nil
     state.progress = 1.0
+    -- The developer switch: the frames as the detector left them, before the candidates are chosen from and dropped
+    pcall(K.dev_dump, state.target_take_name, state.target_take_guid, params, state.sample_rate, state.results)
     run_hybrid_segmentation()
     state.analysis_empty = (not state.notes or #state.notes == 0)
     K.reset_view()   -- the new model is shown whole
 
     -- Store into multi-item session cache, then persist inside ONE named undo block
     if state.target_take_guid then
-      state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       local take_data = {
         guid = state.target_take_guid,
         name = state.target_take_name or "Item",
@@ -4392,6 +4946,18 @@ local function process_analysis_step()
         scale_idx = state.scale_idx,
         separation = state.separation,
       }
+      if K.batch then
+        -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item.
+        -- An item long enough to be read that gave no frame at all was not read (its media went away): it is not
+        -- stored as "no pitched notes" over what the item had
+        if #take_data.results == 0 and K.block_fits(0, params, state.sample_rate, state.end_time) then
+          K.batch_item_failed(nil)
+        else
+          K.batch_item_done(take_data)
+        end
+        return
+      end
+      state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       state.session_takes[state.target_take_guid] = take_data
 
       local found = false
@@ -4413,6 +4979,27 @@ local function process_analysis_step()
   elseif state.item_len > 0 then
     state.progress = state.current_time / state.item_len
   end
+end
+
+--- One frame of the running analysis (loop_body). In a batch, an error raised while an item is analysed does not
+--- end the batch: that item is counted as failed (K.batch_item_failed) and the next one starts. An error raised
+--- while the batch itself ended (its write) is not an item's: it is passed on to the window's error handling, which
+--- also closes an undo block left open.
+K.analysis_tick = function()
+  if not K.batch then
+    process_analysis_step()
+    return
+  end
+  -- A batch always has an item in progress. If something dropped the running analysis, that item counts as failed
+  -- and the batch goes on: it must never sit there with nothing to do
+  if not state.is_analyzing then
+    K.batch_item_failed(nil)
+    return
+  end
+  local ok, err = xpcall(process_analysis_step, debug.traceback)
+  if ok then return end
+  if not K.batch then error(err, 0) end
+  K.batch_item_failed(err)
 end
 
 -------------------------------------------------------------------------------
@@ -5689,15 +6276,20 @@ local function draw_graph(draw_ctx, w, h)
   local target_take, target_item = K.frame_target()
   local is_bypassed = is_take_pitch_bypassed(target_take)
 
-  -- The one button the canvas draws (Analyze Item, Open Settings, Enable): a real Button on the large preset,
-  -- centred on cx with its top edge at y (its height is Theme.layout.btn_lg.h), hand cursor and tooltip.
+  -- The one button the canvas draws (Analyze Item / Analyze All Selected Items, Open Settings, Enable): a real Button
+  -- on the large preset, centred on cx with its top edge at y (its height is Theme.layout.btn_lg.h), hand cursor and tooltip.
   -- Returns true when it was clicked (never while it is disabled). It moves the layout cursor into the canvas:
   -- whoever used it calls restore_canvas_layout() before leaving draw_graph.
   local buttons_used = false
-  local function canvas_button(label, id, cx, y, enabled, tip)
+  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label)
     buttons_used = true
     local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, "lg")
     local btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + L.btn_lg.pad_x * 2
+    -- narrow_label: what the button reads when the canvas is narrower than its label (a narrow docker)
+    if narrow_label and btn_w > full_w - L.sm * 2 then
+      label = narrow_label
+      btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + L.btn_lg.pad_x * 2
+    end
     reaper.ImGui_SetCursorScreenPos(draw_ctx, cx - btn_w * 0.5, y)
     if not enabled then reaper.ImGui_BeginDisabled(draw_ctx) end
     local clicked = reaper.ImGui_Button(draw_ctx, label .. "###" .. id, btn_w, 0)
@@ -5729,19 +6321,45 @@ local function draw_graph(draw_ctx, w, h)
     local gap = L.lg
 
     if #state.results == 0 then
-      local msg = "No data. Select an item and click Analyze."
-      local text_w, text_h = reaper.ImGui_CalcTextSize(draw_ctx, msg)
-      local start_y = cy - (L.btn_lg.h + gap + text_h) * 0.5
+      -- With two or more audio items selected in REAPER the button analyses them all (a batch); the lines under it
+      -- say what it will take, or that several items can be analysed at once. Each line is wrapped to the canvas
+      -- and centred; in a canvas too short for the button and the lines, the lines go, the last one first.
+      local peek = K.batch_peek(reaper.time_precise())
+      local is_batch = peek.n >= 2
+      local _, text_h = reaper.ImGui_CalcTextSize(draw_ctx, "Ag")
+      local shown = {}
+      for _, line in ipairs({ K.batch_lines(peek) }) do
+        shown[#shown + 1] = K.wrap_lines(draw_ctx, line, full_w - L.sm * 2)
+      end
+      local function block_h()
+        local total = L.btn_lg.h
+        for i, rows in ipairs(shown) do
+          total = total + (i == 1 and gap or L.xs) + #rows * text_h
+        end
+        return total
+      end
+      while #shown > 0 and block_h() > h do shown[#shown] = nil end
+      local start_y = cy - block_h() * 0.5
 
-      local can_analyze = (target_take ~= nil and not state.is_analyzing)
-      local tip = can_analyze and "Detect the pitch of the selected audio item"
-        or (state.is_analyzing and "Analysis in progress" or "Select an audio item in REAPER to analyze it.")
-      if canvas_button("Analyze Item", "cv_analyze", cx, start_y, can_analyze, tip) then
-        start_analysis()
+      local can_analyze = (is_batch or target_take ~= nil) and not state.is_analyzing
+      local tip = state.is_analyzing and "Analysis in progress"
+        or (is_batch and K.batch_tip(peek.n))
+        or (target_take ~= nil and "Detect the pitch of the selected audio item"
+          or "Select an audio item in REAPER to analyze it.")
+      if canvas_button(K.batch_label(peek.n, false), "cv_analyze", cx, start_y, can_analyze, tip,
+          K.batch_label(peek.n, true)) then
+        if is_batch then K.batch_request() else start_analysis() end
       end
 
-      -- Centered text below the button
-      reaper.ImGui_DrawList_AddText(draw_list, cx - text_w * 0.5, start_y + L.btn_lg.h + gap, P.text_dim, msg)
+      -- Centred text below the button
+      local y = start_y + L.btn_lg.h
+      for i, rows in ipairs(shown) do
+        y = y + (i == 1 and gap or L.xs)
+        for _, row in ipairs(rows) do
+          reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
+          y = y + text_h
+        end
+      end
     else
       local title = "No pitched notes found"
       local hint = "Try another Vocal Range or Detection Mode in Settings."
@@ -8488,7 +9106,7 @@ K.INFO_SECTIONS = {
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
   { title = "Icons", rows = {
-    { "… (top right)", "More: Analyze, Reset, Layers, Note Tone, Settings, Help" },
+    { "… (top right)", "More: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help" },
     { "× (top right)", "Close the window (Esc when floating)" },
     { "> / <", "Hide / show the Pitched Items panel" },
     { "▾ / ▸ (section header)", "Collapse / expand the section" },
@@ -8533,6 +9151,9 @@ K.draw_items_body = function(sidebar_ctx)
   -- Row geometry: a card as tall as a table row (or a frame, when the font is larger, or the Remove target), L.xs of
   -- air above and below it, and every element centred on the card
   local to_remove = nil
+  -- While an analysis runs (one item or a batch) the list is read-only: the analysis owns the open item, and an
+  -- item's envelope and stored analysis must not change under it. The reason is in each row's tooltip.
+  local rows_locked = state.is_analyzing or K.batch ~= nil
   local avail_w = reaper.ImGui_GetContentRegionAvail(sidebar_ctx)
   local frame_h = reaper.ImGui_GetFrameHeight(sidebar_ctx)
   local del_sz = L.icon_target.size + L.icon_target.pad * 2   -- Remove is destructive: the 24 px minimum target (WCAG 2.5.8)
@@ -8623,21 +9244,22 @@ K.draw_items_body = function(sidebar_ctx)
         -- Bypass checkbox: default frame padding; disabled (and unchecked) when the item no longer exists
         local is_enabled = (not is_missing) and not is_take_pitch_bypassed(take_obj)
         Theme.vcenter(sidebar_ctx, frame_h, card_h, line_y)
-        if is_missing then reaper.ImGui_BeginDisabled(sidebar_ctx) end
+        local cb_off = is_missing or rows_locked
+        if cb_off then reaper.ImGui_BeginDisabled(sidebar_ctx) end
         -- The panel's surface is the recessed one, so the box takes the button face to keep its boundary visible
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBg(), P.btn)
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
         reaper.ImGui_PushStyleColor(sidebar_ctx, reaper.ImGui_Col_FrameBgActive(), P.btn_a)
         local cb_changed, new_en = reaper.ImGui_Checkbox(sidebar_ctx, "##bp", is_enabled)
         reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
-        if is_missing then reaper.ImGui_EndDisabled(sidebar_ctx) end
+        if cb_off then reaper.ImGui_EndDisabled(sidebar_ctx) end
         local cb_w = reaper.ImGui_GetItemRectSize(sidebar_ctx)
-        if cb_changed and not is_missing then
+        if cb_changed and not cb_off then
           toggle_take_pitch_bypass(take_obj)
         end
-        if is_missing then
+        if cb_off then
           if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-            Theme.tooltip(sidebar_ctx, BODY.tip_missing)
+            Theme.tooltip(sidebar_ctx, is_missing and BODY.tip_missing or K.REASON_ANALYZING)
           end
         elseif reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           Theme.tooltip(sidebar_ctx, new_en and "Envelope Active — click to bypass it" or "Envelope Bypassed — click to enable it")
@@ -8679,14 +9301,21 @@ K.draw_items_body = function(sidebar_ctx)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_ItemSpacing(), 0, 0)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_SelectableTextAlign(), 0, 0.5)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
-        if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h) then
+        if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
+        if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h)
+           and not rows_locked then
           switch_active_target(guid, take_obj)
         end
+        if rows_locked then reaper.ImGui_EndDisabled(sidebar_ctx) end
         reaper.ImGui_PopStyleVar(sidebar_ctx, 2)
         reaper.ImGui_PopStyleColor(sidebar_ctx, 3)
         if name_font then Theme.pop_font(sidebar_ctx, name_font) end
 
-        if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        if rows_locked then
+          if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+            Theme.tooltip(sidebar_ctx, string.format("Item: %s\n%s", full_name, K.REASON_ANALYZING))
+          end
+        elseif reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           local lines = { string.format("Item: %s", full_name) }
           if is_missing then
             lines[#lines + 1] = state_tip
@@ -8715,6 +9344,7 @@ K.draw_items_body = function(sidebar_ctx)
         reaper.ImGui_SameLine(sidebar_ctx, del_x)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
         Theme.vcenter(sidebar_ctx, del_sz, card_h, line_y)
+        if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
         if Theme.icon_btn(sidebar_ctx, "##del", Theme.icons.close, {
           preset = L.icon_target,
           icon_size = L.icon_md.size,   -- the glyph matches the other icons; only the click target is 24 px
@@ -8722,8 +9352,15 @@ K.draw_items_body = function(sidebar_ctx)
           color = P.text_dim,
           hover_color = P.red,
           tooltip = "Remove from Pitched Items and clear its envelope and saved analysis (asks to confirm)"
-        }) then
+        }) and not rows_locked then
           to_remove = guid
+        end
+        if rows_locked then
+          reaper.ImGui_EndDisabled(sidebar_ctx)
+          -- A theme widget's own tooltip does not show on a disabled item: the reason is given here
+          if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+            Theme.tooltip(sidebar_ctx, K.REASON_ANALYZING)
+          end
         end
 
         -- End of row: one item spanning it, so the next row starts below and the list's extent is valid
@@ -9465,6 +10102,9 @@ local function draw_settings_modal()
     local btn_w = math.max(text_w(clear_text), text_w(wipe_text)) + L.md * 2
     local clear_reason = (not state.notes or #state.notes == 0) and "No analysis to clear" or nil
     local wipe_reason = (session_n == 0) and "Pitched Items is empty" or nil
+    if locked or K.batch then   -- an analysis owns the open item and, in a batch, holds models of others
+      clear_reason, wipe_reason = K.REASON_ANALYZING, K.REASON_ANALYZING
+    end
 
     Theme.align(ctx)
     reaper.ImGui_BeginDisabled(ctx, clear_reason ~= nil)
@@ -9599,6 +10239,70 @@ end
 
 --- The one confirm modal (see request_confirm): consequence and count in the body, Cancel first,
 --- Esc = Cancel, danger-styled confirm button. Called inside the main window's `if visible` block.
+--- The list of a confirm dialog (request_confirm's `list`): one row per thing the action replaces, its name and,
+--- dimmed at the right, where it is (`where`, e.g. track and position). The region takes the room the dialog has
+--- left above its closing lines and buttons, three rows at least, and scrolls; only the rows in view are drawn. A
+--- name that does not fit is shortened (its row's tooltip has it in full), and `where` gives way first.
+K.confirm_list = function(c)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local row_h = reaper.ImGui_GetTextLineHeightWithSpacing(ctx)
+  local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
+  -- What comes below the list, with the spacing ImGui puts after every item: the closing lines (a gap, then the
+  -- line wrapped to the dialog's width) and the button row with the gap above it. The gap drawn above the list and
+  -- the spacing after it count too, or the buttons are pushed out of a dialog that cannot grow
+  local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+  spacing_y = spacing_y or 0
+  local below = (L.xs + spacing_y) + spacing_y + (L.lg + spacing_y) + reaper.ImGui_GetFrameHeight(ctx)
+  for _, line in ipairs(c.after_lines) do
+    local _, line_h = reaper.ImGui_CalcTextSize(ctx, line, nil, nil, false, avail_w)
+    below = below + (L.sm + spacing_y) + (line_h or 0) + spacing_y
+  end
+  -- The region's own padding, above and below its rows: a list that fits must not get a scrollbar
+  local _, pad_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+  local pad = (pad_y or L.sm) * 2
+  local list_h = math.max(row_h * 3 + pad, math.min(#c.list * row_h + pad, avail_h - below))
+
+  reaper.ImGui_Dummy(ctx, 0, L.xs)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.well)
+  if reaper.ImGui_BeginChild(ctx, "##confirm_list", 0, list_h, reaper.ImGui_ChildFlags_Borders()) then
+    -- A clipper of its own, attached to the context (see the Pitched Items list for why)
+    if not K.confirm_clipper or not reaper.ImGui_ValidatePtr(K.confirm_clipper, "ImGui_ListClipper*") then
+      K.confirm_clipper = reaper.ImGui_CreateListClipper(ctx)
+      reaper.ImGui_Attach(ctx, K.confirm_clipper)
+    end
+    local clipper = K.confirm_clipper
+    local inner_w = reaper.ImGui_GetContentRegionAvail(ctx)
+    local start_x = reaper.ImGui_GetCursorPosX(ctx)
+    reaper.ImGui_ListClipper_Begin(clipper, #c.list, row_h)
+    while reaper.ImGui_ListClipper_Step(clipper) do
+      local first_row, end_row = reaper.ImGui_ListClipper_GetDisplayRange(clipper)   -- 0-based, end exclusive
+      for index = first_row + 1, end_row do
+        local row = c.list[index]
+        local name = row.name or "Item"
+        local where = row.where or ""
+        local where_w = where ~= "" and (reaper.ImGui_CalcTextSize(ctx, where)) or 0
+        local name_w = reaper.ImGui_CalcTextSize(ctx, name)
+        -- `where` shows only while the name keeps half of the row (or fits whole beside it)
+        local room = inner_w - where_w - L.md
+        local show_where = where_w > 0 and room >= math.min(name_w, inner_w * 0.5)
+        local shown = fit_text(ctx, name, show_where and room or inner_w, "regular")
+        reaper.ImGui_Text(ctx, shown)
+        if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+          Theme.tooltip(ctx, where ~= "" and (name .. "\n" .. where) or name)
+        end
+        if show_where then
+          reaper.ImGui_SameLine(ctx)
+          reaper.ImGui_SetCursorPosX(ctx, start_x + inner_w - where_w)
+          reaper.ImGui_TextColored(ctx, P.text_dim, where)
+        end
+      end
+    end
+    reaper.ImGui_EndChild(ctx)
+  end
+  reaper.ImGui_PopStyleColor(ctx, 1)
+end
+
 local function draw_confirm_modal()
   local c = state.confirm
   if not c then return end
@@ -9625,6 +10329,11 @@ local function draw_confirm_modal()
 
     for i, line in ipairs(c.body_lines) do
       if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.sm) end
+      reaper.ImGui_TextWrapped(ctx, line)
+    end
+    if c.list and #c.list > 0 then K.confirm_list(c) end
+    for _, line in ipairs(c.after_lines) do
+      reaper.ImGui_Dummy(ctx, 0, L.sm)
       reaper.ImGui_TextWrapped(ctx, line)
     end
 
@@ -9821,6 +10530,64 @@ local function request_analyze()
       end
     end,
   })
+end
+
+--- Analyze All Selected Items (the canvas button with two or more audio items selected, "…" > Analyze Selected
+--- Items): the selection is read now and frozen; when any of its items holds notes the user is asked once, with
+--- those items listed, before anything starts.
+K.batch_request = function()
+  if state.is_analyzing or K.batch then return end
+  local sel = K.batch_selection()
+  if #sel.takes == 0 then
+    set_status("Select an audio item first")
+    return
+  end
+  -- An item can hold an analysis this window has not loaded (pasted, duplicated or its project opened after the
+  -- script started): it is asked about as well. Checked once, here, not while the window only counts
+  for _, entry in ipairs(sel.takes) do
+    if not entry.has_notes and not state.session_takes[entry.guid] and read_take_raw(entry.take) ~= "" then
+      entry.has_notes = true
+    end
+  end
+  local req = K.batch_confirm(sel.takes)
+  if not req then
+    K.batch_start(sel.takes)
+    return
+  end
+  for _, row in ipairs(req.list) do
+    -- Where the item is: its track and its start as REAPER's ruler shows it (items often share a name)
+    local at = reaper.format_timestr_pos(row.pos or 0, "", -1) or ""
+    row.where = (row.track ~= nil and row.track ~= "") and (row.track .. " · " .. at) or at
+  end
+  req.id = "batch"
+  req.on_confirm = function() K.batch_start(sel.takes) end
+  request_confirm(req)
+end
+
+--- `text` broken into rows at most max_w wide in the font pushed now, at spaces: { { text, w } ... }. A word wider
+--- than max_w gets a row of its own. The last answer per text is kept (the empty canvas asks every frame).
+K.wrap_lines = function(wctx, text, max_w)
+  K.wrap_cache = K.wrap_cache or {}
+  local hit = K.wrap_cache[text]
+  if hit and hit.max_w == max_w then return hit.rows end
+  local rows, current, current_w = {}, nil, 0
+  for word in text:gmatch("%S+") do
+    local candidate = current and (current .. " " .. word) or word
+    local w = reaper.ImGui_CalcTextSize(wctx, candidate) or 0
+    if current and w > max_w then
+      rows[#rows + 1] = { text = current, w = current_w }
+      current, current_w = word, reaper.ImGui_CalcTextSize(wctx, word) or 0
+    else
+      current, current_w = candidate, w
+    end
+  end
+  if current then rows[#rows + 1] = { text = current, w = current_w } end
+  if not hit then
+    K.wrap_cache_n = (K.wrap_cache_n or 0) + 1
+    if K.wrap_cache_n > 32 then K.wrap_cache, K.wrap_cache_n = {}, 1 end   -- the count lines change with the selection
+  end
+  K.wrap_cache[text] = { max_w = max_w, rows = rows }
+  return rows
 end
 
 K.RESPLIT_UNDO = "Change Note Separation"   -- the undo label of K.resplit
@@ -10098,7 +10865,7 @@ do
   -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = "Select an audio item"
   local HDR_REASON_NO_NOTES = "Analyze an item first"
-  local HDR_MORE_TIP = "Menu: Analyze, Reset, Layers, Note Tone, Settings, Help"
+  local HDR_MORE_TIP = "Menu: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help"
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
@@ -10384,30 +11151,49 @@ do
     end
   end
 
-  --- "…" (More) and its popup: Analyze / Re-Analyze and Reset (with the reason beside a disabled one), then
-  --- Layers, Settings and Help. While analysing the button reads the progress ("42%") and the popup offers
-  --- Cancel in place of Analyze (Esc is not bound to Cancel: on a floating window Esc closes the window, which
+  --- "…" (More) and its popup: Analyze / Re-Analyze, Analyze Selected Items and Reset (with the reason beside a
+  --- disabled one), then Layers, Settings and Help. While analysing the button reads the progress ("42%") and the
+  --- popup offers Cancel (Cancel Batch for a batch) in place of Analyze (Esc is not bound to Cancel: on a floating window Esc closes the window, which
   --- cancels too).
   local function hdr_draw_more(hs)
     local s = hs.s
-    local analyzing = state.is_analyzing
-    local pct = math.floor(state.progress * 100)
+    local batch = K.batch
+    local analyzing = state.is_analyzing or batch ~= nil
+    -- One number for a batch, here and in the status line: the share of its audio that is analysed
+    local pct = math.floor(K.analysis_progress() * 100)
     if reaper.ImGui_Button(ctx, (analyzing and string.format("%d%%", pct) or HDR_ELLIPSIS) .. "###hdr_more", s.more_w, 0) then
       reaper.ImGui_OpenPopup(ctx, "##hdr_more_popup")
     end
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, analyzing and "Analyzing. Open to cancel" or HDR_MORE_TIP)
+      local tip = HDR_MORE_TIP
+      if batch then
+        tip = string.format("Analyzing %d of %d. Open to cancel", math.min(batch.index, #batch.queue), #batch.queue)
+      elseif analyzing then
+        tip = "Analyzing. Open to cancel"
+      end
+      Theme.tooltip(ctx, tip)
     end
     if reaper.ImGui_BeginPopup(ctx, "##hdr_more_popup") then
       -- HC5: Esc closes this popup (innermost); the window-level handler ignores Esc while a popup is open
       if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
       if analyzing then
-        if reaper.ImGui_MenuItem(ctx, string.format(K.CANCEL_FMT, pct) .. "###more_analyze") then
+        if reaper.ImGui_MenuItem(ctx, string.format(batch and K.CANCEL_BATCH_FMT or K.CANCEL_FMT, pct) .. "###more_analyze") then
           K.cancel_analysis()
+        end
+        if batch and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+          Theme.tooltip(ctx, K.CANCEL_BATCH_TIP)
         end
       elseif reaper.ImGui_MenuItem(ctx, hs.analyze_label .. "###more_analyze",
           (not hs.has_target) and HDR_REASON_NO_TARGET or nil, false, hs.has_target) then
         request_analyze()
+      end
+      -- Analyze Selected Items: always in the menu; with fewer than two audio items selected in REAPER, or while
+      -- an analysis runs, it is disabled with the reason beside it
+      local peek = K.batch_peek(reaper.time_precise())
+      local batch_reason = analyzing and K.REASON_ANALYZING or (peek.n < 2 and K.REASON_BATCH_FEW or nil)
+      local batch_label = batch_reason and "Analyze Selected Items" or string.format("Analyze Selected Items (%d)", peek.n)
+      if reaper.ImGui_MenuItem(ctx, batch_label .. "###more_batch", batch_reason, false, batch_reason == nil) then
+        K.batch_request()
       end
       if reaper.ImGui_MenuItem(ctx, hs.reset_label .. "###more_reset",
           (not hs.has_notes) and HDR_REASON_NO_NOTES or nil, false, hs.has_notes) then
@@ -10819,6 +11605,12 @@ do
   K.status_line = function(editing)
     if state.status.text ~= "" and reaper.time_precise() < state.status.until_time then
       return state.status.text
+    end
+    local batch = K.batch
+    if batch then
+      local entry = batch.queue[batch.index]
+      return string.format("Analyzing %d of %d: %s… %d%%", math.min(batch.index, #batch.queue), #batch.queue,
+        entry and entry.name or "item", math.floor(K.analysis_progress() * 100))
     end
     if state.is_analyzing then
       return string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor((state.progress or 0) * 100))
@@ -11308,7 +12100,7 @@ local function loop_body()
 
   -- Follow REAPER's undo / redo / project changes (one cheap count check per frame)
   sync_with_project()
-  process_analysis_step()
+  K.analysis_tick()
   K.stale_check_step(ctx)
 
   local P = Theme.get_palette()
@@ -11357,7 +12149,8 @@ local function loop_body()
     -- Automatic selection tracking from REAPER (edge-triggered): switch target only when the first
     -- selected audio item CHANGES (or the current target no longer exists). A sidebar click sets the
     -- target without touching REAPER's selection, so it must not be overridden by the old selection.
-    if not state.is_analyzing then
+    -- A batch owns the target while it runs.
+    if not state.is_analyzing and not K.batch then
       local cur_sel_item = reaper.GetSelectedMediaItem(0, 0)
       local cur_sel_take = cur_sel_item and reaper.GetActiveTake(cur_sel_item)
       local cur_guid = nil
@@ -11378,6 +12171,7 @@ local function loop_body()
         local target_lost = state.target_take_guid ~= nil
           and not resolve_take_by_guid(state.target_take_guid, true)
         if sel_changed or target_lost then
+          K.status_release()   -- a held closing message belongs to the item being left
           -- Commit a pending arrow-key nudge to the take being left
           flush_nudge_burst()
           local switched = switch_active_target(cur_guid, cur_sel_take)
@@ -11406,6 +12200,8 @@ local function loop_body()
         end
       end
     end
+
+    K.status_watch(ctx)   -- a held closing message (a batch's) goes on the user's next input
 
     -- The target, asked once per frame: the top bar, canvas and sidebar read it from state.frame
     local target_take, target_item = get_target_take()
@@ -11590,14 +12386,19 @@ local function loop()
       state.error_streak = 0
     else
       reaper.ShowConsoleMsg("Fancy Pitch Correct Error: " .. tostring(open) .. "\n")
-      pcall(K.cancel_analysis)
-      pcall(K.tone_kill)
-      if state.undo_open then   -- the frame failed inside apply_envelope_to_take: close its undo block
+      if state.undo_open then   -- the frame failed inside an undo block (a note edit, a batch's write): close it
         state.undo_open = false
         pcall(reaper.Undo_EndBlock, "Apply Pitch Correction (interrupted)", -1)
       end
       K.drop_project_cache()    -- what the failed frame asked REAPER is not trusted any more
+      pcall(K.cancel_analysis)  -- a batch writes its finished items here, in an undo block of its own
+      pcall(K.tone_kill)
+      if state.undo_open then   -- that write failed as well
+        state.undo_open = false
+        pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
+      end
       state.clipper = nil       -- nor is a list clipper it may have left begun (a new one is made when needed)
+      K.confirm_clipper = nil
       state.error_streak = state.error_streak + 1
       state.fatal = { message = K.FATAL_TEXT, count = state.error_streak }
       open = true
@@ -11621,6 +12422,16 @@ local function main()
   local Utils = require("utils")
   local release_toolbar = Utils.init_toolbar_toggle()
   reaper.atexit(function()
+    if K.batch then
+      -- Ended mid-batch: the finished items are kept. What the last frame asked REAPER is not trusted here (the
+      -- project may be closing), and a write that fails must not leave its undo block open
+      K.drop_project_cache()
+      pcall(K.batch_finish, true)
+      if state.undo_open then
+        state.undo_open = false
+        pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
+      end
+    end
     K.release_analysis()
     K.tone_kill()
     release_toolbar()
@@ -11670,6 +12481,7 @@ end
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
-           run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block }
+           run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
+           request_confirm = request_confirm, sync_with_project = sync_with_project }
 end
 main()
