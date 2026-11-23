@@ -1015,7 +1015,16 @@ K.short_level = function(s, b_size, sample_rate, window_s)
   return math.sqrt(sum / n)
 end
 
--- Process a single block of audio using the YIN algorithm
+--- The detector on one block of audio (YIN's difference function). `samples`: at least block_size samples, 1-based.
+--- Returns rms (whole block), freq, lvl (K.short_level around the block's middle) and cands.
+--- cands: the periods the block could be read at, for K.pitch_track to choose from across frames: the dips of the
+--- normalised difference function inside the searched range, { tau = period in samples (fractional), d = its depth
+--- (0 = the sound repeats perfectly) }, the K.TRACK.MAX_CANDS deepest, in order of period. A value at the edge of the
+--- range is not a dip. The block has a pitch when its deepest dip is at most twice params.threshold: the threshold
+--- decides whether there is a pitch, not which one. freq is then the reading of the block on its own (K.cand_best);
+--- without a pitch freq and cands are nil.
+--- Every period is measured on a stretch of samples centred on the block's middle, so a frame's reading belongs to
+--- the middle of its block (K.frame_centre_s).
 local function yin_process_block(samples, sample_rate, params)
   local b_size = params.calc_block_size or params.block_size
 
@@ -1041,10 +1050,11 @@ local function yin_process_block(samples, sample_rate, params)
   local diff = {}
   local cmndf = {}
 
-  -- 1. Difference function
+  -- 1. Difference function: W samples against the W samples tau later, the pair centred on the block's middle
   for tau = 0, max_tau do
+    local o = (b_size - W - tau) // 2
     local sum = 0
-    for j = 1, W do
+    for j = o + 1, o + W do
       local d = s[j] - s[j + tau]
       sum = sum + d * d
     end
@@ -1063,53 +1073,48 @@ local function yin_process_block(samples, sample_rate, params)
     end
   end
 
-  -- 3. Absolute threshold
-  local tau_estimate = -1
-  for tau = min_tau, max_tau do
-    if cmndf[tau] < params.threshold then
-      -- Find local minimum
-      local cur_tau = tau
-      while cur_tau + 1 <= max_tau and cmndf[cur_tau + 1] < cmndf[cur_tau] do
-        cur_tau = cur_tau + 1
-      end
-      tau_estimate = cur_tau
-      break
+  -- 3. Candidates: the dips (a value below the one before and not above the one after), the deepest MAX_CANDS
+  local T = K.TRACK
+  local dips, d_min = {}, math.huge
+  for tau = math.max(min_tau, 2), max_tau - 1 do
+    local v = cmndf[tau]
+    if v < T.CAND_MAX_D and v < cmndf[tau - 1] and v <= cmndf[tau + 1] then
+      dips[#dips + 1] = tau
+      if v < d_min then d_min = v end
     end
   end
-
-  if tau_estimate == -1 then
-    -- Fallback to global minimum if nothing is below threshold
-    local min_val = 1
-    for tau = min_tau, max_tau do
-      if cmndf[tau] < min_val then
-        min_val = cmndf[tau]
-        tau_estimate = tau
-      end
-    end
-    -- If even the global minimum is high, it's likely unvoiced
-    if min_val > params.threshold * 2 then
-      return rms, nil, K.short_level(s, b_size, sample_rate)
-    end
+  if #dips == 0 or d_min > params.threshold * 2 then   -- no dip deep enough: no pitch
+    return rms, nil, K.short_level(s, b_size, sample_rate), nil
+  end
+  if #dips > T.MAX_CANDS then
+    table.sort(dips, function(x, y) return cmndf[x] < cmndf[y] or (cmndf[x] == cmndf[y] and x < y) end)
+    for q = #dips, T.MAX_CANDS + 1, -1 do dips[q] = nil end
+    table.sort(dips)
   end
 
   -- 4. Parabolic interpolation for better precision
-  local better_tau = tau_estimate
-  if tau_estimate > 0 and tau_estimate < max_tau then
-    local s0 = cmndf[tau_estimate - 1]
-    local s1 = cmndf[tau_estimate]
-    local s2 = cmndf[tau_estimate + 1]
+  local cands = {}
+  for q, tau in ipairs(dips) do
+    local better_tau = tau
+    local s0, s1, s2 = cmndf[tau - 1], cmndf[tau], cmndf[tau + 1]
     local denom = (2 * (2 * s1 - s2 - s0))
     if denom ~= 0 then
       local adjustment = (s2 - s0) / denom
       if math.abs(adjustment) < 1 then
-         better_tau = better_tau + adjustment
+        better_tau = better_tau + adjustment
       end
     end
+    cands[q] = { tau = better_tau, d = s1 }
   end
 
-  local freq = sample_rate / better_tau
+  local freq = sample_rate / K.cand_best(cands).tau
   -- The short level spans two periods of the pitch found (10 ms at least): it does not swing within a period
-  return rms, freq, K.short_level(s, b_size, sample_rate, K.level_window_s(freq))
+  return rms, freq, K.short_level(s, b_size, sample_rate, K.level_window_s(freq)), cands
+end
+
+--- Where in its block a frame's reading belongs, in seconds from the block's start: the middle.
+K.frame_centre_s = function(block_size, sample_rate)
+  return block_size / 2 / sample_rate
 end
 
 -------------------------------------------------------------------------------
@@ -3726,6 +3731,103 @@ K.frame_step = function(results)
   return (steps[m / 2] + steps[m / 2 + 1]) * 0.5
 end
 
+--- Choosing a frame's period (K.cand_cost, K.pitch_track). A frame's candidates are the dips of its difference function
+--- { tau = period in samples, d = how badly the sound repeats at that period (0 = perfectly) }. FLOOR: added to the
+--- deepest dip before another dip is compared with it (so two dips near 0 are not told apart by noise); OCTAVE_COST:
+--- what one octave down costs (a sound that repeats at a period repeats at its multiples too, so of dips about as deep
+--- the shortest period is the pitch); JUMP_COST: what each semitone of pitch change from one frame to the next costs,
+--- up to JUMP_CAP_ST; REF_HOP_S: the frame spacing the costs of a frame are given for (they scale with the spacing);
+--- MAX_CANDS / CAND_MAX_D: how many dips a frame keeps, and how shallow a dip may be.
+K.TRACK = { FLOOR = 0.02, OCTAVE_COST = 0.7, JUMP_COST = 0.15, JUMP_CAP_ST = 12, REF_HOP_S = 512 / 48000,
+  MAX_CANDS = 8, CAND_MAX_D = 0.8 }
+
+--- What it costs to read a frame at candidate `c`, judged within the frame alone: how much shallower its dip is than
+--- the frame's deepest (d_min), relative to that depth, plus OCTAVE_COST per octave its period is above the frame's
+--- shortest candidate period (tau_min). The frame's best reading costs 0 only when it is both.
+K.cand_cost = function(c, d_min, tau_min)
+  local T = K.TRACK
+  return (c.d - d_min) / (d_min + T.FLOOR) + T.OCTAVE_COST * math.log(c.tau / tau_min, 2)
+end
+
+--- The candidate of `cands` (not empty) that costs least within its frame (K.cand_cost): a frame's reading before
+--- its neighbours are known.
+K.cand_best = function(cands)
+  local d_min, tau_min = math.huge, math.huge
+  for _, c in ipairs(cands) do
+    d_min, tau_min = math.min(d_min, c.d), math.min(tau_min, c.tau)
+  end
+  local best, best_cost
+  for _, c in ipairs(cands) do
+    local cost = K.cand_cost(c, d_min, tau_min)
+    if not best or cost < best_cost then best, best_cost = c, cost end
+  end
+  return best
+end
+
+--- Gives every frame that has candidates (`results`: time-ordered frames, `cands` on the voiced ones) its pitch: the
+--- candidate on the cheapest line through the frames, where a line pays each frame's K.cand_cost and JUMP_COST for
+--- every semitone it moves between frames. A line runs through unvoiced stretches shorter than K.SEG.BRIDGE_S and
+--- starts afresh after a longer one. Sets freq and note, removes cands (they are not stored), and returns how many
+--- frames it gave a pitch.
+K.pitch_track = function(results, sample_rate)
+  local T, n = K.TRACK, #results
+  local hop = n >= 2 and K.frame_step(results) or 0
+  if not (hop > 0) then hop = 0 end   -- luacheck: ignore 581 (also catches NaN)
+  local scale = hop > 0 and hop / T.REF_HOP_S or 1
+  local done = 0
+  local line = {}   -- the frames of the running line: { i = result index, cost = { per candidate }, from = { per candidate } }
+  local function finish()   -- walk the cheapest line back and set its frames
+    local m = #line
+    if m == 0 then return end
+    local pick, low = 1, math.huge
+    for ci, cost in ipairs(line[m].cost) do
+      if cost < low then pick, low = ci, cost end
+    end
+    for k = m, 1, -1 do
+      local f = results[line[k].i]
+      f.freq = sample_rate / f.cands[pick].tau
+      f.note = freq_to_note(f.freq)
+      f.cands = nil
+      done = done + 1
+      pick = line[k].from[pick]
+    end
+    line = {}
+  end
+  for i = 1, n do
+    local f = results[i]
+    local cands = f.cands
+    if cands and #cands > 0 then
+      local last = line[#line]
+      if last and f.time - results[last.i].time - hop >= K.SEG.BRIDGE_S then
+        finish()
+        last = nil
+      end
+      local d_min, tau_min = math.huge, math.huge
+      for _, c in ipairs(cands) do
+        d_min, tau_min = math.min(d_min, c.d), math.min(tau_min, c.tau)
+      end
+      local cost, from = {}, {}
+      for ci, c in ipairs(cands) do
+        local best, best_from = 0, 0
+        if last then
+          best = math.huge
+          for pi, pc in ipairs(results[last.i].cands) do
+            local jump = math.min(T.JUMP_CAP_ST, math.abs(12 * math.log(pc.tau / c.tau, 2)))
+            local total = last.cost[pi] + T.JUMP_COST * jump
+            if total < best then best, best_from = total, pi end
+          end
+        end
+        cost[ci], from[ci] = best + K.cand_cost(c, d_min, tau_min) * scale, best_from
+      end
+      line[#line + 1] = { i = i, cost = cost, from = from }
+    elseif cands then
+      f.cands = nil   -- an empty list: no pitch
+    end
+  end
+  finish()
+  return done
+end
+
 --- Octave errors of the pitch detection (K.octave_fix): JUMP_TOL_ST = how far from a whole number of octaves a
 --- frame-to-frame jump may be and still count as an octave jump; MAX_RUN_S = the longest stretch that is put back (a
 --- longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames are in;
@@ -4177,7 +4279,10 @@ K.resplit_match = function(old_notes, new_notes, tol_s, is_modified)
 end
 
 local function run_hybrid_segmentation()
-  K.octave_fix(state.results or {})   -- before the split: the notes and their centres are made from the fixed frames
+  -- Before the split, so the notes and their centres are made from the final frames: each voiced frame's period is
+  -- chosen across the frames, then any short octave-off stretch that is left is put back
+  K.pitch_track(state.results or {}, state.sample_rate)
+  K.octave_fix(state.results or {})
   state.notes, state.split_points = K.segment(state.results or {}, state.separation)
 
   -- Anchor pitch
@@ -4206,7 +4311,11 @@ local function process_analysis_step()
   -- Work for one short slice, then yield to the window (the progress and Cancel stay responsive)
   local slice_start = reaper.time_precise()
 
-  while state.current_time < state.end_time do
+  -- Only blocks that lie whole inside the item are read: a block that runs past the item's end gave a pitch of its
+  -- own (the hop's period). A frame's time is the middle of its block (K.frame_centre_s)
+  local block_s = params.block_size / state.sample_rate
+  local centre_s = K.frame_centre_s(params.block_size, state.sample_rate)
+  while state.current_time + block_s <= state.end_time do
     if reaper.time_precise() - slice_start > K.ANALYSIS_SLICE_S then
       break
     end
@@ -4222,17 +4331,20 @@ local function process_analysis_step()
     )
 
     if num_read > 0 then
-      local rms, freq, lvl = yin_process_block(state.buffer, state.sample_rate, params)
+      -- freq / note: the block's reading on its own, shown while the analysis runs; K.pitch_track makes the final
+      -- choice from cands when the last block is read
+      local rms, freq, lvl, cands = yin_process_block(state.buffer, state.sample_rate, params)
       local note = nil
       if freq and freq >= params.min_freq and freq <= params.max_freq then
         note = freq_to_note(freq)
       end
       table.insert(state.results, {
-        time = state.current_time,
+        time = state.current_time + centre_s,
         freq = freq,
         note = note,
         rms = rms,
-        lvl = lvl
+        lvl = lvl,
+        cands = cands
       })
     end
 
@@ -4240,7 +4352,7 @@ local function process_analysis_step()
     state.current_time = state.current_time + (params.hop_size / state.sample_rate)
   end
 
-  if state.current_time >= state.end_time then
+  if state.current_time + block_s > state.end_time then
     -- The resync is paused while analysing: remember whether the project changed meanwhile so the
     -- next frame still picks up external changes (undo etc.) after this script's own writes.
     local external_change = (state.last_change_count ~= reaper.GetProjectStateChangeCount(0))
@@ -11547,6 +11659,6 @@ end
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
-           run_hybrid_segmentation = run_hybrid_segmentation }
+           run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block }
 end
 main()
