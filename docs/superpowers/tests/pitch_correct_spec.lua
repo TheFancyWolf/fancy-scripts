@@ -1930,6 +1930,349 @@ test("analysis_fixes_octaves_before_splitting", function()   -- what an analysis
   if not ok then error(err, 0) end
 end)
 
+-- Choosing the period across frames (K.pitch_track) ------------------------------------------------
+
+local TSR = 48000
+-- list: runs of { frame count, candidates | nil }; candidates: { { tau, d }, ... } (d: how badly the sound repeats
+-- at that period, 0 = perfectly). Returns result frames with `cands`
+local function track_frames(list, hop)
+  local out = {}
+  for _, r in ipairs(list) do
+    for _ = 1, r[1] do
+      local cands
+      if r[2] then
+        cands = {}
+        for i, c in ipairs(r[2]) do cands[i] = { tau = c[1], d = c[2] } end
+      end
+      out[#out + 1] = { time = #out * (hop or OHOP), cands = cands, rms = 0.1, lvl = 0.1 }
+    end
+  end
+  return out
+end
+local function tau_of(f) return f.freq and TSR / f.freq or nil end
+
+test("track_prefers_the_far_deeper_dip", function()   -- the chorus: half the period passes the threshold, barely
+  local fr = track_frames({ { 30, { { 64, 0.07 }, { 128, 0.001 }, { 192, 0.075 }, { 256, 0.002 }, { 384, 0.003 } } } })
+  S.K.pitch_track(fr, TSR)
+  for i, f in ipairs(fr) do near(tau_of(f), 128, 1e-9, "frame " .. i) end
+  near(fr[1].note, 69 + 12 * math.log(375 / 440, 2), 1e-9, "note follows freq")
+end)
+
+test("track_keeps_the_period_at_a_shaky_onset", function()   -- the verse: the double period is deeper by a hair
+  local fr = track_frames({ { 5, { { 190, 0.02 }, { 380, 0.025 } } },
+    { 2, { { 94, 0.332 }, { 190, 0.117 }, { 286, 0.336 }, { 384, 0.109 }, { 478, 0.36 } } },
+    { 20, { { 190, 0.01 }, { 380, 0.012 } } } })
+  S.K.pitch_track(fr, TSR)
+  for i, f in ipairs(fr) do near(tau_of(f), 190, 1e-9, "frame " .. i) end
+  -- the first frame of a phrase, the double period clearly deeper (the verse at 5.58 s)
+  local first = track_frames({ { 3, nil }, { 1, { { 232, 0.177 }, { 463, 0.073 } } }, { 20, { { 232, 0.02 }, { 464, 0.03 } } } })
+  S.K.pitch_track(first, TSR)
+  near(tau_of(first[4]), 232, 1e-9, "phrase start")
+end)
+
+test("track_follows_a_real_octave_leap", function()
+  local fr = track_frames({ { 20, { { 256, 0.005 }, { 512, 0.006 } } },
+    { 20, { { 128, 0.004 }, { 256, 0.006 }, { 384, 0.006 } } } })
+  S.K.pitch_track(fr, TSR)
+  for i = 1, 20 do near(tau_of(fr[i]), 256, 1e-9, "low frame " .. i) end
+  for i = 21, 40 do near(tau_of(fr[i]), 128, 1e-9, "high frame " .. i) end
+end)
+
+test("track_follows_a_glide", function()
+  local fr = track_frames({ { 21, { { 200, 0.01 } } } })
+  for i, f in ipairs(fr) do f.cands = { { tau = 200 - (i - 1), d = 0.01 }, { tau = 2 * (200 - (i - 1)), d = 0.012 } } end
+  S.K.pitch_track(fr, TSR)
+  for i, f in ipairs(fr) do near(tau_of(f), 200 - (i - 1), 1e-9, "frame " .. i) end
+end)
+
+test("track_neighbours_decide_a_doubtful_frame", function()
+  local doubtful = { { 128, 0.30 }, { 256, 0.10 } }   -- alone, the double period is the better reading
+  local alone = track_frames({ { 3, nil }, { 1, doubtful }, { 3, nil } })
+  S.K.pitch_track(alone, TSR)
+  near(tau_of(alone[4]), 256, 1e-9, "alone")
+  local among = track_frames({ { 10, { { 128, 0.01 }, { 256, 0.01 } } }, { 1, doubtful }, { 10, { { 128, 0.01 }, { 256, 0.01 } } } })
+  S.K.pitch_track(among, TSR)
+  for i, f in ipairs(among) do near(tau_of(f), 128, 1e-9, "among, frame " .. i) end
+end)
+
+test("track_gaps_and_leftovers", function()
+  local fr = track_frames({ { 2, nil }, { 6, { { 128, 0.01 }, { 256, 0.012 } } }, { 8, nil }, { 6, { { 300, 0.01 } } }, { 2, nil } })
+  eq(S.K.pitch_track(fr, TSR), 12, "frames given a pitch")
+  eq(fr[1].note, nil, "an unvoiced frame has no pitch"); eq(fr[1].freq, nil, "nor a freq")
+  near(tau_of(fr[3]), 128, 1e-9, "first stretch"); near(tau_of(fr[17]), 300, 1e-9, "after the gap")
+  for i, f in ipairs(fr) do eq(f.cands, nil, "candidates are not kept, frame " .. i) end
+  eq(S.K.pitch_track(fr, TSR), 0, "a second run has nothing to do")
+  near(tau_of(fr[3]), 128, 1e-9, "and leaves the pitch alone")
+end)
+
+test("track_degenerate", function()
+  eq(S.K.pitch_track({}, TSR), 0, "no frames")
+  local one = track_frames({ { 1, { { 128, 0.01 } } } })
+  eq(S.K.pitch_track(one, TSR), 1, "one frame"); near(tau_of(one[1]), 128, 1e-9, "its only candidate")
+  local same = track_frames({ { 5, { { 128, 0.01 }, { 256, 0.012 } } } })
+  for _, f in ipairs(same) do f.time = 0 end
+  eq(S.K.pitch_track(same, TSR), 5, "equal times"); near(tau_of(same[3]), 128, 1e-9, "still the period")
+  local empty = track_frames({ { 3, {} } })
+  eq(S.K.pitch_track(empty, TSR), 0, "empty candidate lists"); eq(empty[1].note, nil, "no pitch")
+end)
+
+test("track_any_hop", function()
+  for _, hop in ipairs({ 256 / 48000, 512 / 48000, 1024 / 48000 }) do
+    local n = math.floor(0.2 / hop)
+    local fr = track_frames({ { n, { { 128, 0.01 }, { 256, 0.01 } } }, { math.max(1, math.floor(0.012 / hop)), { { 128, 0.30 }, { 256, 0.10 } } },
+      { n, { { 128, 0.01 }, { 256, 0.01 } } } }, hop)
+    S.K.pitch_track(fr, TSR)
+    for i, f in ipairs(fr) do near(tau_of(f), 128, 1e-9, "hop " .. hop .. " frame " .. i) end
+  end
+end)
+
+-- This machine only: what the detector had to choose from on the two reported items, recorded in real REAPER on
+-- 2026-11-23 (per frame: every dip of the difference function). Returns the frames, or nil
+local function diag_frames(name)
+  local f = io.open(FIXTURE_DIR .. "detector-diag-2026-11-23/" .. name, "rb")
+  if not f then return nil end
+  local out = {}
+  for line in f:lines() do
+    if not line:match("^#") and not line:match("^time") then
+      local cols = {}
+      for col in (line .. "\t"):gmatch("(.-)\t") do cols[#cols + 1] = col end
+      local fr = { time = tonumber(cols[1]), rms = tonumber(cols[3]), lvl = tonumber(cols[3]) }
+      if cols[4] ~= "unvoiced" then
+        fr.cands = {}
+        for tau, d in (cols[10] or ""):gmatch("(%d+):([%d%.]+)") do fr.cands[#fr.cands + 1] = { tau = tonumber(tau), d = tonumber(d) } end
+      end
+      out[#out + 1] = fr
+    end
+  end
+  f:close()
+  return out
+end
+-- How many frames read more than 6 st from the middle pitch of the 12 frames each side (octave errors, mostly)
+local function frames_off(fr)
+  local off = 0
+  for i, f in ipairs(fr) do
+    if f.note then
+      local around = {}
+      for x = math.max(1, i - 12), math.min(#fr, i + 12) do
+        if x ~= i and fr[x].note then around[#around + 1] = fr[x].note end
+      end
+      if #around >= 6 then
+        table.sort(around)
+        if math.abs(f.note - around[(#around + 1) // 2]) > 6 then off = off + 1 end
+      end
+    end
+  end
+  return off
+end
+
+test("track_real_items", function()
+  local chorus, verse = diag_frames("diag_Chorus_Error_b1024_th0.08.tsv"), diag_frames("diag_V_Main_Verse_1_b1024_th0.08.tsv")
+  if not chorus or not verse then print("SKIP track_real_items (no local fixture)") return end
+  S.K.pitch_track(chorus, TSR)
+  S.K.pitch_track(verse, TSR)
+  local c, v = frames_off(chorus), frames_off(verse)
+  -- With the old choice: chorus 41, verse 32. What is left (chorus 1, verse 21 when this was written) is unchanged
+  -- readings: quiet falling tails at phrase ends, one real high blip at 11.75 s and the junk at the items' ends
+  if c > 2 then error("chorus: " .. c .. " frames off", 0) end
+  if v > 23 then error("verse: " .. v .. " frames off", 0) end
+end)
+
+-- The detector on one block (yin_process_block) --------------------------------------------------------
+
+local YP = { block_size = 1024, threshold = 0.08, min_freq = 65, max_freq = 1000 }
+-- A block of `fn(t)` (t in seconds from the block's start) at 48 kHz
+local function block_of(fn)
+  local s = {}
+  for i = 1, YP.block_size do s[i] = fn((i - 1) / TSR) end
+  return s
+end
+local function tone(freq, a1, a2, a3)
+  return function(t)
+    local ph = 2 * math.pi * freq * t
+    return (a1 or 1) * math.sin(ph) + (a2 or 0) * math.sin(2 * ph) + (a3 or 0) * math.sin(3 * ph)
+  end
+end
+
+test("yin_reads_a_plain_tone", function()
+  local rms, freq, lvl, cands = S.yin_process_block(block_of(tone(220, 1, 0.5, 0.3)), TSR, YP)
+  near(freq, 220, 0.5, "freq")
+  if not (rms > 0 and lvl > 0) then error("levels") end
+  if not (#cands >= 2 and #cands <= S.K.TRACK.MAX_CANDS) then error("candidates: " .. #cands) end
+  for i, c in ipairs(cands) do
+    if c.d >= S.K.TRACK.CAND_MAX_D then error("candidate " .. i .. " too shallow: " .. c.d) end
+    if i > 1 and c.tau <= cands[i - 1].tau then error("candidates are in order of period") end
+  end
+  near(cands[1].tau, TSR / 220, 0.3, "the period"); near(cands[2].tau, 2 * TSR / 220, 0.6, "its double")
+end)
+
+test("yin_strong_second_harmonic", function()   -- the chorus: the note is 375 Hz, most of the sound is at 750
+  local _, freq = S.yin_process_block(block_of(tone(375, 0.12, 1)), TSR, YP)
+  near(freq, 375, 1, "freq")
+end)
+
+test("yin_noise_has_no_pitch", function()
+  local seed = 12345
+  local _, freq, _, cands = S.yin_process_block(block_of(function()
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return seed / 1073741824 - 1
+  end), TSR, YP)
+  eq(freq, nil, "freq"); eq(cands, nil, "candidates")
+end)
+
+test("yin_nothing_at_the_longest_period", function()   -- 93.75 Hz repeats exactly at the last period looked at
+  local _, freq = S.yin_process_block(block_of(tone(93.75, 1, 0.5)), TSR, YP)
+  eq(freq, nil, "a reading at the edge of the search is no dip")
+end)
+
+test("yin_reads_the_middle_of_the_block", function()   -- a rising pitch: 200 Hz at the block's start, 216 at its end
+  local dur = YP.block_size / TSR
+  local _, freq = S.yin_process_block(block_of(function(t)
+    local ph = 2 * math.pi * (200 * t + 0.5 * (16 / dur) * t * t)
+    return math.sin(ph) + 0.5 * math.sin(2 * ph) + 0.3 * math.sin(3 * ph)
+  end), TSR, YP)
+  near(freq, 208, 0.8, "the pitch at the middle of the block")
+end)
+
+
+test("analysis_chooses_periods_before_splitting", function()   -- what an analysis runs when its last frame is read
+  local st = S.state
+  local saved = { st.results, st.notes, st.split_points, st.separation, st.sample_rate }
+  st.results = track_frames({ { 3, nil }, { 40, { { 64, 0.07 }, { 128, 0.001 }, { 256, 0.002 } } }, { 3, nil } })
+  st.separation, st.sample_rate = 0.5, TSR
+  local ok, err = pcall(function()
+    S.run_hybrid_segmentation()
+    near(st.results[10].freq, 375, 1e-9, "the frames are read at the period, not half of it")
+    eq(st.results[10].cands, nil, "candidates are not kept")
+    eq(#st.notes, 1, "notes")
+    near(st.notes[1].avg_note, 69 + 12 * math.log(375 / 440, 2), 1e-6, "the note's centre")
+  end)
+  st.results, st.notes, st.split_points, st.separation, st.sample_rate = table.unpack(saved, 1, 5)
+  if not ok then error(err, 0) end
+end)
+
+test("frame_centre", function()
+  near(S.K.frame_centre_s(1024, 48000), 512 / 48000, 1e-12, "the middle of the block")
+end)
+
+-- After the whole-branch review of the detector change -----------------------------------------------
+
+test("yin_steady_high_note", function()   -- more dips than a frame keeps: the note's own period must be among them
+  for _, hz in ipairs({ 880, 932, 988 }) do
+    local _, freq, _, cands = S.yin_process_block(block_of(tone(hz, 1, 0.3, 0.1)), TSR, YP)
+    near(freq, hz, 2, hz .. " Hz")
+    eq(#cands, S.K.TRACK.MAX_CANDS, hz .. " Hz: the frame is trimmed")
+    near(cands[1].tau, TSR / hz, 0.3, hz .. " Hz: the shortest deep dip is kept")
+  end
+end)
+
+test("yin_threshold_decides_whether_there_is_a_pitch", function()   -- a noisy tone: its deepest dip is about 0.2
+  local seed = 99
+  local function noisy(t)
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    return math.sin(2 * math.pi * 220 * t) + 0.62 * (seed / 1073741824 - 1)
+  end
+  local blk = block_of(noisy)
+  local function at(th) return S.yin_process_block(blk, TSR, { block_size = 1024, threshold = th, min_freq = 65, max_freq = 1000 }) end
+  local _, strict = at(0.08)
+  local _, standard, _, cands = at(0.15)
+  eq(strict, nil, "no pitch at 0.08: the deepest dip is over 0.16")
+  near(standard, 220, 3, "a pitch at 0.15: the deepest dip is under 0.30")
+  local deepest = math.huge
+  for _, c in ipairs(cands) do deepest = math.min(deepest, c.d) end
+  if deepest <= 0.16 or deepest > 0.30 then error("the block's deepest dip is " .. deepest .. ", the test needs 0.16..0.30") end
+end)
+
+-- The same note with noise 20 dB under it. (With the noise 15 dB under, the note's own tone, 18 dB under its
+-- overtone, is below the noise: the block then really is a 750 Hz sound in noise, and is read as one.)
+test("yin_strong_second_harmonic_in_noise", function()
+  local seed = 4242
+  local amp = math.sqrt((0.12 * 0.12 + 1) / 2) / 10 ^ (20 / 20) * math.sqrt(3)
+  local n = 20 * 512 + 1024
+  local x = {}
+  for i = 1, n do
+    local t = (i - 1) / TSR
+    seed = (seed * 1103515245 + 12345) % 2147483648
+    x[i] = 0.12 * math.sin(2 * math.pi * 375 * t) + math.sin(2 * math.pi * 750 * t) + amp * (seed / 1073741824 - 1)
+  end
+  local fr = {}
+  for k = 0, 19 do
+    local blk = {}
+    for i = 1, 1024 do blk[i] = x[k * 512 + i] end
+    local rms, freq, lvl, cands = S.yin_process_block(blk, TSR, YP)
+    fr[#fr + 1] = { time = k * OHOP, freq = freq, rms = rms, lvl = lvl, cands = cands }
+  end
+  S.K.pitch_track(fr, TSR)
+  for i, f in ipairs(fr) do near(f.freq, 375, 3, "frame " .. i) end
+end)
+
+test("track_a_line_runs_through_a_short_gap_only", function()
+  local good, doubtful = { { 128, 0.01 }, { 256, 0.01 } }, { { 128, 0.30 }, { 256, 0.10 } }
+  -- 2 unvoiced frames (21 ms, under K.SEG.BRIDGE_S): the doubtful frame is read with the line before the gap
+  local short = track_frames({ { 10, good }, { 2, nil }, { 1, doubtful } })
+  S.K.pitch_track(short, TSR)
+  near(tau_of(short[13]), 128, 1e-9, "after a short gap")
+  -- 3 unvoiced frames (32 ms): a new line, the frame is read on its own
+  local long = track_frames({ { 10, good }, { 3, nil }, { 1, doubtful } })
+  S.K.pitch_track(long, TSR)
+  near(tau_of(long[14]), 256, 1e-9, "after a long gap")
+end)
+
+test("track_same_answer_at_any_hop", function()
+  local good, doubtful = { { 128, 0.01 }, { 256, 0.01 } }, { { 128, 0.30 }, { 256, 0.10 } }
+  for _, hop in ipairs({ 256 / 48000, 512 / 48000, 1024 / 48000 }) do
+    local side = math.floor(0.3 / hop + 0.5)
+    -- 21 ms of doubtful frames among good ones stay on the line; 64 ms are followed
+    for _, case in ipairs({ { 0.0213, 128 }, { 0.064, 256 } }) do
+      local n = math.floor(case[1] / hop + 0.5)
+      local fr = track_frames({ { side, good }, { n, doubtful }, { side, good } }, hop)
+      S.K.pitch_track(fr, TSR)
+      near(tau_of(fr[side + 1]), case[2], 1e-9, string.format("%.0f ms at hop %.4f", case[1] * 1000, hop))
+      near(tau_of(fr[1]), 128, 1e-9, "the frames around")
+    end
+  end
+end)
+
+test("track_empty_candidate_list_is_removed", function()
+  local fr = track_frames({ { 2, {} } })
+  S.K.pitch_track(fr, TSR)
+  eq(fr[1].cands, nil, "removed")
+end)
+
+test("analysis_frame_and_block_times", function()
+  local P = { block_size = 1024, min_freq = 65, max_freq = 1000 }
+  local cands = { { tau = 128, d = 0.01 } }
+  local f = S.K.analysis_frame(1.0, P, TSR, 0.1, 375, 0.09, cands)
+  near(f.time, 1.0 + 512 / TSR, 1e-12, "the middle of the block")
+  eq(f.freq, 375); near(f.note, 69 + 12 * math.log(375 / 440, 2), 1e-9, "note"); eq(f.rms, 0.1); eq(f.lvl, 0.09)
+  eq(f.cands, cands, "the candidates ride on the frame until the choice is made")
+  eq(S.K.analysis_frame(0, P, TSR, 0.1, 1200, 0.1, nil).note, nil, "a reading outside the range has no note")
+  eq(S.K.analysis_frame(0, P, TSR, 0.1, nil, 0.1, nil).note, nil, "no pitch, no note")
+  -- which blocks are read: only those that lie whole inside the item
+  local block_s = 1024 / TSR
+  eq(S.K.block_fits(0, P, TSR, 1.0), true, "the first block")
+  eq(S.K.block_fits(1.0 - block_s, P, TSR, 1.0), true, "a block that ends with the item")
+  eq(S.K.block_fits(1.0 - block_s + 1e-6, P, TSR, 1.0), false, "a block that runs past the end")
+  eq(S.K.block_fits(0, P, TSR, block_s / 2), false, "an item shorter than a block")
+end)
+
+test("analysis_pitch_range_follows_the_final_choice", function()
+  local st = S.state
+  local saved = { st.results, st.notes, st.split_points, st.separation, st.sample_rate }
+  st.results = track_frames({ { 40, { { 64, 0.07 }, { 128, 0.001 }, { 256, 0.002 } } } })
+  for _, f in ipairs(st.results) do f.note = 99 end   -- what the frames showed while the analysis ran
+  st.separation, st.sample_rate = 0.5, TSR
+  local ok, err = pcall(function()
+    local _, _, before = S.K.results_range(st.results)
+    eq(before, 99, "the range while the analysis runs")
+    S.run_hybrid_segmentation()
+    local _, low, high = S.K.results_range(st.results)
+    local want = 69 + 12 * math.log(375 / 440, 2)
+    near(low, want, 1e-6, "lowest pitch after the choice"); near(high, want, 1e-6, "highest pitch after the choice")
+  end)
+  st.results, st.notes, st.split_points, st.separation, st.sample_rate = table.unpack(saved, 1, 5)
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
