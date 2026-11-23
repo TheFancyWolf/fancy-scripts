@@ -2846,11 +2846,17 @@ K.correction_build = function(notes, item_len)
       and nb.start_time - na.end_time < 2 * J.FADE_S
   end
 
-  local mode_points, mode_ranges = {}, {}
-  local function put(t, val) mode_points[#mode_points + 1] = { time = clamp(t), val = val } end
+  -- blocks[k]: the points of one Classic or Hard note, in time order; blocks are in note order. A point is
+  -- never clamped onto another: a step in before the item start or a close after its end is not written.
+  local blocks, mode_ranges = {}, {}
+  local block
+  local function put(t, val) block[#block + 1] = { time = clamp(t), val = val } end
   for idx = 1, num_notes do
     local n = notes[idx]
-    if modes[idx] and has_frames(n) then
+    if modes[idx] and not has_frames(n) then
+      n.frame_shifts = {}
+    elseif modes[idx] then
+      block = {}
       local fr, nf = n.frames, #n.frames
       local shifts, steps = K.mode_line(n, modes[idx], pcs)
       local offsets = K.points_offsets(n)
@@ -2859,11 +2865,13 @@ K.correction_build = function(notes, item_len)
       n.frame_shifts = fs
 
       local t_first, t_last = fr[1].time, fr[nf].time
-      if idx > 1 and held(idx - 1) then
-        local p = notes[idx - 1]
-        put(t_first - STEP, p.frame_shifts[#p.frames])
-      else
-        put(t_first - STEP, 0.0)
+      if t_first - STEP >= 0 then
+        if idx > 1 and held(idx - 1) then
+          local p = notes[idx - 1]
+          put(t_first - STEP, p.frame_shifts[#p.frames])
+        else
+          put(t_first - STEP, 0.0)
+        end
       end
       for i = 1, nf do
         if i > 1 and steps[i] then put(fr[i].time - STEP, fs[i - 1]) end
@@ -2874,24 +2882,36 @@ K.correction_build = function(notes, item_len)
         range.t1 = clamp(notes[idx + 1].frames[1].time)
       else
         local t_close = math.max(n.end_time, t_last + STEP)
-        if t_close - STEP > t_last then put(t_close - STEP, fs[nf]) end
-        put(t_close, 0.0)
+        if t_close - STEP > t_last and t_close - STEP <= item_len then put(t_close - STEP, fs[nf]) end
+        if t_close <= item_len then put(t_close, 0.0) end
         range.t1 = clamp(t_close)
       end
       mode_ranges[#mode_ranges + 1] = range
+      blocks[#blocks + 1] = block
     end
   end
 
-  -- Natural's points outside every Classic or Hard range (closed at both ends), then the mode points
-  local points = {}
+  -- Natural's points outside every Classic or Hard range (closed at both ends), in Natural's own order; each
+  -- note's block goes just before the first of them that is later than the block's first point (the envelope
+  -- writer simplifies in list order, so the list must not go back in time)
+  local points, next_block = {}, 1
+  local function add_blocks_before(t)
+    while blocks[next_block] and (t == nil or t > blocks[next_block][1].time) do
+      for _, q in ipairs(blocks[next_block]) do points[#points + 1] = q end
+      next_block = next_block + 1
+    end
+  end
   for _, p in ipairs(A.points) do
     local inside = false
     for _, r in ipairs(mode_ranges) do
       if p.time >= r.t0 and p.time <= r.t1 then inside = true break end
     end
-    if not inside then points[#points + 1] = p end
+    if not inside then
+      add_blocks_before(p.time)
+      points[#points + 1] = p
+    end
   end
-  for _, p in ipairs(mode_points) do points[#points + 1] = p end
+  add_blocks_before(nil)
 
   local all = {}
   for _, r in ipairs(A.ranges) do all[#all + 1] = { t0 = r.t0, t1 = r.t1 } end
@@ -11182,6 +11202,6 @@ end
 
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
-           SCALE_DEFINITIONS = SCALE_DEFINITIONS }
+           SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify }
 end
 main()

@@ -1454,6 +1454,76 @@ test("build_item_mode_reaches_edited_notes_only", function() chromatic(function(
   end)
 end) end)
 
+local function sorted_by_time(points)
+  local p = {}
+  for i, q in ipairs(points) do p[i] = q end
+  table.sort(p, function(a, b) return a.time < b.time end)
+  return p
+end
+local function no_close_points(points, msg)
+  local p = sorted_by_time(points)
+  for i = 2, #p do
+    if p[i].time - p[i - 1].time < 0.0001 then error((msg or "") .. ": two points closer than 0.1 ms at " .. p[i].time) end
+  end
+end
+
+test("build_mode_then_later_natural_is_written_as_built", function() chromatic(function()
+  local build = S.K.correction_build({ hard_note(0.5, 60.3), join_note(2.0, 0.3, 60, 1) }, 10)
+  local simplified = sorted_by_time(S.rdp_simplify(build.points, 0.01))
+  near(simplified[1].val, 0, 1e-12, "starts with no correction")
+  near(simplified[1].time, 0.5 - STEP, 1e-9, "at the step in")
+  near(value_at(simplified, 0.25), 0, 1e-12, "nothing before the Hard note")
+  near(value_at(simplified, 0.6), -0.3, 1e-9, "the Hard note")
+end) end)
+
+test("build_points_keep_time_order", function() chromatic(function()
+  local function notes_of(bypass)
+    local list = { hard_note(0.5, 60.3), join_note(1.5, 0.3, 60, 1), hard_note(2.5, 62.4), join_note(3.5, 0.3, 64, -1) }
+    if bypass then
+      for _, i in ipairs({ 1, 3 }) do list[i].controls.correct_mode, list[i].controls.bypassed = nil, true end
+    end
+    return list
+  end
+  local notes = notes_of(false)
+  local build = S.K.correction_build(notes, 10)
+  for i = 2, #build.points do
+    if build.points[i].time < build.points[i - 1].time then error("time goes back at point " .. i) end
+  end
+  local ref = S.K.natural_build(notes_of(true), 10)
+  local function in_mode_note(t)
+    for _, i in ipairs({ 1, 3 }) do
+      if t >= notes[i].start_time - 0.01 and t <= notes[i].end_time + 0.01 then return true end
+    end
+    return false
+  end
+  local q, n_ref = 1, 0
+  for _, p in ipairs(ref.points) do
+    if not in_mode_note(p.time) then
+      n_ref = n_ref + 1
+      while build.points[q] and not (build.points[q].time == p.time and build.points[q].val == p.val) do q = q + 1 end
+      if not build.points[q] then error("Natural's point " .. n_ref .. " is missing or out of order") end
+      q = q + 1
+    end
+  end
+  if n_ref < 4 then error("the reference has no Natural points to compare") end
+end) end)
+
+test("build_mode_note_at_item_start_is_flat", function() chromatic(function()
+  local h = mode_note(0, 0.2, 60.3, 60.3, { correct_mode = 2 })
+  local build = S.K.correction_build({ h }, 0.2)
+  local simplified = sorted_by_time(S.rdp_simplify(build.points, 0.01))
+  for _, t in ipairs({ 0, 0.05, 0.1, 0.15 }) do near(value_at(simplified, t), -0.3, 1e-9, "flat at " .. t) end
+  no_close_points(build.points, "raw build")
+end) end)
+
+test("build_mode_note_at_item_end_has_no_shared_time", function() chromatic(function()
+  local h = hard_note(0.5, 60.3)
+  local build = S.K.correction_build({ h }, h.end_time)
+  no_close_points(build.points, "raw build")
+  build = S.K.correction_build({ h }, h.end_time - STEP - 0.0002)   -- the note runs just past the item end
+  no_close_points(build.points, "note past the item end")
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
