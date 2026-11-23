@@ -2384,6 +2384,190 @@ K.cancel_analysis = function()
   return true
 end
 
+-------------------------------------------------------------------------------
+-- 3b. BATCH ANALYSIS (Analyze All Selected Items)
+-------------------------------------------------------------------------------
+-- Design: docs/design/pitch-correct-analyze-selected.md. A batch analyses the audio items selected in REAPER's
+-- arrange view one after another. The models of finished items are held in memory and written together, in one
+-- undo block, when the batch ends (an undo block cannot stay open between frames).
+
+--- The items a batch would analyse now: every selected item whose active take is audio, in REAPER's order of the
+--- selection. Returns { takes = { entry ... }, skipped = how many other selected items there are }, with
+--- entry = { guid, take, item, name, len (seconds), pos (project seconds), track (its name), sample_rate,
+--- has_notes (it holds notes that a new analysis would replace) }. REAPER's selection is only read.
+--- sample_rate is asked here, when the user has just clicked in the window: REAPER can report 0 for every source
+--- while it is in the background ("Set media items offline when application is not active"), and a batch runs on
+--- while the user works elsewhere.
+K.batch_selection = function()
+  local out = { takes = {}, skipped = 0 }
+  local count = reaper.CountSelectedMediaItems(0) or 0
+  for i = 0, count - 1 do
+    local item = reaper.GetSelectedMediaItem(0, i)
+    local take = item and reaper.GetActiveTake(item) or nil
+    local guid = nil
+    if take and not reaper.TakeIsMIDI(take) then guid = get_take_guid(take) end
+    if guid then
+      local source = reaper.GetMediaItemTake_Source(take)
+      local track = reaper.GetMediaItemTrack(item)
+      local track_name = ""
+      if track then
+        local ok, name = reaper.GetTrackName(track)
+        if ok and name then track_name = name end
+      end
+      local data = state.session_takes[guid]
+      out.takes[#out.takes + 1] = {
+        guid = guid, take = take, item = item,
+        name = reaper.GetTakeName(take) or "Item",
+        len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0,
+        pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION") or 0,
+        track = track_name,
+        sample_rate = source and reaper.GetMediaSourceSampleRate(source) or 0,
+        has_notes = (data ~= nil and data.notes ~= nil and #data.notes > 0),
+      }
+    elseif item then
+      out.skipped = out.skipped + 1
+    end
+  end
+  return out
+end
+
+-- How long K.batch_peek's answer is kept while the selection and the project state stay the same (seconds)
+K.BATCH_PEEK_S = 0.25
+
+--- What the window says about a possible batch: { n = audio items selected, skipped = other selected items,
+--- with_notes = how many of the n hold notes, target_in = the open item is one of them }. The selection is not
+--- walked every frame: the answer is kept until the number of selected items, the project state or the open item
+--- changes, and for K.BATCH_PEEK_S at most (a selection change need not move the project's change count).
+--- A batch never uses this: it reads the selection afresh when it starts (K.batch_request).
+K.batch_peek = function(now)
+  local sel_n = reaper.CountSelectedMediaItems(0) or 0
+  local count = reaper.GetProjectStateChangeCount(0)
+  local cache = K.batch_peek_cache
+  if cache and cache.sel_n == sel_n and cache.count == count and cache.target == state.target_take_guid
+     and now - cache.at < K.BATCH_PEEK_S then
+    return cache.peek
+  end
+  local sel = K.batch_selection()
+  local peek = { n = #sel.takes, skipped = sel.skipped, with_notes = 0, target_in = false }
+  for _, entry in ipairs(sel.takes) do
+    if entry.has_notes then peek.with_notes = peek.with_notes + 1 end
+    if entry.guid == state.target_take_guid then peek.target_in = true end
+  end
+  K.batch_peek_cache = { sel_n = sel_n, count = count, target = state.target_take_guid, at = now, peek = peek }
+  return peek
+end
+
+--- The canvas button's label for n selected audio items. narrow: the canvas has no room for the full batch label.
+K.batch_label = function(n, narrow)
+  if n < 2 then return "Analyze Item" end
+  return narrow and "Analyze All" or "Analyze All Selected Items"
+end
+
+--- The canvas button's tooltip for a batch of n items.
+K.batch_tip = function(n)
+  return string.format("Detect the pitch of the %d selected audio items, one after another. One undo step for all of them.", n)
+end
+
+--- The lines under the canvas button for what K.batch_peek returned: the first, and the second or nil.
+K.batch_lines = function(peek)
+  if peek.n < 2 then
+    return "No data. Select an item and click Analyze.", "Select several items in REAPER to analyze them all at once."
+  end
+  local first = string.format("%d audio items selected", peek.n)
+  if peek.skipped == 1 then
+    first = first .. " (1 other item is skipped)"
+  elseif peek.skipped > 1 then
+    first = first .. string.format(" (%d other items are skipped)", peek.skipped)
+  end
+  first = first .. "."
+  if not peek.target_in then first = first .. " This item is not one of them." end
+  local second = nil
+  if peek.with_notes == 1 then
+    second = "1 already has notes. You will be asked before it is replaced."
+  elseif peek.with_notes > 1 then
+    second = string.format("%d already have notes. You will be asked before they are replaced.", peek.with_notes)
+  end
+  return first, second
+end
+
+--- What to ask before a batch over `entries` (K.batch_selection's takes) replaces existing notes: the fields of a
+--- request_confirm request ({ title, body_lines, list, after_lines, confirm_label }; list = the items that hold
+--- notes, in order, as { name, track, pos }), or nil when no item holds notes: then nothing is asked.
+K.batch_confirm = function(entries)
+  local total, list = #entries, {}
+  for _, entry in ipairs(entries) do
+    if entry.has_notes then list[#list + 1] = { name = entry.name, track = entry.track, pos = entry.pos } end
+  end
+  if #list == 0 then return nil end
+  local body
+  if total == 1 then
+    body = "This item already has notes. Analyzing replaces its notes and any edits:"
+  elseif #list == total then
+    body = string.format("All %d already have notes. Analyzing replaces their notes and any edits:", total)
+  elseif #list == 1 then
+    body = "1 of them already has notes. Analyzing replaces its notes and any edits:"
+  else
+    body = string.format("%d of them already have notes. Analyzing replaces their notes and any edits:", #list)
+  end
+  local after = total == 1 and string.format("%s+Z restores it once the batch has finished.", K.MOD_LABEL)
+    or string.format("%s+Z restores all %d items in one step once the batch has finished.", K.MOD_LABEL, total)
+  return {
+    title = total == 1 and "Analyze 1 item?" or string.format("Analyze %d items?", total),
+    body_lines = { body }, list = list, after_lines = { after },
+    confirm_label = total == 1 and "Analyze 1 Item" or string.format("Analyze %d Items", total),
+  }
+end
+
+--- A batch over `entries`, not started yet. queue = the entries, frozen (a later selection change does not reach
+--- it); index = the entry being analysed (0 = none yet); done = { { guid, data, json, empty } ... } of the finished
+--- ones; failed = entries that could not be analysed; total_len / done_len = seconds of audio in the queue / in the
+--- entries that are behind; prev_guid = the item that was open when it started.
+K.batch_new = function(entries, prev_guid)
+  local total_len = 0
+  for _, entry in ipairs(entries) do total_len = total_len + (entry.len or 0) end
+  return { queue = entries, index = 0, done = {}, failed = 0, total_len = total_len, done_len = 0,
+    prev_guid = prev_guid }
+end
+
+--- How far a batch is, 0 .. 1: the share of its audio that has been analysed. item_progress = how far the entry in
+--- progress is (0 .. 1). The one number the "…" button and the status line both show.
+K.batch_progress = function(batch, item_progress)
+  if batch.total_len <= 0 then return 0 end
+  local entry = batch.queue[batch.index]
+  local part = entry and (entry.len or 0) * (item_progress or 0) or 0
+  return math.max(0, math.min(1, (batch.done_len + part) / batch.total_len))
+end
+
+--- The undo label of a batch that wrote n items.
+K.batch_undo_label = function(n)
+  return string.format("Analyze Pitch (%d %s)", n, n == 1 and "item" or "items")
+end
+
+--- The closing message of a batch. r = { total = items in the batch, written = items analysed and stored,
+--- empty = how many of the written hold no pitched notes, failed = items that could not be analysed,
+--- cancelled = it was stopped before its end }.
+K.batch_summary = function(r)
+  local function items(n) return n == 1 and "1 item" or string.format("%d items", n) end
+  local undo = string.format(" %s+Z to undo.", K.MOD_LABEL)
+  if r.cancelled then
+    if r.written == 0 then return "Batch cancelled. Nothing was changed." end
+    return string.format("Batch cancelled. %d of %s %s analyzed and kept.", r.written, items(r.total),
+      r.written == 1 and "was" or "were") .. undo
+  end
+  if r.written == 0 then
+    if r.total == 1 then return "The item could not be analyzed. Nothing was changed." end
+    return string.format("None of the %s could be analyzed. Nothing was changed.", items(r.total))
+  end
+  local text = r.written == r.total and ("Analyzed " .. items(r.total))
+    or string.format("Analyzed %d of %s", r.written, items(r.total))
+  if r.empty > 0 then
+    text = text .. string.format(" (%d %s no pitched notes)", r.empty, r.empty == 1 and "has" or "have")
+  end
+  text = text .. "."
+  if r.failed > 0 then text = text .. string.format(" %d could not be analyzed.", r.failed) end
+  return text .. undo
+end
+
 local function switch_active_target(guid, take_obj)
   -- A pending arrow-key nudge belongs to the take being left: commit it first
   flush_nudge_burst()

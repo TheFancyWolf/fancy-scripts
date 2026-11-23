@@ -2394,6 +2394,116 @@ test("dev_dump_off_by_default_and_on", function()
   eq(body, S.K.dump_text(DUMP_PARAMS, 48000, dump_results()))
 end)
 
+-- What a batch is made of: the selection, the counts, the copy
+local MOD = S.K.MOD_LABEL
+
+local function with_selection(items, fn)   -- items: { { take = id | nil, midi = bool, name, len, sr, track, pos } }
+  reaper.CountSelectedMediaItems = function() return #items end
+  reaper.GetSelectedMediaItem = function(_, i) return items[i + 1] end
+  reaper.GetActiveTake = function(it) return it.take end
+  reaper.TakeIsMIDI = function(tk) for _, it in ipairs(items) do if it.take == tk then return it.midi == true end end end
+  reaper.GetSetMediaItemTakeInfo_String = function(tk, key) if key == "GUID" then return true, "{" .. tk .. "}" end return false, "" end
+  reaper.GetTakeName = function(tk) for _, it in ipairs(items) do if it.take == tk then return it.name end end end
+  reaper.GetMediaItemInfo_Value = function(it, key) return key == "D_LENGTH" and (it.len or 1) or (it.pos or 0) end
+  reaper.GetMediaItemTake_Source = function(tk) return tk end
+  reaper.GetMediaSourceSampleRate = function(tk) for _, it in ipairs(items) do if it.take == tk then return it.sr or 48000 end end end
+  reaper.GetMediaItemTrack = function(it) return it end
+  reaper.GetTrackName = function(it) return true, it.track or "Vox" end
+  local ok, err = pcall(fn)
+  for _, name in ipairs({ "CountSelectedMediaItems", "GetSelectedMediaItem", "GetActiveTake", "TakeIsMIDI",
+    "GetSetMediaItemTakeInfo_String", "GetTakeName", "GetMediaItemInfo_Value", "GetMediaItemTake_Source",
+    "GetMediaSourceSampleRate", "GetMediaItemTrack", "GetTrackName" }) do reaper[name] = nil end
+  S.K.batch_peek_cache = nil
+  if not ok then error(err, 0) end
+end
+
+test("batch_selection_audio_only", function()
+  local st = S.state
+  st.session_takes["{b}"] = { notes = { {} }, results = { {} } }
+  st.session_takes["{d}"] = { notes = {}, results = { {} } }
+  with_selection({ { take = "a", name = "A", len = 10, pos = 4 }, { take = "m", midi = true }, { name = "empty" },
+      { take = "b", name = "B", len = 20, sr = 44100, track = "Dbl" }, { take = "d", name = "D" } }, function()
+    local sel = S.K.batch_selection()
+    eq(#sel.takes, 3); eq(sel.skipped, 2)
+    eq(sel.takes[1].guid, "{a}"); eq(sel.takes[1].name, "A"); eq(sel.takes[1].len, 10); eq(sel.takes[1].pos, 4)
+    eq(sel.takes[1].has_notes, false)
+    eq(sel.takes[2].guid, "{b}"); eq(sel.takes[2].sample_rate, 44100); eq(sel.takes[2].track, "Dbl"); eq(sel.takes[2].has_notes, true)
+    eq(sel.takes[3].has_notes, false, "analysed without notes: nothing to lose")
+  end)
+  st.session_takes["{b}"], st.session_takes["{d}"] = nil, nil
+end)
+
+test("batch_peek_is_cached", function()
+  local calls = 0
+  with_selection({ { take = "a" }, { take = "b" } }, function()
+    local get = reaper.GetSelectedMediaItem
+    reaper.GetSelectedMediaItem = function(...) calls = calls + 1; return get(...) end
+    reaper.GetProjectStateChangeCount = function() return 7 end
+    eq(S.K.batch_peek(10).n, 2); local first = calls
+    S.K.batch_peek(10.1); eq(calls, first, "same selection, same project state, under 0.25 s: no walk")
+    S.K.batch_peek(10.3); eq(calls > first, true, "walked again after 0.25 s")
+    reaper.GetProjectStateChangeCount = nil
+  end)
+end)
+
+test("batch_copy", function()
+  local K = S.K
+  eq(K.batch_label(1), "Analyze Item"); eq(K.batch_label(0), "Analyze Item")
+  eq(K.batch_label(2), "Analyze All Selected Items"); eq(K.batch_label(12, true), "Analyze All")
+  local a, b = K.batch_lines({ n = 1, skipped = 0, with_notes = 0, target_in = true })
+  eq(a, "No data. Select an item and click Analyze."); eq(b, "Select several items in REAPER to analyze them all at once.")
+  a, b = K.batch_lines({ n = 12, skipped = 0, with_notes = 0, target_in = true })
+  eq(a, "12 audio items selected."); eq(b, nil)
+  a, b = K.batch_lines({ n = 12, skipped = 2, with_notes = 3, target_in = false })
+  eq(a, "12 audio items selected (2 other items are skipped). This item is not one of them.")
+  eq(b, "3 already have notes. You will be asked before they are replaced.")
+  a, b = K.batch_lines({ n = 2, skipped = 1, with_notes = 1, target_in = true })
+  eq(a, "2 audio items selected (1 other item is skipped)."); eq(b, "1 already has notes. You will be asked before it is replaced.")
+  eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another. One undo step for all of them.")
+  eq(K.batch_undo_label(12), "Analyze Pitch (12 items)"); eq(K.batch_undo_label(1), "Analyze Pitch (1 item)")
+end)
+
+test("batch_confirm_copy", function()
+  local K = S.K
+  local function entries(n, with)
+    local out = {}
+    for i = 1, n do out[i] = { guid = "{" .. i .. "}", name = "N" .. i, track = "T", pos = i, has_notes = i <= with } end
+    return out
+  end
+  eq(K.batch_confirm(entries(3, 0)), nil, "nothing to replace: no confirm")
+  local c = K.batch_confirm(entries(12, 3))
+  eq(c.title, "Analyze 12 items?"); eq(c.confirm_label, "Analyze 12 Items")
+  eq(c.body_lines[1], "3 of them already have notes. Analyzing replaces their notes and any edits:")
+  eq(#c.list, 3); eq(c.list[2].name, "N2"); eq(c.list[2].track, "T"); eq(c.list[2].pos, 2)
+  eq(c.after_lines[1], MOD .. "+Z restores all 12 items in one step once the batch has finished.")
+  eq(K.batch_confirm(entries(12, 1)).body_lines[1], "1 of them already has notes. Analyzing replaces its notes and any edits:")
+  eq(K.batch_confirm(entries(12, 12)).body_lines[1], "All 12 already have notes. Analyzing replaces their notes and any edits:")
+end)
+
+test("batch_progress_by_audio_length", function()
+  local K = S.K
+  local b = K.batch_new({ { len = 10 }, { len = 30 }, { len = 0 } }, "{p}")
+  eq(b.total_len, 40); eq(b.prev_guid, "{p}"); eq(K.batch_progress(b, 0), 0)
+  b.index = 1; near(K.batch_progress(b, 0.5), 0.125, 1e-12)
+  b.index, b.done_len = 2, 10; near(K.batch_progress(b, 0.5), 0.625, 1e-12)
+  eq(K.batch_progress(K.batch_new({ { len = 0 } }), 0.5), 0, "no audio at all")
+end)
+
+test("batch_summary_copy", function()
+  local sum = S.K.batch_summary
+  eq(sum({ total = 12, written = 12, empty = 0, failed = 0 }), "Analyzed 12 items. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 1, written = 1, empty = 0, failed = 0 }), "Analyzed 1 item. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 11, empty = 1, failed = 1 }),
+    "Analyzed 11 of 12 items (1 has no pitched notes). 1 could not be analyzed. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 12, empty = 2, failed = 0 }), "Analyzed 12 items (2 have no pitched notes). " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 2, empty = 0, failed = 0, cancelled = true }),
+    "Batch cancelled. 2 of 12 items were analyzed and kept. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 1, empty = 0, failed = 0, cancelled = true }),
+    "Batch cancelled. 1 of 12 items was analyzed and kept. " .. MOD .. "+Z to undo.")
+  eq(sum({ total = 12, written = 0, empty = 0, failed = 0, cancelled = true }), "Batch cancelled. Nothing was changed.")
+  eq(sum({ total = 12, written = 0, empty = 0, failed = 12 }), "None of the 12 items could be analyzed. Nothing was changed.")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
