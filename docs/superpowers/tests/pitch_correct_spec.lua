@@ -1637,6 +1637,11 @@ test("param_color_keys", function()
     seen[key] = c
   end
   eq(S.K.param_color("separation"), P.accent, "an unknown key takes the accent")
+  -- The washes come from the palette hue itself, not the fitted edge colour
+  local Theme = package.loaded["theme"]
+  local hue = { tighten = P.green, retune_speed = P.accent, tolerance = P.yellow, slide_in = P.orange }
+  for key, c in pairs(hue) do eq(S.K.param_wash(key, 0.27), Theme.with_alpha(c, 0.27), "wash of " .. key) end
+  eq(S.K.param_wash("separation", 0.27), Theme.with_alpha(P.accent, 0.27), "an unknown key washes in the accent")
 end)
 
 test("value_track_draws_track_then_fill", function()

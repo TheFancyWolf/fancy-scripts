@@ -741,6 +741,13 @@ test("canvas: contrast, all three palettes", function()
       end
       for _, fill in ipairs({ C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited }) do
         check(contrast(C.span_edge, composite(fill, r)), 3.0, "span edge on a note fill")
+        -- The value colours edge spans and outlines over the blocks. One known exception: in a light Match Theme,
+        -- Slide In cannot reach 3:1 on the note fills and stay apart from Tolerance (both are pushed to L* ~21, where
+        -- yellow and orange differ by Delta E 17); it keeps 3:1 on the rows and the distance, and 2.4:1 on the fills
+        for _, k in ipairs({ "param_tighten", "param_strength", "param_tolerance", "param_slide_in" }) do
+          local need = (o.theme == LIGHT and k == "param_slide_in") and 2.4 or 3.0
+          check(contrast(C[k], composite(fill, r)), need, k .. " on a note fill")
+        end
       end
     end
     check(contrast(C.gutter_text, C.gutter_bg), 4.5, "gutter text")
@@ -749,6 +756,56 @@ test("canvas: contrast, all three palettes", function()
     assert(contrast(C.gutter_text_dim, C.gutter_bg_dim) < contrast(C.gutter_text, C.gutter_bg), tag .. ": dim name dimmer")
     check(contrast(C.pill_text, composite(C.pill_bg, C.row)), 4.5, "pill text")
   end
+end)
+
+-- CIE L*a*b* (D65) and LCh of an opaque colour, for the value colours of Pitch Correct
+local function lab(c)
+  local function lin(c8) local v = c8 / 255; if v <= 0.04045 then return v / 12.92 end; return ((v + 0.055) / 1.055) ^ 2.4 end
+  local r, g, b = lin((c >> 24) & 0xFF), lin((c >> 16) & 0xFF), lin((c >> 8) & 0xFF)
+  local function f(t) return t > 0.008856 and t ^ (1 / 3) or 7.787 * t + 16 / 116 end
+  local fx = f((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047)
+  local fy = f(0.2126 * r + 0.7152 * g + 0.0722 * b)
+  local fz = f((0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883)
+  return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
+end
+local function lch(c)
+  local l, a, b = lab(c)
+  return l, math.sqrt(a * a + b * b), math.deg(math.atan(b, a)) % 360
+end
+local function delta_e(c1, c2)
+  local l1, a1, b1 = lab(c1)
+  local l2, a2, b2 = lab(c2)
+  return math.sqrt((l1 - l2) ^ 2 + (a1 - a2) ^ 2 + (b1 - b2) ^ 2)
+end
+
+test("canvas: the four value colours stay apart and keep their hue, all three palettes", function()
+  local SOURCE = { param_tighten = "green", param_strength = "accent", param_tolerance = "yellow", param_slide_in = "orange" }
+  local KEYS = { "param_tighten", "param_strength", "param_tolerance", "param_slide_in" }
+  for _, o in ipairs(CANVAS_PALETTES) do
+    local P = load_theme(o).build_palette(); local C = P.canvas
+    local tag = (o.theme == LIGHT and "match light") or (o.theme and "match reapertips") or "fancy"
+    for i, k in ipairs(KEYS) do
+      -- Told apart at a glance: Delta E*ab >= 25 (the closest pair the user chose, Fancy yellow and orange, is 35)
+      for j = i + 1, #KEYS do
+        local d = delta_e(C[k], C[KEYS[j]])
+        assert(d >= 25, string.format("%s: %s vs %s Delta E %.1f", tag, k, KEYS[j], d))
+      end
+      -- Its hue survives the fit: still colourful (C* >= 20) and within 10 degrees of the palette colour's hue
+      local _, c, h = lch(C[k])
+      local _, _, h0 = lch(P[SOURCE[k]])
+      local dh = math.abs(h - h0); dh = math.min(dh, 360 - dh)
+      assert(c >= 20, string.format("%s: %s chroma %.1f", tag, k, c))
+      assert(dh <= 10, string.format("%s: %s hue %.0f vs %.0f", tag, k, h, h0))
+    end
+  end
+  -- Fancy Dark: the colours the user chose; Slide In is the palette orange, lightened at its hue to reach 3:1
+  local P = load_theme({ mode = "fancy" }).build_palette(); local C = P.canvas
+  assert(P.orange == 0xF5853FFF)
+  assert(C.param_tighten == P.green and C.param_strength == P.accent and C.param_tolerance == P.yellow)
+  local _, _, h_o = lch(P.orange)
+  local l_s, _, h_s = lch(C.param_slide_in)
+  local l_o = lch(P.orange)
+  assert(l_s > l_o and math.abs(h_s - h_o) <= 2, "slide in: the orange, lighter, same hue")
 end)
 
 test("canvas: Match Theme keeps its derivation (the note column follows the theme's panel)", function()

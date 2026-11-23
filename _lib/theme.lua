@@ -499,6 +499,139 @@ local function fit_contrast(col, surfaces, min_ratio, keep, keep_hue)
   return best
 end
 
+--- CIE L*a*b* (D65) of an 0xRRGGBBAA colour (alpha ignored): L 0..100, a and b about -128..128.
+local function to_lab(rgba)
+  local r = srgb_to_linear((rgba >> 24) & 0xFF)
+  local g = srgb_to_linear((rgba >> 16) & 0xFF)
+  local b = srgb_to_linear((rgba >> 8) & 0xFF)
+  local function f(t) return t > 0.008856 and t ^ (1 / 3) or 7.787 * t + 16 / 116 end
+  local fx = f((0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047)
+  local fy = f(0.2126 * r + 0.7152 * g + 0.0722 * b)
+  local fz = f((0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883)
+  return 116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)
+end
+
+--- The inverse of the L*a*b* companding function.
+local function lab_finv(t)
+  local t3 = t * t * t
+  return t3 > 0.008856 and t3 or (t - 16 / 116) / 7.787
+end
+local function lin_to_8(c)   -- a linear channel to 0..255, or nil outside sRGB
+  if c < -0.001 or c > 1.001 then return nil end
+  c = math.max(0, math.min(1, c))
+  c = c <= 0.0031308 and c * 12.92 or 1.055 * c ^ (1 / 2.4) - 0.055
+  return math.floor(c * 255 + 0.5)
+end
+--- The opaque 0xRRGGBBFF colour of CIE L*a*b* (D65) l, a, b, or nil when it lies outside sRGB.
+local function from_lab(l, a, b)
+  local fy = (l + 16) / 116
+  local x, y, z = 0.95047 * lab_finv(fy + a / 500), lab_finv(fy), 1.08883 * lab_finv(fy - b / 200)
+  local r = lin_to_8(3.2406 * x - 1.5372 * y - 0.4986 * z)
+  if not r then return nil end
+  local g = lin_to_8(-0.9689 * x + 1.8758 * y + 0.0415 * z)
+  if not g then return nil end
+  local bl = lin_to_8(0.0557 * x - 0.2040 * y + 1.0570 * z)
+  if not bl then return nil end
+  return (r << 24) | (g << 16) | (bl << 8) | 0xFF
+end
+
+--- CIE76 colour difference (Delta E*ab) of two colours (alpha ignored): about 2 is just noticeable, 20 and more
+--- tells two marks apart at a glance.
+local function color_distance(c1, c2)
+  local l1, a1, b1 = to_lab(c1)
+  local l2, a2, b2 = to_lab(c2)
+  return math.sqrt((l1 - l2) ^ 2 + (a1 - a2) ^ 2 + (b1 - b2) ^ 2)
+end
+
+--- Like fit_contrast with keep_hue, for an opaque colour that must keep its hue AND its colourfulness (the four value
+--- colours of Pitch Correct, told apart by hue): of the colours of the same CIE LCh hue that reach `min_ratio` on every
+--- surface, the one nearest to `col` in L*a*b* (lightness and chroma both move as little as they can; shading toward
+--- white or black alone would grey it out), never with less chroma than HUE_CHROMA_MIN.
+--- `apart` (optional): colours the result must stay at least APART_MIN (color_distance) from. When no colour of the
+--- hue reaches `min_ratio` on every surface while staying apart, the one that reaches it on `keep` (the surfaces that
+--- matter most) and stays apart wins, with the best worst case over `surfaces`. Falls back to
+--- fit_contrast(col, surfaces, min_ratio, keep, true) when the hue allows neither.
+local APART_MIN = 25   -- Delta E*ab: the Fancy Dark yellow and orange, the closest pair the user chose, are 35 apart
+local HUE_CHROMA_MIN = 20   -- C*ab a fitted hue keeps (less, if the colour itself has less): below it, it reads as grey
+local function fit_hue(col, surfaces, min_ratio, keep, apart)
+  col = (col & 0xFFFFFF00) | 0xFF
+  apart = apart or {}
+  -- Kept in the widget fit cache, keyed by every colour that enters the search (a few ms each, once per palette)
+  local k_surf, k_keep, k_apart = table.concat(surfaces, ","), table.concat(keep or {}, ","), table.concat(apart, ",")
+  local hit = _fit_cache_get("hue", col, k_surf, min_ratio, k_keep, k_apart)
+  if hit then return hit end
+  local need = min_ratio + FIT_MARGIN
+  local function far(c)
+    for _, o in ipairs(apart) do
+      if color_distance(c, o) < APART_MIN then return false end
+    end
+    return true
+  end
+  -- Every candidate is opaque: its contrast on a surface needs only the two luminances
+  local function worst(c, list)
+    local lc, lums, w = luminance(c), surface_lums(list), math.huge
+    for i = 1, #lums do
+      local hi, lo = math.max(lc, lums[i]), math.min(lc, lums[i])
+      w = math.min(w, (hi + 0.05) / (lo + 0.05))
+    end
+    return w
+  end
+  local function clears(c, list)   -- worst(c, list) >= need, stopping at the first surface that falls short
+    local lc, lums = luminance(c), surface_lums(list)
+    for i = 1, #lums do
+      local hi, lo = math.max(lc, lums[i]), math.min(lc, lums[i])
+      if (hi + 0.05) / (lo + 0.05) < need then return false end
+    end
+    return true
+  end
+  local function done(v) return _fit_cache_put(v, "hue", col, k_surf, min_ratio, k_keep, k_apart) end
+  if reaches(col, surfaces, need) and far(col) then return done(col) end
+  local l0, a0, b0 = to_lab(col)
+  local c0 = math.sqrt(a0 * a0 + b0 * b0)
+  if c0 < 1 then return done(fit_contrast(col, surfaces, min_ratio, keep, true)) end
+  local ua, ub = a0 / c0, b0 / c0
+  local c_min = math.floor(math.min(c0, HUE_CHROMA_MIN))
+  -- The nearest candidate that reaches `min_ratio` everywhere and stays apart: a coarse pass (lightness 4, chroma 8
+  -- apart) bounds the distance, then a fine one (1 and 2) looks only nearer than that
+  local best, best_d = nil, math.huge
+  for _, step in ipairs({ { 4, 8 }, { 1, 2 } }) do
+    for l = 0, 100, step[1] do
+      for c = c_min, 150, step[2] do
+        local d = (l - l0) ^ 2 + (c - c0) ^ 2
+        if d < best_d then
+          local cand = from_lab(l, c * ua, c * ub)
+          if cand and clears(cand, surfaces) and far(cand) then best, best_d = cand, d end
+        end
+      end
+    end
+  end
+  if best then return done(best) end
+  -- Out of reach: hold `keep` and the distance, with the best worst case over `surfaces` (the nearer on a tie)
+  local best_w, best_l, best_c = -1, nil, nil
+  local function try(l, c)
+    local cand = from_lab(l, c * ua, c * ub)
+    if cand and clears(cand, keep) and far(cand) then
+      local w, d = worst(cand, surfaces), (l - l0) ^ 2 + (c - c0) ^ 2
+      if w > best_w + 1e-9 or (math.abs(w - best_w) <= 1e-9 and d < best_d) then
+        best, best_w, best_d, best_l, best_c = cand, w, d, l, c
+      end
+    end
+  end
+  if keep then
+    -- Coarse (lightness 2, chroma 6 apart), then fine around the coarse winner
+    for l = 0, 100, 2 do
+      for c = c_min, 150, 6 do try(l, c) end
+    end
+    if best_l then
+      local l1, c1 = best_l, best_c
+      for l = math.max(0, l1 - 2), math.min(100, l1 + 2) do
+        for c = math.max(c_min, c1 - 6), c1 + 6, 2 do try(l, c) end
+      end
+    end
+  end
+  return done(best or fit_contrast(col, surfaces, min_ratio, keep, true))
+end
+
 --- Appends the lightest and darkest of `list` (opaque colours) to `into`: a colour that clears both ends of
 --- a narrow band of surfaces clears the ones between them.
 local function add_ends(into, list)
@@ -624,7 +757,11 @@ local function build_canvas_fancy(P)
   C.param_tighten         = P.green
   C.param_strength        = P.accent
   C.param_tolerance       = P.yellow
-  C.param_slide_in        = P.orange
+  -- Slide In: the palette orange, lightened at the same hue as far as 3:1 on every note fill needs (it edges spans
+  -- that run over the blocks); the other three already reach it
+  local rows_f = { C.row, C.row_black, C.row_tonic, C.row_dim, C.row_dim_black, C.row_plain, C.row_plain_black }
+  C.param_slide_in        = fit_hue(P.orange, concat_lists(rows_f, over_each({ C.note_fill, C.note_edited,
+    C.note_selected, C.note_selected_edited }, rows_f)), 3.0)
   -- Zone highlights and trim handles (over a note block)
   C.zone_drift      = with_alpha(P.blue, 0.267)
   C.zone_shift      = 0xFFAA4444
@@ -798,10 +935,10 @@ local function build_canvas_match(P)
   C.span_fill = with_alpha(P.yellow, 0.16)
   C.span_edge = fit_contrast(P.yellow, shown, 3.0, rows, true)
   -- One colour per parameter (value bars, drag readouts, canvas highlights): each hue fitted on rows and blocks
-  C.param_tighten   = fit_contrast(P.green, shown, 3.0, rows, true)
-  C.param_strength  = fit_contrast(P.accent, shown, 3.0, rows, true)
-  C.param_tolerance = fit_contrast(P.yellow, shown, 3.0, rows, true)
-  C.param_slide_in  = fit_contrast(P.orange, shown, 3.0, rows, true)
+  C.param_tighten   = fit_hue(P.green, shown, 3.0, rows)
+  C.param_strength  = fit_hue(P.accent, shown, 3.0, rows, { C.param_tighten })
+  C.param_tolerance = fit_hue(P.yellow, shown, 3.0, rows, { C.param_tighten, C.param_strength })
+  C.param_slide_in  = fit_hue(P.orange, shown, 3.0, rows, { C.param_tighten, C.param_strength, C.param_tolerance })
   local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
   local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
   C.trace      = fit_contrast(with_alpha(P.text, 0.90), line_on, 3.0, rows, true)   -- raw pitch trace: text colour (90 % alpha)

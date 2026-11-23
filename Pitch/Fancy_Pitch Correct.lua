@@ -4362,6 +4362,14 @@ K.param_color = function(key)
   local P = Theme.get_palette()
   return P.canvas[K.PARAM_COLOR_KEYS[key] or ""] or P.accent
 end
+--- The wash of the parameter `key` at `alpha` (a K.PARAM_WASH value): its palette hue itself, not the fitted edge
+--- colour of K.param_color (fitted to contrast, that one can be far lighter or darker than the hue, and the note's
+--- border and curves drawn over a wash of it would lose contrast).
+K.PARAM_HUE_KEYS = { tighten = "green", retune_speed = "accent", tolerance = "yellow", slide_in = "orange" }
+K.param_wash = function(key, alpha)
+  local P = Theme.get_palette()
+  return Theme.with_alpha(P[K.PARAM_HUE_KEYS[key] or ""] or P.accent, alpha)
+end
 
 --- For a param_drag caller that writes the value while it moves. Call right after param_drag with `raw`, the caller's
 --- own value as it read it before drawing the control: it is remembered when the press begins, and returned when the
@@ -5101,9 +5109,9 @@ K.draw_setting_hint = function(draw_list, hint, build)
   local pad = Theme.layout.xs
   local drawn = 0
   local skipped, natural = 0, 0
-  -- The parameter's own colour (K.param_color): an opaque edge and a wash of it
+  -- The parameter's own colour: an opaque edge (K.param_color) and a wash of its hue (K.param_wash)
   local edge = K.param_color(key)
-  local wash = Theme.with_alpha(edge, K.PARAM_WASH.span)
+  local wash = K.param_wash(key, K.PARAM_WASH.span)
 
   -- The note takes the value that is being changed. edited_only: it must also be corrected (edited, not bypassed)
   local function reached(idx, edited_only)
@@ -6753,18 +6761,17 @@ local function draw_graph(draw_ctx, w, h)
           if has_shift then
             -- Shift + drag anywhere on the note adjusts Slide In: the whole block is its zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y,
-              Theme.with_alpha(K.param_color("slide_in"), K.PARAM_WASH.zone))
+              K.param_wash("slide_in", K.PARAM_WASH.zone))
           elseif state.hovered_zone == "tighten" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, sx + zone_w, bot_y, Theme.with_alpha(
-                K.param_color("tighten"), K.PARAM_WASH.zone))
+              sx, top_y, sx + zone_w, bot_y, K.param_wash("tighten", K.PARAM_WASH.zone))
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
           elseif state.hovered_zone == "tolerance" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex - zone_w, bot_y, fill)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              ex - zone_w, top_y, ex, bot_y, Theme.with_alpha(K.param_color("tolerance"), K.PARAM_WASH.zone))
+              ex - zone_w, top_y, ex, bot_y, K.param_wash("tolerance", K.PARAM_WASH.zone))
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex, bot_y, fill)
@@ -7276,7 +7283,8 @@ local function draw_graph(draw_ctx, w, h)
     if zc then
       local v = math.max(zc.lo, math.min(zc.hi, K.zone_value(zc, drag_gauge)))
       local frac = (v - zc.lo) / (zc.hi - zc.lo)
-      K.value_track(draw_list, bx, bx + bw, by + bh, 0, frac, K.param_color(zc.key))
+      -- Inset by the pill's corner radius, so the square track stays inside its rounded bottom corners
+      K.value_track(draw_list, bx + L.rounding, bx + bw - L.rounding, by + bh, 0, frac, K.param_color(zc.key))
     end
   end
 
