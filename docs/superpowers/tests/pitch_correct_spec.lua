@@ -1780,6 +1780,35 @@ test("octave_fix_degenerate", function()
   eq(S.K.octave_fix(same), 0, "equal times")
 end)
 
+test("octave_fix_only_moves_frames_that_get_closer", function()
+  -- A note onset: only 52.2 is an octave off. It is reached by a jump that is not an octave, so the two frames before
+  -- it share its octave class; they must stay where they are
+  local onset = oct_frames({ { 3, nil }, { 1, 69.2 }, { 1, 68.2 }, { 1, 52.2 }, { 17, 64.0 }, { 2, nil } })
+  eq(S.K.octave_fix(onset), 1, "onset: frames changed")
+  eq(onset[4].note, 69.2, "onset: first frame untouched")
+  eq(onset[5].note, 68.2, "onset: second frame untouched")
+  near(onset[6].note, 64.2, 1e-9, "onset: the octave-off frame is put back")
+  -- A right pickup before a wrong stretch that is left by a jump that is not an octave: the pickup stays
+  local pickup = oct_frames({ { 1, nil }, { 10, 60 }, { 4, 72 }, { 60, 62.5 } })
+  eq(S.K.octave_fix(pickup), 0, "pickup: frames changed")
+  eq(pickup[2].note, 60, "pickup: untouched")
+  -- A wrong stretch followed by a right tail in the same class: the stretch moves, the tail stays
+  local tail = oct_frames({ { 40, 60 }, { 4, 72 }, { 8, 62.5 }, { 1, nil } })
+  eq(S.K.octave_fix(tail), 4, "tail: frames changed")
+  near(tail[41].note, 60, 1e-9, "tail: the wrong stretch is put back")
+  eq(tail[45].note, 62.5, "tail: untouched")
+end)
+
+test("octave_fix_needs_enough_frames_to_trust", function()
+  -- A three-frame scrap (the verse at 17.6 s): two frames are no majority to move the third by
+  local scrap = oct_frames({ { 2, nil }, { 1, 58.4 }, { 1, 45.0 }, { 1, 56.6 }, { 2, nil } })
+  eq(S.K.octave_fix(scrap), 0, "scrap: frames changed")
+  -- Three frames (32 ms at this hop) are enough
+  local enough = oct_frames({ { 2, nil }, { 3, 60 }, { 1, 72 }, { 2, nil } })
+  eq(S.K.octave_fix(enough), 1, "enough: frames changed")
+  near(enough[6].note, 60, 1e-9, "enough: put back")
+end)
+
 test("octave_fix_real_items", function()   -- this machine only: the two takes of the 2026-11-23 report
   local json = loadfile("_lib/json.lua")()
   local function model(name)
@@ -1791,11 +1820,38 @@ test("octave_fix_real_items", function()   -- this machine only: the two takes o
   end
   local verse, chorus = model("octave_verse_model.json"), model("octave_chorus_model.json")
   if not verse or not chorus then print("SKIP octave_fix_real_items (no local fixture)") return end
-  S.K.octave_fix(verse.results)
+  -- No changed frame may end further from the frames around it (the middle pitch of up to 5 voiced frames each side,
+  -- after the fix) than it started
+  local function fix_checked(results, what)
+    local before = {}
+    for i, f in ipairs(results) do before[i] = f.note end
+    local changed = S.K.octave_fix(results)
+    for i, f in ipairs(results) do
+      if f.note ~= before[i] then
+        local around = {}
+        for d = 1, 5 do
+          for _, x in ipairs({ i - d, i + d }) do
+            if results[x] and results[x].note then around[#around + 1] = results[x].note end
+          end
+        end
+        table.sort(around)
+        local mid = around[(#around + 1) // 2]
+        if mid and math.abs(f.note - mid) > math.abs(before[i] - mid) then
+          error(string.format("%s frame at %.3f moved away from its neighbours: %.1f -> %.1f (around %.1f)",
+            what, f.time, before[i], f.note, mid), 0)
+        end
+      end
+    end
+    return changed
+  end
+  fix_checked(verse.results, "verse")
   for _, f in ipairs(verse.results) do
     if f.time > 0.90 and f.time < 0.92 then near(f.note, 59.0, 0.5, "verse frame at " .. f.time) end
+    -- the onset at 11.79 s: 69.2 and 68.2 are right and stay; 52.2 is an octave off
+    if f.time > 11.78 and f.time < 11.80 then near(f.note, 68.7, 0.6, "verse onset frame at " .. f.time) end
+    if f.time > 11.80 and f.time < 11.81 then near(f.note, 64.2, 0.1, "verse onset frame at " .. f.time) end
   end
-  eq(S.K.octave_fix(chorus.results), 40, "chorus frames changed")
+  eq(fix_checked(chorus.results, "chorus"), 40, "chorus frames changed")
   for _, f in ipairs(chorus.results) do
     if f.time > 0.30 and f.time < 3.19 then near(f.note, 66.3, 1.5, "chorus frame at " .. f.time) end
   end
@@ -1857,6 +1913,21 @@ test("centre_real_only_outlier_notes_move", function()   -- this machine only
     if note.avg_note ~= want then moved = moved + 1 end
   end
   eq(moved, 4, "notes whose centre moved (2, 4, 17 and 32 hold octave-wrong frames)")
+end)
+
+test("analysis_fixes_octaves_before_splitting", function()   -- what an analysis runs when its last frame is read
+  local st = S.state
+  local saved = { st.results, st.notes, st.split_points, st.separation }
+  st.results = oct_frames({ { 3, nil }, { 5, 58.8 }, { 2, 47.0 }, { 40, 58.8 }, { 3, nil } })
+  st.separation = 0.5
+  local ok, err = pcall(function()
+    S.run_hybrid_segmentation()
+    near(st.results[9].note, 59.0, 1e-9, "the stored frames are fixed")
+    eq(#st.notes, 1, "notes")
+    near(st.notes[1].avg_note, 58.8, 0.05, "the note's centre")
+  end)
+  st.results, st.notes, st.split_points, st.separation = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
 end)
 
 -- Tests appended by later tasks go above this line.

@@ -3728,14 +3728,18 @@ end
 
 --- Octave errors of the pitch detection (K.octave_fix): JUMP_TOL_ST = how far from a whole number of octaves a
 --- frame-to-frame jump may be and still count as an octave jump; MAX_RUN_S = the longest stretch that is put back (a
---- longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames are in.
-K.OCTAVE = { JUMP_TOL_ST = 1.0, MAX_RUN_S = 0.15, WINDOW_S = 0.25 }
+--- longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames are in;
+--- MIN_MAJORITY_S = how much of that window those frames must fill to be trusted (fewer are no majority).
+K.OCTAVE = { JUMP_TOL_ST = 1.0, MAX_RUN_S = 0.15, WINDOW_S = 0.25, MIN_MAJORITY_S = 0.03 }
 
 --- Puts short octave-off stretches of analysed frames back (`results`: time-ordered { time, note | nil, freq | nil }).
 --- Within each stretch of frames that all have a pitch, a frame-to-frame jump of a whole number of octaves (within
---- JUMP_TOL_ST) starts a new octave class. A run of one class no longer than MAX_RUN_S moves to the class that
---- strictly most frames within WINDOW_S of it are in; with no such class it stays. Changes note and freq in place and
---- returns how many frames changed. A second call changes nothing.
+--- JUMP_TOL_ST) starts a new octave class. A run of one class no longer than MAX_RUN_S belongs to the class that
+--- strictly most frames within WINDOW_S of it are in (with no such class, or one of fewer frames than MIN_MAJORITY_S,
+--- it stays). Each frame of the run then moves
+--- by the octaves between the two classes only when that brings it closer to the middle pitch of that majority's
+--- frames: a run can hold right frames too, when it was entered or left by a jump that is not an octave. Changes note
+--- and freq in place and returns how many frames changed.
 K.octave_fix = function(results)
   local O, n = K.OCTAVE, #results
   if n < 2 then return 0 end
@@ -3759,26 +3763,36 @@ K.octave_fix = function(results)
         local e = q
         while e + 1 <= j and class[e + 1] == class[q] do e = e + 1 end
         if results[e].time - results[q].time + hop <= O.MAX_RUN_S then
+          -- lo..hi: the frames of the stretch within WINDOW_S of the run (the run included)
+          local lo, hi = q, e
+          while lo - 1 >= i and results[lo - 1].time >= results[q].time - O.WINDOW_S do lo = lo - 1 end
+          while hi + 1 <= j and results[hi + 1].time <= results[e].time + O.WINDOW_S do hi = hi + 1 end
           local count, best, best_n, tied = {}, nil, 0, false
-          for x = i, j do
-            if results[x].time >= results[q].time - O.WINDOW_S and results[x].time <= results[e].time + O.WINDOW_S then
-              count[class[x]] = (count[class[x]] or 0) + 1
-            end
-          end
+          for x = lo, hi do count[class[x]] = (count[class[x]] or 0) + 1 end
           for c, cn in pairs(count) do
             if cn > best_n then best, best_n, tied = c, cn, false
             elseif cn == best_n then tied = true end
           end
-          if not tied and best ~= class[q] then moves[#moves + 1] = { q, e, class[q] - best } end
+          if not tied and best ~= class[q] and best_n * hop >= O.MIN_MAJORITY_S then
+            local ref = {}   -- the majority's pitches; their middle one is where the run's frames should end up near
+            for x = lo, hi do
+              if class[x] == best then ref[#ref + 1] = results[x].note end
+            end
+            table.sort(ref)
+            moves[#moves + 1] = { q, e, class[q] - best, ref[(#ref + 1) // 2] }
+          end
         end
         q = e + 1
       end
       for _, mv in ipairs(moves) do
         for x = mv[1], mv[2] do
           local f = results[x]
-          f.note = f.note - 12 * mv[3]
-          if f.freq then f.freq = f.freq / 2 ^ mv[3] end
-          changed = changed + 1
+          local moved = f.note - 12 * mv[3]
+          if math.abs(moved - mv[4]) < math.abs(f.note - mv[4]) then
+            f.note = moved
+            if f.freq then f.freq = f.freq / 2 ^ mv[3] end
+            changed = changed + 1
+          end
         end
       end
       i = j + 1
@@ -11532,6 +11546,7 @@ end
 
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
-           SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify }
+           SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
+           run_hybrid_segmentation = run_hybrid_segmentation }
 end
 main()

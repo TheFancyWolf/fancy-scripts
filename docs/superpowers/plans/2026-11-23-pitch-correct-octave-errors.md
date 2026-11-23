@@ -419,3 +419,15 @@ Expected: `ok 106 tests`, `0 warnings / 0 errors`.
 git add "Pitch/Fancy_Pitch Correct.lua" CHANGELOG.md
 git commit -m "fix(pitch-correct): octave errors in the analysis (v2.19.1)"
 ```
+
+---
+
+## After the whole-branch review (2026-11-23)
+
+The review found that Task 1's algorithm, as written above, moved a whole run by its class label. A run entered or left by a jump that is not an octave can hold right frames too, and those were pushed an octave away (the verse at 11.79 s: `69.2 68.2 52.2` became `81.2 80.2 64.2`). The code now differs from the block in Task 1 Step 4 in three ways:
+
+- **Frame by frame.** A frame of a short run moves only when that brings it closer to the middle pitch of the majority's frames in the window. Test: `octave_fix_only_moves_frames_that_get_closer`.
+- **Enough frames to trust.** `K.OCTAVE.MIN_MAJORITY_S = 0.03`: a majority of fewer frames than that moves nothing. Test: `octave_fix_needs_enough_frames_to_trust`.
+- **The window is walked outward from the run**, not scanned over the whole stretch.
+
+`octave_fix_real_items` now also fails if any changed frame ends further from the frames around it than it started. `run_hybrid_segmentation` is in the test export table, and `analysis_fixes_octaves_before_splitting` covers the call that makes the fix reach an analysis. The suite is 109 tests.
