@@ -342,4 +342,11 @@ Calls made in this doc, for you to check:
 - **The developer switch** is ExtState only, as the brief says; it is not mentioned anywhere in the window or the Help modal.
 - **Not checked for this doc:** the empty canvas was read from code, and the lint tool does not run against the current theme (see References).
 
+Changed during the build (2026-11-23, found while testing in real REAPER; reported to the user with the build):
+
+- **The closing message also ends when the project changes or another item is opened,** not only on the next click or key in the window. After Cmd+Z in REAPER, "Analyzed 3 items" stayed on screen over items that were no longer analysed.
+- **Redo lists every item of the batch again.** The Pitched Items list only re-read the open item after a redo; items an undo removed are now looked at again whenever the project changes.
+- **The Re-Analyze fix switches nothing off audibly.** The audio accessor keeps the take state it was made with, so the Pitch envelope is bypassed, the accessor made and the envelope put back inside one call (measured: 0.3 ms, the envelope identical afterwards, no undo point).
+- **An item's sample rate is read when the batch starts,** because REAPER reports none for every source while it is in the background ("Set media items offline when application is not active"). An item with no sample rate even then counts as "could not be analyzed"; a single analysis of such an item says its audio could not be read instead of storing an analysis without notes.
+
 HC6 conflicts: None.
