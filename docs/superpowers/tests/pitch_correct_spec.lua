@@ -1253,6 +1253,81 @@ test("mode_unused", function()
   eq(S.K.mode_unused("separation", { h }, 1), nil)
 end)
 
+-- A note from t0 lasting dur. sung: a number, or fn(local_time) -> number | nil. avg: its sung average.
+local function mode_note(t0, dur, sung, avg, ctrl)
+  local fr = {}
+  local nf = math.floor(dur / JHOP + 0.5)
+  for i = 1, nf do
+    local lt = (i - 1) * JHOP
+    local v = sung
+    if type(sung) == "function" then v = sung(lt) end
+    fr[i] = { time = t0 + lt, note = v }
+  end
+  local c = { center_pitch = avg, bypassed = false }
+  for k, v in pairs(ctrl or {}) do c[k] = v end
+  return { start_time = t0, end_time = t0 + nf * JHOP, frames = fr, avg_note = avg, controls = c }
+end
+local C_MAJOR = { [0] = true, [2] = true, [4] = true, [5] = true, [7] = true, [9] = true, [11] = true }
+
+test("mode_nearest_scale_pitch", function()
+  local f = S.K.nearest_scale_pitch
+  eq(f(60.4, nil), 60); eq(f(60.6, nil), 61)
+  eq(f(60.5, nil), 60, "a tie goes to the lower")
+  eq(f(61.4, C_MAJOR), 62); eq(f(61.0, C_MAJOR), 60, "tie in the scale"); eq(f(59.2, C_MAJOR), 59)
+  eq(f(61.4, {}), 61, "an empty scale is every semitone")
+end)
+
+test("mode_scale_pcs", function()
+  local major
+  for i, d in ipairs(S.SCALE_DEFINITIONS) do if d.name == "Major" then major = i end end
+  local pcs = S.K.scale_pcs(1, major)
+  for pc = 0, 11 do eq(pcs[pc] == true, C_MAJOR[pc] == true, "pc " .. pc) end
+  eq(S.K.scale_pcs(3, major)[2], true, "the root moves with the key")
+  eq(S.K.scale_pcs(1, 999), nil, "unknown scale")
+end)
+
+test("mode_line_hard", function()
+  local n = mode_note(0.5, 0.3, 60.3, 60.3)
+  local shifts, steps = S.K.mode_line(n, "hard", nil)
+  eq(#shifts, #n.frames)
+  for i = 1, #shifts do near(shifts[i], -0.3, 1e-9, "frame " .. i) end
+  eq(next(steps), nil)
+  n = mode_note(0.5, 0.3, 60.3, 60.3, { center_pitch = 62.4 })
+  near(S.K.mode_line(n, "hard", nil)[1], 62 - 60.3, 1e-9, "follows where the note was moved")
+  near(S.K.mode_line(n, "hard", C_MAJOR)[1], 62 - 60.3, 1e-9)
+end)
+
+test("mode_line_classic_step", function()
+  local n = mode_note(0, 0.2, function(lt) return lt < 0.0975 and 60.2 or 61.2 end, 60.7, { tighten = 1 })
+  local shifts, steps = S.K.mode_line(n, "classic", nil)
+  near(shifts[20], -0.2, 1e-9); near(shifts[21], -0.2, 1e-9)
+  eq(steps[21], true, "a step where the scale note changes")
+  eq(steps[20], nil); eq(steps[22], nil)
+end)
+
+test("mode_line_classic_glide", function()
+  local n = mode_note(0, 0.2, function(lt) return lt < 0.0975 and 60 or 61 end, 60.5)   -- Tighten 0: 100 ms
+  local shifts, steps = S.K.mode_line(n, "classic", nil)
+  local a = 1 - math.exp(-JHOP / 0.100)
+  near(shifts[20], 0, 1e-9)
+  near(shifts[21], (60 + a) - 61, 1e-9)
+  near(shifts[22], (60 + 1 - (1 - a) ^ 2) - 61, 1e-9)
+  eq(next(steps), nil, "a glide writes no step")
+end)
+
+test("mode_line_untrusted_frames", function()
+  local n = mode_note(0.5, 0.1, 60.3, 60.3)
+  n.frames[5].note = 72.3   -- a wrong-octave frame
+  n.frames[6].note = nil    -- no pitch
+  local shifts = S.K.mode_line(n, "hard", nil)
+  near(shifts[5], shifts[4], 1e-12); near(shifts[6], shifts[4], 1e-12)
+  local silent = mode_note(0.5, 0.1, nil, 60.3)
+  shifts = S.K.mode_line(silent, "classic", nil)
+  for i = 1, #shifts do near(shifts[i], 60 - 60.3, 1e-9, "no pitch at all: flat at the scale note") end
+  local empty = { start_time = 1, end_time = 1.2, frames = {}, avg_note = 60, controls = { center_pitch = 60 } }
+  eq(#(S.K.mode_line(empty, "hard", nil)), 0)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

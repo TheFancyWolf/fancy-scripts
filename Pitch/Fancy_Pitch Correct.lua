@@ -2714,6 +2714,91 @@ K.mode_unused = function(key, notes, n)
   return nil
 end
 
+--- The pitch classes ({ [0..11] = true }) of scale `scale_idx` in key `key_idx` (1 = C); nil for an unknown scale.
+K.scale_pcs = function(key_idx, scale_idx)
+  local scale = SCALE_DEFINITIONS[scale_idx]
+  if not scale or type(key_idx) ~= "number" then return nil end
+  local root = (key_idx - 1) % 12
+  local pcs = {}
+  for _, intv in ipairs(scale.intervals) do pcs[(root + intv) % 12] = true end
+  return pcs
+end
+
+--- Key and Scale of the take the build is for (its stored ones), each falling back to the combos' value.
+K.item_scale = function()
+  local td = state.target_take_guid and state.session_takes and state.session_takes[state.target_take_guid]
+  local key_idx = td and td.key_idx or state.key_idx
+  local scale_idx = td and td.scale_idx or state.scale_idx
+  return key_idx, scale_idx
+end
+
+K.item_scale_pcs = function()
+  return K.scale_pcs(K.item_scale())
+end
+
+--- The whole semitone nearest `pitch` whose pitch class is in `pcs` (nil or empty: every semitone). Searched 6 either
+--- side of the rounded pitch; a tie goes to the lower.
+K.nearest_scale_pitch = function(pitch, pcs)
+  local base = math.floor(pitch + 0.5)
+  local any = pcs == nil or next(pcs) == nil
+  local best, best_d = base, math.huge
+  for c = base - 6, base + 6 do
+    if any or pcs[c % 12] then
+      local d = math.abs(c - pitch)
+      if d < best_d then best, best_d = c, d end
+    end
+  end
+  return best
+end
+
+--- Classic or Hard correction of one note: shifts[i] (semitones, without pitch-point offsets) for each frame, and
+--- steps[i] = true where the pitch steps just before frame i. Cached on note.mode_cache.
+K.mode_line = function(note, mode, pcs)
+  local frames = note.frames or {}
+  local ctrl = note.controls or {}
+  local tighten = tonumber(ctrl.tighten) or 0
+  if tighten < 0 then tighten = 0 elseif tighten > 1 then tighten = 1 end
+  local avg = note.avg_note
+  local centre = type(ctrl.center_pitch) == "number" and ctrl.center_pitch or avg
+  local c = note.mode_cache
+  if c and c.frames == frames and c.tighten == tighten and c.mode == mode and c.centre == centre
+     and c.avg == avg and c.pcs == pcs then
+    return c.shifts, c.steps
+  end
+  local shifts, steps = {}, {}
+  if #frames > 0 and type(avg) == "number" and type(centre) == "number" then
+    local move = centre - avg
+    local target = K.nearest_scale_pitch(centre, pcs)
+    local last = target - avg
+    local tau = K.MODE.GLIDE_S * (1 - tighten)
+    local line, have_line = 0, false
+    for i = 1, #frames do
+      local sung = frames[i].note
+      if type(sung) == "number" and math.abs(sung - avg) <= K.MODE.OUTLIER_ST then
+        if mode == "hard" then
+          last = target - sung
+        else
+          local goal = K.nearest_scale_pitch(sung + move, pcs)
+          local dt = i > 1 and (frames[i].time - frames[i - 1].time) or 0
+          if not have_line then
+            line, have_line = goal, true
+          elseif tau * 3 <= dt then
+            if goal ~= line then steps[i] = true end
+            line = goal
+          else
+            line = line + (1 - math.exp(-dt / tau)) * (goal - line)
+          end
+          last = line - sung
+        end
+      end
+      shifts[i] = last
+    end
+  end
+  note.mode_cache = { frames = frames, tighten = tighten, mode = mode, centre = centre, avg = avg, pcs = pcs,
+                      shifts = shifts, steps = steps }
+  return shifts, steps
+end
+
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
 --- keep_pitch_mode leaves the item's I_PITCHMODE untouched (used by re-analysis, which applies no correction); so does
 --- the Settings option "Keep each item's own pitch algorithm" (state.keep_pitch_mode).
