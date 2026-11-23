@@ -22,22 +22,29 @@ A temporary diagnostic in the script recorded, for every frame of the user's two
 
 ## Approaches
 
-1. **Judge each dip against the deepest one, per frame.** Fixes the chorus (42 frames off down to 2 on the recording) but not the verse's onsets (31 against 32): at an onset the right and the wrong dip are equally deep, and one frame cannot tell them apart.
-2. **Keep every dip as a candidate and choose the line through the frames that costs least (chosen).** Each frame pays for how much shallower its chosen dip is than its deepest, and for each octave below its shortest candidate; the line pays for every semitone it moves between frames. Fixes both kinds: chorus 42 down to 1, verse 31 down to 21, where the 21 are unchanged readings (quiet falling tails, one real high blip, the item-end junk that the whole-block rule now removes).
+1. **Judge each dip against the deepest one, per frame.** Fixes the chorus (about 42 frames off down to 2 on the recording) but not the verse's onsets (about 31 against 32): at an onset the right and the wrong dip are equally deep, and one frame cannot tell them apart.
+2. **Keep every dip as a candidate and choose the line through the frames that costs least (chosen).** Each frame pays for how much shallower its chosen dip is than its deepest, and for each octave below its shortest candidate; the line pays for every semitone it moves between frames. Fixes both kinds: by the test's own count, chorus 41 down to 1 and verse 32 down to 21, where the 21 are unchanged readings (quiet falling tails, one real high blip, the item-end junk that the whole-block rule now removes).
 3. **A longer analysis window.** Refuted by the test above, and it triples the analysis time.
 4. **Many thresholds at once, as in pYIN.** Not chosen: on the chorus note every threshold above 0.07 gives the half period, so it would lean the wrong way on every frame and continuity could not save it.
 
 ## What is built
 
-- **`yin_process_block`** returns the block's candidates: the dips of the normalised difference function inside the searched range (`{ tau, d }`, the `K.TRACK.MAX_CANDS` deepest, each with its interpolated period). A value at the edge of the range is not a dip. Each period is measured on samples centred on the block's middle.
+- **`yin_process_block`** returns the block's candidates: the dips of the normalised difference function inside the searched range (`{ tau, d }`, the `K.TRACK.MAX_CANDS` that cost least within the block, each with its interpolated period; trimming by depth alone dropped the true period of steady notes from about A5 up, found in review). A value at the edge of the range is not a dip. Each period is measured on samples centred on the block's middle.
 - **The threshold only decides whether a block has a pitch** (deepest dip at most twice the threshold, as before). It no longer decides which pitch. The Detection setting keeps its meaning.
 - **`K.pitch_track(results, sample_rate)`** runs once when the last block is read. It chooses each voiced frame's candidate on the cheapest line (`K.cand_cost` per frame, `JUMP_COST` per semitone between frames), carries a line through unvoiced stretches shorter than `K.SEG.BRIDGE_S`, sets `freq` and `note`, and removes the candidates (they are not stored).
-- **Frame times** are the middle of the block (`K.frame_centre_s`). Only blocks that lie whole inside the item are read.
+- **Frame times** are the middle of the block (`K.analysis_frame`). Only blocks that lie whole inside the item are read (`K.block_fits`), so the pitch line starts and ends half a block inside the item.
 - **`K.octave_fix` stays** as a second line after the choice.
 
 ## The constants (`K.TRACK`) and how they were set
 
 `FLOOR = 0.02`, `OCTAVE_COST = 0.7`, `JUMP_COST = 0.15`, `JUMP_CAP_ST = 12`, costs given for a frame spacing of 512/48000 s and scaled with the spacing. `OCTAVE_COST` was tried from 0.25 to 1.35 on the four recordings: 0.5 to 0.9 gives the same, best result; 1.35 picks shallow junk dips at note changes. They rest on two items by one singer and are meant to be set again when the other singers' recordings arrive.
+
+## Known limits (found in review, not fixed)
+
+- **A note cut at an item's start** has its first frame half a block in, so its correction ramps in over that stretch instead of holding from 0.
+- **A faint fundamental under heavy noise.** With the note's own tone below the noise (a test signal with the overtone 18 dB over the tone and noise 15 dB under the sound) the block is read at the overtone. At 20 dB it is read right, where the old detector was wrong at every noise level up to there.
+- **A whole note consistently in the wrong octave** would not show in the "frames off their neighbours" count used on the recordings.
+- **Not tested here:** which of `K.pitch_track` and `K.octave_fix` runs first, and the jump cap.
 
 ## Not goals
 

@@ -7,8 +7,8 @@ All notable changes to Fancy Scripts will be documented here.
 - **Fancy Pitch Correct v2.20.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Pitch detection chooses across moments:
   - **Octaves read right**: each moment's pitch is now chosen together with the moments around it, not on its own. A note read an octave too high (a strong overtone) or too low (a shaky note start) is now read right at the source; the repair added in 2.19.1 stays as a second line.
   - **Detection setting**: it now only decides what counts as a pitched sound. It no longer changes which octave a note is read in (at Standard, a held note with a strong overtone could be read an octave high throughout).
-  - **Timing**: the pitch line and the notes sit about 10 ms later, where the sound actually is (they were drawn early).
-  - **Item ends**: no more false low reading at the very end of an item; the last few milliseconds of an item are no longer analysed.
+  - **Timing**: the pitch line and the notes sit half an analysis block later (about 10 ms at Standard quality, 21 ms at High Quality), where the sound actually is; they were drawn early. The line now starts and ends that far inside the item.
+  - **Item ends**: no more false low reading at the very end of an item.
   - **Analyze again**: items analysed before keep their old readings and timing until you analyze them again.
 - **Fancy Pitch Correct v2.19.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Octave errors in the analysis:
   - **No more spikes and drops**: a short stretch the analysis read one octave too high or too low (up to 150 ms, with the right octave around it) is put back in the octave of the singing around it.

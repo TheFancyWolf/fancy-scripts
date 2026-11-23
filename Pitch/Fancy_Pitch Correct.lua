@@ -4,8 +4,8 @@
 -- @changelog
 --   Pitch detection: each moment's pitch is now chosen together with the moments around it, not on its own. A note read an octave too high (a strong overtone) or too low (a shaky note start) is now read right, without relying on the repair added in 2.19.1
 --   The Detection setting now only decides what counts as a pitched sound; it no longer changes which octave a note is read in
---   The pitch line and the notes sit about 10 ms later, where the sound actually is (they were drawn early)
---   No more false low reading at the very end of an item; the last few milliseconds of an item are no longer analysed
+--   The pitch line and the notes sit half an analysis block later (about 10 ms at Standard quality), where the sound actually is; they were drawn early. The line now starts and ends that far inside the item
+--   No more false low reading at the very end of an item
 --   Analyze an item again to get this
 -- @about
 --   Native Lua pitch correction and tracking.
@@ -1021,7 +1021,7 @@ end
 --- Returns rms (whole block), freq, lvl (K.short_level around the block's middle) and cands.
 --- cands: the periods the block could be read at, for K.pitch_track to choose from across frames: the dips of the
 --- normalised difference function inside the searched range, { tau = period in samples (fractional), d = its depth
---- (0 = the sound repeats perfectly) }, the K.TRACK.MAX_CANDS deepest, in order of period. A value at the edge of the
+--- (0 = the sound repeats perfectly) }, the K.TRACK.MAX_CANDS that cost least (K.cand_cost), in order of period. A value at the edge of the
 --- range is not a dip. The block has a pitch when its deepest dip is at most twice params.threshold: the threshold
 --- decides whether there is a pitch, not which one. freq is then the reading of the block on its own (K.cand_best);
 --- without a pitch freq and cands are nil.
@@ -1089,7 +1089,11 @@ local function yin_process_block(samples, sample_rate, params)
     return rms, nil, K.short_level(s, b_size, sample_rate), nil
   end
   if #dips > T.MAX_CANDS then
-    table.sort(dips, function(x, y) return cmndf[x] < cmndf[y] or (cmndf[x] == cmndf[y] and x < y) end)
+    -- Keep the MAX_CANDS readings that cost least within the block (K.cand_cost), not the deepest: a steady note has a
+    -- dip about as deep at every multiple of its period, and by depth alone the period itself could be dropped
+    local cost, tau_min = {}, dips[1]
+    for _, tau in ipairs(dips) do cost[tau] = K.cand_cost({ tau = tau, d = cmndf[tau] }, d_min, tau_min) end
+    table.sort(dips, function(x, y) return cost[x] < cost[y] or (cost[x] == cost[y] and x < y) end)
     for q = #dips, T.MAX_CANDS + 1, -1 do dips[q] = nil end
     table.sort(dips)
   end
@@ -1117,6 +1121,24 @@ end
 --- Where in its block a frame's reading belongs, in seconds from the block's start: the middle.
 K.frame_centre_s = function(block_size, sample_rate)
   return block_size / 2 / sample_rate
+end
+
+--- True when the block that starts at start_s lies whole inside an item of end_s seconds. Only such blocks are read:
+--- a block that runs past the item's end gave a pitch of its own (the hop's period).
+K.block_fits = function(start_s, params, sample_rate, end_s)
+  return start_s + params.block_size / sample_rate <= end_s
+end
+
+--- The analysis frame of the block that starts at start_s, from what yin_process_block returned for it. Its time is
+--- the middle of the block. freq / note are the block's reading on its own (note only inside the searched range),
+--- shown while the analysis runs; cands ride on the frame until K.pitch_track makes the final choice.
+K.analysis_frame = function(start_s, params, sample_rate, rms, freq, lvl, cands)
+  local note = nil
+  if freq and freq >= params.min_freq and freq <= params.max_freq then
+    note = freq_to_note(freq)
+  end
+  return { time = start_s + K.frame_centre_s(params.block_size, sample_rate), freq = freq, note = note, rms = rms,
+    lvl = lvl, cands = cands }
 end
 
 -------------------------------------------------------------------------------
@@ -4285,6 +4307,8 @@ local function run_hybrid_segmentation()
   -- chosen across the frames, then any short octave-off stretch that is left is put back
   K.pitch_track(state.results or {}, state.sample_rate)
   K.octave_fix(state.results or {})
+  -- Both rewrite frames in place: the pitch range kept for drawing (K.results_range) starts over
+  state.draw_cache.range.results = nil
   state.notes, state.split_points = K.segment(state.results or {}, state.separation)
 
   -- Anchor pitch
@@ -4313,11 +4337,8 @@ local function process_analysis_step()
   -- Work for one short slice, then yield to the window (the progress and Cancel stay responsive)
   local slice_start = reaper.time_precise()
 
-  -- Only blocks that lie whole inside the item are read: a block that runs past the item's end gave a pitch of its
-  -- own (the hop's period). A frame's time is the middle of its block (K.frame_centre_s)
-  local block_s = params.block_size / state.sample_rate
-  local centre_s = K.frame_centre_s(params.block_size, state.sample_rate)
-  while state.current_time + block_s <= state.end_time do
+  -- Only blocks that lie whole inside the item are read (K.block_fits)
+  while K.block_fits(state.current_time, params, state.sample_rate, state.end_time) do
     if reaper.time_precise() - slice_start > K.ANALYSIS_SLICE_S then
       break
     end
@@ -4333,28 +4354,15 @@ local function process_analysis_step()
     )
 
     if num_read > 0 then
-      -- freq / note: the block's reading on its own, shown while the analysis runs; K.pitch_track makes the final
-      -- choice from cands when the last block is read
       local rms, freq, lvl, cands = yin_process_block(state.buffer, state.sample_rate, params)
-      local note = nil
-      if freq and freq >= params.min_freq and freq <= params.max_freq then
-        note = freq_to_note(freq)
-      end
-      table.insert(state.results, {
-        time = state.current_time + centre_s,
-        freq = freq,
-        note = note,
-        rms = rms,
-        lvl = lvl,
-        cands = cands
-      })
+      table.insert(state.results, K.analysis_frame(state.current_time, params, state.sample_rate, rms, freq, lvl, cands))
     end
 
     -- Advance time by hop size
     state.current_time = state.current_time + (params.hop_size / state.sample_rate)
   end
 
-  if state.current_time + block_s > state.end_time then
+  if not K.block_fits(state.current_time, params, state.sample_rate, state.end_time) then
     -- The resync is paused while analysing: remember whether the project changed meanwhile so the
     -- next frame still picks up external changes (undo etc.) after this script's own writes.
     local external_change = (state.last_change_count ~= reaper.GetProjectStateChangeCount(0))
@@ -4607,7 +4615,8 @@ K.fit_array = function(arr, n)
 end
 
 --- Raw min / max pitch over the analysis frames of `results` (has: some frame carries a pitch). Frames are only
---- appended, so each call looks only at the frames added since the last one (a different table starts over).
+--- appended while an analysis runs, so each call looks only at the frames added since the last one (a different
+--- table starts over, and so does the end of an analysis, which rewrites pitches: run_hybrid_segmentation).
 K.results_range = function(results)
   local range = state.draw_cache.range
   local n = #results
