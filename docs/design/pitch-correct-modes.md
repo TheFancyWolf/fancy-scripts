@@ -1,14 +1,46 @@
 # Design: Fancy Pitch Correct — Mode: Natural, Classic and Hard
 
-Target file(s): `Pitch/Fancy_Pitch Correct.lua`
+Target file(s): `Pitch/Fancy_Pitch Correct.lua`, `_lib/theme.lua` (Amendment 1: four canvas colours and one palette colour)
 Archetype(s): main window → Editor / canvas (the top bar's value bar, the note right-click menu's value rows and the note canvas)
 Status: Approved
 Date: 2026-11-23
-Approver: TheFancyWolf (in chat, 2026-11-23)
+Approver: TheFancyWolf (in chat, 2026-11-23; Amendment 1 asked for by TheFancyWolf in chat, 2026-11-23)
 
 ## Summary
 
-Fancy Pitch Correct gets a **Mode** with three choices. **Natural** is today's correction, left exactly as it is. **Classic** and **Hard** are the deliberate auto-tuned effect: Classic jumps between the notes of the scale (Tighten sets how fast), Hard holds one flat scale note. Mode is a dropdown next to Tighten in the top bar and a row in the note's right-click menu. This is the second attempt: the first (branch `feat/pitch-correct-overtune`, deleted 2026-11-23) made sounds the user liked but changed Natural's code in place, and Natural no longer felt right. So this design's first rule is that Natural's code is not edited at all, and that is proven before anything else is built. Primary display: the note canvas (unchanged). Primary action: dragging a value (unchanged).
+Fancy Pitch Correct gets a **Mode** with three choices. **Natural** is today's correction, left exactly as it is. **Classic** and **Hard** are the deliberate auto-tuned effect: Classic jumps between the notes of the scale (Tighten sets how fast), Hard holds one flat scale note. Mode is a dropdown directly left of Tighten in the top bar and a row above Tighten in the note's right-click menu. This is the second attempt: the first (branch `feat/pitch-correct-overtune`, deleted 2026-11-23) made sounds the user liked but changed Natural's code in place, and Natural no longer felt right. So this design's first rule is that Natural's code is not edited at all, and that is proven before anything else is built. Primary display: the note canvas (unchanged). Primary action: dragging a value (unchanged).
+
+## Amendment 1 (2026-11-23): dropdown left of Tighten, one colour per value
+
+Asked for by TheFancyWolf after seeing the first build. It overrides the rest of this doc where they differ. Natural's sound and feel stay under the contract below; this amendment changes how the value controls **look**, for every mode, which the first version of this doc had set aside.
+
+**1. The Mode dropdown sits directly left of Tighten** in the top bar: `(pill) [Mode ▾] [Tighten] [Strength] [Tolerance] [Slide In] [Separation]`. In the narrowest layout the rows are pill + Mode, Tighten + Strength, Tolerance + Slide In, Separation. In the note menu the Mode row stays where it is, above the Tighten row.
+
+**2. One colour per value, the same wherever the value shows.** As in the last build of the first attempt:
+
+| Value | Colour (Fancy Dark) | Canvas palette key |
+|---|---|---|
+| Tighten | green | `param_tighten` |
+| Strength | blue (the accent) | `param_strength` |
+| Tolerance | yellow | `param_tolerance` |
+| Slide In | orange | `param_slide_in` |
+
+Where it shows:
+
+- **Top bar:** the range fill along the bottom of each value control. It no longer tells a note's own value from the default by colour; the `*` mark and the tooltip still do. Separation keeps the accent. Mode has no colour.
+- **Note menu:** each value row shows the same range fill, in the same colour, under its control.
+- **Drag readout on a note:** the readout pill carries the same thin bar along its bottom, filled to the value, in the value's colour. The pill keeps the width of its longest text so the bar does not rescale while dragging.
+- **Highlight on the notes** while a value is hovered or dragged: the outline, band or span is drawn in the value's colour, with a wash of the same colour. The hovered zone of a note (left = Tighten, right = Tolerance, Shift = Slide In) is washed in that value's colour.
+
+A value that is not used by the selected notes keeps its dim text; its bar keeps its colour.
+
+**Library change (`_lib/theme.lua`):** palette colour `orange` (`0xF5853FFF`, between yellow and red and clearly apart from red, which stays the error colour); canvas keys `param_tighten`, `param_strength`, `param_tolerance`, `param_slide_in`, in Fancy Dark taken from the palette's green, accent, yellow and orange, in Match Theme each fitted to at least 3:1 on the rows and note blocks like the existing highlight edge. No other change to the library.
+
+**What this does to the contract.** Rule 1's "no change to `_lib/theme.lua`" becomes "only the additions above". The Natural functions, numbers and drag feel stay pinned by the tests. The lines that draw fills, highlights and the readout change colour source only; ranges, speeds, texts and what is drawn where do not change.
+
+**Acceptance, added:** CL1 / HC1: every value colour is at least 3:1 on rows and note fills in both theme modes (state indicator); CL2: a value is still named by its text everywhere, never by colour alone; CL3: orange stays clearly apart from the error red; CN2 / CN3: the colours are palette keys, none is written in the script; CL4: checked in Fancy Dark and Match Theme.
+
+Still set aside: Tolerance's band shown while Tighten is at 0 %, and tooltips set in paragraphs.
 
 ## Feature inventory
 
@@ -169,7 +201,7 @@ Carried over from the earlier Pitch Correct designs and the first attempt's chec
 
 Regions touched (no existing control is moved, removed or changed):
 
-1. **Value bar.** One new unit, the Mode dropdown, right after Tighten. It follows the bar's rule: with nothing selected it shows and sets the item's mode; with notes selected it shows and sets theirs.
+1. **Value bar.** One new unit, the Mode dropdown, directly left of Tighten (Amendment 1; it was first built right of it). It follows the bar's rule: with nothing selected it shows and sets the item's mode; with notes selected it shows and sets theirs.
 2. **Note menu.** One new row, Mode, above the Tighten row.
 3. **Value bar and note menu, existing values.** Unchanged controls. A value the selected notes do not use is drawn dim and says why.
 4. **Note canvas.** No new drawing. A Classic or Hard note looks like any edited note; its Preview Curve shows stairs or a flat line because that is what is written.
@@ -186,13 +218,13 @@ Who decides a note's mode, first match wins: the note's own mode → the item's 
 **Wide (one row), nothing selected:**
 
 ```
-[◆] [V_Main.wav] [E▾] [Major▾] │ (Defaults) [Tighten –] [Natural ▾] [Strength 100%] [Tolerance 8¢] [Slide In –] [Separation 50%]   […][×]
+[◆] [V_Main.wav] [E▾] [Major▾] │ (Defaults) [Natural ▾] [Tighten –] [Strength 100%] [Tolerance 8¢] [Slide In –] [Separation 50%]   […][×]
 ```
 
 **Wide, three Classic notes selected:**
 
 ```
-[◆] [V_Main.wav] [E▾] [Major▾] │ (3 notes) [Tighten 40%] [Classic ▾] ‹Strength 100%› ‹Tolerance 8¢› ‹Slide In 0%› [Separation 50%]   […][×]
+[◆] [V_Main.wav] [E▾] [Major▾] │ (3 notes) [Classic ▾] [Tighten 40%] ‹Strength 100%› ‹Tolerance 8¢› ‹Slide In 0%› [Separation 50%]   […][×]
 ```
 
 **The dropdown in its states** (one control, fixed width from its longest text, `Natural`):
@@ -213,7 +245,7 @@ open:  ┌─────────┐
 
 ```
 [◆] [V_Main.wav…] [E▾] [Major▾]                                                        […][×]
-(1 note) ‹Tighten 0%› [Hard ▾] ‹Strength 100%› ‹Tolerance 8¢› ‹Slide In 0%› [Separation 50%]
+(1 note) [Hard ▾] ‹Tighten 0%› ‹Strength 100%› ‹Tolerance 8¢› ‹Slide In 0%› [Separation 50%]
 ```
 
 **Narrow docker (~260 px):** today's narrowest plan, two units per row, gains the dropdown and so one row:
@@ -221,8 +253,8 @@ open:  ┌─────────┐
 ```
 [◆] [V_Main…]        […][×]
 [E▾] [Major▾]
-(3 notes) [Tighten 40%]
-[Classic ▾] ‹Strength 100%›
+(3 notes) [Classic ▾]
+[Tighten 40%] ‹Strength 100%›
 ‹Tolerance 8¢› ‹Slide In 0%›
 [Separation 50%]
 ```
@@ -301,7 +333,7 @@ Keyboard map: no new keys. Esc (HC5): the open list or menu closes first, then a
 
 ## Library proposals
 
-None. `_lib/theme.lua` is not changed by this design.
+Amendment 1 adds to `_lib/theme.lua`: palette colour `orange`; canvas keys `param_tighten`, `param_strength`, `param_tolerance`, `param_slide_in` (see Amendment 1 for values and fitting). Why no existing key fits: the canvas has one highlight colour for every value, and scripts may not hold colours of their own. Beneficiary: Fancy Pitch Correct; `orange` becomes available to every script.
 
 ## Acceptance criteria
 
@@ -379,8 +411,7 @@ Rules:
 
 The first attempt ended with some extras that change how Natural's own controls look. They are left out so that this change cannot alter anything about Natural, and can come back as their own small design once this one is in and Natural is confirmed:
 
-- one colour per value everywhere (Tighten green, Strength blue, Tolerance yellow, Slide In orange);
-- a progress bar under the drag readout of every value dragged on a note, and the same bars in the note menu;
+- (now in scope, see Amendment 1) one colour per value everywhere, the bar under the drag readout, and the same bars in the note menu;
 - Tolerance's band on a note also shown while Tighten is at 0 % (on hover or drag);
 - tooltips set in short paragraphs, gestures one per line.
 

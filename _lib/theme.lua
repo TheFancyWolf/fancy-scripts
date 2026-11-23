@@ -25,6 +25,7 @@
 --   Semantic:   green/green_h/green_d/green_l (success, enabled, positive)
 --               red/red_h/red_d/red_l         (error, delete, destructive)
 --               yellow/yellow_l               (warning, caution)
+--               orange                        (between yellow and red, clearly apart from red)
 --   Structure:  border, sep, dim_bg           (border = control outline, same value as outline in Fancy; sep = neutral
 --                                              hairline, no accent tint; dim_bg = modal overlay)
 --   Table:      table_row, table_row_alt      (alternating row backgrounds; kept for scripts, the style stack uses bg)
@@ -38,7 +39,7 @@
 --               hover, select                 hovered / selected row of a selectable or menu item (select = accent at 25%)
 --               scroll, scroll_h, scroll_a    scrollbar grab: 17 / 26 / 35% (white in Fancy, text colour in Match Theme)
 --               title                         title bar and docked header strip
---   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, span_*, handle*, trace, preview, overview_*, view_*, ... }
+--   Canvas:     canvas = { row*, grid*, gutter_*, key_*, note_*, zone_*, span_*, param_*, handle*, trace, preview, overview_*, view_*, ... }
 --               Colours for custom-drawn editors (piano roll, notes, curves, pills). Fixed in Fancy,
 --               derived and contrast-fitted (text >= 4.5:1, boundaries >= 3:1) in Match Theme. See section 4A.
 --   Helpers:    Theme.with_alpha(rgba, a) / .lighten(rgba, f) / .darken(rgba, f) / .bgr_to_rgba(bgr)
@@ -298,6 +299,7 @@ local FANCY_PALETTE = {
   green    = 0x44CD8CFF,
   red      = 0xE45E65FF,
   yellow   = 0xFEC13AFF,
+  orange   = 0xF5853FFF,   -- between yellow and red, clearly apart from red (red stays the error colour)
   blue     = 0xA990F5FF,
 
   -- Structural base
@@ -618,6 +620,11 @@ local function build_canvas_fancy(P)
   C.note_label_edited    = P.text
   C.note_edit_mark       = P.text
   C.note_wave            = with_alpha(P.text, 0.22)
+  -- One colour per parameter of Pitch Correct, the same in its value bars, drag readouts and canvas highlights
+  C.param_tighten         = P.green
+  C.param_strength        = P.accent
+  C.param_tolerance       = P.yellow
+  C.param_slide_in        = P.orange
   -- Zone highlights and trim handles (over a note block)
   C.zone_drift      = with_alpha(P.blue, 0.267)
   C.zone_shift      = 0xFFAA4444
@@ -790,6 +797,11 @@ local function build_canvas_match(P)
   -- Setting highlights: a yellow wash (decoration, like the vibrato band) inside a yellow edge fitted on rows and blocks
   C.span_fill = with_alpha(P.yellow, 0.16)
   C.span_edge = fit_contrast(P.yellow, shown, 3.0, rows, true)
+  -- One colour per parameter (value bars, drag readouts, canvas highlights): each hue fitted on rows and blocks
+  C.param_tighten   = fit_contrast(P.green, shown, 3.0, rows, true)
+  C.param_strength  = fit_contrast(P.accent, shown, 3.0, rows, true)
+  C.param_tolerance = fit_contrast(P.yellow, shown, 3.0, rows, true)
+  C.param_slide_in  = fit_contrast(P.orange, shown, 3.0, rows, true)
   local curve_on = concat_lists(shown, over_each({ C.vibrato }, shown)) -- ... and the wash over those: every persistent surface
   local line_on  = concat_lists(curve_on, over_each({ C.ruler_bg }, rows))    -- the playhead also crosses the ruler strip
   C.trace      = fit_contrast(with_alpha(P.text, 0.90), line_on, 3.0, rows, true)   -- raw pitch trace: text colour (90 % alpha)
@@ -839,8 +851,8 @@ local function attach_canvas(P, mode, overrides)
   if mode == Theme.MODE_MATCH then
     -- The Match Theme derivation searches for contrast (about 0.5 ms): keep the last result, keyed by every colour
     -- it reads, and hand out a copy so callers may change their table
-    local key = string.format("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", P.bg, P.panel, P.card, P.text, P.accent, P.accent_l,
-      P.blue, P.blue_l, P.green, P.yellow)
+    local key = string.format("%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d", P.bg, P.panel, P.card, P.text, P.accent, P.accent_l,
+      P.blue, P.blue_l, P.green, P.yellow, P.orange)
     if key ~= _match_canvas_key then
       _match_canvas_key, _match_canvas = key, build_canvas_match(P)
     end
@@ -917,6 +929,7 @@ function Theme.build_palette(overrides)
   P.green   = overrides.green   or FANCY_PALETTE.green
   P.red     = overrides.red     or FANCY_PALETTE.red
   P.yellow  = overrides.yellow  or FANCY_PALETTE.yellow
+  P.orange  = overrides.orange  or FANCY_PALETTE.orange
   local blue_base = overrides.accent2 or overrides.blue or FANCY_PALETTE.blue
   P.blue    = blue_base
   P.accent2 = blue_base

@@ -3,9 +3,10 @@
 -- @version 2.19.0
 -- @changelog
 --   Mode: how an edited note is corrected. Natural is as before (nothing about it has changed); Classic is the auto-tuned effect: the pitch jumps between the notes of the scale and Tighten sets how fast (0% glides, 100% steps at once); Hard is one flat note of the scale
---   Set the Mode in the dropdown next to Tighten (this item when nothing is selected, the selected notes otherwise) or in the Mode row of the note's right-click menu
+--   Set the Mode in the dropdown directly left of Tighten (this item when nothing is selected, the selected notes otherwise) or in the Mode row of the note's right-click menu
 --   Classic and Hard follow where a note was moved and the item's Key and Scale; a Key or Scale change rewrites them at once, as one undo step
 --   Strength, Tolerance and Slide In are not used in Classic or Hard (nor Tighten in Hard): they are dimmed and say so. An untouched note is never corrected in any mode; analysing an item again puts its mode back to Natural
+--   Each value has one colour everywhere (Tighten green, Strength blue, Tolerance yellow, Slide In orange): its bar in the top bar, the same bar on its row in the note's right-click menu, a bar under the readout while it is dragged on a note, and its highlight on the notes. The bar's colour no longer tells a note's own value from the default; the * mark and the tooltip still do
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -4323,6 +4324,45 @@ local function param_drag(pctx, id, label, value, lo, hi, fmt, speed)
   return rv == true, v, committed, false, false
 end
 
+--- The range fill of a value control (the top bar and the note menu), drawn on the item just submitted: a track
+--- along the bottom edge of the frame and, on it, the part from lo_frac to hi_frac (0..1 of the range) in `color`.
+--- frame_w (optional): the width of the control's frame, for a control with its label drawn right of it (the item's
+--- rectangle includes that label).
+K.value_fill = function(vctx, lo_frac, hi_frac, color, frame_w)
+  local x1, _ = reaper.ImGui_GetItemRectMin(vctx)
+  local x2, y2 = reaper.ImGui_GetItemRectMax(vctx)
+  if not (x1 and x2 and y2) then return end
+  if frame_w then x2 = x1 + frame_w end
+  K.value_track(reaper.ImGui_GetWindowDrawList(vctx), x1, x2, y2, lo_frac, hi_frac, color)
+end
+
+--- The track K.value_fill draws, on any draw list: along the bottom edge y2 of a box spanning x1 .. x2 (the value
+--- controls, and the readout of a value drag on the canvas, so they all look the same).
+K.value_track = function(dl, x1, x2, y2, lo_frac, hi_frac, color)
+  local L = Theme.layout
+  local w = x2 - x1
+  local top = y2 - L.xs
+  reaper.ImGui_DrawList_AddRectFilled(dl, x1, top, x2, y2, Theme.get_palette().outline)
+  lo_frac = math.max(0, math.min(1, lo_frac))
+  hi_frac = math.max(lo_frac, math.min(1, hi_frac))
+  local fx1, fx2 = x1 + w * lo_frac, x1 + w * hi_frac
+  if lo_frac > 0 and fx2 - fx1 < L.xs then   -- a mixed range too narrow to see: keep a visible mark
+    fx1 = math.max(x1, fx2 - L.xs)
+  end
+  if fx2 > fx1 then reaper.ImGui_DrawList_AddRectFilled(dl, fx1, top, fx2, y2, color) end
+end
+
+-- Parameter colours on the canvas (K.param_color): the wash of a highlighted span and of a hovered note zone
+K.PARAM_WASH = { span = 0.26, zone = 0.27 }
+--- The colour of the parameter `key`, the same wherever it shows: its value bar, its drag readout and its highlight
+--- on the canvas.
+K.PARAM_COLOR_KEYS = { tighten = "param_tighten", retune_speed = "param_strength", tolerance = "param_tolerance",
+                       slide_in = "param_slide_in" }
+K.param_color = function(key)
+  local P = Theme.get_palette()
+  return P.canvas[K.PARAM_COLOR_KEYS[key] or ""] or P.accent
+end
+
 --- For a param_drag caller that writes the value while it moves. Call right after param_drag with `raw`, the caller's
 --- own value as it read it before drawing the control: it is remembered when the press begins, and returned when the
 --- drag was cancelled (Esc) so the caller can put it back; nil otherwise. `raw` must not be nil.
@@ -5050,10 +5090,10 @@ K.HINT_KINDS = {
 --- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
 --- on every note Strength reaches, the Tolerance band of each tightened note, a span over each slide for Slide In.
 --- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
---- `build` is K.correction_view's result, C the canvas palette. Returns how many marks were drawn.
+--- `build` is K.correction_view's result. Returns how many marks were drawn.
 --- Also returns `skipped`: how many notes in view the value reaches that got no mark because they are Classic or
 --- Hard (K.mode_value 1 or 2; for Tighten: Hard), 0 when a reached Natural note (Tighten: a non-Hard one) is in view.
-K.draw_setting_hint = function(draw_list, hint, build, C)
+K.draw_setting_hint = function(draw_list, hint, build)
   local m = state.draw_cache.map
   local notes, key, set = state.notes, hint.key, hint.notes
   if not (m.w and m.h and m.range and m.vt1 and m.vt1 > m.vt0 and m.range > 0) then return 0 end
@@ -5061,6 +5101,9 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
   local pad = Theme.layout.xs
   local drawn = 0
   local skipped, natural = 0, 0
+  -- The parameter's own colour (K.param_color): an opaque edge and a wash of it
+  local edge = K.param_color(key)
+  local wash = Theme.with_alpha(edge, K.PARAM_WASH.span)
 
   -- The note takes the value that is being changed. edited_only: it must also be corrected (edited, not bypassed)
   local function reached(idx, edited_only)
@@ -5092,7 +5135,7 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         local top, bot = block_y(idx)
         if bot >= y_min and top <= y_max then
           reaper.ImGui_DrawList_AddRect(draw_list, math.max(x_min, t_x(n.start_time) - pad), math.max(y_min, top - pad),
-            math.min(x_max, t_x(n.end_time) + pad), math.min(y_max, bot + pad), C.span_edge)
+            math.min(x_max, t_x(n.end_time) + pad), math.min(y_max, bot + pad), edge)
           drawn = drawn + 1
         end
       end
@@ -5115,9 +5158,9 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         local x0, x1 = math.max(x_min, t_x(n.start_time)), math.min(x_max, t_x(n.end_time))
         if bot >= y_min and top <= y_max and x1 > x0 then
           top, bot = math.max(y_min, top), math.min(y_max, bot)
-          if bot - top >= 2 then reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, C.span_fill) end
-          reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x1, top, C.span_edge)
-          reaper.ImGui_DrawList_AddLine(draw_list, x0, bot, x1, bot, C.span_edge)
+          if bot - top >= 2 then reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, wash) end
+          reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x1, top, edge)
+          reaper.ImGui_DrawList_AddLine(draw_list, x0, bot, x1, bot, edge)
           drawn = drawn + 1
         end
       end
@@ -5155,11 +5198,11 @@ K.draw_setting_hint = function(draw_list, hint, build, C)
         if bot > top and x1 >= x0 then
           if x1 - x0 < 2 then
             local x = (x0 + x1) * 0.5
-            reaper.ImGui_DrawList_AddLine(draw_list, x, top, x, bot, C.span_edge)
+            reaper.ImGui_DrawList_AddLine(draw_list, x, top, x, bot, edge)
           else
-            reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, C.span_fill)
-            reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x0, bot, C.span_edge)
-            reaper.ImGui_DrawList_AddLine(draw_list, x1, top, x1, bot, C.span_edge)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, x0, top, x1, bot, wash)
+            reaper.ImGui_DrawList_AddLine(draw_list, x0, top, x0, bot, edge)
+            reaper.ImGui_DrawList_AddLine(draw_list, x1, top, x1, bot, edge)
           end
           drawn = drawn + 1
         end
@@ -5793,9 +5836,11 @@ local function draw_graph(draw_ctx, w, h)
   -- (C.pill_text, C.marquee_text) are fitted to >= 4.5:1 on the pill over every row and every note fill. The pill
   -- is kept inside the note area (below the ruler); with flip_dx it moves to the left of x when it would run past the right edge.
   -- `big`: the drag readout's pill, in the large font with more padding, centred on y.
-  local function pill_text(x, y, text, col, flip_dx, big)
+  local function pill_text(x, y, text, col, flip_dx, big, widest)
     local pushed = big and Theme.push_font(draw_ctx, fonts.large)
     local tw, th = reaper.ImGui_CalcTextSize(draw_ctx, text)
+    -- widest (optional): the longest text this pill can show, so its width stays put while the value changes
+    if widest then tw = math.max(tw, (reaper.ImGui_CalcTextSize(draw_ctx, widest))) end
     local pad_x, pad_y = L.sm, L.xs
     if big then pad_x, pad_y = L.md, L.sm end
     local pill_w, pill_h = tw + pad_x * 2, th + pad_y * 2
@@ -5806,6 +5851,7 @@ local function draw_graph(draw_ctx, w, h)
     reaper.ImGui_DrawList_AddRectFilled(draw_list, x, y, x + pill_w, y + pill_h, C.pill_bg, L.rounding)
     reaper.ImGui_DrawList_AddText(draw_list, x + pad_x, y + pad_y, col, text)
     Theme.pop_font(draw_ctx, pushed)
+    return x, y, pill_w, pill_h
   end
 
   --- True when `text` on a pill fits `room` pixels: the pill pill_text draws, plus the offset the zone labels start at.
@@ -6706,17 +6752,19 @@ local function draw_graph(draw_ctx, w, h)
 
           if has_shift then
             -- Shift + drag anywhere on the note adjusts Slide In: the whole block is its zone
-            reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y, C.zone_shift)
+            reaper.ImGui_DrawList_AddRectFilled(draw_list, sx, top_y, ex, bot_y,
+              Theme.with_alpha(K.param_color("slide_in"), K.PARAM_WASH.zone))
           elseif state.hovered_zone == "tighten" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              sx, top_y, sx + zone_w, bot_y, C.zone_drift)
+              sx, top_y, sx + zone_w, bot_y, Theme.with_alpha(
+                K.param_color("tighten"), K.PARAM_WASH.zone))
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx + zone_w, top_y, ex, bot_y, fill)
           elseif state.hovered_zone == "tolerance" then
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex - zone_w, bot_y, fill)
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
-              ex - zone_w, top_y, ex, bot_y, C.zone_shift)
+              ex - zone_w, top_y, ex, bot_y, Theme.with_alpha(K.param_color("tolerance"), K.PARAM_WASH.zone))
           else -- pitch zone
             reaper.ImGui_DrawList_AddRectFilled(draw_list,
               sx, top_y, ex, bot_y, fill)
@@ -6876,7 +6924,7 @@ local function draw_graph(draw_ctx, w, h)
     local hint = state.setting_hint
     local live = hint.key ~= nil and hint.frame >= (reaper.ImGui_GetFrameCount(draw_ctx) or 0) - 1
     if live and state.show_preview and not is_bypassed and state.notes and #state.notes > 0 then
-      local marks, skipped = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item), C)
+      local marks, skipped = K.draw_setting_hint(draw_list, hint, K.frame_view(draw_ctx, state.notes, target_item))
       if hint.dragging and marks == 0 and not hint.said and (skipped or 0) > 0 then
         -- Every note in view the value reaches is one whose mode does not use it
         hint.said = true
@@ -7137,6 +7185,7 @@ local function draw_graph(draw_ctx, w, h)
   -- DRAG READOUT (a pill on the canvas, drawn after the playhead so it sits in front of it) and HOVER HINT (a tooltip)
   ---------------------------------------------------------------------------
   local drag_tip = nil
+  local drag_gauge, drag_zone = nil, nil   -- the note and the K.ZONE_CONTROLS entry of a value drag: its readout carries the value's track
   if state.point_drag and state.point_drag.dirty then
     -- The point's own offset in whole cents, then the pitch the note aims for there (the note readout's format)
     local pd = state.point_drag
@@ -7161,6 +7210,7 @@ local function draw_graph(draw_ctx, w, h)
       local tip
       if zone_ctl then
         tip = K.zone_text(zone_ctl, d_note, false) .. count_suffix
+        drag_gauge, drag_zone = d_note, zone_ctl
       else
         local cp = d_note.controls.center_pitch
         local nearest = math.floor(cp + 0.5)
@@ -7216,7 +7266,19 @@ local function draw_graph(draw_ctx, w, h)
   end
 
   -- The drag readout, beside the pointer, never outside the note area (nor over the note-name column or the ruler)
-  if drag_tip then pill_text(mx + L.xl, my, drag_tip, C.pill_text, L.xl * 2, true) end
+  if drag_tip then
+    -- A value drag: the readout carries the track of that value in the top bar (K.value_track), in the parameter's
+    -- colour; it keeps the width of its longest text so the track does not rescale (and is never narrower than the
+    -- text shown, which may carry a suffix).
+    local zc = drag_zone
+    local widest = zc and string.format(zc.read, zc.hi * (zc.show or 1)) or nil
+    local bx, by, bw, bh = pill_text(mx + L.xl, my, drag_tip, C.pill_text, L.xl * 2, true, widest)
+    if zc then
+      local v = math.max(zc.lo, math.min(zc.hi, K.zone_value(zc, drag_gauge)))
+      local frac = (v - zc.lo) / (zc.hi - zc.lo)
+      K.value_track(draw_list, bx, bx + bw, by + bh, 0, frac, K.param_color(zc.key))
+    end
+  end
 
   reaper.ImGui_DrawList_PopClipRect(draw_list)   -- the note area
 
@@ -7422,6 +7484,9 @@ local function draw_graph(draw_ctx, w, h)
          if dim then reaper.ImGui_PushStyleColor(draw_ctx, reaper.ImGui_Col_Text(), Theme.get_palette().text_dim) end
          local s_changed, new_val, committed, reset = param_drag(draw_ctx, "cm_" .. key, label, cur_val, min_v, max_v, fmt)
          if dim then reaper.ImGui_PopStyleColor(draw_ctx) end
+         -- The top bar's range fill (K.value_fill), in the parameter's colour
+         K.value_fill(draw_ctx, 0, (cur_val - min_v) / (max_v - min_v), K.param_color(key),
+            reaper.ImGui_CalcItemWidth(draw_ctx))
          if K.drag_hot.hovered or K.drag_hot.active then
             -- The canvas shades where this value acts on the menu's note
             local set = state.setting_hint.menu_set
@@ -9823,7 +9888,7 @@ do
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes)
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
-  local HDR_VALUES = { "pill", "tight", "mode", "strength", "tol", "slide", "sep" }
+  local HDR_VALUES = { "pill", "mode", "tight", "strength", "tol", "slide", "sep" }
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for _, id in ipairs(HDR_VALUES) do HDR_GROUP[id] = "values" end
@@ -9841,7 +9906,7 @@ do
     { rows = { hdr_row(HDR_CLIP, HDR_VALUES) } },
     { rows = { HDR_CLIP, HDR_VALUES } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, HDR_VALUES } },
-    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "tight" }, { "mode", "strength" }, { "tol", "slide" },
+    { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "mode" }, { "tight", "strength" }, { "tol", "slide" },
       { "sep" } } },
   }
   -- The plan a first-use window is sized for: two rows
@@ -10463,26 +10528,6 @@ do
     end
   end
 
-  --- The range fill of a value control, drawn on the item just submitted: a track along the bottom edge of the
-  --- frame and, on it, the part from lo_frac to hi_frac (0..1 of the range) in `color`.
-  K.bar_value_fill = function(bctx, lo_frac, hi_frac, color)
-    local L = Theme.layout
-    local x1, _ = reaper.ImGui_GetItemRectMin(bctx)
-    local x2, y2 = reaper.ImGui_GetItemRectMax(bctx)
-    if not (x1 and x2 and y2) then return end
-    local dl = reaper.ImGui_GetWindowDrawList(bctx)
-    local w = x2 - x1
-    local top = y2 - L.xs
-    reaper.ImGui_DrawList_AddRectFilled(dl, x1, top, x2, y2, Theme.get_palette().outline)
-    lo_frac = math.max(0, math.min(1, lo_frac))
-    hi_frac = math.max(lo_frac, math.min(1, hi_frac))
-    local fx1, fx2 = x1 + w * lo_frac, x1 + w * hi_frac
-    if lo_frac > 0 and fx2 - fx1 < L.xs then   -- a mixed range too narrow to see: keep a visible mark
-      fx1 = math.max(x1, fx2 - L.xs)
-    end
-    if fx2 > fx1 then reaper.ImGui_DrawList_AddRectFilled(dl, fx1, top, fx2, y2, color) end
-  end
-
   --- How many notes are selected, and the index of one of them (the note itself when exactly one is).
   local function bar_selection()
     local sel_count, sel_idx = 0, nil
@@ -10810,10 +10855,10 @@ do
         return
       end
 
-      -- The fill says where the value comes from as well (the mark and the tooltip say it without colour)
+      -- The fill is in the value's own colour; where the value comes from is said by the mark and the tooltip
       local span = spec.hi - spec.lo
-      K.bar_value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
-        (view.level == "note") and P.accent2 or P.accent)
+      K.value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
+        K.param_color(key))   -- one colour per parameter, the same on the canvas
 
       local scope = BAR_SCOPE_DEFAULT
       if view.target == "notes" then
@@ -10966,7 +11011,7 @@ do
         return
       end
       local span = spec.hi - spec.lo
-      K.bar_value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
+      K.value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
       bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_SEP_GESTURES)
 
       --- The edit is done: save the value and split again, once, only when it changed

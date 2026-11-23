@@ -691,12 +691,14 @@ local CANVAS_KEYS = {
   "row", "row_black", "row_dim", "row_dim_black", "row_plain", "row_plain_black", "row_tint", "row_tonic",
   "row_tonic_tint", "ruler_bg", "scrim", "span_edge", "span_fill", "spot", "trace", "trend", "vibrato", "view_border", "view_fill", "view_grip",
   "zone_divider", "zone_drift", "zone_shift",
+  -- one colour per parameter of Pitch Correct (2026-11-23)
+  "param_tighten", "param_strength", "param_tolerance", "param_slide_in",
 }
 
 local CANVAS_PALETTES = { { mode = "fancy" }, { mode = "match", theme = REAPERTIPS }, { mode = "match", theme = LIGHT } }
 
 test("canvas: key set unchanged, both modes", function()
-  assert(#CANVAS_KEYS == 82)
+  assert(#CANVAS_KEYS == 86)
   for _, o in ipairs(CANVAS_PALETTES) do
     local C = load_theme(o).build_palette().canvas
     for _, k in ipairs(CANVAS_KEYS) do assert(C[k] ~= nil, k) end
@@ -734,6 +736,9 @@ test("canvas: contrast, all three palettes", function()
       check(contrast(C.trace, r), 3.0, "trace")
       -- Setting highlights: the edge of a span and the outline of a reached note, on a row and on every note fill
       check(contrast(C.span_edge, r), 3.0, "span edge on a row")
+      for _, k in ipairs({ "param_tighten", "param_strength", "param_tolerance", "param_slide_in" }) do
+        check(contrast(C[k], r), 3.0, k .. " on a row")
+      end
       for _, fill in ipairs({ C.note_fill, C.note_edited, C.note_selected, C.note_selected_edited }) do
         check(contrast(C.span_edge, composite(fill, r)), 3.0, "span edge on a note fill")
       end

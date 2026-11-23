@@ -1620,6 +1620,49 @@ test("build_written_equals_built", function() chromatic(function()
   end
 end) end)
 
+-- Amendment 1: one colour per value (the script's Theme is the module its require() loaded)
+test("param_color_keys", function()
+  local P = package.loaded["theme"].get_palette()
+  local want = { tighten = "param_tighten", retune_speed = "param_strength", tolerance = "param_tolerance",
+                 slide_in = "param_slide_in" }
+  local seen = {}
+  for key, ckey in pairs(want) do
+    eq(S.K.PARAM_COLOR_KEYS[key], ckey, "colour key of " .. key)
+    local c = S.K.param_color(key)
+    eq(type(c), "number", "colour of " .. key)
+    eq(c, P.canvas[ckey], "colour of " .. key)
+    for other, oc in pairs(seen) do
+      if oc == c then error(key .. " and " .. other .. " share a colour") end
+    end
+    seen[key] = c
+  end
+  eq(S.K.param_color("separation"), P.accent, "an unknown key takes the accent")
+end)
+
+test("value_track_draws_track_then_fill", function()
+  local orig = reaper.ImGui_DrawList_AddRectFilled
+  local rects = {}
+  reaper.ImGui_DrawList_AddRectFilled = function(_, x1, y1, x2, y2, col)
+    rects[#rects + 1] = { x1 = x1, y1 = y1, x2 = x2, y2 = y2, col = col }
+  end
+  local ok, err = pcall(function()
+    S.K.value_track("dl", 100, 200, 50, 0, 0.25, 0xFF)
+    eq(#rects, 2, "track and fill")
+    eq(rects[1].x1, 100, "track x1"); eq(rects[1].x2, 200, "track x2"); eq(rects[1].y2, 50, "track y2")
+    eq(rects[2].x1, 100, "fill x1"); eq(rects[2].x2, 125, "fill x2"); eq(rects[2].y2, 50, "fill y2")
+    eq(rects[2].col, 0xFF, "fill colour")
+    rects = {}
+    S.K.value_track("dl", 100, 200, 50, 0, 0, 0xFF)
+    eq(#rects, 1, "an empty value: the track only")
+    rects = {}
+    S.K.value_track("dl", 100, 200, 50, -0.5, 1.5, 0xFF)
+    eq(#rects, 2, "held: track and fill")
+    eq(rects[2].x1, 100, "held fill x1"); eq(rects[2].x2, 200, "held fill x2")
+  end)
+  reaper.ImGui_DrawList_AddRectFilled = orig
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
