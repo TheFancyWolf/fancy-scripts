@@ -1187,10 +1187,11 @@ test("natural_same_text", function()
   local ref, now = text_lines(ref_src), text_lines(now_src)
   -- Value levels (2026-11-24) changed the build, K.tighten_line, K.ZONE_CONTROLS and the Tighten line of
   -- K.controls_load on purpose (item values reach every note; 0 is a note value of its own). Their numbers stay
-  -- pinned by natural_same_numbers.
+  -- pinned by natural_same_numbers. The bar's BAR_VALUES changed on purpose too (Task 3: every value has an item
+  -- level, and 0 is stored as a value).
   for _, prefix in ipairs({ "K.note_body = function(", "K.points_offsets = function(",
       "local function is_note_modified(", "K.controls_edited = function(",
-      "local function param_drag(", "  local BAR_VALUES = {" }) do
+      "local function param_drag(" }) do
     text_same(ref, now, prefix, prefix, false, prefix)
   end
   text_single(ref, now, "K.JOIN = {", "K.JOIN")
@@ -3132,9 +3133,86 @@ test("mode_own_and_status", function()
   local byp = untouched_note(1.3)
   byp.controls.correct_mode, byp.controls.bypassed = 1, true
   eq(S.K.mode_own_count({ own, moved, untouched, byp }), 1, "notes with a mode of their own, not bypassed")
-  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item: every note uses it")
+  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Every note uses it")
   eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 notes with their own mode)")
   eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 note with its own mode)")
+end)
+
+-- The bar edits this item or the notes, never the starting values (value levels, Task 3) ---------------------------
+local function with_no_project(fn)   -- runs fn where an envelope write finds no take (it says so and writes nothing)
+  local saved = { reaper.time_precise, reaper.CountMediaItems }
+  reaper.time_precise = function() return 0 end
+  reaper.CountMediaItems = function() return 0 end
+  local ok, err = pcall(fn)
+  reaper.time_precise, reaper.CountMediaItems = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end
+
+test("reset_item_to_start", function()
+  with_no_project(function() with_item({ tolerance = 30 }, function()
+    eq(type(S.K.reset_target("tolerance", {}, 0)), "boolean", "returns a boolean")
+    eq(S.state.session_takes["{IV}"].overrides.tolerance, S.global_defaults.tolerance, "the item's value")
+  end) end)
+end)
+
+test("reset_notes_to_item", function()
+  with_no_project(function() with_item({ tolerance = 30 }, function()
+    local a, b = { controls = { tolerance = 5 } }, { controls = { tolerance = 9, tighten = 0 } }
+    S.K.reset_target("tolerance", { a, b }, 2)
+    eq(a.controls.tolerance, nil, "first note follows the item")
+    eq(b.controls.tolerance, nil, "second note follows the item")
+    eq(b.controls.tighten, 0, "other values kept")
+    eq(S.state.session_takes["{IV}"].overrides.tolerance, 30, "the item's value is untouched")
+  end) end)
+end)
+
+test("bar_never_saves_cascade", function()
+  local K = S.K
+  local saves, ext = 0, 0
+  local save, set_ext, sep = K.save_settings, reaper.SetExtState, S.state.separation
+  K.save_settings = function() saves = saves + 1 end
+  reaper.SetExtState = function() ext = ext + 1 end
+  local ok, err = pcall(with_no_project, function() with_item({ tolerance = 8 }, function()
+    local data = S.state.session_takes["{IV}"]
+    K.bar_write("tolerance", 20, {}, 0)
+    eq(data.overrides.tolerance, 20, "the item's value")
+    K.bar_write("correct_mode", 0, {}, 0)
+    eq(data.overrides.correct_mode, 0, "Natural is stored as the item's mode")
+    K.bar_write("separation", 0.7, {}, 0)
+    eq(data.separation, 0.7, "the item's Separation")
+    K.reset_target("tolerance", {}, 0)
+  end) end)
+  K.save_settings, reaper.SetExtState, S.state.separation = save, set_ext, sep
+  if not ok then error(err, 0) end
+  eq(saves, 0, "K.save_settings calls")
+  eq(ext, 0, "SetExtState calls")
+end)
+
+test("bar_write_note_zero", function()
+  with_item({ tighten = 0.4 }, function()
+    local n = { controls = {} }
+    S.K.bar_write("tighten", 0, { n }, 1)
+    eq(n.controls.tighten, 0, "0 is the note's own value")
+    S.K.bar_write("slide_in", 0, { n }, 1)
+    eq(n.controls.slide_in, 0, "Slide In 0 too")
+    eq(S.state.session_takes["{IV}"].overrides.tighten, 0.4, "the item is untouched")
+  end)
+end)
+
+test("scale_change_keeps_start_key", function()
+  local st, K = S.state, S.K
+  local ext = 0
+  local set_ext = reaper.SetExtState
+  reaper.SetExtState = function() ext = ext + 1 end
+  local saved = { st.target_take_guid, st.key_idx, S.global_defaults.key_idx }
+  st.target_take_guid = nil
+  st.key_idx = (S.global_defaults.key_idx or 1) % 12 + 1
+  local ok, err = pcall(K.scale_changed)
+  reaper.SetExtState = set_ext
+  st.target_take_guid, st.key_idx = saved[1], saved[2]
+  if not ok then error(err, 0) end
+  eq(ext, 0, "SetExtState calls")
+  eq(S.global_defaults.key_idx, saved[3], "the starting key")
 end)
 
 -- Tests appended by later tasks go above this line.

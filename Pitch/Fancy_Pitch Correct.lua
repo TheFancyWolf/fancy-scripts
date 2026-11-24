@@ -209,6 +209,8 @@ local PARAM_LABELS = {
   slide_in = "Slide In", -- per-note only (the top bar, Shift + drag on a note, note context menu)
   tighten = "Tighten",         -- per-note only (the top bar, the left side of a note, note context menu)
   tolerance = "Tolerance",
+  correct_mode = "Mode",
+  separation = "Separation",
 }
 
 -- Named constants, in one table so they take a single one of the chunk's 200 locals
@@ -2323,11 +2325,10 @@ local function save_take_data(take, data, json)
   end
 end
 
---- Save the active Key/Scale. The global ExtState write stays outside undo; the per-take model
---- write is one named undo point so Cmd+Z reverts it together with the Key/Scale selection.
+--- Save the active Key/Scale as the open item's own (one named undo point, so Cmd+Z reverts it together with the
+--- Key/Scale selection). It is not a starting value: new items start from those (K.start_values). An item not
+--- analysed yet keeps it in state.key_idx / state.scale_idx, and its first analysis stores it.
 local function save_current_scale_settings()
-  reaper.SetExtState("FancyScripts", "pitch_key_idx", tostring(state.key_idx), true)
-  reaper.SetExtState("FancyScripts", "pitch_scale_idx", tostring(state.scale_idx), true)
   if state.target_take_guid and state.session_takes[state.target_take_guid] then
     local data = state.session_takes[state.target_take_guid]
     data.key_idx = state.key_idx
@@ -3373,7 +3374,7 @@ end
 --- The status message of a change of the item's mode to `mode` (0, 1 or 2); `count` notes keep their own mode.
 K.mode_item_status = function(mode, count)
   local name = K.MODES[(mode or 0) + 1] or K.MODES[1]
-  if count == 0 then return string.format("Mode: %s for this item: every note uses it", name) end
+  if count == 0 then return string.format("Mode: %s for this item. Every note uses it", name) end
   return string.format("Mode: %s for this item (%d %s)", name, count,
     count == 1 and "note with its own mode" or "notes with their own mode")
 end
@@ -3724,8 +3725,6 @@ K.scale_changed = function()
     save_current_scale_settings()
     return
   end
-  reaper.SetExtState("FancyScripts", "pitch_key_idx", tostring(state.key_idx), true)
-  reaper.SetExtState("FancyScripts", "pitch_scale_idx", tostring(state.scale_idx), true)
   data.key_idx = state.key_idx
   data.scale_idx = state.scale_idx
   if apply_envelope_to_take("Change Key/Scale") then
@@ -5785,7 +5784,7 @@ do
                      read = "Slide In: %.0f%%", hover = "Slide In: %.0f%% (Shift+Drag)", undo = "Adjust Slide In" }
   for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
 end
-K.TOLERANCE_IDLE = " (used once Tighten is above 0%)"   -- appended where a note's Tolerance is shown while its Tighten is 0
+K.TOLERANCE_IDLE = " (not used yet: raise Tighten first)"   -- appended where a note's Tolerance is shown while its Tighten is 0
 -- Appended where a value is shown on a note whose mode does not use it (K.zone_text): Tolerance and Slide In on a
 -- Classic or Hard note, Tighten on a Hard one
 K.MODE_IDLE = " (not used in Classic or Hard mode)"
@@ -7845,7 +7844,7 @@ local function draw_graph(draw_ctx, w, h)
       end
       if hint.dragging and marks == 0 and not hint.said then
         hint.said = true
-        set_status((hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first")
+        set_status((hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten first")
           or (hint.key == "slide_in" and "Nothing to flatten: no note in view slides into its pitch")
           or "No note in view uses this value")
       end
@@ -9147,7 +9146,7 @@ K.INFO_SECTIONS = {
       panel = { "Edit", 10, "Tighten · Tolerance", "Drag note side" } },
     { "Drag Right Zone", string.format("Tolerance: how far the note may stray from its centre untouched (%s = fine)", K.MOD_LABEL) },
     { "Mode (top bar, note menu)", "Natural, Classic (the pitch jumps between scale notes; Tighten sets how fast) or Hard (one flat scale note)" },
-    { "Drag a value in the top bar", string.format("Changes the selected notes, or the defaults when nothing is selected (%s = fine)", K.MOD_LABEL) },
+    { "Drag a value in the top bar", string.format("Changes the selected notes, or this item when nothing is selected (%s = fine)", K.MOD_LABEL) },
     { "Shift + Drag Note", "Adjust Slide In", panel = { "Edit", 11, "Slide In", "Shift + Drag" } },
     { "Drag Note Edge", "Trim note start / end boundary", panel = { "Edit", 12, "Trim note", "Drag edge" } },
     { "Drag a pitch point", string.format("Bend the pitch at that moment (%s = fine)", K.MOD_LABEL), panel = { "Edit", 13, "Pitch point", "Drag dot" } },
@@ -9169,9 +9168,9 @@ K.INFO_SECTIONS = {
     { "Q", "Quantize selected note(s) to scale", panel = { "Edit", 6, "Quantize to scale" } },
     { "B", "Bypass the selected notes (again: turn bypass off)", panel = { "Edit", 4, "Bypass note" } },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch", panel = { "Edit", 3, "Reset pitch", "R" } },
-    { "Right-click a note", "Note menu: bypass, overrides, Snap, Quantize, Split, Reset", panel = { "Edit", 9, "Note menu", "Right-click" } },
-    { "Right-click a top bar value", "Item override and reset" },
-    { "Double-click a value", "Reset to its default" },
+    { "Right-click a note", "Note menu: bypass, values, Snap, Quantize, Split, Reset", panel = { "Edit", 9, "Note menu", "Right-click" } },
+    { "Right-click a top bar value", "Reset, or apply it to other items" },
+    { "Double-click a value", "Back to the item's value (notes) or the starting value (item)" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
     { "Hover or drag a setting", "Shows on the notes where it acts" },
     { "Note action bar (under the selected note)", "Snap · Quantize · Cursor · Split · Merge (S / Q / C / X / M)" },
@@ -10672,12 +10671,12 @@ K.wrap_lines = function(wctx, text, max_w)
   return rows
 end
 
-K.RESPLIT_UNDO = "Change Note Separation"   -- the undo label of K.resplit
+K.RESPLIT_UNDO = "Re-split item"   -- the undo label of K.resplit
 
 --- The target's notes were reloaded by an undo or redo (`data`: what is stored now). When the step undone or redone
---- is a re-split, Separation follows it: the value the stored notes were split at (data.separation), or, for notes
---- stored without one, the value from before / after this session's last re-split of the item. ExtState is not
---- part of REAPER's undo, so without this the bar would keep a value the notes no longer match.
+--- is a re-split, Separation follows it: the value the stored notes were split at (data.separation, the item's own
+--- value), or, for notes stored without one, the value from before / after this session's last re-split of the item.
+--- Nothing is saved outside the item: the bar shows what the stored notes were split at.
 K.follow_resplit_undo = function(data)
   local undone = reaper.Undo_CanRedo2(0) == K.RESPLIT_UNDO
   local redone = reaper.Undo_CanUndo2(0) == K.RESPLIT_UNDO
@@ -10689,17 +10688,16 @@ K.follow_resplit_undo = function(data)
     sep = undone and last.before or last.after
   end
   sep = math.max(K.LIMITS.separation[1], math.min(K.LIMITS.separation[2], sep))
-  if sep ~= state.separation then
-    state.separation = sep
-    K.save_settings("engine")
-  end
+  state.separation = sep
+  if data then data.separation = sep end
 end
 
---- Separation changed (state.separation; it was prev_separation): split the active item's notes again from the
---- analysed frames in memory. A new note whose start and end are an old note's (within one frame) keeps that
---- note's edits: its controls and bypass, its target as the same offset from its new centre, its pitch points.
+--- The item's Separation changed (data.separation, mirrored in state.separation; it was prev_separation): split the
+--- active item's notes again from the analysed frames in memory. A new note whose start and end are an old note's
+--- (within one frame) keeps that note's edits: its controls and bypass, its target as the same offset from its new
+--- centre, its pitch points.
 --- When other edited notes would lose their edits it asks first; Cancel puts Separation back. One undo point
---- ("Change Note Separation") holds the envelope and the stored notes; the view stays, the selection is cleared.
+--- (K.RESPLIT_UNDO) holds the envelope and the stored notes; the view stays, the selection is cleared.
 --- Without analysed frames (or while analysing) only the value is stored: the next analysis uses it.
 K.resplit = function(prev_separation)
   local results = state.results
@@ -10711,7 +10709,9 @@ K.resplit = function(prev_separation)
   -- A pending arrow-key nudge is its own undo point, and its note counts as edited below
   if state.nudge_burst then flush_nudge_burst() end
 
-  local new_notes, split_points = K.segment(results, state.separation)
+  local data = state.session_takes[state.target_take_guid]
+  local sep = tonumber(K.item_value(data, "separation")) or state.separation
+  local new_notes, split_points = K.segment(results, sep)
   local tol_s = K.frame_step(results)   -- one frame, as K.segment measures it
   local old_notes = state.notes
   local matched, lost = K.resplit_match(old_notes or {}, new_notes, tol_s, is_note_modified)
@@ -10740,9 +10740,9 @@ K.resplit = function(prev_separation)
     state.notes, state.split_points = new_notes, split_points
     state.analysis_empty = (#new_notes == 0)
     -- Stored with the notes, so an undo / redo of this step brings its Separation back (K.follow_resplit_undo)
-    local data = state.session_takes[state.target_take_guid]
-    if data then data.separation = state.separation end
-    K.resplit_last = { guid = state.target_take_guid, before = prev_separation, after = state.separation }
+    state.separation = sep
+    if data then data.separation = sep end
+    K.resplit_last = { guid = state.target_take_guid, before = prev_separation, after = sep }
     clear_interaction_state(true)   -- note indices changed; the view stays
 
     -- Written as an edit (the take's pitch mode is set) when an edit survived, else like a fresh analysis
@@ -10757,6 +10757,11 @@ K.resplit = function(prev_separation)
     return
   end
   local guid = state.target_take_guid
+  --- Cancel, or the item changed meanwhile: the item keeps the Separation its notes were split at
+  local function put_back()
+    if data then data.separation = prev_separation end
+    if state.target_take_guid == guid then state.separation = prev_separation end
+  end
   request_confirm({
     id = "resplit",
     title = string.format("Re-split %s?", state.target_take_name or "this item"),
@@ -10770,16 +10775,12 @@ K.resplit = function(prev_separation)
       if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes
         or not target_take_exists() then
         set_status("The item changed meanwhile. Nothing was re-split.")
-        state.separation = prev_separation
-        K.save_settings("engine")
+        put_back()
         return
       end
       run()
     end,
-    on_cancel = function()
-      state.separation = prev_separation
-      K.save_settings("engine")
-    end,
+    on_cancel = put_back,
   })
 end
 
@@ -11413,46 +11414,46 @@ end
 -- the selection pill and one value control per entry of BAR_VALUES (a drag with its text inside and a range fill
 -- under it). The note actions (Snap, Quantize, Split, Merge) share the bar's enable rules and reasons
 -- (K.note_actions_frame) but are drawn on the canvas, under the selected note (K.draw_note_bar). A value control edits what the
--- pill names: the selected notes, else the item's own value, else the default; Separation is the exception, one
--- value for the analysis whatever is selected.
+-- pill names: the selected notes, else this item. The bar never changes the starting values (the values a new
+-- item copies once, global_defaults): only "Apply to other items" does.
 -- K.bar_measure gives their widths, each from its longest label, so a value, an override mark or a selection
 -- never changes the layout; K.bar_frame returns the function that draws one unit this frame. The top bar
 -- (above) decides where they go. The status line that used to sit beside them is a pill on the canvas
 -- (K.canvas_status).
 
 do
-  -- Appended to a value that is not the default: an item's own value, or a selected note's own value
+  -- Appended to a value that differs from the level above it: this item's from the starting value, a selected
+  -- note's from the item's
   local BAR_OVERRIDE_MARK = "*"
   -- Shown in place of a value that does not exist for what is selected
   local BAR_NO_VALUE = "\xE2\x80\x93"
   local BAR_RANGE_SEP = "\xE2\x80\x93"   -- between the lowest and highest value of a mixed selection
   -- The selection pill: what a drag in the bar changes
-  local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "Defaults", "1 note", "%d notes"
-  local BAR_PILL_TIP_NONE = "Nothing is selected: the values here are the defaults. Select notes to change only those notes."
-  local BAR_PILL_TIP_NOTES = "The values here belong to the selected notes. Press Esc to go back to the defaults."
+  local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "This item", "1 note", "%d notes"
+  local BAR_PILL_TIP_NONE = "Your edits change this item only. Select notes to change just those notes. Click for: apply to other items."
+  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes. Esc goes back to this item. Click for: apply to other items."
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
   local BAR_REASON_NO_TARGET = "Select an audio item"
   local BAR_REASON_NOT_ANALYZED = "Analyze an item first"
-  local BAR_REASON_NEEDS_NOTES = string.format("Select notes to change it (%s+A selects all)", K.MOD_LABEL)
   local BAR_HINT_SELECT_NOTE = "Select a note to edit it"
   local BAR_HINT_OUTDATED = "Outdated: this item's envelope is from other settings. Edit a note to rewrite it."
-  -- What a drag changes, by its target (a line of every value tooltip), and the gestures
-  local BAR_SCOPE_DEFAULT = "Changes the default for every item without its own value."
-  local BAR_SCOPE_ITEM = "Changes this item's own value (" .. BAR_OVERRIDE_MARK .. ")."
+  -- What a drag changes, by its target (a line of every value tooltip), the levels, and the gestures
+  local BAR_SCOPE_ITEM = "Changes this item."
   local BAR_SCOPE_NOTE = "Changes the selected note."
   local BAR_SCOPE_NOTES = "Changes the %d selected notes; each keeps its difference from the others."
+  local BAR_LEVELS = "Starting value: %s. This item: %s."
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
-  local BAR_TOLERANCE_IDLE = "Used once Tighten is above 0%."
+  local BAR_TOLERANCE_IDLE = "Not used yet: raise Tighten first."
   -- The Mode dropdown (see draw_mode): its tooltip, its scope line by what it changes, the text of a mixed selection,
   -- and the line a value's tooltip gains when the selected notes' mode does not use it (key: K.mode_unused)
   local BAR_MODE = {
-    tip = "Mode: how an edited note is corrected.\n"
+    tip = "Mode: how a note is corrected.\n"
       .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n"
       .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n"
       .. "Hard: one flat note of the scale.",
-    scope_item = "Changes this item: every edited note without its own mode.",
+    scope_item = "Changes this item: every note without its own mode.",
     scope_note = "Changes the selected note.",
     scope_notes = "Changes the %d selected notes.",
     mixed = "Mixed",
@@ -11462,20 +11463,21 @@ do
       classic = "In Classic mode: how fast the pitch jumps between scale notes. 0% glides, 100% steps at once.",
     },
   }
-  -- Separation (see draw_separation): what letting go does, and its gestures (no right-click menu)
-  local BAR_SEP_RESPLIT = "One value for every item. Letting go splits this item's notes again."
-  local BAR_SEP_NEXT = "One value for every item. The next analysis uses it."
-  local BAR_SEP_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value.",
-    K.MOD_LABEL, K.MOD_LABEL)
+  -- Separation (see draw_separation): what letting go does
+  local BAR_SEP_RESPLIT = "Letting go splits this item's notes again."
+  local BAR_SEP_NEXT = "This item's first analysis uses it."
+  -- The right-click menu of a value (K.value_menu)
+  local BAR_MENU_RESET_ITEM, BAR_MENU_RESET_NOTES = "Reset to starting value", "Reset to item value"
+  local BAR_MENU_APPLY = "Apply %s to other items\xE2\x80\xA6"
+  local BAR_MENU_APPLY_NONE = "No other pitched items"
 
   -- The values of the bar, in the order they are shown. key = the model's key; label = the name on the control;
   -- lo / hi / num / unit = the range and the text in display units (scale x the stored value); levels = where the
-  -- value exists: "all" (default, item, note), "note" (notes only) or "analysis" (one value for the analysis,
-  -- state[key], no level: see draw_separation); zero_nil = 0 is stored as "no value"; tip = what the value does to
-  -- the sound.
+  -- value exists: "all" (starting value, item, note; Separation has no note level of its own: see draw_separation);
+  -- tip = what the value does to the sound.
   local BAR_VALUES = {
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
-      levels = "note", zero_nil = true,
+      levels = "all",
       tip = "Tighten: steadies a wobbly note. Low values take out slow drift, higher values also take out wobble and then vibrato; 100% is a flat line." },
     { id = "strength", key = "retune_speed", label = "Strength", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
@@ -11484,10 +11486,10 @@ do
       num = "%.0f", unit = "\xC2\xA2", levels = "all",
       tip = "Tolerance: how far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement." },
     { id = "slide", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
-      levels = "note",
+      levels = "all",
       tip = "Slide In: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
     { id = "sep", key = "separation", label = "Separation", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
-      levels = "analysis",
+      levels = "all",
       tip = "Separation: how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
   }
   -- The note actions, in the order of the note action bar (K.draw_note_bar): the same commands as the keys and the
@@ -11516,9 +11518,9 @@ do
     local mark_w = bar_text_w(bctx, " " .. BAR_OVERRIDE_MARK)
     for _, spec in ipairs(BAR_VALUES) do
       local hi_t = string.format(spec.num, spec.hi)
-      if spec.levels == "analysis" then
-        -- One value, never a range, a blank or a mark
-        s.unit_w[spec.id] = bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit) + s.pad_x
+      if spec.id == "sep" then
+        -- One value (the item's), never a range or a blank
+        s.unit_w[spec.id] = bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit) + mark_w + s.pad_x
       else
         local widest = math.max(
           bar_text_w(bctx, spec.label .. " " .. hi_t .. spec.unit),
@@ -11534,39 +11536,6 @@ do
     for _, name in ipairs(K.MODES) do mode_text_w = math.max(mode_text_w, bar_text_w(bctx, name)) end
     s.unit_w.mode = mode_text_w + s.pad_x + s.frame_h
     return s
-  end
-
-  --- Flag the other session items whose stored envelope was written with the old global default of `key`:
-  --- those without an item value for it and with an edited note that inherits it (an untouched item has no
-  --- envelope to go stale). Returns how many were flagged.
-  local function mark_stale_takes(key)
-    local n = 0
-    for _, guid in ipairs(state.session_order) do
-      local data = state.session_takes[guid]
-      if guid ~= state.target_take_guid and data
-         and not (data.overrides and data.overrides[key] ~= nil) then
-        for _, note in ipairs(data.notes or {}) do
-          local own = note.controls and note.controls[key] ~= nil
-          if is_note_modified(note) and not own then
-            state.stale_takes[guid] = true
-            n = n + 1
-            break
-          end
-        end
-      end
-    end
-    K.queue_stale_checks()   -- the envelopes are compared next: a value put back to what an item was written with clears its mark
-    return n
-  end
-
-  --- Status text of a global default change / reset: it is saved outside the undo history, and the other
-  --- items keep the envelope they have until they are edited.
-  local function global_change_status(prefix, stale_n)
-    if stale_n <= 0 then return prefix end
-    if stale_n == 1 then
-      return prefix .. ". 1 other item keeps its old envelope until edited."
-    end
-    return string.format("%s. %d other items keep their old envelope until edited.", prefix, stale_n)
   end
 
   --- The selected notes that hold values, in one reused table (no table per frame), and how many.
@@ -11598,9 +11567,70 @@ do
 
   --- Give `note` its own value of `spec` (display units, clamped to the range).
   local function bar_note_write(note, spec, v)
-    v = math.max(spec.lo, math.min(spec.hi, v)) / spec.scale
-    if spec.zero_nil and v <= 0 then v = nil end
-    note.controls[spec.key] = v
+    note.controls[spec.key] = math.max(spec.lo, math.min(spec.hi, v)) / spec.scale
+  end
+
+  --- The bar's write path: give the `sel_n` notes of `sel_notes` their own value `v` of `key` (stored units; 0 is a
+  --- value of its own), or, with none, this item (data.overrides, Separation data.separation and state.separation;
+  --- an item not analysed yet keeps its Separation in state.separation, and its first analysis stores it). A model
+  --- change only: the caller writes the envelope (one undo point). Never a starting value, never ExtState.
+  K.bar_write = function(key, v, sel_notes, sel_n)
+    if sel_n > 0 then
+      for i = 1, sel_n do sel_notes[i].controls[key] = v end
+      return
+    end
+    local data = state.target_take_guid and state.session_takes[state.target_take_guid]
+    if key == "separation" then
+      state.separation = v
+      if data then data.separation = v end
+    elseif data then
+      data.overrides = data.overrides or {}
+      data.overrides[key] = v
+    end
+  end
+
+  --- Reset `key` (double-click, or the right-click menu): the `sel_n` selected notes lose their own value (they
+  --- follow the item again), else this item takes the starting value. One undo point when something changed; true
+  --- when it was written. Separation is reset by draw_separation (a re-split).
+  K.reset_target = function(key, sel_notes, sel_n)
+    state.bar_edit = nil
+    local changed = false
+    if sel_n > 0 then
+      for i = 1, sel_n do
+        local ctrl = sel_notes[i].controls
+        if ctrl[key] ~= nil then ctrl[key], changed = nil, true end
+      end
+    else
+      local data = state.target_take_guid and state.session_takes[state.target_take_guid]
+      if not data then return false end
+      local start = global_defaults[key]
+      if start ~= nil and K.item_value(data, key) ~= start then
+        K.bar_write(key, start, sel_notes, 0)
+        changed = true
+      end
+    end
+    if not changed then return false end
+    return apply_envelope_to_take("Reset " .. (PARAM_LABELS[key] or key)) == true
+  end
+
+  --- The right-click menu of the value `key` named `label` (call right after its control): reset to the level above
+  --- (the item's value with notes selected, else the starting value), and apply it to other items (K.apply_open).
+  --- Returns true when Reset was chosen: the caller resets (K.reset_target, or Separation's re-split).
+  K.value_menu = function(bctx, key, label, sel_n)
+    if not reaper.ImGui_BeginPopupContextItem(bctx, "##ctx_" .. key) then return false end
+    -- HC5: Esc closes this menu (innermost)
+    if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
+    local reset = reaper.ImGui_MenuItem(bctx, (sel_n > 0) and BAR_MENU_RESET_NOTES or BAR_MENU_RESET_ITEM)
+    local can_apply = K.apply_open ~= nil
+    if reaper.ImGui_MenuItem(bctx, string.format(BAR_MENU_APPLY, label), nil, false, can_apply) and can_apply then
+      K.apply_open({ key })
+    end
+    if not can_apply and reaper.ImGui_IsItemHovered(bctx, reaper.ImGui_HoveredFlags_ForTooltip()
+        | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+      Theme.tooltip(bctx, BAR_MENU_APPLY_NONE)
+    end
+    reaper.ImGui_EndPopup(bctx)
+    return reset == true
   end
 
   --- Give every note of a bar drag back what it held when the drag began (false = no own value).
@@ -11753,22 +11783,25 @@ do
     -- Why the values are disabled (nil = usable)
     local inspector_reason = bar_inspector_reason(has_target, has_data)
 
-    -- What the value controls act on: the selected notes that hold values (none = the defaults)
+    -- What the value controls act on: the selected notes that hold values (none = this item)
     local sel_notes, sel_n = bar_sel_notes()
 
     --- What the control of `spec` shows and what a drag on it writes to (worked out once per frame):
     ---   lo_v, hi_v  the value in display units; with several notes, their lowest and highest
     ---   mixed       the selected notes do not all show the same value
-    ---   level       "global" (the default), "item" or "note": where the value comes from
-    ---   target      "default", "item" or "notes": what a drag changes
+    ---   marked      the value differs from the level above: a selected note's from the item's, else this item's
+    ---               from the starting value (the "*" mark)
+    ---   target      "item" or "notes": what a drag changes
     ---   blank       there is no value to show; disabled / reason: the control cannot be used, and why
     local views = {}
     local function bar_view(spec)
       local view = views[spec.id]
       if view then return view end
       local key = spec.key
-      view = { lo_v = spec.lo, hi_v = spec.lo, mixed = false, level = "global", target = "default" }
+      view = { lo_v = spec.lo, hi_v = spec.lo, mixed = false, marked = false, target = "item" }
       views[spec.id] = view
+      local item_v = (tonumber(get_effective(nil, key)) or DEFAULTS[key] or 0) * spec.scale
+      local function differs(a, b) return string.format(spec.num, a) ~= string.format(spec.num, b) end
       if sel_n > 0 then
         view.target = "notes"
         local lo_v, hi_v = math.huge, -math.huge
@@ -11777,24 +11810,18 @@ do
           local v = bar_note_value(note, spec)
           if v < lo_v then lo_v = v end
           if v > hi_v then hi_v = v end
-          if note.controls[key] ~= nil then view.level = "note" end
+          if note.controls[key] ~= nil and differs(v, item_v) then view.marked = true end
         end
-        if view.level ~= "note" and get_override_level(nil, key) == "item" then view.level = "item" end
         view.lo_v, view.hi_v = lo_v, hi_v
-        view.mixed = string.format(spec.num, lo_v) ~= string.format(spec.num, hi_v)
+        view.mixed = differs(lo_v, hi_v)
       else
-        local v = get_effective(nil, key)
-        if v == nil then v = DEFAULTS[key] end
-        view.lo_v = (tonumber(v) or 0) * spec.scale
-        view.hi_v = view.lo_v
-        view.level = (get_override_level(nil, key) == "item") and "item" or "global"
-        if view.level == "item" then view.target = "item" end
+        view.lo_v, view.hi_v = item_v, item_v
+        view.marked = get_override_level(nil, key) == "item"
+          and differs(item_v, (tonumber(global_defaults[key]) or 0) * spec.scale)
       end
       if inspector_reason then
         view.disabled, view.reason = true, inspector_reason
         view.blank = not (has_target and has_data)
-      elseif spec.levels == "note" and sel_n == 0 then
-        view.disabled, view.reason, view.blank = true, BAR_REASON_NEEDS_NOTES, true
       end
       return view
     end
@@ -11804,7 +11831,7 @@ do
     local function value_format(spec, view)
       local unit = spec.unit:gsub("%%", "%%%%")
       if view.blank then return spec.label .. " " .. BAR_NO_VALUE end
-      local mark = (view.level ~= "global") and (" " .. BAR_OVERRIDE_MARK) or ""
+      local mark = view.marked and (" " .. BAR_OVERRIDE_MARK) or ""
       if view.mixed then
         return spec.label .. " " .. string.format(spec.num, view.lo_v) .. BAR_RANGE_SEP
           .. string.format(spec.num, view.hi_v) .. unit .. mark
@@ -11812,65 +11839,10 @@ do
       return spec.label .. " " .. spec.num .. unit .. mark
     end
 
-    --- Write an edited value: to the item override when there is one, else to the global default. The global default is
-    --- saved (K.save_settings) when the edit is committed, not on every frame of a drag.
-    local function write_cascade_value(key, v)
-      if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
-        take_data.overrides[key] = v
-      else
-        global_defaults[key] = v
-      end
-    end
-
-    --- An edit was committed: when it went to the global default, the other items still hold an envelope
-    --- written with the old value; say so (a global default is not part of the undo history).
-    local function note_global_edit(key)
-      if take_data and take_data.overrides and take_data.overrides[key] ~= nil then return end
-      local n = mark_stale_takes(key)
-      if n > 0 then set_status(global_change_status("Global default changed (not undoable)", n)) end
-    end
-
-    --- Item override on / off (right-click menu): a new override starts at the current global default.
-    local function toggle_item_override(key)
-      if not take_data then return end
-      take_data.overrides = take_data.overrides or {}
-      if take_data.overrides[key] ~= nil then
-        take_data.overrides[key] = nil
-      else
-        take_data.overrides[key] = global_defaults[key]
-      end
-      apply_envelope_to_take("Toggle Item Override: " .. (PARAM_LABELS[key] or key))
-    end
-
-    --- Double-click / "Reset to default": an item override goes back to inheriting (one undo point);
-    --- otherwise the global default returns to its DEFAULTS value, which is saved and applied to the take
-    --- but not part of the undo history.
-    local function reset_cascade_param(key)
-      local name = PARAM_LABELS[key] or key
-      if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
-        take_data.overrides[key] = nil
-        apply_envelope_to_take("Reset Item Override: " .. name)
-      elseif DEFAULTS[key] ~= nil and global_defaults[key] ~= DEFAULTS[key] then
-        global_defaults[key] = DEFAULTS[key]
-        K.save_settings("cascade")
-        if take_data then apply_envelope_to_take("Reset Default: " .. name) end
-        set_status(global_change_status("Global default reset (not undoable)", mark_stale_takes(key)))
-      end
-    end
-
-    --- Right-click menu of a cascade control (call right after the control).
-    local function item_override_menu(key)
-      if not reaper.ImGui_BeginPopupContextItem(bctx, "##ctx_" .. key) then return end
-      -- HC5: Esc closes this menu (innermost)
-      if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
-      local has_override = take_data ~= nil and take_data.overrides ~= nil and take_data.overrides[key] ~= nil
-      if reaper.ImGui_MenuItem(bctx, "Override for this item", nil, has_override, take_data ~= nil) then
-        toggle_item_override(key)
-      end
-      if reaper.ImGui_MenuItem(bctx, "Reset to default") then
-        reset_cascade_param(key)
-      end
-      reaper.ImGui_EndPopup(bctx)
+    --- The last line of a value's tooltip: its starting value and this item's (stored units).
+    local function levels_line(spec, item_raw)
+      local function text(raw) return string.format(spec.num, (tonumber(raw) or 0) * spec.scale) .. spec.unit end
+      return string.format(BAR_LEVELS, text(global_defaults[spec.key]), text(item_raw))
     end
 
     --- Tooltip for the item just drawn, gated on the hover delay. A disabled item passes
@@ -11882,29 +11854,31 @@ do
       end
     end
 
-    --- Put the selected notes back to inheriting the value of `spec` (Tighten, Slide In: to 0), as one undo point.
-    local function reset_notes(spec)
-      state.bar_edit = nil
-      local had = false
-      for i = 1, sel_n do
-        local ctrl = sel_notes[i].controls
-        if ctrl[spec.key] ~= nil then
-          ctrl[spec.key] = nil
-          had = true
+    --- Tolerance does nothing yet: no note it reaches has a Tighten above 0 (the selected notes, else every note
+    --- of this item).
+    local function tolerance_idle()
+      if sel_n > 0 then
+        for i = 1, sel_n do
+          if (tonumber(get_effective(sel_notes[i], "tighten")) or 0) > 0 then return false end
         end
+        return true
       end
-      if had then apply_envelope_to_take("Reset " .. (PARAM_LABELS[spec.key] or spec.label)) end
+      if (tonumber(get_effective(nil, "tighten")) or 0) > 0 then return false end
+      for _, note in ipairs(state.notes or {}) do
+        if note.controls and (tonumber(note.controls.tighten) or 0) > 0 then return false end
+      end
+      return true
     end
 
     --- One value of the bar: a drag with its text inside and the range fill under it. It edits what the pill
     --- names: the selected notes (each moves by the same amount from its own value, as a drag on the canvas
-    --- does; a typed value sets them all), else the item's own value, else the default.
+    --- does; a typed value sets them all), else this item (K.bar_write).
     local function draw_value(spec)
       local view = bar_view(spec)
       local key, id = spec.key, "bv_" .. spec.id
       local name = PARAM_LABELS[key] or spec.label
 
-      -- The selected notes' mode may not use this value: its text is dim and its tooltip says why
+      -- The mode of what the pill names may not use this value: its text is dim and its tooltip says why
       local unused = K.mode_unused(key, sel_notes, sel_n)
       local dim = (unused == "mode" or unused == "hard")
 
@@ -11921,7 +11895,7 @@ do
 
       -- A press belongs to what it was aimed at. When that changes under it (the notes were reloaded by an undo,
       -- the selection went away, another item became the target), the rest of the gesture does nothing: it must
-      -- never turn a drag on notes into a change of the default.
+      -- never turn a drag on notes into a change of the item.
       local gest = bar_gesture
       if pressed then gest.id, gest.target, gest.notes, gest.dead = spec.id, view.target, state.notes, false end
       local dead = false
@@ -11948,25 +11922,17 @@ do
       K.value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
         K.param_color(key))   -- one colour per parameter, the same on the canvas
 
-      local scope = BAR_SCOPE_DEFAULT
+      local scope = BAR_SCOPE_ITEM
       if view.target == "notes" then
         scope = (sel_n == 1) and BAR_SCOPE_NOTE or string.format(BAR_SCOPE_NOTES, sel_n)
-        if key == "tolerance" then
-          local idle = true
-          for i = 1, sel_n do
-            if (tonumber(get_effective(sel_notes[i], "tighten")) or 0) > 0 then idle = false break end
-          end
-          if idle and unused ~= "mode" then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
-        end
-        if unused then scope = BAR_MODE.unused[unused] .. "\n" .. scope end
-      elseif view.target == "item" then
-        scope = BAR_SCOPE_ITEM
       end
-      bar_tooltip(spec.tip .. "\n" .. scope .. "\n" .. BAR_GESTURES)
+      if key == "tolerance" and unused ~= "mode" and tolerance_idle() then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
+      if unused then scope = BAR_MODE.unused[unused] .. "\n" .. scope end
+      bar_tooltip(spec.tip .. "\n" .. scope .. "\n" .. BAR_GESTURES .. "\n" .. levels_line(spec, get_effective(nil, key)))
       if dead then return end
 
       if hovered or active then
-        -- The canvas shades where the value acts: on the selected notes, or wherever the default reaches
+        -- The canvas shades where the value acts: on the selected notes, or wherever this item's value reaches
         local set = nil
         if view.target == "notes" then
           set = state.setting_hint.menu_set
@@ -11977,31 +11943,18 @@ do
         K.setting_hint(bctx, key, active, set)
       end
 
+      if K.value_menu(bctx, key, spec.label, sel_n) then K.reset_target(key, sel_notes, sel_n) end
+
       if view.target ~= "notes" then
-        item_override_menu(key)
         if back ~= nil then
-          write_cascade_value(key, back)   -- Esc during the drag: the value from before it, nothing saved or written
+          K.bar_write(key, back, sel_notes, 0)   -- Esc during the drag: the value from before it, nothing written
         elseif reset then
-          reset_cascade_param(key)
+          K.reset_target(key, sel_notes, 0)
         else
-          if changed then write_cascade_value(key, v / spec.scale) end
-          if committed then K.save_settings("cascade") end   -- the drag is over: one write, only the key that changed
-          if committed and take_data then
-            apply_envelope_to_take("Adjust " .. name)
-            note_global_edit(key)
-          end
+          if changed then K.bar_write(key, v / spec.scale, sel_notes, 0) end
+          if committed and take_data then apply_envelope_to_take("Adjust " .. name) end
         end
         return
-      end
-
-      -- Right-click with notes selected: back to what the notes inherit
-      if reaper.ImGui_BeginPopupContextItem(bctx, "##ctxn_" .. key) then
-        -- HC5: Esc closes this menu (innermost)
-        if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
-        if reaper.ImGui_MenuItem(bctx, (spec.levels == "note") and "Reset to 0%" or "Reset to inherited") then
-          reset_notes(spec)
-        end
-        reaper.ImGui_EndPopup(bctx)
       end
 
       -- The drag in progress: what each note held (raws; false = no own value) and showed (starts) when it began,
@@ -12020,7 +11973,7 @@ do
           state.bar_edit = nil
         end
       elseif reset then
-        reset_notes(spec)
+        K.reset_target(key, sel_notes, sel_n)
       elseif changed and typed then
         -- A typed value sets every selected note to it
         state.bar_edit = nil
@@ -12071,22 +12024,27 @@ do
       bar_tooltip((sel_n == 0) and BAR_PILL_TIP_NONE or BAR_PILL_TIP_NOTES)
     end
 
-    --- Separation: one value for the analysis (state.separation), the same whatever is selected: no item or note
-    --- level, so no mark and no right-click menu. A drag only moves the value; letting go (or a typed value, or
-    --- the double-click reset to the default) saves it and splits the item's notes again, given the value from
-    --- before (K.resplit: it may ask first, and Cancel puts the value back). Usable whenever no analysis runs and
-    --- no confirmation is open: without analysed notes the next analysis uses it.
+    --- Separation: this item's value (state.separation mirrors data.separation), shown whatever is selected (it has
+    --- no note level of its own; re-splitting just the selected notes' stretch is not drawn yet, so with notes
+    --- selected it acts on the item too). A drag only moves the value; letting go (or a typed value, or the reset to
+    --- the starting value) stores it as the item's (K.bar_write) and splits the item's notes again, given the value
+    --- from before (K.resplit: it may ask first, and Cancel puts the value back). Usable whenever there is a target,
+    --- no analysis runs and no confirmation is open: on an item not analysed yet, its first analysis uses it.
     local function draw_separation(spec)
       local key, id = spec.key, "bv_" .. spec.id
-      local disabled = state.is_analyzing or state.confirm ~= nil
+      local reason = (state.is_analyzing and BAR_REASON_ANALYZING) or ((not has_target) and BAR_REASON_NO_TARGET) or nil
+      local disabled = reason ~= nil or state.confirm ~= nil
       if disabled and bar_sep_before ~= nil then
-        state[key] = bar_sep_before   -- a drag cut short: nothing was saved or split, so the value goes back
+        state[key] = bar_sep_before   -- a drag cut short: nothing was stored or split, so the value goes back
         bar_sep_before = nil
       end
 
+      local start = tonumber(global_defaults[key]) or DEFAULTS[key]
+      local marked = has_target
+        and string.format(spec.num, state[key] * spec.scale) ~= string.format(spec.num, start * spec.scale)
       reaper.ImGui_BeginDisabled(bctx, disabled)
       reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
-      local fmt = spec.label .. " " .. spec.num .. (spec.unit:gsub("%%", "%%%%"))
+      local fmt = spec.label .. " " .. spec.num .. (spec.unit:gsub("%%", "%%%%")) .. (marked and (" " .. BAR_OVERRIDE_MARK) or "")
       local changed, v, committed, reset, cancelled = param_drag(bctx, id, nil, state[key] * spec.scale, spec.lo, spec.hi, fmt)
       local back = K.drag_revert(id, state[key], cancelled)
       local pressed, active, typed = K.drag_hot.activated, K.drag_hot.active, K.drag_hot.typed
@@ -12094,31 +12052,32 @@ do
       reaper.ImGui_EndDisabled(bctx)
 
       if disabled then
-        bar_tooltip(state.is_analyzing and (spec.tip .. "\n" .. BAR_REASON_ANALYZING) or spec.tip,
-          reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(reason and (spec.tip .. "\n" .. reason) or spec.tip, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
         return
       end
       local span = spec.hi - spec.lo
       K.value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
-      bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_SEP_GESTURES)
+      bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_GESTURES
+        .. "\n" .. levels_line(spec, state[key]))
+      local menu_reset = K.value_menu(bctx, key, spec.label, 0)
 
-      --- The edit is done: save the value and split again, once, only when it changed
+      --- The edit is done: store the item's value and split again, once, only when it changed
       local function commit(prev)
         bar_sep_before = nil
         if prev == nil or state[key] == prev then return end
-        K.save_settings("engine")
+        K.bar_write(key, state[key], sel_notes, 0)
         K.resplit(prev)
       end
 
       if pressed then bar_sep_before = state[key] end
       if back ~= nil then
         -- Esc during the drag: the value from before it (or from the reset the same press already committed),
-        -- nothing saved or split
+        -- nothing stored or split
         if bar_sep_before ~= nil then state[key] = bar_sep_before else state[key] = back end
         bar_sep_before = nil
-      elseif reset or (changed and typed) then
+      elseif reset or menu_reset or (changed and typed) then
         local prev = state[key]
-        state[key] = reset and DEFAULTS[key] or v / spec.scale
+        state[key] = (reset or menu_reset) and start or v / spec.scale
         commit(prev)
         -- Still held (a double-click whose second press goes on into a drag): that drag starts from the value just
         -- committed, and letting go commits it as its own edit
@@ -12130,8 +12089,9 @@ do
       if not active then bar_sep_before = nil end   -- the press is over (a click that changed nothing)
     end
 
-    --- Mode: the selected notes' mode (Mixed when they differ), else the item's. A choice is stored on every
-    --- selected note, else as the item's mode (Natural removes it), as one undo point; the same choice does nothing.
+    --- Mode: the selected notes' mode (Mixed when they differ), else this item's. A choice is stored on every
+    --- selected note, else as this item's mode (Natural too: it is a value of its own), as one undo point; the same
+    --- choice does nothing.
     local function draw_mode()
       local idx
       if sel_n == 0 then
@@ -12144,20 +12104,23 @@ do
       end
       local scope = (sel_n == 0) and BAR_MODE.scope_item or (sel_n == 1) and BAR_MODE.scope_note
         or string.format(BAR_MODE.scope_notes, sel_n)
+      local function mode_name(raw) return K.MODES[(tonumber(raw) or 0) + 1] or K.MODES[1] end
+      local levels = string.format(BAR_LEVELS, mode_name(global_defaults.correct_mode),
+        mode_name(get_effective(nil, "correct_mode")))
       local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
         w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
-        tooltip = BAR_MODE.tip .. "\n" .. (inspector_reason or scope),
+        tooltip = BAR_MODE.tip .. "\n" .. (inspector_reason or (scope .. "\n" .. levels)),
       })
-      if not changed or choice == idx or inspector_reason then return end
-      if sel_n > 0 then
-        for i = 1, sel_n do sel_notes[i].controls.correct_mode = choice - 1 end
-        apply_envelope_to_take("Change Mode")
-      elseif take_data then
-        take_data.overrides = take_data.overrides or {}
-        take_data.overrides.correct_mode = (choice > 1) and (choice - 1) or nil
-        if apply_envelope_to_take("Change Mode") then
-          set_status(K.mode_item_status(choice - 1, K.mode_own_count(state.notes)))
+      if inspector_reason then return end
+      if K.value_menu(bctx, "correct_mode", "Mode", sel_n) then
+        if K.reset_target("correct_mode", sel_notes, sel_n) and sel_n == 0 then
+          set_status(K.mode_item_status(K.mode_value(nil), K.mode_own_count(state.notes)))
         end
+      end
+      if not changed or choice == idx or not take_data then return end
+      K.bar_write("correct_mode", choice - 1, sel_notes, sel_n)
+      if apply_envelope_to_take("Change Mode") and sel_n == 0 then
+        set_status(K.mode_item_status(choice - 1, K.mode_own_count(state.notes)))
       end
     end
 
@@ -12168,7 +12131,7 @@ do
         draw_mode()
       elseif BAR_VALUE_BY_ID[id] then
         local spec = BAR_VALUE_BY_ID[id]
-        if spec.levels == "analysis" then draw_separation(spec) else draw_value(spec) end
+        if spec.id == "sep" then draw_separation(spec) else draw_value(spec) end
       end
     end
   end
