@@ -2502,7 +2502,9 @@ test("batch_confirm_copy", function()
   eq(c.title, "Analyze 12 items?"); eq(c.confirm_label, "Analyze 12 Items")
   eq(c.body_lines[1], "3 of them already have notes. Analyzing replaces their notes and any edits:")
   eq(#c.list, 3); eq(c.list[2].name, "N2"); eq(c.list[2].track, "T"); eq(c.list[2].pos, 2)
-  eq(c.after_lines[1], MOD .. "+Z restores all 12 items in one step once the batch has finished.")
+  eq(c.after_lines[1], "Their values go back to the defaults; Key and Scale stay.")
+  eq(c.after_lines[2], MOD .. "+Z restores all 12 items in one step once the batch has finished.")
+  eq(K.batch_confirm(entries(12, 1)).after_lines[1], "Its values go back to the defaults; Key and Scale stay.")
   eq(K.batch_confirm(entries(12, 1)).body_lines[1], "1 of them already has notes. Analyzing replaces its notes and any edits:")
   eq(K.batch_confirm(entries(12, 12)).body_lines[1], "All 12 already have notes. Analyzing replaces their notes and any edits:")
 end)
@@ -3005,7 +3007,8 @@ test("confirm_carries_the_list", function()
   req.id, req.on_confirm = "batch", function() end
   S.request_confirm(req)
   eq(st.confirm.id, "batch"); eq(#st.confirm.list, 1); eq(st.confirm.list[1].name, "A")
-  eq(st.confirm.after_lines[1], MOD .. "+Z restores all 2 items in one step once the batch has finished.")
+  eq(st.confirm.after_lines[1], "Its values go back to the defaults; Key and Scale stay.")
+  eq(st.confirm.after_lines[2], MOD .. "+Z restores all 2 items in one step once the batch has finished.")
   st.confirm = nil
 end)
 
@@ -4210,6 +4213,252 @@ test("apply_confirm_says_when_no_row_can_be_ticked", function() with_write_stubs
   st.target_take_guid, st.confirm, reaper.TakeIsMIDI = table.unpack(saved, 1, 3)
   if not ok then error(err, 0) end
 end) end)
+
+-- An open item that loses its analysis (Clear, Remove, Wipe, unreadable data cleared, the analysis undone away) is
+-- not analysed any more: it shows a new item's values, so its next analysis is a first one and splits at 50%
+local function open_analysed_at_70(st, NK)
+  st.session_takes["{a}"] = { guid = "{a}", name = "A", separation = 0.7, key_idx = 5, scale_idx = 3,
+    notes = {}, results = { { time = 0, note = 60 } }, item_len = 1, sample_rate = 48000 }
+  st.session_order[#st.session_order + 1] = "{a}"
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{a}", 0.7, 5, 3   -- adopt_take_data's mirrors
+  NK.key_idx, NK.scale_idx = 2, 1
+end
+
+test("clearing_the_open_item_starts_it_at_a_new_items_values", function() with_write_stubs({}, function()
+  local K, st, NK = S.K, S.state, S.K.new_key
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+    K.open_accessor, st.results, st.notes, st.sample_rate, st.end_time, st.current_time }
+  local ok, err = pcall(function()
+    open_analysed_at_70(st, NK)
+    reaper.GetMediaItemInfo_Value = function() return 1 end
+    S.clear_take_analysis("{a}")
+    eq(st.separation, S.DEFAULTS.separation, "Separation back to the default, not the cleared 70%")
+    eq(st.key_idx, 2, "the Key last chosen"); eq(st.scale_idx, 1)
+    reaper.GetMediaItemTake_Source = function() return "src" end
+    reaper.GetMediaSourceSampleRate = function() return 48000 end
+    K.open_accessor = function() return "acc" end
+    eq(K.analysis_begin("a", "item_a", { defer_envelope = true }), true, "the next analysis starts")
+    eq(st.separation, S.DEFAULTS.separation, "it splits at 50%")
+  end)
+  reaper.GetMediaItemInfo_Value, reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate = nil, nil, nil
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, K.open_accessor,
+    st.results, st.notes, st.sample_rate, st.end_time, st.current_time = table.unpack(saved, 1, 12)
+  st.is_analyzing, st.analysis_params, st.accessor = false, nil, nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("wiping_the_session_starts_the_open_item_at_a_new_items_values", function() with_write_stubs({}, function()
+  local st, NK = S.state, S.K.new_key
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+    st.session_order, st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes }
+  local ok, err = pcall(function()
+    st.session_order, st.session_takes = {}, {}
+    open_analysed_at_70(st, NK)
+    reaper.GetMediaItemInfo_Value = function() return 1 end
+    reaper.CountAutomationItems = function() return 0 end
+    eq(S.wipe_entire_session(), 1)
+    eq(st.separation, S.DEFAULTS.separation, "Separation back to the default")
+    eq(st.key_idx, 2, "the Key last chosen")
+  end)
+  reaper.GetMediaItemInfo_Value, reaper.CountAutomationItems = nil, nil
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.session_order,
+    st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes = table.unpack(saved, 1, 11)
+  if not ok then error(err, 0) end
+end) end)
+
+test("an_analysis_undone_away_starts_the_open_item_at_a_new_items_values", function()
+  local K, st, NK = S.K, S.state, S.K.new_key
+  local raw, changes = "", 2
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+    st.last_change_count, #st.session_order, st.results, st.notes }
+  local ok, err = pcall(function()
+    open_analysed_at_70(st, NK)
+    st.raw_cache["{a}"] = K.take_json(st.session_takes["{a}"])
+    K.drop_project_cache()
+    st.last_change_count = 1
+    S.sync_with_project()   -- Cmd+Z took the item's first analysis away
+    eq(st.session_takes["{a}"], nil, "undone: not analysed")
+    eq(st.separation, S.DEFAULTS.separation, "Separation back to the default")
+    eq(st.key_idx, 2, "the Key last chosen")
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"], st.undone_takes["{a}"] = nil, nil, nil, nil
+  while #st.session_order > saved[8] do table.remove(st.session_order) end
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.last_change_count,
+    st.results, st.notes = saved[1], saved[2], saved[3], saved[4], saved[5], saved[6], saved[7], saved[9], saved[10]
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
+-- Re-analysing puts an item's values back to the defaults: the confirm says so, and with no confirm (no edited
+-- note) the status line says it once the new analysis is written (HC4)
+local function reanalyse_stubs(K)
+  reaper.GetMediaItemTake_Source = function() return "src" end
+  reaper.GetMediaSourceSampleRate = function() return 48000 end
+  reaper.GetMediaItemInfo_Value = function() return 0 end
+  reaper.GetTakeName = function(take) return take end
+  reaper.time_precise = function() return 0 end
+  local saved = { K.open_accessor, K.write_take_envelope }
+  K.open_accessor = function() return "acc" end
+  K.write_take_envelope = function() return true end
+  return function()
+    reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate, reaper.GetMediaItemInfo_Value = nil, nil, nil
+    reaper.GetTakeName, reaper.time_precise = nil, nil
+    K.open_accessor, K.write_take_envelope = saved[1], saved[2]
+  end
+end
+
+test("reanalyze_confirm_says_the_values_go_back", function() with_write_stubs({}, function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.notes, st.confirm }
+  local ok, err = pcall(function()
+    st.session_takes["{a}"] = analysed_before("{a}")
+    st.target_take_guid, st.target_take_name = "{a}", "A"
+    st.notes = { { avg_note = 60, controls = { bypassed = true } } }   -- one edited note: the confirm
+    st.confirm = nil
+    K.request_analyze()
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.id, "reanalyze")
+    eq(c.body_lines[2], "Its values go back to the defaults; Key and Scale stay.")
+    eq(c.body_lines[3], MOD .. "+Z restores them once the analysis has finished.")
+  end)
+  st.target_take_guid, st.target_take_name, st.notes, st.confirm = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
+end) end)
+
+test("reanalyze_without_confirm_says_the_values_went_back", function() with_write_stubs({}, function()
+  local K, st = S.K, S.state
+  local undo = reanalyse_stubs(K)
+  local saved = { st.target_take_guid, st.target_take_name, st.separation, st.key_idx, st.scale_idx, st.results,
+    st.notes, st.sample_rate, st.end_time, st.current_time, st.confirm }
+  local ok, err = pcall(function()
+    local function reanalyse(data)
+      st.session_takes["{a}"] = data
+      st.target_take_guid, st.notes, st.confirm = "{a}", {}, nil   -- no edited note: no confirm
+      st.status.text = ""
+      K.request_analyze()
+      eq(st.confirm, nil, "no confirm")
+      eq(st.is_analyzing, true, "the analysis starts")
+      eq(st.status.text, "", "nothing said before the write")
+      at_analysis_end(st)
+      K.analysis_tick()
+      eq(st.is_analyzing, false, "the analysis ended")
+      return st.status.text
+    end
+    eq(reanalyse(analysed_before("{a}")), "Re-analyzed: values back to the defaults (" .. MOD .. "+Z undoes).",
+      "values that differed from the defaults: said")
+    local at_defaults = analysed_before("{a}")
+    at_defaults.overrides, at_defaults.separation = {}, S.DEFAULTS.separation
+    eq(reanalyse(at_defaults), "", "already at the defaults: nothing to say")
+  end)
+  undo()
+  st.target_take_guid, st.target_take_name, st.separation, st.key_idx, st.scale_idx, st.results, st.notes,
+    st.sample_rate, st.end_time, st.current_time, st.confirm = table.unpack(saved, 1, 11)
+  st.is_analyzing, st.analysis_params, st.accessor = false, nil, nil
+  st.stale_takes["{a}"], st.missing_takes["{a}"] = nil, nil
+  st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_keep_says_key_and_scale_are_still_applied", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a = apply_target("a", fr, 0.5, 12)
+    st.session_takes["{a}"] = a.data
+    st.session_order[#st.session_order + 1] = "{a}"
+    local function key_line(keys, keep)
+      st.target_take_guid, st.confirm = "{open}", nil
+      K.apply_open(keys)
+      local c = st.confirm
+      st.confirm = nil
+      eq(c.fit, true, "the Apply confirm takes its content's height")
+      for _, line in ipairs(c.consequence(keep, c.ticked).lines) do
+        if line == "Key and Scale are still applied." then return true end
+      end
+      return false
+    end
+    eq(key_line({ "key_idx", "scale_idx" }, true), true, "Key given, Keep on: said")
+    eq(key_line(nil, true), true, "every value (Key included), Keep on: said")
+    eq(key_line({ "key_idx", "scale_idx" }, false), false, "Keep off: not said")
+    eq(key_line({ "tolerance" }, true), false, "no Key given: not said")
+  end)
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+-- The Apply confirm takes its content's height: no empty band above the footer, the buttons never clipped
+test("confirm_fit_h_puts_the_footer_under_the_content", function()
+  local K = S.K
+  -- a modal 480 tall whose body is 380: 100 of title bar, padding and footer
+  eq(K.confirm_fit_h(480, 380, 150, 1000), 250, "short content: the modal shrinks to it")
+  eq(K.confirm_fit_h(480, 380, 600, 1000), 700, "long content: the modal grows to it")
+  eq(K.confirm_fit_h(480, 380, 2000, 900), 900, "never taller than the window it opens from allows")
+  eq(K.confirm_fit_h(480, 380, 0, 1000), 101, "no content: the body keeps one pixel, the footer stays")
+  eq(K.confirm_fit_h(480, 380, 150, 50), 101, "a tiny host: the footer is never cut (the constraint caps the rest)")
+end)
+
+test("confirm_fit_due_only_when_the_content_changes", function()
+  local K, c = S.K, {}
+  eq(K.confirm_fit_due(c, "k1", 380, 150), true, "first sight: fit")
+  eq(K.confirm_fit_due(c, "k1", 150, 150), false, "fitted: nothing to do")
+  eq(K.confirm_fit_due(c, "k2", 150, 150), false, "a row ticked, same content size: no move")
+  eq(K.confirm_fit_due(c, "k3", 150, 170), true, "a line more: fit again")
+  eq(K.confirm_fit_due(c, "k3", 160, 170), true, "still off (capped, re-wrapped): once more")
+  eq(K.confirm_fit_due(c, "k3", 160, 170), false, "never a third time for one content: no resize every frame")
+  eq(K.confirm_fit_due(c, "k4", 160, 300), true, "new content: fit again")
+end)
+
+test("confirm_sized_to_its_content_resizes_once_before_it_begins", function()
+  local K, st, L = S.K, S.state, package.loaded["theme"].layout
+  local sizes, cursor = {}, 0
+  local stubs = {
+    ImGui_IsPopupOpen = function() return true end,
+    ImGui_BeginPopupModal = function() return true, true end,
+    ImGui_BeginChild = function() return true end,
+    ImGui_GetWindowSize = function() return 560, 480 end,
+    ImGui_GetWindowPos = function() return 100, 50 end,
+    ImGui_Viewport_GetPos = function() return 0, 0 end,
+    ImGui_Viewport_GetSize = function() return 800, 600 end,
+    ImGui_GetContentRegionAvail = function() return 520, 400 end,
+    ImGui_GetStyleVar = function() return 4, 4 end,
+    ImGui_GetFrameHeight = function() return 20 end,
+    ImGui_GetTextLineHeight = function() return 14 end,
+    ImGui_CalcTextSize = function() return 40, 14 end,
+    ImGui_GetCursorPosX = function() return 0 end,
+    ImGui_GetCursorPosY = function() cursor = cursor + 1; return (cursor % 2 == 1) and 0 or 104 end,
+    -- the fit's own (no condition): Theme.center_next_window's, at Cond_Appearing, are not counted
+    ImGui_Cond_Appearing = function() return 4 end,
+    ImGui_SetNextWindowSize = function(_, w, h, cond) if cond == nil then sizes[#sizes + 1] = { w = w, h = h } end end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local ok, err = pcall(function()
+    S.request_confirm({ id = "fit", title = "T", body_lines = { "One line" }, on_confirm = function() end,
+      fit = true, size = { w = 560, h = 480 },
+      consequence = function() return { lines = {} } end })
+    S.draw_confirm_modal()   -- opens at size.h (Theme.center_next_window) and measures its content: 100
+    local opened = #sizes
+    eq(opened, 0, "nothing resized before it was measured")
+    S.draw_confirm_modal()   -- resized before it begins
+    eq(#sizes, opened + 1, "one resize asked")
+    local body_h = 400 - (4 + L.lg + 4 + 20) - (14 + 4)   -- K.confirm_body_h with the reason's line kept
+    eq(sizes[#sizes].w, 560, "the same width (a narrow docker's fit is kept)")
+    eq(sizes[#sizes].h, K.confirm_fit_h(480, body_h, 100, 480 - L.xl * 2), "the footer right under the content")
+    S.draw_confirm_modal(); S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(#sizes, opened + 2, "the stubbed body never matches: tried twice for one content, then left alone")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  st.confirm = nil
+  if not ok then error(err, 0) end
+end)
 
 -- Tests appended by later tasks go above this line.
 local failed = false

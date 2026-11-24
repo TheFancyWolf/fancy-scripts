@@ -254,6 +254,11 @@ local K = {
   REASON_ANALYZING = "Wait for the analysis to finish",   -- why the Pitched Items rows and the batch entry are locked
   REASON_BATCH_FEW = "Select 2 or more audio items",
   CANCELLED_TEXT = "Analysis cancelled.",
+  -- A new analysis puts the item's values back to the defaults (only its Key and Scale stay): the Re-Analyze and
+  -- batch confirms say so, and with no confirm the status line says it once the analysis is written (HC4)
+  REANALYZE_VALUES_LINE = "Its values go back to the defaults; Key and Scale stay.",
+  REANALYZE_VALUES_LINE_N = "Their values go back to the defaults; Key and Scale stay.",
+  REANALYZED_DEFAULTS_TEXT = "Re-analyzed: values back to the defaults (%s+Z undoes).",
 
   -- Error recovery (see loop): the window shows this, with Retry and Close, instead of disappearing
   FATAL_TEXT = "Something went wrong. Your corrections on the items are unchanged.",
@@ -692,7 +697,8 @@ end
 ---             the ticked rows or the check change (HI5) and its answer is kept in state.confirm.cons; its
 ---             confirm_label replaces the request's, and a `reason` disables the confirm button and is shown above it.
 --- on_confirm(checked, ticked) receives the state of the check and the ticked rows.
---- size = a Theme.layout modal size (default L.modal_sm).
+--- size = a Theme.layout modal size (default L.modal_sm). fit = true: size.h is only where it opens; the modal then
+--- takes its content's height (up to the most the window it opens from allows) with the footer right under it.
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
   local ticked = {}
@@ -719,6 +725,7 @@ local function request_confirm(req)
     cons = nil,       -- the consequence's answer for cons_key (see K.confirm_consequence)
     cons_key = nil,
     size = req.size,
+    fit = req.fit == true,  -- sized to its content (K.confirm_fit_h), else req.size throughout
     open_pending = true,  -- OpenPopup once, on the next draw_confirm_modal() call
     opened = false,
   }
@@ -1601,6 +1608,7 @@ end
 --- (REAPER gave no audio accessor). Nothing is changed when it returns false.
 K.analysis_begin = function(take, item, opts)
   opts = opts or {}
+  K.reanalyze_status_guid = nil   -- set again by K.request_analyze for the analysis it starts
   local sample_rate = opts.sample_rate
   if not sample_rate then
     local source = reaper.GetMediaItemTake_Source(take)
@@ -2590,6 +2598,7 @@ K.cancel_analysis = function()
   end
   if not state.is_analyzing and not state.accessor then return false end
   K.release_analysis()
+  K.reanalyze_status_guid = nil
   state.progress = 0
   local guid = state.target_take_guid
   local data = guid and state.session_takes[guid]
@@ -2733,7 +2742,8 @@ K.batch_confirm = function(entries)
     or string.format("%s+Z restores all %d items in one step once the batch has finished.", K.MOD_LABEL, total)
   return {
     title = total == 1 and "Analyze 1 item?" or string.format("Analyze %d items?", total),
-    body_lines = { body }, list = list, after_lines = { after },
+    body_lines = { body }, list = list,
+    after_lines = { #list == 1 and K.REANALYZE_VALUES_LINE or K.REANALYZE_VALUES_LINE_N, after },
     confirm_label = total == 1 and "Analyze 1 Item" or string.format("Analyze %d Items", total),
   }
 end
@@ -3110,6 +3120,7 @@ local function sync_with_project()
             state.split_points = nil
             state.progress = 0
             state.analysis_empty = false
+            K.adopt_new_item_values()   -- not analysed any more: its next analysis is a first one
           end
         else
           -- Stored data is unreadable: keep the in-memory model (raw_cache now holds the bad string)
@@ -5272,10 +5283,14 @@ local function process_analysis_step()
       -- a previous analysis and writes the new model to the take inside the same "Analyze Pitch" block.
       -- The take's pitch mode is left alone, as for any analysis.
       if resolve_take_by_guid(state.target_take_guid, true) then
-        apply_envelope_to_take("Analyze Pitch", true)
+        if apply_envelope_to_take("Analyze Pitch", true)
+            and K.reanalyze_status_guid == state.target_take_guid then
+          set_status(string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL))
+        end
       else
         state.missing_takes[state.target_take_guid] = true
       end
+      K.reanalyze_status_guid = nil
     end
     if external_change then state.last_change_count = nil end
   elseif state.item_len > 0 then
@@ -9034,6 +9049,7 @@ local function remove_take_core(guid)
       state.end_time = nil
       state.item_len = nil
       state.sample_rate = nil
+      K.adopt_new_item_values()   -- nothing open: the next item starts at a new item's values
     end
   end
 
@@ -9068,6 +9084,7 @@ local function wipe_entire_session()
   end
   -- Every item's envelope was cleared above; only the in-memory analysis is left to drop
   reset_analysis_model()
+  K.adopt_new_item_values()   -- whatever is open next starts at a new item's values
   state.session_takes = {}
   state.session_order = {}
   state.raw_cache = {}
@@ -9128,6 +9145,7 @@ local function clear_take_analysis(guid)
   end
   if guid == state.target_take_guid then
     reset_analysis_model()
+    K.adopt_new_item_values()   -- not analysed any more: its next analysis is a first one, at a new item's values
   end
   return note_count, wrote
 end
@@ -9254,7 +9272,10 @@ K.clear_unreadable = function()
           break
         end
       end
-      if guid == state.target_take_guid then reset_analysis_model() end
+      if guid == state.target_take_guid then
+        reset_analysis_model()
+        K.adopt_new_item_values()   -- not analysed any more: a new item's values
+      end
     end
   end
   reaper.Undo_EndBlock("Clear Unreadable Pitched Items Data", -1)
@@ -10258,11 +10279,13 @@ end
 --- Keep a dialog inside the window it opens from. A dialog larger than that window becomes an OS window of its
 --- own, centred on the (small) docked window, and can run off the screen with its end out of reach; capped to the
 --- window it stays inside and longer content scrolls. Call right before BeginPopupModal, in the host window's scope.
+--- Returns the largest width and height the dialog may take.
 function K.fit_modal(modal_ctx)
   local L = Theme.layout
   local host_w, host_h = reaper.ImGui_GetWindowSize(modal_ctx)
-  reaper.ImGui_SetNextWindowSizeConstraints(modal_ctx, 0, 0,
-    math.max(host_w - L.xl * 2, L.xxxl), math.max(host_h - L.xl * 2, L.xxxl))
+  local max_w, max_h = math.max((host_w or 0) - L.xl * 2, L.xxxl), math.max((host_h or 0) - L.xl * 2, L.xxxl)
+  reaper.ImGui_SetNextWindowSizeConstraints(modal_ctx, 0, 0, max_w, max_h)
+  return max_w, max_h
 end
 
 local function draw_settings_modal()
@@ -10557,6 +10580,27 @@ K.confirm_body_h = function(avail_h, btn_h, gap, reason_h, spacing_y)
   return math.max(1, avail_h - footer)
 end
 
+--- The height a confirm sized to its content (request_confirm's `fit`) asks for: the modal now (win_h) less the body
+--- it has (body_h) plus the body its content needs (content_h), so the footer sits right under the content. Never
+--- taller than max_h (the most the window it opens from allows, K.fit_modal: longer content scrolls in the body,
+--- and K.confirm_body_h keeps the buttons in view), and the body keeps at least one pixel. Pure.
+K.confirm_fit_h = function(win_h, body_h, content_h, max_h)
+  local frame = win_h - body_h   -- everything but the body: the title bar, the padding and the footer
+  return math.max(frame + 1, math.min(max_h, frame + math.max(0, content_h)))
+end
+
+--- When the confirm `c` (sized to its content) is resized: once its content changed (key: what the body draws:
+--- the consequence, the rows, the width it wraps to) and the body is not the content's height. At most twice for
+--- one content (the second try mends a first frame measured short), so a body capped by max_h or a scrollbar that
+--- re-wraps the text never makes it resize every frame, and ticking rows that keep the content's size never moves
+--- it. Returns true when it should be resized now.
+K.confirm_fit_due = function(c, key, body_h, content_h)
+  if c.fit_key ~= key then c.fit_key, c.fit_tries = key, 0 end
+  if (c.fit_tries or 0) >= 2 or math.abs(content_h - body_h) < 1 then return false end
+  c.fit_tries = (c.fit_tries or 0) + 1
+  return true
+end
+
 --- The one confirm modal (see request_confirm): consequence and count in the body, Cancel first,
 --- Esc = Cancel, danger-styled confirm button. Called inside the main window's `if visible` block.
 --- The list of a confirm dialog (request_confirm's `list`): one row per thing the action replaces, its name and,
@@ -10730,7 +10774,12 @@ local function draw_confirm_modal()
   end
 
   Theme.center_next_window(ctx, size.w, size.h, reaper.ImGui_Cond_Appearing())
-  K.fit_modal(ctx)
+  local _, max_h = K.fit_modal(ctx)
+  if c.fit_size then   -- sized to its content (asked last frame): same width, kept centred where it was
+    reaper.ImGui_SetNextWindowPos(ctx, c.fit_size.x, c.fit_size.y)
+    reaper.ImGui_SetNextWindowSize(ctx, c.fit_size.w, c.fit_size.h)
+    c.fit_size = nil
+  end
   Theme.modal_scrim(ctx, popup_name)
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, popup_name, true, reaper.ImGui_WindowFlags_NoResize())
   local confirmed = false
@@ -10759,7 +10808,9 @@ local function draw_confirm_modal()
     end
     local body_h = K.confirm_body_h(avail_h, btn_h, L.lg, reason_h, spacing_y or 0)
 
+    local content_h = nil
     if reaper.ImGui_BeginChild(ctx, "##confirm_body", 0, body_h, 0) then
+      local top_y = reaper.ImGui_GetCursorPosY(ctx) or 0
       for i, line in ipairs(c.body_lines) do
         if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.sm) end
         reaper.ImGui_TextWrapped(ctx, line)
@@ -10776,7 +10827,25 @@ local function draw_confirm_modal()
           reaper.ImGui_TextWrapped(ctx, line)
         end
       end
+      -- The content's height: the cursor is past the last item and its spacing (scrolling does not change it); the
+      -- body's padding below is the same as above it
+      local end_y = reaper.ImGui_GetCursorPosY(ctx)
+      if end_y then content_h = end_y - (spacing_y or 0) + top_y end
       reaper.ImGui_EndChild(ctx)
+    end
+    -- A confirm sized to its content: the body is as tall as what it draws (up to the most the window it opens from
+    -- allows), the footer right under it; asked for next frame, before the modal begins
+    if c.fit and content_h then
+      local key = tostring(c.cons_key) .. "|" .. tostring(c.checklist and #c.checklist.rows or 0) .. "|"
+        .. tostring(math.floor((avail_w or 0) + 0.5))
+      if K.confirm_fit_due(c, key, body_h, content_h) then
+        local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
+        local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
+        if win_w and win_h and win_x and win_y then
+          local h = K.confirm_fit_h(win_h, body_h, content_h, max_h)
+          c.fit_size = { x = win_x, y = win_y + (win_h - h) * 0.5, w = win_w, h = h }
+        end
+      end
     end
 
     reaper.ImGui_Dummy(ctx, 0, L.lg)
@@ -10949,10 +11018,14 @@ K.note_action = function(id, note_idx)
 end
 
 --- Header Analyze / Re-Analyze: analyze right away, unless it would discard the user's edits.
-local function request_analyze()
+K.request_analyze = function()
   local edited = count_modified_notes()
   if edited == 0 then
     start_analysis()
+    -- No confirm: an item whose values differ from the defaults is told so once the new analysis is written
+    if state.is_analyzing and K.item_off_defaults(state.session_takes[state.target_take_guid or ""]) > 0 then
+      K.reanalyze_status_guid = state.target_take_guid
+    end
     return
   end
   local guid = state.target_take_guid
@@ -10963,6 +11036,7 @@ local function request_analyze()
     body_lines = {
       string.format("This replaces the detected notes and discards your edits to %d %s.",
         edited, plural(edited, "note", "notes")),
+      K.REANALYZE_VALUES_LINE,
       string.format("%s+Z restores them once the analysis has finished.", K.MOD_LABEL),
     },
     confirm_label = "Re-Analyze",
@@ -12176,7 +12250,7 @@ do
         end
       elseif reaper.ImGui_MenuItem(ctx, hs.analyze_label .. "###more_analyze",
           (not hs.has_target) and HDR_REASON_NO_TARGET or nil, false, hs.has_target) then
-        request_analyze()
+        K.request_analyze()
       end
       -- Analyze Selected Items: always in the menu; with fewer than two audio items selected in REAPER, or while
       -- an analysis runs, it is disabled with the reason beside it
@@ -12588,6 +12662,7 @@ do
     check = "Keep changes already made to items and notes",
     consequence = "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost).",
     keep = "%d items with edited notes are not split again.",
+    keep_key = "Key and Scale are still applied.",
     confirm = "Apply (%d)",
     nothing = "Nothing would change",
     changed = "The item changed meanwhile. Nothing was applied.",
@@ -12635,8 +12710,12 @@ do
     local rows = K.apply_rows()
     local ticked = K.apply_initial_ticks(rows, K.apply_selected_guids())
     -- Only a Separation given splits items again: the keep line is about that alone
-    local gives_sep = false
-    for _, key in ipairs(keys) do if key == "separation" then gives_sep = true end end
+    -- ... and Keep never holds back a Key and Scale given (they have no default): the confirm says so
+    local gives_sep, gives_key = false, false
+    for _, key in ipairs(keys) do
+      if key == "separation" then gives_sep = true end
+      if key == "key_idx" or key == "scale_idx" then gives_key = true end
+    end
     -- The item the values come from: it must still be the open item when the user confirms
     local open_guid = state.target_take_guid
     -- Planned from the rows of now: an undo in the arrange view while the confirm is up reloads the pitched items
@@ -12657,6 +12736,7 @@ do
         rows = rows, ticked = ticked },
       check = { label = APPLY_COPY.check, value = false },
       size = Theme.layout.modal_md,
+      fit = true,   -- its content changes with the ticks: no empty band above the buttons
       confirm_label = string.format(APPLY_COPY.confirm, 0),
       consequence = function(checked, ticks)
         local plan, n_ticked, tickable = plan_for(checked, ticks)
@@ -12665,6 +12745,7 @@ do
         if n_ticked > 0 then
           lines[1] = string.format(APPLY_COPY.consequence, c.items_lose, c.notes_lose, c.key_change, c.resplit, c.lost)
           if checked and gives_sep then lines[#lines + 1] = string.format(APPLY_COPY.keep, c.not_resplit) end
+          if checked and gives_key then lines[#lines + 1] = APPLY_COPY.keep_key end
         end
         local out = { lines = lines, confirm_label = string.format(APPLY_COPY.confirm, plan.changed) }
         if n_ticked == 0 then
@@ -13657,6 +13738,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
            request_confirm = request_confirm, draw_confirm_modal = draw_confirm_modal, sync_with_project = sync_with_project,
            get_effective = get_effective, get_override_level = get_override_level,
-           measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w }
+           measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
+           clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session }
 end
 main()
