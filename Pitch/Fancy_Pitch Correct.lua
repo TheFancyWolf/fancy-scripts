@@ -4563,8 +4563,10 @@ end
 --- Splits analysed frames (`results`: time-ordered { time, note | nil, rms, lvl }) into notes at Separation `sep`.
 --- Returns notes { start_time, end_time, frames, sum_note, count } (frames: the original result frames, voiced only)
 --- and split_points { time, reason } (one per note, reason "Onset" / "Pitch change" / "Level dip"). Every time constant
---- is converted with the frames' own spacing. `results` is not modified.
-K.segment = function(results, sep)
+--- is converted with the frames' own spacing. `results` is not modified. floor_db (optional): the level below which a
+--- frame counts as silent, as K.segment_floor gives it for the whole item (a stretch re-split passes the item's, so
+--- the same Separation splits the same way); nil = worked out from `results`.
+K.segment = function(results, sep, floor_db)
   local P, SEG = K.separation_params(sep), K.SEG
   local notes, split_points = {}, {}
   local n = #results
@@ -4617,8 +4619,10 @@ K.segment = function(results, sep)
     if f.note then loud[#loud + 1] = db[i] end
   end
   if #loud == 0 then return notes, split_points end
-  table.sort(loud)
-  local floor_db = loud[math.max(1, math.ceil(0.95 * #loud))] - SEG.SILENCE_DB
+  if not floor_db then
+    table.sort(loud)
+    floor_db = loud[math.max(1, math.ceil(0.95 * #loud))] - SEG.SILENCE_DB
+  end
   local voiced = {}
   for i, f in ipairs(results) do voiced[i] = f.note ~= nil and db[i] >= floor_db end
 
@@ -4908,11 +4912,24 @@ K.segment = function(results, sep)
   return notes, split_points
 end
 
+--- The silence floor K.segment works out from `results` (dB; nil when no frame has a pitch): the item's loud level
+--- (95th percentile of the pitched frames' levels) less K.SEG.SILENCE_DB. Pure.
+K.segment_floor = function(results)
+  local loud = {}
+  for _, f in ipairs(results) do
+    if f.note then loud[#loud + 1] = 20 * math.log(math.max(f.lvl or f.rms or 0, 1e-10), 10) end
+  end
+  if #loud == 0 then return nil end
+  table.sort(loud)
+  return loud[math.max(1, math.ceil(0.95 * #loud))] - K.SEG.SILENCE_DB
+end
+
 --- Re-split one stretch of the item: the frames of `results` with t0 <= time <= t1 are split at Separation `sep`
 --- (K.segment); the notes of `old_notes` (time order) that start before t0 come first, unchanged (the same tables), then
 --- the new notes, then the old notes that start at or after t1. old_split_points (optional) is merged the same way by
 --- time. Returns notes, split_points, and the indices of the first and last new note (last < first: none); nil when
---- the stretch holds fewer than two frames. Pure: no REAPER calls, `results` and `old_notes` are not modified. The
+--- the stretch holds fewer than two frames. The silence floor is the whole item's (K.segment_floor), so the stretch
+--- at the item's Separation splits as the item did. Pure: no REAPER calls, `results` and `old_notes` are not modified. The
 --- caller carries edits over (K.resplit_match against the old notes inside the stretch).
 K.segment_stretch = function(results, sep, old_notes, t0, t1, old_split_points)
   local sub = {}
@@ -4920,7 +4937,7 @@ K.segment_stretch = function(results, sep, old_notes, t0, t1, old_split_points)
     if f.time >= t0 and f.time <= t1 then sub[#sub + 1] = f end
   end
   if #sub < 2 then return nil end
-  local mid, mid_splits = K.segment(sub, sep)
+  local mid, mid_splits = K.segment(sub, sep, K.segment_floor(results))
   local notes, split_points = {}, {}
   for _, n in ipairs(old_notes) do
     if n.start_time < t0 then notes[#notes + 1] = n end
@@ -10710,6 +10727,7 @@ end
 K.RESPLIT_UNDO = "Re-split item"   -- the undo label of K.resplit
 K.RESPLIT_STRETCH_UNDO = "Re-split selected notes"   -- the undo label of K.resplit_stretch
 K.STRETCH_NO_ANALYSIS = "This stretch has no analysis: Re-analyze the item"
+K.STRETCH_UNCHANGED = "Nothing to re-split."
 
 --- The target's notes were reloaded by an undo or redo (`data`: what is stored now). When the step undone or redone
 --- is a re-split, Separation follows it: the value the stored notes were split at (data.separation, the item's own
@@ -10880,6 +10898,17 @@ K.resplit_stretch = function(sep)
   for i = i0, i1 do new_in[#new_in + 1] = new_notes[i] end
   local tol_s = K.frame_step(results)   -- one frame, as K.segment measures it
   local matched, lost = K.resplit_match(old_in, new_in, tol_s, is_note_modified)
+  if #new_in == #old_in then
+    local all_paired = true
+    for i = 1, #new_in do
+      if not matched[i] then all_paired = false break end
+    end
+    if all_paired then
+      -- The same notes again: nothing changes, so no undo point (UC1)
+      set_status(K.STRETCH_UNCHANGED)
+      return
+    end
+  end
 
   local function run()
     local any_edited = K.resplit_features(new_in, matched)

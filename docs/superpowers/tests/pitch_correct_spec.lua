@@ -3321,6 +3321,69 @@ test("resplit_stretch_keeps_item_value", function() with_write_stubs({}, functio
   eq(status, "Re-split 1 notes into 2.", "status")
 end) end)
 
+-- A stretch at the item's own Separation splits as the item did, also where the stretch is quiet: the silence
+-- floor is the whole item's
+local function quiet_frames()
+  local q, hush = 10 ^ (-45 / 20), 10 ^ (-70 / 20)
+  return frames({ { dur = 0.4, note = 55 }, STRETCH_GAP,
+    { dur = 0.3, note = 60, lvl = q }, { dur = 0.1, note = 60, lvl = hush }, { dur = 0.3, note = 62, lvl = q },
+    STRETCH_GAP, { dur = 0.4, note = 67 } }, HOP)
+end
+
+test("segment_stretch_same_sep_same_notes", function()
+  for _, case in ipairs({ { stretch_frames(slide_segs(62)), "loud" }, { quiet_frames(), "quiet" } }) do
+    local fr, name = case[1], case[2]
+    for _, sep in ipairs({ 0.2, 0.5, 0.9 }) do
+      local old, old_splits = S.K.segment(fr, sep)
+      local first, last = 2, #old - 1
+      local new, _, i0, i1 = S.K.segment_stretch(fr, sep, old, old[first].start_time, old[last].end_time, old_splits)
+      local tag = name .. " sep " .. sep
+      eq(#new, #old, tag .. ": notes")
+      eq(i1 - i0, last - first, tag .. ": notes in the stretch")
+      for i = i0, i1 do
+        eq(new[i].start_time, old[i].start_time, tag .. ": start " .. i)
+        eq(new[i].end_time, old[i].end_time, tag .. ": end " .. i)
+      end
+    end
+  end
+end)
+
+test("segment_floor_matches_segment", function()
+  local fr = quiet_frames()
+  local a = S.K.segment(fr, 0.5)
+  local b = S.K.segment(fr, 0.5, S.K.segment_floor(fr))
+  eq(#b, #a, "notes")
+  for i = 1, #a do
+    eq(b[i].start_time, a[i].start_time, "start " .. i)
+    eq(b[i].end_time, a[i].end_time, "end " .. i)
+  end
+  eq(S.K.segment_floor({ { time = 0, rms = 0.1, lvl = 0.1 } }), nil, "no pitched frame")
+end)
+
+test("resplit_stretch_unchanged_no_undo", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(60.6))
+  local old, old_splits = K.segment(fr, 0.2)
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, separation = 0.2, item_len = 2,
+    sample_rate = 44100 }
+  local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text }
+  reaper.time_precise = function() return 0 end
+  st.target_take_guid, st.session_takes["{a}"] = "{a}", data
+  st.results, st.notes, st.split_points, st.separation = fr, old, old_splits, 0.2
+  st.selected_notes, st.selected_note = { [2] = true }, 2
+  -- the item's own value (Reset with notes selected), and another value that gives the same notes
+  local ok, err = pcall(function() K.resplit_stretch(0.2); K.resplit_stretch(0.25) end)
+  local notes, sel, status = st.notes, st.selected_notes, st.status.text
+  st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+  eq(#rec.labels, 0, "no undo point")
+  eq(rawequal(notes, old), true, "the notes stay")
+  eq(sel[2], true, "the selection stays")
+  eq(status, "Nothing to re-split.", "status")
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
