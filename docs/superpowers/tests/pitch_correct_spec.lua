@@ -3244,6 +3244,83 @@ test("key_scale_undo_labels", function()
   eq(labels[2], "Set Scale", "scale")
 end)
 
+-- Stretch re-split (K.segment_stretch): three phrases apart; the middle one is a slide
+local STRETCH_GAP = { dur = 0.1 }
+local function stretch_frames(mid)
+  local segs = { { dur = 0.4, note = 55 }, STRETCH_GAP }
+  for _, s in ipairs(mid) do segs[#segs + 1] = s end
+  segs[#segs + 1] = STRETCH_GAP
+  segs[#segs + 1] = { dur = 0.4, note = 67 }
+  return frames(segs, HOP)
+end
+
+test("segment_stretch_outside_untouched", function()
+  local fr = stretch_frames({ { dur = 0.4, note = 64 } })
+  local old, old_splits = S.K.segment(fr, 0.5)
+  eq(#old, 3, "old notes")
+  local new, splits, i0, i1 = S.K.segment_stretch(fr, 0.5, old, old[2].start_time, old[2].end_time, old_splits)
+  eq(#new, 3, "new notes")
+  eq(rawequal(new[1], old[1]), true, "before is the same table")
+  eq(rawequal(new[3], old[3]), true, "after is the same table")
+  eq(rawequal(new[2], old[2]), false, "the stretch is split again")
+  near(new[2].start_time, old[2].start_time, 1e-9, "stretch start")
+  near(new[2].end_time, old[2].end_time, 1e-9, "stretch end")
+  eq(i0, 2, "first new")
+  eq(i1, 2, "last new")
+  eq(#splits, 3, "split points")
+  eq(rawequal(splits[1], old_splits[1]), true, "split before kept")
+  eq(rawequal(splits[3], old_splits[3]), true, "split after kept")
+end)
+
+test("segment_stretch_higher_sep_more_notes", function()
+  local fr = stretch_frames(slide_segs(60.6))
+  local old, old_splits = S.K.segment(fr, 0.2)
+  eq(#old, 3, "joined at 0.2")
+  local new, splits, i0, i1 = S.K.segment_stretch(fr, 0.9, old, old[2].start_time, old[2].end_time, old_splits)
+  eq(#new, 4, "two notes in the stretch at 0.9")
+  eq(rawequal(new[1], old[1]), true, "before")
+  eq(rawequal(new[4], old[3]), true, "after")
+  eq(i0, 2, "first new")
+  eq(i1, 3, "last new")
+  eq(#splits, 4, "split points")
+  for i = 2, 4 do
+    if splits[i].time <= splits[i - 1].time then error("split points out of order at " .. i) end
+  end
+end)
+
+test("segment_stretch_too_few_frames", function()
+  local fr = stretch_frames({ { dur = 0.4, note = 64 } })
+  local old = S.K.segment(fr, 0.5)
+  local new = S.K.segment_stretch(fr, 0.5, old, 0.45, 0.45 + HOP / 2)
+  eq(new, nil, "nothing to split")
+end)
+
+test("resplit_stretch_keeps_item_value", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(60.6))
+  local old, old_splits = K.segment(fr, 0.2)
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, separation = 0.2, item_len = 2,
+    sample_rate = 44100 }
+  local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text }
+  reaper.time_precise = function() return 0 end
+  st.target_take_guid, st.session_takes["{a}"] = "{a}", data
+  st.results, st.notes, st.split_points, st.separation = fr, old, old_splits, 0.2
+  st.selected_notes, st.selected_note = { [2] = true }, 2
+  local ok, err = pcall(function() K.resplit_stretch(0.9) end)
+  local notes, sel, sep, status = st.notes, st.selected_notes, st.separation, st.status.text
+  st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+  eq(#notes, 4, "notes")
+  eq(rawequal(notes[1], old[1]) and rawequal(notes[4], old[3]), true, "outside untouched")
+  eq(sel[2] and sel[3] and not sel[1] and not sel[4], true, "the new notes are selected")
+  eq(data.separation, 0.2, "item value unchanged")
+  eq(sep, 0.2, "bar value unchanged")
+  eq(rec.labels[#rec.labels], "Re-split selected notes", "undo label")
+  eq(status, "Re-split 1 notes into 2.", "status")
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

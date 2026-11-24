@@ -4908,6 +4908,39 @@ K.segment = function(results, sep)
   return notes, split_points
 end
 
+--- Re-split one stretch of the item: the frames of `results` with t0 <= time <= t1 are split at Separation `sep`
+--- (K.segment); the notes of `old_notes` (time order) that start before t0 come first, unchanged (the same tables), then
+--- the new notes, then the old notes that start at or after t1. old_split_points (optional) is merged the same way by
+--- time. Returns notes, split_points, and the indices of the first and last new note (last < first: none); nil when
+--- the stretch holds fewer than two frames. Pure: no REAPER calls, `results` and `old_notes` are not modified. The
+--- caller carries edits over (K.resplit_match against the old notes inside the stretch).
+K.segment_stretch = function(results, sep, old_notes, t0, t1, old_split_points)
+  local sub = {}
+  for _, f in ipairs(results) do
+    if f.time >= t0 and f.time <= t1 then sub[#sub + 1] = f end
+  end
+  if #sub < 2 then return nil end
+  local mid, mid_splits = K.segment(sub, sep)
+  local notes, split_points = {}, {}
+  for _, n in ipairs(old_notes) do
+    if n.start_time < t0 then notes[#notes + 1] = n end
+  end
+  local first = #notes + 1
+  for _, n in ipairs(mid) do notes[#notes + 1] = n end
+  local last = #notes
+  for _, n in ipairs(old_notes) do
+    if n.start_time >= t1 then notes[#notes + 1] = n end
+  end
+  for _, sp in ipairs(old_split_points or {}) do
+    if sp.time < t0 then split_points[#split_points + 1] = sp end
+  end
+  for _, sp in ipairs(mid_splits) do split_points[#split_points + 1] = sp end
+  for _, sp in ipairs(old_split_points or {}) do
+    if sp.time >= t1 then split_points[#split_points + 1] = sp end
+  end
+  return notes, split_points, first, last
+end
+
 --- Re-split: which new notes are old notes whose start and end did not move. pairs[new_index] = old_note when both
 --- edges differ by at most tol_s (seconds; the caller passes one frame); each old note pairs at most once. lost =
 --- how many old notes for which is_modified(old) is true are in no pair (their edits are dropped). Both lists are in
@@ -10675,12 +10708,18 @@ K.wrap_lines = function(wctx, text, max_w)
 end
 
 K.RESPLIT_UNDO = "Re-split item"   -- the undo label of K.resplit
+K.RESPLIT_STRETCH_UNDO = "Re-split selected notes"   -- the undo label of K.resplit_stretch
+K.STRETCH_NO_ANALYSIS = "This stretch has no analysis: Re-analyze the item"
 
 --- The target's notes were reloaded by an undo or redo (`data`: what is stored now). When the step undone or redone
 --- is a re-split, Separation follows it: the value the stored notes were split at (data.separation, the item's own
 --- value), or, for notes stored without one, the value from before / after this session's last re-split of the item.
---- Nothing is saved outside the item: the bar shows what the stored notes were split at.
+--- Nothing is saved outside the item: the bar shows what the stored notes were split at. A stretch re-split
+--- (K.RESPLIT_STRETCH_UNDO) never changed the item's value, so undoing or redoing it leaves the value alone.
 K.follow_resplit_undo = function(data)
+  if reaper.Undo_CanRedo2(0) == K.RESPLIT_STRETCH_UNDO or reaper.Undo_CanUndo2(0) == K.RESPLIT_STRETCH_UNDO then
+    return
+  end
   local undone = reaper.Undo_CanRedo2(0) == K.RESPLIT_UNDO
   local redone = reaper.Undo_CanUndo2(0) == K.RESPLIT_UNDO
   if not (undone or redone) then return end
@@ -10695,6 +10734,33 @@ K.follow_resplit_undo = function(data)
   if data then data.separation = sep end
 end
 
+--- Give the new notes of a re-split their pitch and features; a note paired with an old one (matched[i], see
+--- K.resplit_match) keeps that note's edits: its controls and bypass, its target as the same offset from its new
+--- centre, its pitch points. True when any of them ends up edited.
+K.resplit_features = function(new_notes, matched)
+  local any_edited = false
+  for i, n in ipairs(new_notes) do
+    if n.count > 0 then
+      n.avg_note = n.sum_note / n.count
+      n.display_note = math.floor(n.avg_note + 0.5)
+      local old = matched[i]
+      if old and old.controls then
+        -- As split_note_at: the target follows the centre extract_note_features finds, by the old offset
+        local pitch_offset = old.controls.center_pitch - old.avg_note
+        extract_note_features(n, K.controls_carry(old.controls))
+        if n.controls then
+          n.controls.center_pitch = n.avg_note + pitch_offset
+          K.points_transfer(n, { old }, {})
+        end
+      else
+        extract_note_features(n)
+      end
+      if is_note_modified(n) then any_edited = true end
+    end
+  end
+  return any_edited
+end
+
 --- The item's Separation changed (data.separation, mirrored in state.separation; it was prev_separation): split the
 --- active item's notes again from the analysed frames in memory. A new note whose start and end are an old note's
 --- (within one frame) keeps that note's edits: its controls and bypass, its target as the same offset from its new
@@ -10705,14 +10771,17 @@ end
 K.resplit = function(prev_separation)
   local results = state.results
   if state.is_analyzing or not state.target_take_guid or not results or #results < 2 then return end
+  local data = state.session_takes[state.target_take_guid]
   if not target_take_exists() then
+    -- Nothing was split: the item keeps the Separation its notes were split at (the caller stored the new one)
+    if data then data.separation = prev_separation end
+    state.separation = prev_separation
     set_status("This item is no longer in the project")
     return
   end
   -- A pending arrow-key nudge is its own undo point, and its note counts as edited below
   if state.nudge_burst then flush_nudge_burst() end
 
-  local data = state.session_takes[state.target_take_guid]
   local sep = tonumber(K.item_value(data, "separation")) or state.separation
   local new_notes, split_points = K.segment(results, sep)
   local tol_s = K.frame_step(results)   -- one frame, as K.segment measures it
@@ -10720,26 +10789,7 @@ K.resplit = function(prev_separation)
   local matched, lost = K.resplit_match(old_notes or {}, new_notes, tol_s, is_note_modified)
 
   local function run()
-    local any_edited = false
-    for i, n in ipairs(new_notes) do
-      if n.count > 0 then
-        n.avg_note = n.sum_note / n.count
-        n.display_note = math.floor(n.avg_note + 0.5)
-        local old = matched[i]
-        if old and old.controls then
-          -- As split_note_at: the target follows the centre extract_note_features finds, by the old offset
-          local pitch_offset = old.controls.center_pitch - old.avg_note
-          extract_note_features(n, K.controls_carry(old.controls))
-          if n.controls then
-            n.controls.center_pitch = n.avg_note + pitch_offset
-            K.points_transfer(n, { old }, {})
-          end
-        else
-          extract_note_features(n)
-        end
-        if is_note_modified(n) then any_edited = true end
-      end
-    end
+    local any_edited = K.resplit_features(new_notes, matched)
     state.notes, state.split_points = new_notes, split_points
     state.analysis_empty = (#new_notes == 0)
     -- Stored with the notes, so an undo / redo of this step brings its Separation back (K.follow_resplit_undo)
@@ -10784,6 +10834,92 @@ K.resplit = function(prev_separation)
       run()
     end,
     on_cancel = put_back,
+  })
+end
+
+--- Separation `sep` with notes selected: split again only the stretch from the first selected note's start to the
+--- last selected note's end (the unselected notes between them too), from the analysed frames in memory. The notes
+--- outside it stay as they are; the new notes keep the edits of old notes with the same start and end (as K.resplit)
+--- and end up selected. When other edited notes inside it would lose their edits it asks first (as K.resplit). One
+--- undo point (K.RESPLIT_STRETCH_UNDO). The item's Separation (data.separation) is not changed: a stretch value is
+--- not stored, and a whole-item re-split replaces it.
+K.resplit_stretch = function(sep)
+  local results = state.results
+  if state.is_analyzing or not state.target_take_guid or not state.notes then return end
+  if not target_take_exists() then
+    set_status("This item is no longer in the project")
+    return
+  end
+  -- A pending arrow-key nudge is its own undo point, and its note counts as edited below
+  if state.nudge_burst then flush_nudge_burst() end
+
+  local old_notes = state.notes
+  local first, last
+  for idx in pairs(state.selected_notes) do
+    if old_notes[idx] then
+      if not first or idx < first then first = idx end
+      if not last or idx > last then last = idx end
+    end
+  end
+  if not first and state.selected_note and old_notes[state.selected_note] then
+    first, last = state.selected_note, state.selected_note
+  end
+  if not first then return end
+  sep = math.max(K.LIMITS.separation[1], math.min(K.LIMITS.separation[2], tonumber(sep) or state.separation))
+  local new_notes, split_points, i0, i1
+  if results then
+    new_notes, split_points, i0, i1 = K.segment_stretch(results, sep, old_notes,
+      old_notes[first].start_time, old_notes[last].end_time, state.split_points)
+  end
+  if not new_notes then
+    set_status(K.STRETCH_NO_ANALYSIS)
+    return
+  end
+  local old_in, new_in = {}, {}
+  for i = first, last do old_in[#old_in + 1] = old_notes[i] end
+  for i = i0, i1 do new_in[#new_in + 1] = new_notes[i] end
+  local tol_s = K.frame_step(results)   -- one frame, as K.segment measures it
+  local matched, lost = K.resplit_match(old_in, new_in, tol_s, is_note_modified)
+
+  local function run()
+    local any_edited = K.resplit_features(new_in, matched)
+    for i, n in ipairs(new_notes) do
+      if (i < i0 or i > i1) and is_note_modified(n) then any_edited = true break end
+    end
+    state.notes, state.split_points = new_notes, split_points
+    state.analysis_empty = (#new_notes == 0)
+    clear_interaction_state(true)   -- note indices changed; the view stays
+    for i = i0, i1 do state.selected_notes[i] = true end
+    state.selected_note = (i1 >= i0) and i0 or nil
+
+    -- Written as an edit (the take's pitch mode is set) when an edit survived, else like a fresh analysis
+    if apply_envelope_to_take(K.RESPLIT_STRETCH_UNDO, not any_edited) then
+      set_status(string.format("Re-split %d notes into %d.", #old_in, #new_in))
+    end
+  end
+
+  if lost == 0 then
+    run()
+    return
+  end
+  local guid = state.target_take_guid
+  request_confirm({
+    id = "resplit",
+    title = string.format("Re-split %s?", state.target_take_name or "this item"),
+    body_lines = {
+      string.format("This re-splits the notes and discards your edits to %d %s.", lost, plural(lost, "note", "notes")),
+      string.format("%s+Z restores them.", K.MOD_LABEL),
+    },
+    confirm_label = "Re-Split",
+    on_confirm = function()
+      -- The match was made against the item's notes as they were (an undo reloads them)
+      if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes
+        or not target_take_exists() then
+        set_status("The item changed meanwhile. Nothing was re-split.")
+        return
+      end
+      run()
+    end,
   })
 end
 
@@ -11469,6 +11605,7 @@ do
   -- Separation (see draw_separation): what letting go does
   local BAR_SEP_RESPLIT = "Letting go splits this item's notes again."
   local BAR_SEP_NEXT = "This item's first analysis uses it."
+  local BAR_SEP_NOTES = "Splits the selected stretch again: only the notes from the first to the last selected one change."
   -- The right-click menu of a value (K.value_menu)
   local BAR_MENU_RESET_ITEM, BAR_MENU_RESET_NOTES = "Reset to starting value", "Reset to item value"
   local BAR_MENU_APPLY = "Apply %s to other items\xE2\x80\xA6"
@@ -12052,14 +12189,17 @@ do
     end
 
     --- Separation: this item's value (state.separation mirrors data.separation), shown whatever is selected (it has
-    --- no note level of its own; re-splitting just the selected notes' stretch is not drawn yet, so with notes
-    --- selected it acts on the item too). A drag only moves the value; letting go (or a typed value, or the reset to
-    --- the starting value) stores it as the item's (K.bar_write) and splits the item's notes again, given the value
-    --- from before (K.resplit: it may ask first, and Cancel puts the value back). Usable whenever there is a target,
-    --- no analysis runs and no confirmation is open: on an item not analysed yet, its first analysis uses it.
+    --- no note level of its own). A drag only moves the value; letting go (or a typed value, or the reset to the
+    --- starting value) stores it as the item's (K.bar_write) and splits the item's notes again, given the value from
+    --- before (K.resplit: it may ask first, and Cancel puts the value back). With notes selected, letting go (or a
+    --- typed value) splits again only their stretch at that value (K.resplit_stretch) and the bar goes back to the
+    --- item's value, which is not changed; the reset splits the stretch again at the item's value. Usable whenever
+    --- there is a target, no analysis runs and no confirmation is open: on an item not analysed yet, its first
+    --- analysis uses it. With notes selected it needs the analysed frames in memory.
     local function draw_separation(spec)
       local key, id = spec.key, "bv_" .. spec.id
-      local reason = (state.is_analyzing and BAR_REASON_ANALYZING) or ((not has_target) and BAR_REASON_NO_TARGET) or nil
+      local reason = (state.is_analyzing and BAR_REASON_ANALYZING) or ((not has_target) and BAR_REASON_NO_TARGET)
+        or ((sel_n > 0 and not (state.results and #state.results >= 2)) and K.STRETCH_NO_ANALYSIS) or nil
       local disabled = reason ~= nil or state.confirm ~= nil
       if disabled and bar_sep_before ~= nil then
         state[key] = bar_sep_before   -- a drag cut short: nothing was stored or split, so the value goes back
@@ -12084,14 +12224,21 @@ do
       end
       local span = spec.hi - spec.lo
       K.value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
-      bar_tooltip(spec.tip .. "\n" .. (has_data and BAR_SEP_RESPLIT or BAR_SEP_NEXT) .. "\n" .. BAR_GESTURES
-        .. "\n" .. levels_line(spec, state[key]))
-      local menu_reset = K.value_menu(bctx, key, spec.label, 0)
+      local what = (sel_n > 0 and BAR_SEP_NOTES) or (has_data and BAR_SEP_RESPLIT) or BAR_SEP_NEXT
+      bar_tooltip(spec.tip .. "\n" .. what .. "\n" .. BAR_GESTURES .. "\n" .. levels_line(spec, state[key]))
+      local menu_reset = K.value_menu(bctx, key, spec.label, sel_n)
 
-      --- The edit is done: store the item's value and split again, once, only when it changed
+      --- The edit is done: store the item's value and split again, once, only when it changed. With notes
+      --- selected: the bar goes back to the item's value (prev) and only their stretch is split again
       local function commit(prev)
         bar_sep_before = nil
         if prev == nil or state[key] == prev then return end
+        if sel_n > 0 then
+          local stretch_sep = state[key]
+          state[key] = prev
+          K.resplit_stretch(stretch_sep)
+          return
+        end
         K.bar_write(key, state[key], sel_notes, 0)
         K.resplit(prev)
       end
@@ -12102,6 +12249,12 @@ do
         -- nothing stored or split
         if bar_sep_before ~= nil then state[key] = bar_sep_before else state[key] = back end
         bar_sep_before = nil
+      elseif (reset or menu_reset) and sel_n > 0 then
+        -- The level above the notes is the item: their stretch is split again at the item's value
+        if bar_sep_before ~= nil then state[key] = bar_sep_before end
+        bar_sep_before = nil
+        K.resplit_stretch(state[key])
+        if active then bar_sep_before = state[key] end
       elseif reset or menu_reset or (changed and typed) then
         local prev = state[key]
         state[key] = (reset or menu_reset) and start or v / spec.scale
