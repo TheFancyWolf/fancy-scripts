@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.23.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Calmer note rows:
+  - **Two greys for the note rows**: every in-key row is now the same grey, with a thin line between rows; rows outside the key stay dark. In Chromatic every row is the in-key grey, so the two look alike. Black-key rows no longer get their own shade, and the faint accent tint on in-key rows is gone.
 - **Fancy Pitch Correct v2.23.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Remove several Pitched Items at once:
   - **Select rows**: in the Pitched Items list, a click still opens the item and now selects only that row; Cmd-click (Ctrl on Windows) adds or removes a row and Shift-click selects a range, without changing the open item. Selected rows are tinted; the open item keeps its accent bar and bold name.
   - **Remove the selected rows**: with two or more rows selected, a "Remove Selected" button appears on the line of the "On" heading. One confirm names how many items and up to five of them, and the removal is one undo step, "Remove N Items from Pitched Items".
