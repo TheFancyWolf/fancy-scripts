@@ -1658,14 +1658,15 @@ end
 -- (controls.center_pitch), its bypass (controls.bypassed) and its pitch points (controls.points) are handled apart.
 --   merge    what a merged note gets: "weighted" = the merged notes' average by length, "first" = the first note's
 --   edited   when the value makes its note count as edited: "positive" = above 0; "set" = stored at all (an
---            override that equals the inherited value still counts)
+--            override that equals the item's value still counts)
+-- nil means "follow the item" (get_effective); every value, 0 included, is a value of the note's own.
 -------------------------------------------------------------------------------
 K.NOTE_CONTROLS = {
-  { key = "tighten",       merge = "weighted", edited = "positive" },   -- 0 (as sung) .. 1 (a flat line)
-  { key = "tolerance",     merge = "first",    edited = "set" },        -- cents; inherits item -> global
-  { key = "retune_speed",  merge = "first",    edited = "set" },        -- inherits
-  { key = "slide_in",      merge = "first",    edited = "positive" },   -- 0 (natural) .. 1 (corrected)
-  { key = "correct_mode",  merge = "first",    edited = "set" },        -- 0 Natural, 1 Classic, 2 Hard; inherits item
+  { key = "tighten",       merge = "weighted", edited = "set" },   -- 0 (as sung) .. 1 (a flat line)
+  { key = "tolerance",     merge = "first",    edited = "set" },   -- cents
+  { key = "retune_speed",  merge = "first",    edited = "set" },
+  { key = "slide_in",      merge = "first",    edited = "set" },   -- 0 (natural) .. 1 (corrected)
+  { key = "correct_mode",  merge = "first",    edited = "set" },   -- 0 Natural, 1 Classic, 2 Hard
 }
 
 --- The values a note cut from the note with `old_ctrl` keeps (Split, Trim): all of them, and its bypass.
@@ -1677,7 +1678,9 @@ K.controls_carry = function(old_ctrl)
   return out
 end
 
---- The values of the note merged from `notes` (in time order); it is not bypassed.
+--- The values of the note merged from `notes` (in time order); it is not bypassed. A weighted value is the
+--- average by length of each note's value in force (its own, else the item's); nil (follow the item) when no
+--- merged note had one of its own.
 K.controls_merge = function(notes)
   local out = { bypassed = false }
   local first = notes[1] and notes[1].controls
@@ -1685,11 +1688,12 @@ K.controls_merge = function(notes)
   for _, n in ipairs(notes) do total = total + (n.end_time - n.start_time) end
   for _, d in ipairs(K.NOTE_CONTROLS) do
     if d.merge == "weighted" then
-      local sum = 0
+      local sum, own = 0, false
       for _, n in ipairs(notes) do
-        sum = sum + (tonumber(n.controls and n.controls[d.key]) or 0) * (n.end_time - n.start_time)
+        if n.controls and n.controls[d.key] ~= nil then own = true end
+        sum = sum + (tonumber(get_effective(n, d.key)) or 0) * (n.end_time - n.start_time)
       end
-      out[d.key] = (total > 0 and sum > 0) and (sum / total) or nil
+      out[d.key] = (own and total > 0) and (sum / total) or nil
     elseif first then
       out[d.key] = first[d.key]
     end
@@ -1730,7 +1734,7 @@ K.controls_load = function(ctrl, saved)
   ctrl.points = saved.points
   for _, d in ipairs(K.NOTE_CONTROLS) do ctrl[d.key] = tonumber(saved[d.key]) end
   local lim = K.LIMITS.tolerance
-  if ctrl.tighten then ctrl.tighten = (ctrl.tighten > 0) and math.min(1, ctrl.tighten) or nil end
+  if ctrl.tighten then ctrl.tighten = math.max(0, math.min(1, ctrl.tighten)) end
   if ctrl.tolerance then ctrl.tolerance = math.max(lim[1], math.min(lim[2], ctrl.tolerance)) end
   if ctrl.correct_mode and (type(saved.correct_mode) ~= "number" or ctrl.correct_mode % 1 ~= 0
       or ctrl.correct_mode < 0 or ctrl.correct_mode > 2) then
@@ -2196,13 +2200,14 @@ K.note_body = function(note)
 end
 
 --- The per-frame pitch (semitones) Tighten takes away from `note`, or nil when it takes nothing (Tighten at 0, or
---- a note with no body to measure). No REAPER calls. Only the body of the note is measured, so a slide into or
---- out of the note does not bend the line; the frames before and after the body take the value at the body's edge
+--- a note with no body to measure). Its Tighten is the one in force: its own, else the item's (get_effective).
+--- No REAPER calls. Only the body of the note is measured, so a slide into or out of the note does not bend the
+--- line; the frames before and after the body take the value at the body's edge
 --- (the slide keeps its shape and lands on the tightened note). Cached on the note: the filtered line until the
 --- note's analysis or its Tighten changes, the result until the Tolerance it uses changes too.
 K.tighten_line = function(note)
-  local ctrl, sm, frames = note.controls, note.smooth, note.frames
-  local amount = ctrl and tonumber(ctrl.tighten) or 0
+  local sm, frames = note.smooth, note.frames
+  local amount = note.controls and tonumber(get_effective(note, "tighten")) or 0
   if amount <= 0 or not sm or not frames or #frames < 3 or #sm ~= #frames then return nil end
   amount = math.min(1, amount)
   local nf, centre = #frames, note.avg_note
@@ -2251,6 +2256,12 @@ local function is_note_modified(note)
   if ctrl.bypassed then return true end
   return math.abs(ctrl.center_pitch - note.avg_note) > 0.001 or K.controls_edited(ctrl)
     or K.points_offsets(note) ~= nil
+end
+
+--- True when the correction reaches `note`: it has controls and is not bypassed. Every note the item's values
+--- reach, edited or not (is_note_modified stays for display, reset and re-split matching).
+K.note_reached = function(note)
+  return note ~= nil and note.controls ~= nil and not note.controls.bypassed
 end
 
 -- Forward declaration; will be set after apply_envelope_to_take is defined
@@ -3082,9 +3093,10 @@ K.natural_build = function(notes, item_len)
         end
       end
     else
-      local is_mod = is_note_modified(n)
+      local is_mod = K.note_reached(n)
       local retune = get_effective(n, "retune_speed")
-      local coarse = is_mod and (n.controls.center_pitch - n.avg_note) * retune or 0.0
+      -- Strength scales the note's pitch move; a note nobody moved (is_note_modified false) has none to scale
+      local coarse = (is_mod and is_note_modified(n)) and (n.controls.center_pitch - n.avg_note) * retune or 0.0
       -- Tighten takes the note's slower movement away: literal, like a pitch point (Strength does not scale it)
       local tight = is_mod and K.tighten_line(n) or nil
       if n.frames then
@@ -3097,8 +3109,8 @@ K.natural_build = function(notes, item_len)
         -- 0 % (the slide as sung). No taper, so the slide meets the body without a step. The pull of one frame is
         -- limited to K.SCOOP_MAX_ST, so a mis-detected frame (an octave error) cannot write a jump of that size
         -- into the envelope. A note that starts on pitch has no slide.
-        local slide_in = (n.controls and n.controls.slide_in) or 0
-        if slide_in > 0 and is_mod then
+        local slide_in = is_mod and tonumber(get_effective(n, "slide_in")) or 0
+        if slide_in > 0 then
           local a = K.note_body(n)
           local settle = a and a > 1 and n.frames[a] and n.frames[a].note
           if settle then
@@ -3125,6 +3137,11 @@ K.natural_build = function(notes, item_len)
         end
       end
     end
+    -- Does the note move the pitch at all? An unedited note the item's values leave as sung writes nothing
+    n.frame_moves = false
+    for i = 1, #n.frame_shifts do
+      if n.frame_shifts[i] ~= 0 then n.frame_moves = true break end
+    end
   end
 
   -- 2. The trajectory across notes. Two neighbours closer than two fades are joined (K.JOIN): the correction
@@ -3133,10 +3150,11 @@ K.natural_build = function(notes, item_len)
   local function emit(t, val)
     all_points[#all_points + 1] = { time = math.max(0.0, math.min(item_len, t)), val = val }
   end
-  -- Corrected (edited and not bypassed): such a note writes its own points and takes part in its joins
+  -- Corrected (reached, and edited or moved by the item's values): such a note writes its own points and takes
+  -- part in its joins. A reached note left as sung writes none, as before: an unedited fresh item has no points.
   local function bypassed(n) return n.controls ~= nil and n.controls.bypassed == true end
   local function active(n)
-    return n ~= nil and not bypassed(n) and is_note_modified(n)
+    return K.note_reached(n) and (is_note_modified(n) or n.frame_moves == true)
   end
   -- The note's shift at time t: its frame shifts joined by straight lines, the first / last one before / after them
   local function shift_at(n, t)
@@ -3325,9 +3343,9 @@ K.mode_value = function(note)
 end
 
 --- "classic" or "hard" when `note` is corrected by that mode; nil when Natural handles it (no controls, bypassed,
---- not edited, or Natural).
+--- or Natural). The item's mode reaches every note, edited or not.
 K.note_mode = function(note)
-  if not (note and note.controls) or note.controls.bypassed or not is_note_modified(note) then return nil end
+  if not K.note_reached(note) then return nil end
   local v = K.mode_value(note)
   if v == 1 then return "classic" end
   if v == 2 then return "hard" end
@@ -3343,30 +3361,30 @@ K.mode_note_count = function(notes)
   return n
 end
 
---- How many of `notes` the item's mode reaches: edited, not bypassed, and without a mode of their own.
-K.mode_reach_count = function(notes)
+--- How many of `notes` keep a mode of their own (not bypassed): the notes the item's mode does not reach.
+K.mode_own_count = function(notes)
   local n = 0
   for _, note in ipairs(notes or {}) do
-    local ctrl = note.controls
-    if ctrl and not ctrl.bypassed and ctrl.correct_mode == nil and is_note_modified(note) then n = n + 1 end
+    if K.note_reached(note) and note.controls.correct_mode ~= nil then n = n + 1 end
   end
   return n
 end
 
---- The status message of a change of the item's mode to `mode` (0, 1 or 2) that reaches `count` edited notes.
+--- The status message of a change of the item's mode to `mode` (0, 1 or 2); `count` notes keep their own mode.
 K.mode_item_status = function(mode, count)
   local name = K.MODES[(mode or 0) + 1] or K.MODES[1]
-  if count == 0 then return string.format("Mode: %s for this item. Notes you edit will use it", name) end
-  return string.format("Mode: %s for this item (%d edited %s)", name, count, count == 1 and "note" or "notes")
+  if count == 0 then return string.format("Mode: %s for this item: every note uses it", name) end
+  return string.format("Mode: %s for this item (%d %s)", name, count,
+    count == 1 and "note with its own mode" or "notes with their own mode")
 end
 
 --- Why the control `key` does nothing for the `n` notes in `notes`: "mode" (the mode does not use it), "hard" or
---- "classic" (Tighten only: that mode ignores it); nil when it works for at least one note.
+--- "classic" (Tighten only: that mode ignores it); nil when it works for at least one note. With no notes (n = 0)
+--- it is the item's value, judged by the item's mode.
 K.mode_unused = function(key, notes, n)
-  if n == 0 then return nil end
   local all1, all2, none0 = true, true, true
-  for i = 1, n do
-    local v = K.mode_value(notes[i])
+  for i = 1, math.max(1, n) do
+    local v = K.mode_value(n > 0 and notes[i] or nil)
     if v ~= 1 then all1 = false end
     if v ~= 2 then all2 = false end
     if v == 0 then none0 = false end
@@ -3432,7 +3450,7 @@ end
 K.mode_line = function(note, mode, pcs)
   local frames = note.frames or {}
   local ctrl = note.controls or {}
-  local tighten = tonumber(ctrl.tighten) or 0
+  local tighten = note.controls and tonumber(get_effective(note, "tighten")) or 0
   if tighten < 0 then tighten = 0 elseif tighten > 1 then tighten = 1 end
   local avg = note.avg_note
   local centre = type(ctrl.center_pitch) == "number" and ctrl.center_pitch or avg
@@ -3662,17 +3680,17 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
     return true
   end
 
-  -- Check if any note in the phrase is modified
-  local any_modified = false
+  -- Does the correction reach any note? (the item's values reach unedited notes too)
+  local any_reached = false
   for _, n in ipairs(state.notes) do
-    if is_note_modified(n) then
-      any_modified = true
+    if K.note_reached(n) then
+      any_reached = true
       break
     end
   end
 
-  if not any_modified then
-    -- Clean envelope: untouched takes have no points
+  if not any_reached then
+    -- Clean envelope: a take whose notes are all bypassed has no points
     reaper.Envelope_SortPointsEx(env, -1)
     reaper.UpdateArrange()
     end_apply(take, undo_desc)
@@ -5571,13 +5589,13 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 2, n.end_time) or changed
     changed = set(sig, k + 3, n.frames) or changed
     changed = set(sig, k + 4, n.smooth) or changed
-    changed = set(sig, k + 5, c and c.tighten or 0) or changed
+    changed = set(sig, k + 5, c and get_effective(n, "tighten") or 0) or changed
     changed = set(sig, k + 6, get_effective(n, "tolerance")) or changed
     changed = set(sig, k + 7, n.avg_note) or changed
     changed = set(sig, k + 8, (K.note_body(n))) or changed
     changed = set(sig, k + 9, c and c.bypassed or false) or changed
     changed = set(sig, k + 10, c and c.center_pitch) or changed
-    changed = set(sig, k + 11, c and c.slide_in or 0) or changed
+    changed = set(sig, k + 11, c and get_effective(n, "slide_in") or 0) or changed
     changed = set(sig, k + 12, get_effective(n, "retune_speed")) or changed
     -- An override that equals the inherited value still makes the note "edited"
     changed = set(sig, k + 13, is_note_modified(n)) or changed
@@ -5747,12 +5765,12 @@ end
 --   key      the note value (note.controls[key]); inherit = an unset value starts from the inherited one
 --   lo, hi   its range; rows = a drag as tall as that many semitone rows sweeps it, or px = units per pixel
 --   show     factor from the stored value to the shown one; read / hover = the drag readout and the hover tooltip
---   fine     Ctrl/Cmd-drag is fine adjust (HC2); zero_nil = a value of 0 is stored as "not set"
+--   fine     Ctrl/Cmd-drag is fine adjust (HC2)
 --   hint     the setting highlight the canvas shows while it is dragged (K.setting_hint)
 -- Shift + drag anywhere on a note (every zone) adjusts Slide In.
 K.ZONE_CONTROLS = {
   tighten = {
-    [false] = { key = "tighten", lo = 0, hi = 1, rows = 2, show = 100, fine = true, zero_nil = true,
+    [false] = { key = "tighten", lo = 0, hi = 1, rows = 2, show = 100, fine = true, inherit = true,
                 read = "Tighten: %.0f%%", hover = "Tighten: %.0f%%", undo = "Adjust Tighten" },
   },
   pitch = {},
@@ -5763,6 +5781,7 @@ K.ZONE_CONTROLS = {
 }
 do
   local slide_in = { key = "slide_in", lo = 0, hi = 1, rows = 2, show = 100, fine = true, hint = "slide_in",
+                     inherit = true,
                      read = "Slide In: %.0f%%", hover = "Slide In: %.0f%% (Shift+Drag)", undo = "Adjust Slide In" }
   for _, by_shift in pairs(K.ZONE_CONTROLS) do by_shift[true] = slide_in end
 end
@@ -5795,7 +5814,9 @@ K.zone_text = function(zc, note, hover)
     if zc.key == "tighten" and mode == 2 then return text .. K.HARD_IDLE end
     return text
   end
-  if zc.key == "tolerance" and (tonumber(note.controls.tighten) or 0) <= 0 then text = text .. K.TOLERANCE_IDLE end
+  if zc.key == "tolerance" and (tonumber(get_effective(note, "tighten")) or 0) <= 0 then
+    text = text .. K.TOLERANCE_IDLE
+  end
   return text
 end
 
@@ -5967,12 +5988,12 @@ K.draw_setting_hint = function(draw_list, hint, build)
   local edge = K.param_color(key)
   local wash = K.param_wash(key, K.PARAM_WASH.span)
 
-  -- The note takes the value that is being changed. edited_only: it must also be corrected (edited, not bypassed)
+  -- The note takes the value that is being changed. edited_only: it must also be corrected (not bypassed)
   local function reached(idx, edited_only)
     local n = notes[idx]
     if not (n and n.controls) then return false end
     if set then return set[idx] ~= nil end
-    if edited_only and (n.controls.bypassed or not is_note_modified(n)) then return false end
+    if edited_only and not K.note_reached(n) then return false end
     return n.controls[key] == nil
   end
   -- A note in view the value reaches: is it one the mode leaves unmarked (counted in skipped) or a Natural one?
@@ -6012,7 +6033,7 @@ K.draw_setting_hint = function(draw_list, hint, build)
       local skip = K.mode_value(n) ~= 0   -- a Classic or Hard note gets no band
       tally(idx, skip)
       if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
-          and (tonumber(n.controls.tighten) or 0) > 0 then
+          and (tonumber(get_effective(n, "tighten")) or 0) > 0 then
         local cp = n.controls.center_pitch
         local tol = (tonumber(get_effective(n, "tolerance")) or 0) / 100
         local top = m.py + m.h - ((cp + tol - m.min) / m.range) * m.h
@@ -7101,7 +7122,7 @@ local function draw_graph(draw_ctx, w, h)
           local n = state.notes[idx]
           if n and n.controls then
             local v = math.max(zone_ctl.lo, math.min(zone_ctl.hi, orig_val + state.drag.acc))
-            n.controls[zone_ctl.key] = not (zone_ctl.zero_nil and v <= 0) and v or nil
+            n.controls[zone_ctl.key] = v
           end
         end
       else
@@ -7825,8 +7846,8 @@ local function draw_graph(draw_ctx, w, h)
       if hint.dragging and marks == 0 and not hint.said then
         hint.said = true
         set_status((hint.key == "tolerance" and "No note uses Tolerance yet: raise Tighten on a note first")
-          or (hint.key == "slide_in" and "Nothing to flatten: no edited note in view slides into its pitch")
-          or "No edited note in view uses this value")
+          or (hint.key == "slide_in" and "Nothing to flatten: no note in view slides into its pitch")
+          or "No note in view uses this value")
       end
     end
     if not (live and hint.dragging) then hint.said = false end
@@ -11933,7 +11954,7 @@ do
         if key == "tolerance" then
           local idle = true
           for i = 1, sel_n do
-            if (tonumber(sel_notes[i].controls.tighten) or 0) > 0 then idle = false break end
+            if (tonumber(get_effective(sel_notes[i], "tighten")) or 0) > 0 then idle = false break end
           end
           if idle and unused ~= "mode" then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
         end
@@ -12135,7 +12156,7 @@ do
         take_data.overrides = take_data.overrides or {}
         take_data.overrides.correct_mode = (choice > 1) and (choice - 1) or nil
         if apply_envelope_to_take("Change Mode") then
-          set_status(K.mode_item_status(choice - 1, K.mode_reach_count(state.notes)))
+          set_status(K.mode_item_status(choice - 1, K.mode_own_count(state.notes)))
         end
       end
     end

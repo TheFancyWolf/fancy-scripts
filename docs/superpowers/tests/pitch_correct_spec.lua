@@ -1185,24 +1185,19 @@ test("natural_same_text", function()
   local now_src = f:read("a")
   f:close()
   local ref, now = text_lines(ref_src), text_lines(now_src)
-  for _, prefix in ipairs({ "K.tighten_line = function(", "K.note_body = function(", "K.points_offsets = function(",
-      "local function is_note_modified(", "K.controls_edited = function(", "K.ZONE_CONTROLS = {",
+  -- Value levels (2026-11-24) changed the build, K.tighten_line, K.ZONE_CONTROLS and the Tighten line of
+  -- K.controls_load on purpose (item values reach every note; 0 is a note value of its own). Their numbers stay
+  -- pinned by natural_same_numbers.
+  for _, prefix in ipairs({ "K.note_body = function(", "K.points_offsets = function(",
+      "local function is_note_modified(", "K.controls_edited = function(",
       "local function param_drag(", "  local BAR_VALUES = {" }) do
     text_same(ref, now, prefix, prefix, false, prefix)
   end
-  -- The build may be renamed (natural_build) but not changed; its first line carries the name
-  local build = "K.correction_build = function(notes, item_len)"
-  local renamed = "K.natural_build = function(notes, item_len)"
-  local has_renamed = false
-  for _, l in ipairs(now) do if l:sub(1, #renamed) == renamed then has_renamed = true break end end
-  text_same(ref, now, build, has_renamed and renamed or build, true, "the build")
   text_single(ref, now, "K.JOIN = {", "K.JOIN")
   local loaded = text_block(now, "K.controls_load = function(")
   local ref_loaded = text_block(ref, "K.controls_load = function(")
   if not (loaded and ref_loaded) then error("K.controls_load not found") end
-  for _, prefix in ipairs({ "  if ctrl.tighten then", "  if ctrl.tolerance then" }) do
-    text_single(ref_loaded, loaded, prefix, "K.controls_load " .. prefix)
-  end
+  text_single(ref_loaded, loaded, "  if ctrl.tolerance then", "K.controls_load   if ctrl.tolerance then")
 end)
 
 if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
@@ -1245,7 +1240,7 @@ test("mode_value_and_note_mode", function()
   with_item_mode(1, function()
     eq(S.K.mode_value(nil), 1, "the item's")
     eq(S.K.note_mode(moved), "classic", "edited note takes the item's mode")
-    eq(S.K.note_mode(untouched), nil, "an untouched note is never corrected")
+    eq(S.K.note_mode(untouched), "classic", "the item's mode reaches an untouched note too")
     moved.controls.correct_mode = 0
     eq(S.K.note_mode(moved), nil, "its own Natural wins")
     moved.controls.correct_mode = 2
@@ -1468,14 +1463,12 @@ test("build_mode_note_at_item_edges", function() chromatic(function()
   eq(#build.points, 0, "a note without frames writes nothing")
 end) end)
 
-test("build_item_mode_reaches_edited_notes_only", function() chromatic(function()
+test("build_item_mode_reaches_every_note", function() chromatic(function()
   with_item_mode(2, function()
     local moved, untouched = mode_note(0.1, 0.3, 60.3, 60.3, { center_pitch = 61.3 }), mode_note(1, 0.3, 60.3, 60.3)
-    local build = S.K.correction_build({ moved, untouched }, 10)
+    S.K.correction_build({ moved, untouched }, 10)
     near(moved.frame_shifts[1], 61 - 60.3, 1e-9, "Hard, around where it was moved")
-    for _, p in ipairs(build.points) do
-      if p.time >= untouched.start_time - 0.05 and math.abs(p.val) > 1e-9 then error("the untouched note is corrected") end
-    end
+    near(untouched.frame_shifts[1], 60 - 60.3, 1e-9, "the untouched note is Hard too")
   end)
 end) end)
 
@@ -1553,17 +1546,8 @@ test("mode_note_count", function()
   local a, b, c = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
   a.controls.correct_mode = 1
   eq(S.K.mode_note_count({ a, b, c }), 1)
-  with_item_mode(2, function() eq(S.K.mode_note_count({ a, b, c }), 2, "the item's mode reaches the edited note") end)
+  with_item_mode(2, function() eq(S.K.mode_note_count({ a, b, c }), 3, "the item's mode reaches every note") end)
   eq(S.K.mode_note_count({}), 0)
-end)
-
-test("mode_reach_and_status", function()
-  local own, moved, untouched = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
-  own.controls.correct_mode = 0
-  eq(S.K.mode_reach_count({ own, moved, untouched }), 1)
-  eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 edited notes)")
-  eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 edited note)")
-  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Notes you edit will use it")
 end)
 
 test("zone_text_mode_suffix", function()
@@ -3031,6 +3015,126 @@ test("unanalysed_take_takes_start_values", function()
   eq(got[1], 0.8, "separation")
   eq(got[2], 4, "key_idx")
   eq(got[3], 2, "scale_idx")
+end)
+
+-- Item values reach every note (value levels, Task 2) --------------------------------------------------------------
+local function with_item(overrides, fn)   -- runs fn with an open item whose own values are `overrides`
+  local st = S.state
+  local saved = { st.target_take_guid, st.session_takes["{IV}"] }
+  st.target_take_guid = "{IV}"
+  st.session_takes["{IV}"] = { overrides = overrides }
+  local ok, err = pcall(fn)
+  st.target_take_guid, st.session_takes["{IV}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end
+
+local function wobbly_untouched(t0)   -- an unedited note whose body wobbles (so Tighten has something to take)
+  return wobbly(untouched_note(t0 or 0.1, 0.4, 60), nil, nil)
+end
+
+test("item_tighten_reaches_unedited", function()
+  with_item({ tighten = 1, tolerance = 0 }, function()
+    local n = wobbly_untouched()
+    local build = S.K.correction_build({ n }, 10)
+    if #build.points == 0 then error("the unedited note is not corrected") end
+    local a, b = S.K.note_body(n)
+    for i = a, b do near(n.frames[i].note + n.frame_shifts[i], 60, 1e-9, "flat at frame " .. i) end
+  end)
+end)
+
+test("note_zero_survives_load", function()
+  local ctrl = {}
+  S.K.controls_load(ctrl, { tighten = 0 })
+  eq(ctrl.tighten, 0, "0 is a value of its own")
+  with_item({ tighten = 0.4, tolerance = 0 }, function()
+    local n = wobbly_untouched()
+    n.controls.tighten = ctrl.tighten
+    S.K.correction_build({ n }, 10)
+    for i = 1, #n.frames do near(n.frame_shifts[i], 0, 1e-12, "as sung at frame " .. i) end
+    local follows = wobbly_untouched()
+    S.K.correction_build({ follows }, 10)
+    local moved = false
+    for i = 1, #follows.frames do if math.abs(follows.frame_shifts[i]) > 1e-6 then moved = true end end
+    eq(moved, true, "a note without its own Tighten takes the item's")
+  end)
+end)
+
+test("bypassed_untouched", function()
+  with_item({ tighten = 1, tolerance = 0, slide_in = 1 }, function()
+    local n = wobbly_untouched()
+    n.controls.bypassed = true
+    local build = S.K.correction_build({ n }, 10)
+    for i = 1, #n.frames do eq(n.frame_shifts[i], 0, "frame " .. i) end
+    eq(#build.points, 0, "points")
+  end)
+end)
+
+test("item_mode_reaches_unedited", function()
+  with_item_mode(2, function()
+    eq(S.K.note_mode(untouched_note(0.5)), "hard")
+    local b = untouched_note(0.9)
+    b.controls.bypassed = true
+    eq(S.K.note_mode(b), nil, "bypassed")
+  end)
+end)
+
+test("fresh_item_as_sung", function()
+  local st = S.state
+  local notes = { wobbly_untouched(0.1) }
+  notes[2] = untouched_note(notes[1].end_time, 0.3, 62, { from = 60, dur = 0.04 })
+  notes[3] = wobbly(untouched_note(notes[2].end_time + 0.3, 0.4, 64), nil, nil)
+  local data = { notes = notes, results = {} }
+  S.K.item_seed(data)
+  local saved = { st.target_take_guid, st.session_takes["{fresh}"] }
+  st.target_take_guid, st.session_takes["{fresh}"] = "{fresh}", data
+  local ok, err = pcall(function()
+    local build = S.K.correction_build(notes, 10)
+    for i, p in ipairs(build.points) do near(p.val, 0, 1e-12, "point " .. i) end
+    for k, n in ipairs(notes) do
+      for i = 1, #n.frames do near(n.frame_shifts[i], 0, 1e-12, "note " .. k .. " frame " .. i) end
+    end
+  end)
+  st.target_take_guid, st.session_takes["{fresh}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("item_slide_in_reaches_unedited", function()
+  with_item({ slide_in = 1 }, function()
+    local n = slide_note(1, nil)
+    n.controls.center_pitch, n.controls.retune_speed = 60, nil
+    S.K.correction_build({ n }, 1)
+    local target = n.frames[7].note + n.frame_shifts[7]
+    for i = 1, 6 do near(n.frames[i].note + n.frame_shifts[i], target, 1e-9, "frame " .. i) end
+  end)
+end)
+
+test("merge_tighten_effective", function()
+  with_item({ tighten = 1 }, function()
+    local a, b = join_note(0.1, 0.3, 60, 0), join_note(0.4, 0.3, 60, 0)
+    a.controls.tighten = 0.5
+    near(S.K.controls_merge({ a, b }).tighten, 0.75, 1e-9, "the other note's is the item's")
+    a.controls.tighten = nil
+    eq(S.K.controls_merge({ a, b }).tighten, nil, "no own value: the merged note follows the item")
+    a.controls.tighten = 0
+    near(S.K.controls_merge({ a, b }).tighten, 0.5, 1e-9, "an own 0 counts")
+  end)
+end)
+
+test("mode_unused_item_level", function()
+  with_item_mode(2, function() eq(S.K.mode_unused("tighten", {}, 0), "hard", "the item's mode, nothing selected") end)
+  with_item_mode(1, function() eq(S.K.mode_unused("tolerance", {}, 0), "mode") end)
+  eq(S.K.mode_unused("tighten", {}, 0), nil, "Natural uses it")
+end)
+
+test("mode_own_and_status", function()
+  local own, moved, untouched = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
+  own.controls.correct_mode = 0
+  local byp = untouched_note(1.3)
+  byp.controls.correct_mode, byp.controls.bypassed = 1, true
+  eq(S.K.mode_own_count({ own, moved, untouched, byp }), 1, "notes with a mode of their own, not bypassed")
+  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item: every note uses it")
+  eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 notes with their own mode)")
+  eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 note with its own mode)")
 end)
 
 -- Tests appended by later tasks go above this line.
