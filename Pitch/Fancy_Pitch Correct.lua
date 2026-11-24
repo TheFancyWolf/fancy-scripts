@@ -2908,8 +2908,11 @@ K.batch_next = function()
       reset_analysis_model()
       state.target_take_guid, state.target_take_name = entry.guid, entry.name
       -- It is split at, and stores, its own Separation, Key and Scale (an item analysed for the first time: the
-      -- starting values), never those of the item that was open
+      -- starting values), never those of the item that was open. An analysis stored on the item that the window has
+      -- not loaded (pasted later) counts too: it is read here and kept on the entry for K.batch_item_done
       local before, start = state.session_takes[entry.guid], K.start_values()
+      if not before then before = load_take_data(take) end
+      entry.before = before
       local sep = K.item_value(before, "separation")
       if sep == nil then sep = start.separation end
       state.separation = sep
@@ -2937,7 +2940,7 @@ K.batch_item_done = function(take_data)
   end
   -- An item analysed before keeps every value of its own (Separation, Key and Scale too: K.batch_next set them
   -- before it was read); an item analysed for the first time has the starting values
-  K.item_carry(take_data, state.session_takes[entry.guid], true)
+  K.item_carry(take_data, state.session_takes[entry.guid] or entry.before, true)
   batch.done[#batch.done + 1] = {
     guid = take_data.guid, data = take_data, json = K.take_json(take_data),
     empty = (take_data.notes == nil or #take_data.notes == 0),

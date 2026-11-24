@@ -2865,6 +2865,30 @@ test("batch_keeps_a_previously_analysed_items_values", function() with_batch(fun
   if not ok then error(err, 0) end
 end) end)
 
+test("batch_keeps_the_values_of_a_stored_analysis_not_loaded_yet", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local saved = { st.separation, st.key_idx, st.scale_idx }
+  local stored = K.take_json(analysed_before("{a}"))   -- a holds an analysis the window has not loaded (pasted later)
+  reaper.GetSetMediaItemTakeInfo_String = function(take, key)
+    if key == "GUID" then return true, "{" .. take .. "}" end
+    return true, take == "a" and stored or ""
+  end
+  local ok, err = pcall(function()
+    eq(st.session_takes["{a}"], nil, "not loaded")
+    K.batch_start(entries3())
+    eq(rec.begun[1].sep, 0.8, "split at its stored Separation"); eq(rec.begun[1].key_idx, 5)
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = K.batch.done[1].data
+    check_item_vals(data, "a stored item"); eq(data.separation, 0.8); eq(data.scale_idx, 3)
+  end)
+  reaper.GetSetMediaItemTakeInfo_String = nil
+  st.raw_cache["{a}"], st.unreadable_takes["{a}"] = nil, nil
+  st.separation, st.key_idx, st.scale_idx = table.unpack(saved, 1, 3)
+  st.analysis_params = nil
+  if not ok then error(err, 0) end
+end) end)
+
 test("batch_first_analysis_takes_the_starting_values", function() with_batch(function(rec)
   local K, st = S.K, S.state
   local G = S.global_defaults
