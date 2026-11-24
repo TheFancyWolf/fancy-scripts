@@ -3450,6 +3450,132 @@ test("reset_item_all_one_undo", function() with_write_stubs({}, function(rec)
   if not ok then error(err, 0) end
 end) end)
 
+-- Apply to other items (K.apply_plan, the confirm's choices)
+-- A target of K.apply_plan: a model with notes split from `fr` at `sep`, each note with its controls
+local function apply_target(id, fr, sep, tol)
+  local notes = S.K.segment(fr, sep)
+  S.K.resplit_features(notes, {})
+  local data = { guid = "{" .. id .. "}", name = id, notes = notes, results = fr, item_len = 2, sample_rate = 44100,
+    separation = sep, overrides = { tolerance = tol } }
+  return { guid = data.guid, take = id, name = id, data = data }
+end
+local function apply_start(sep, tol)
+  return { separation = sep, tolerance = tol, correct_mode = 0, tighten = 0, retune_speed = 1, slide_in = 0,
+    key_idx = 1, scale_idx = 1 }
+end
+
+test("apply_plan_overwrites", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+  for _, e in ipairs({ a, b }) do e.data.notes[1].controls.tolerance = 30 end
+  local plan = S.K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, false, apply_start(0.5, 8))
+  eq(#plan.items, 2, "both items")
+  eq(plan.items[1].set.tolerance, 40, "a set"); eq(plan.items[2].set.tolerance, 40, "b set")
+  eq(plan.items[1].clear_note_keys[1], "tolerance", "note keys cleared")
+  eq(plan.counts.items_lose, 2, "items_lose"); eq(plan.counts.notes_lose, 2, "notes_lose")
+  eq(plan.items[1].resplit, false, "no Separation: no re-split")
+end)
+
+test("apply_plan_keep", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local a, b = apply_target("a", fr, 0.5, 8), apply_target("b", fr, 0.5, 20)
+  for _, e in ipairs({ a, b }) do e.data.notes[1].controls.tolerance = 30 end
+  local plan = S.K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, true, apply_start(0.5, 8))
+  eq(plan.items[1].set.tolerance, 40, "a was at the starting value: set")
+  eq(plan.items[2].set.tolerance, nil, "b has its own value: kept")
+  eq(#plan.items[1].clear_note_keys, 0, "notes keep their own"); eq(plan.counts.notes_lose, 0)
+  eq(plan.counts.items_lose, 0, "a held the starting value: nothing of its own is lost"); eq(plan.changed, 1)
+end)
+
+test("apply_plan_keep_no_resplit", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local function target()
+    local t = apply_target("a", fr, 0.5, 8)
+    eq(#t.data.notes, 2, "split at 0.5")
+    t.data.notes[1].controls.center_pitch = t.data.notes[1].controls.center_pitch + 1   -- an edit
+    return t
+  end
+  local keep = S.K.apply_plan({ separation = 0 }, { target() }, { "separation" }, true, apply_start(0.5, 8))
+  eq(keep.items[1].resplit, false, "keep: not split again"); eq(keep.counts.not_resplit, 1)
+  local over = S.K.apply_plan({ separation = 0 }, { target() }, { "separation" }, false, apply_start(0.5, 8))
+  eq(over.items[1].resplit, true, "overwrite: split again"); eq(over.counts.resplit, 1)
+  eq(over.counts.lost > 0, true, "the edited note is lost")
+end)
+
+test("apply_plan_skips_missing", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local gone = apply_target("a", fr, 0.5, 8); gone.take = nil
+  local midi = apply_target("m", fr, 0.5, 8); midi.midi = true
+  local plan = S.K.apply_plan({ tolerance = 40 }, { gone, midi }, { "tolerance" }, false, apply_start(0.5, 8))
+  eq(#plan.items, 0, "no rows"); eq(plan.counts.skipped, 2, "counted")
+end)
+
+test("apply_plan_new_only", function()
+  local plan = S.K.apply_plan({ tolerance = 40 }, {}, { "tolerance" }, false, apply_start(0.5, 8))
+  eq(#plan.items, 0); eq(plan.counts.items_lose, 0); eq(plan.counts.skipped, 0)
+end)
+
+test("confirm_consequence_cached", function()
+  local st = S.state
+  local stubs = {
+    ImGui_IsPopupOpen = function() return true end,
+    ImGui_GetWindowSize = function() return 800, 600 end,
+    ImGui_GetWindowPos = function() return 0, 0 end,
+    ImGui_Viewport_GetPos = function() return 0, 0 end,
+    ImGui_Viewport_GetSize = function() return 800, 600 end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local calls = 0
+  local ok, err = pcall(function()
+    S.request_confirm({ id = "t", title = "T", on_confirm = function() end,
+      choices = { { label = "One", value = "one" }, { label = "Two", value = "two" } },
+      check = { label = "Keep", value = false },
+      consequence = function(choice, checked) calls = calls + 1; return { lines = { choice .. tostring(checked) } } end })
+    S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(calls, 1, "same choice: computed once")
+    eq(st.confirm.cons.lines[1], "onefalse", "cached in state.confirm")
+    st.confirm.choice = "two"; S.draw_confirm_modal()
+    eq(calls, 2, "a new choice: computed again")
+    st.confirm.checked = true; S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(calls, 3, "the check changed: computed again, once")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  st.confirm = nil
+  if not ok then error(err, 0) end
+end)
+
+test("apply_run_one_undo_and_cancel", function() with_write_stubs({}, function(rec)
+  local st, K, G = S.state, S.K, S.global_defaults
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, G.tolerance, reaper.time_precise, st.is_analyzing }
+  reaper.time_precise = function() return 0 end
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid = "{open}"
+    local plan = K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, false, apply_start(0.5, 8))
+    K.apply_run(plan, { "tolerance" }, { tolerance = 40 }, "Tolerance")
+    eq(G.tolerance, 40, "starting value saved first"); eq(K.batch ~= nil, true, "runs as a batch")
+    for _ = 1, 10 do if K.batch then K.analysis_tick() end end
+    eq(K.batch, nil, "done"); eq(st.is_analyzing, false)
+    eq(#rec.labels, 1, "one undo point"); eq(rec.labels[1], "Apply Tolerance to 2 items")
+    eq(st.session_takes["{a}"].overrides.tolerance, 40, "a written"); eq(a.data.overrides.tolerance, 12, "old model untouched")
+    eq(st.status.text, "Applied to 2 items (" .. MOD .. "+Z undoes the items).")
+    -- Cancel before the first item: nothing written, the starting values stay
+    G.tolerance = 8
+    plan = K.apply_plan({ tolerance = 50 }, { a, b }, { "tolerance" }, false, apply_start(0.5, 8))
+    K.apply_run(plan, { "tolerance" }, { tolerance = 50 }, "Tolerance")
+    eq(K.cancel_analysis(), true)
+    eq(#rec.labels, 1, "no new undo point"); eq(G.tolerance, 50, "starting value kept")
+    eq(st.status.text, "Apply cancelled. No item was changed. The starting values were saved.")
+  end)
+  st.target_take_guid, G.tolerance, reaper.time_precise, st.is_analyzing = table.unpack(saved, 1, 4)
+  K.batch = nil
+  st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

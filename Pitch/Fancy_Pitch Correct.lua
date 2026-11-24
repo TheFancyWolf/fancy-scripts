@@ -671,8 +671,25 @@ end
 --- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once, or on_cancel once when
 --- the modal closes without confirming. list: the things the action replaces, shown under body_lines in a region
 --- that scrolls (K.confirm_list); after_lines follow it.
+--- Optional choices (the Apply confirm):
+---   choices = { { label, value, reason } ... }: radio buttons under the body (choices_caption above them); a choice with a `reason` is drawn
+---             disabled with the reason beside it (EP2). choice = the value chosen at first (default: the first
+---             choice without a reason).
+---   check = { label, value }: a checkbox under the choices.
+---   consequence = function(choice, checked) -> { lines = { string... }, confirm_label = string | nil,
+---             reason = string | nil }: what the chosen action does, drawn after the check. It is called only when
+---             the choice or the check changes (HI5) and its answer is kept in state.confirm.cons; its confirm_label
+---             replaces the request's, and a `reason` disables the confirm button and is shown above it.
+--- on_confirm(choice, checked) receives the choice and the check.
+--- size = a Theme.layout modal size (default L.modal_sm).
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
+  local choice = req.choice
+  if choice == nil and req.choices then
+    for _, ch in ipairs(req.choices) do
+      if ch.reason == nil then choice = ch.value break end
+    end
+  end
   state.confirm = {
     id = req.id or "action",
     title = req.title or "Are you sure?",
@@ -682,9 +699,30 @@ local function request_confirm(req)
     confirm_label = req.confirm_label or "Confirm",
     on_confirm = req.on_confirm,
     on_cancel = req.on_cancel,
+    choices = req.choices,
+    choices_caption = req.choices_caption,
+    choice = choice,
+    check = req.check,
+    checked = req.check and req.check.value == true or false,
+    consequence = req.consequence,
+    cons = nil,       -- the consequence's answer for cons_key (see K.confirm_consequence)
+    cons_key = nil,
+    size = req.size,
     open_pending = true,  -- OpenPopup once, on the next draw_confirm_modal() call
     opened = false,
   }
+end
+
+--- The consequence of the confirm `c` for its current choice and check: computed again only when one of them
+--- changed since the last call (HI5), else the kept answer. nil when the request has no consequence.
+K.confirm_consequence = function(c)
+  if not c.consequence then return nil end
+  local key = tostring(c.choice) .. "|" .. tostring(c.checked)
+  if c.cons_key ~= key then
+    c.cons = c.consequence(c.choice, c.checked) or { lines = {} }
+    c.cons_key = key
+  end
+  return c.cons
 end
 
 local function update_scale_pitch_classes()
@@ -2776,6 +2814,10 @@ end
 K.batch_finish = function(cancelled)
   local batch = K.batch
   if not batch then return end
+  if batch.kind == "apply" then   -- an Apply to other items (K.apply_run) ends its own way
+    K.apply_finish(cancelled)
+    return
+  end
   K.batch = nil
   K.release_analysis()
   state.progress = 0
@@ -3662,6 +3704,66 @@ K.correction_build = function(notes, item_len)
   return { points = points, spans = A.spans, ranges = merged }
 end
 
+--- Write the take pitch envelope of the take `guid` from the notes of its model `data`, and store `data` on the take,
+--- with no undo block of its own (the caller holds one open). The correction is built with `guid` standing in as
+--- the target (get_effective and K.item_scale read the target's item values), as K.envelope_check does; the
+--- target comes back even when the build raises. The model is stored only when it is the session's model of
+--- `guid` (state.session_takes[guid] == data). The take's pitch mode is set as for an edit unless keep_pitch_mode
+--- (or the Settings option state.keep_pitch_mode). take / item: the caller's, when it resolved them already.
+--- Returns false when the take or its Pitch envelope is not there (nothing written but the pitch mode).
+K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item)
+  if not data then return false end
+  take = take or (guid and resolve_take_by_guid(guid, true)) or nil
+  item = item or (take and K.take_item(take)) or nil
+  if not take or not item then return false end
+
+  -- Set pitch shift mode (Elastique Soloist Monophonic by default), unless the user keeps each item's own
+  if not keep_pitch_mode and not state.keep_pitch_mode and state.pitchmode_value ~= -1 then
+    reaper.SetMediaItemTakeInfo_Value(take, "I_PITCHMODE", state.pitchmode_value)
+  end
+
+  local env = ensure_take_pitch_envelope(take, item)
+  if not env then return false end
+
+  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+  -- Clear existing points across the entire item
+  reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
+
+  -- Does the correction reach any note? (the item's values reach unedited notes too.) A take whose notes are all
+  -- bypassed, or that has none, gets a clean envelope
+  local notes = data.notes
+  local any_reached = false
+  for _, n in ipairs(notes or {}) do
+    if K.note_reached(n) then
+      any_reached = true
+      break
+    end
+  end
+
+  if any_reached then
+    local SHAPE = 5   -- Bezier
+    local TENSION = 0 -- Neutral tension
+    -- 1-2. The trajectory (frame shifts, scoop, ramps, glides): the same one the canvas draws
+    local saved = state.target_take_guid
+    state.target_take_guid = guid
+    local ok, build = pcall(K.correction_build, notes, item_len)
+    state.target_take_guid = saved
+    if not ok then error(build, 0) end
+    -- 3. Adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
+    for _, pt in ipairs(rdp_simplify(build.points, 0.01)) do
+      local t = math.max(0.0, math.min(item_len, pt.time))
+      reaper.InsertEnvelopePointEx(env, -1, t, pt.val, SHAPE, TENSION, 0, true)
+    end
+  end
+  reaper.Envelope_SortPointsEx(env, -1)
+
+  -- Model (P_EXT) with the points, so Cmd+Z reverts the envelope and the note model together
+  if guid and state.session_takes[guid] == data then save_take_data(take, data) end
+  -- The envelope is rewritten from the model with today's values: the take is current again
+  if guid then state.stale_takes[guid], state.stale_env[guid] = nil, nil end
+  return true
+end
+
 --- Rewrite the take pitch envelope from state.notes and persist the model, as one undo point.
 --- keep_pitch_mode leaves the item's I_PITCHMODE untouched (used by re-analysis, which applies no correction); so does
 --- the Settings option "Keep each item's own pitch algorithm" (state.keep_pitch_mode).
@@ -3677,74 +3779,25 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
     return false
   end
 
-  -- The envelope is rewritten from the model with today's defaults and overrides: the take is current again
-  if state.target_take_guid then
-    state.stale_takes[state.target_take_guid] = nil
-    state.stale_env[state.target_take_guid] = nil
-  end
+  local guid = state.target_take_guid
+  local data = guid and state.session_takes[guid]
+  if data and state.notes then data.notes = state.notes end
 
   reaper.Undo_BeginBlock()
   state.undo_open = true
   K.frame_view_memo.frame = nil   -- the canvas fetches the changed correction again (K.frame_view)
 
-  -- Set pitch shift mode (Elastique Soloist Monophonic by default), unless the user keeps each item's own
-  if not keep_pitch_mode and not state.keep_pitch_mode and state.pitchmode_value ~= -1 then
-    reaper.SetMediaItemTakeInfo_Value(take, "I_PITCHMODE", state.pitchmode_value)
-  end
-
-  -- Ensure pitch envelope exists
-  local env = ensure_take_pitch_envelope(take, item)
-  if not env then
+  -- An open item without a session model still gets its envelope (nothing is stored: see K.write_take_envelope)
+  if not K.write_take_envelope(guid, data or { notes = state.notes }, keep_pitch_mode, take, item) then
     set_status("Couldn't show the pitch envelope on this item. Check that the item is an audio item on an unlocked track, then try again.")
     end_apply(take, "Apply Pitch Correction")
     return false
   end
 
-  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
-
-  -- Clear existing points across the entire item
-  reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
-
-  local SHAPE = 5   -- Bezier
-  local TENSION = 0 -- Neutral tension
-
-  if not state.notes or #state.notes == 0 then
-    reaper.Envelope_SortPointsEx(env, -1)
-    reaper.UpdateArrange()
-    end_apply(take, undo_desc)
-    return true
-  end
-
-  -- Does the correction reach any note? (the item's values reach unedited notes too)
-  local any_reached = false
-  for _, n in ipairs(state.notes) do
-    if K.note_reached(n) then
-      any_reached = true
-      break
-    end
-  end
-
-  if not any_reached then
-    -- Clean envelope: a take whose notes are all bypassed has no points
-    reaper.Envelope_SortPointsEx(env, -1)
-    reaper.UpdateArrange()
-    end_apply(take, undo_desc)
-    return true
-  end
-
-  -- 1-2. The trajectory (frame shifts, scoop, ramps, glides): the same one the canvas draws
-  local all_points = K.correction_build(state.notes, item_len).points
-
-  -- 3. Adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
-  local simplified = rdp_simplify(all_points, 0.01)
-  for _, pt in ipairs(simplified) do
-    local t = math.max(0.0, math.min(item_len, pt.time))
-    reaper.InsertEnvelopePointEx(env, -1, t, pt.val, SHAPE, TENSION, 0, true)
-  end
-
-  reaper.Envelope_SortPointsEx(env, -1)
   reaper.UpdateArrange()
-  end_apply(take, undo_desc)
+  reaper.Undo_EndBlock(undo_desc or "Apply Pitch Correction", -1)
+  state.undo_open = false
+  note_own_write()
   return true
 end
 
@@ -5150,6 +5203,10 @@ end
 --- while the batch itself ended (its write) is not an item's: it is passed on to the window's error handling, which
 --- also closes an undo block left open.
 K.analysis_tick = function()
+  if K.batch and K.batch.kind == "apply" then   -- an Apply to other items: no audio is read
+    K.apply_tick()
+    return
+  end
   if not K.batch then
     process_analysis_step()
     return
@@ -10471,11 +10528,40 @@ K.confirm_list = function(c)
   reaper.ImGui_PopStyleColor(ctx, 1)
 end
 
+--- The choices of a confirm dialog (request_confirm's `choices` and `check`): a caption, one radio button per
+--- choice (a choice with a reason is disabled, the reason beside it in dim text that wraps at a narrow docker,
+--- RB9), then the checkbox. The caption is request_confirm's choices_caption (none when nil). A click changes c.choice / c.checked; the consequence follows on the next frame.
+K.confirm_choices = function(c, P, L)
+  reaper.ImGui_Dummy(ctx, 0, L.sm)
+  if c.choices_caption then reaper.ImGui_Text(ctx, c.choices_caption) end
+  for i, ch in ipairs(c.choices) do
+    if ch.reason then reaper.ImGui_BeginDisabled(ctx) end
+    if reaper.ImGui_RadioButton(ctx, ch.label .. "###confirm_choice_" .. i, c.choice == ch.value)
+        and not ch.reason then
+      c.choice = ch.value
+    end
+    if ch.reason then
+      reaper.ImGui_EndDisabled(ctx)
+      reaper.ImGui_SameLine(ctx, 0, L.md)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+      reaper.ImGui_TextWrapped(ctx, ch.reason)
+      reaper.ImGui_PopStyleColor(ctx, 1)
+    end
+  end
+  if c.check then
+    reaper.ImGui_Dummy(ctx, 0, L.xs)
+    local changed, on = reaper.ImGui_Checkbox(ctx, c.check.label .. "###confirm_check", c.checked)
+    if changed then c.checked = on == true end
+  end
+end
+
 local function draw_confirm_modal()
   local c = state.confirm
   if not c then return end
+  local cons = K.confirm_consequence(c)
   local P = Theme.get_palette()
   local L = Theme.layout
+  local size = c.size or L.modal_sm
   -- Stable ID after ###: the visible title may carry the item name
   local popup_name = c.title .. "###confirm_" .. c.id
 
@@ -10485,11 +10571,13 @@ local function draw_confirm_modal()
     c.opened = true
   end
 
-  Theme.center_next_window(ctx, L.modal_sm.w, L.modal_sm.h, reaper.ImGui_Cond_Appearing())
+  Theme.center_next_window(ctx, size.w, size.h, reaper.ImGui_Cond_Appearing())
   K.fit_modal(ctx)
   Theme.modal_scrim(ctx, popup_name)
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, popup_name, true, reaper.ImGui_WindowFlags_NoResize())
   local confirmed = false
+  local confirm_label = (cons and cons.confirm_label) or c.confirm_label
+  local blocked = cons and cons.reason or nil
   if visible then
     if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) or not open then
       reaper.ImGui_CloseCurrentPopup(ctx)
@@ -10504,16 +10592,28 @@ local function draw_confirm_modal()
       reaper.ImGui_Dummy(ctx, 0, L.sm)
       reaper.ImGui_TextWrapped(ctx, line)
     end
+    if c.choices then K.confirm_choices(c, P, L) end
+    if cons then
+      for _, line in ipairs(cons.lines or {}) do
+        reaper.ImGui_Dummy(ctx, 0, L.sm)
+        reaper.ImGui_TextWrapped(ctx, line)
+      end
+    end
 
-    -- Button row pinned to the bottom of the modal, centred like the Close rows
+    -- Button row pinned to the bottom of the modal, centred like the Close rows; a disabled confirm says why above it
     local cancel_w = reaper.ImGui_CalcTextSize(ctx, "Cancel") + L.md * 2
-    local confirm_w = reaper.ImGui_CalcTextSize(ctx, c.confirm_label) + L.md * 2
+    local confirm_w = reaper.ImGui_CalcTextSize(ctx, confirm_label) + L.md * 2
     local btn_h = reaper.ImGui_GetFrameHeight(ctx)
     local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
     if avail_h > btn_h + L.lg then
       reaper.ImGui_SetCursorPosY(ctx, reaper.ImGui_GetCursorPosY(ctx) + avail_h - btn_h)
     else
       reaper.ImGui_Dummy(ctx, 0, L.lg)
+    end
+    if blocked then
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
+      reaper.ImGui_TextWrapped(ctx, blocked)
+      reaper.ImGui_PopStyleColor(ctx, 1)
     end
     Theme.hcenter(ctx, cancel_w + L.md + confirm_w)
 
@@ -10523,12 +10623,20 @@ local function draw_confirm_modal()
     reaper.ImGui_SetItemDefaultFocus(ctx)
     reaper.ImGui_SameLine(ctx, 0, L.md)
 
+    if blocked then reaper.ImGui_BeginDisabled(ctx) end
     K.push_danger(P)
-    if reaper.ImGui_Button(ctx, c.confirm_label .. "###confirm_ok", confirm_w, 0) then
+    if reaper.ImGui_Button(ctx, confirm_label .. "###confirm_ok", confirm_w, 0) and not blocked then
       confirmed = true
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
     K.pop_danger()
+    if blocked then
+      reaper.ImGui_EndDisabled(ctx)
+      if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()
+          | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+        Theme.tooltip(ctx, blocked)
+      end
+    end
 
     reaper.ImGui_EndPopup(ctx)
   end
@@ -10536,7 +10644,7 @@ local function draw_confirm_modal()
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
   if confirmed then
     c.confirmed = true
-    c.on_confirm()
+    c.on_confirm(c.choice, c.checked)
   end
 
   if c.opened and not reaper.ImGui_IsPopupOpen(ctx, popup_name) then
@@ -11039,6 +11147,325 @@ K.resplit_stretch = function(sep)
   })
 end
 
+-------------------------------------------------------------------------------
+-- 3c. APPLY TO OTHER ITEMS
+-------------------------------------------------------------------------------
+-- Design: docs/design/pitch-correct-value-levels.md (Apply). The open item's values (all of them, or one) are given
+-- to other pitched items and become the starting values for new items. The confirm (K.apply_open, in the GUI
+-- section) names the consequence from a pure plan (K.apply_plan); the run (K.apply_run) computes one item at a time
+-- while the window keeps answering, then writes every finished item in ONE undo block. It runs as K.batch with
+-- kind = "apply", so the window treats it as a batch: values and rows locked, progress on the "…" button, Cancel
+-- through K.cancel_analysis.
+
+-- Every value Apply can give: the item values, then Key and Scale
+K.APPLY_ALL_KEYS = { "separation", "correct_mode", "tighten", "tolerance", "retune_speed", "slide_in", "key_idx",
+  "scale_idx" }
+-- The keys a note can hold a value of its own for (every item value but Separation)
+K.APPLY_NOTE_KEYS = { correct_mode = true, tighten = true, tolerance = true, retune_speed = true, slide_in = true }
+
+--- The value of `key` the model `data` holds (Key and Scale included), or nil.
+K.apply_item_get = function(data, key)
+  if key == "key_idx" or key == "scale_idx" then return data and data[key] end
+  return K.item_value(data, key)
+end
+
+--- The open item's values for `keys` (what Apply gives): its own, else what the window shows for it.
+K.apply_source = function(keys)
+  local data = state.target_take_guid and state.session_takes[state.target_take_guid]
+  local src = {}
+  for _, key in ipairs(keys) do
+    local v = K.apply_item_get(data, key)
+    if v == nil then
+      if key == "separation" or key == "key_idx" or key == "scale_idx" then v = state[key] else v = get_effective(nil, key) end
+    end
+    src[key] = v
+  end
+  return src
+end
+
+--- How many items Apply can reach now: the analysed items of the Pitched Items list but the open one.
+K.apply_other_count = function()
+  local n = 0
+  for _, guid in ipairs(state.session_order) do
+    if guid ~= state.target_take_guid and state.session_takes[guid] then n = n + 1 end
+  end
+  return n
+end
+
+--- The targets of a choice of the Apply confirm, as entries { guid, take (nil: not in the project), midi, name,
+--- data (the session model) }:
+---   "selected": REAPER's selected audio items that are analysed, but the open item (the selection is only read, UC4);
+---   "all": every analysed item of the Pitched Items list (state.session_order) but the open item;
+---   "new": none.
+--- skipped = the selected items that are not targets (not audio, or not analysed); 0 for the other choices.
+K.apply_targets = function(choice)
+  local entries, skipped = {}, 0
+  local open = state.target_take_guid
+  if choice == "selected" then
+    local sel = K.batch_selection()
+    skipped = sel.skipped
+    for _, e in ipairs(sel.takes) do
+      local data = state.session_takes[e.guid]
+      if e.guid ~= open then
+        if data then
+          entries[#entries + 1] = { guid = e.guid, take = e.take, midi = false, name = e.name, data = data }
+        else
+          skipped = skipped + 1
+        end
+      end
+    end
+  elseif choice == "all" then
+    for _, guid in ipairs(state.session_order) do
+      local data = state.session_takes[guid]
+      if guid ~= open and data then
+        local take = resolve_take_by_guid(guid, true)
+        entries[#entries + 1] = { guid = guid, take = take or nil, midi = take and reaper.TakeIsMIDI(take) or false,
+          name = data.name or guid, data = data }
+      end
+    end
+  end
+  return entries, skipped
+end
+
+--- What Apply would do. Pure: reads its arguments only (and the note splitter for the edited notes a re-split
+--- loses). src = the values given ({ key = v }); entries = K.apply_targets's; keys = the keys given; keep = "Keep
+--- changes already made to items and notes"; old_start = the starting values before Apply (K.start_values()).
+--- Returns plan = { items = { { guid, name, set = { key = v }, clear_note_keys = { key ... }, resplit, key_change,
+--- lost, changes } ... }, counts = { items_lose, notes_lose, key_change, resplit, lost, not_resplit, skipped },
+--- changed = how many items change }.
+---   set: the values that differ from the item's. With keep, a value the item holds that differs from old_start is
+---        left out (the user's), and so is Separation on an item whose notes carry edits (it is not split again:
+---        counted in not_resplit).
+---   items_lose: the items whose own values (ones that differ from old_start) are replaced; key_change: the items
+---        whose Key or Scale is set.
+---   clear_note_keys: without keep, the given note keys that any note holds a value of its own for (notes_lose
+---        counts those notes); with keep, none.
+---   resplit: Separation is set and the item has analysed frames; lost = its edited notes the new split does not
+---        match (K.resplit_match).
+--- An entry whose take is not in the project, or is MIDI, or has no model, gets no row: it is counted in skipped.
+K.apply_plan = function(src, entries, keys, keep, old_start)
+  local plan = { items = {}, changed = 0,
+    counts = { items_lose = 0, notes_lose = 0, key_change = 0, resplit = 0, lost = 0, not_resplit = 0, skipped = 0 } }
+  local counts = plan.counts
+  for _, entry in ipairs(entries) do
+    local data = entry.data
+    if not entry.take or entry.midi or not data then
+      counts.skipped = counts.skipped + 1
+    else
+      local notes = data.notes or {}
+      local edited = false
+      for _, n in ipairs(notes) do
+        if is_note_modified(n) then edited = true break end
+      end
+      local row = { guid = entry.guid, name = entry.name, set = {}, clear_note_keys = {}, resplit = false,
+        key_change = false, lost = 0, changes = false }
+      local item_lose = false
+      for _, key in ipairs(keys) do
+        local v, cur = src[key], K.apply_item_get(data, key)
+        local own = keep and cur ~= nil and old_start[key] ~= nil and K.value_changed(cur, old_start[key])
+        if v ~= nil and not own and K.value_changed(cur, v) then
+          if key == "separation" and keep and edited then
+            counts.not_resplit = counts.not_resplit + 1
+          else
+            row.set[key] = v
+            if key == "key_idx" or key == "scale_idx" then
+              row.key_change = true
+            elseif cur ~= nil and old_start[key] ~= nil and K.value_changed(cur, old_start[key]) then
+              item_lose = true   -- a value of its own (not the starting value) is replaced
+            end
+          end
+        end
+        if not keep and K.APPLY_NOTE_KEYS[key] then
+          for _, n in ipairs(notes) do
+            if n.controls and n.controls[key] ~= nil then row.clear_note_keys[#row.clear_note_keys + 1] = key break end
+          end
+        end
+      end
+      -- The notes that lose a value of their own (each note once)
+      local cleared = 0
+      if #row.clear_note_keys > 0 then
+        for _, n in ipairs(notes) do
+          for _, key in ipairs(row.clear_note_keys) do
+            if n.controls and n.controls[key] ~= nil then cleared = cleared + 1 break end
+          end
+        end
+      end
+      local results = data.results
+      if row.set.separation ~= nil and results and #results >= 2 then
+        row.resplit = true
+        if edited then
+          local new_notes = K.segment(results, row.set.separation)
+          local _, lost = K.resplit_match(notes, new_notes, K.frame_step(results), is_note_modified)
+          row.lost = lost or 0
+        end
+      end
+      row.changes = next(row.set) ~= nil or cleared > 0
+      if item_lose then counts.items_lose = counts.items_lose + 1 end
+      if row.key_change then counts.key_change = counts.key_change + 1 end
+      if row.resplit then counts.resplit = counts.resplit + 1 end
+      counts.notes_lose = counts.notes_lose + cleared
+      counts.lost = counts.lost + row.lost
+      if row.changes then plan.changed = plan.changed + 1 end
+      plan.items[#plan.items + 1] = row
+    end
+  end
+  return plan
+end
+
+--- The model a row of the plan gives its item: a copy of `data` (the notes and their controls copied too) with
+--- the row's values set, its note keys cleared and, for a re-split, the notes split again from the analysed frames
+--- (a new note with an old note's start and end keeps its edits, as K.resplit). The session model is not touched.
+K.apply_item_model = function(data, row)
+  local new = {}
+  for k, v in pairs(data) do new[k] = v end
+  new.overrides = {}
+  for k, v in pairs(data.overrides or {}) do new.overrides[k] = v end
+  for key, v in pairs(row.set) do
+    if key == "separation" or key == "key_idx" or key == "scale_idx" then
+      new[key] = v
+    else
+      new.overrides[key] = v
+    end
+  end
+  local notes = {}
+  for i, n in ipairs(data.notes or {}) do
+    local copy = {}
+    for k, v in pairs(n) do copy[k] = v end
+    if n.controls then
+      copy.controls = {}
+      for k, v in pairs(n.controls) do copy.controls[k] = v end
+      for _, key in ipairs(row.clear_note_keys) do copy.controls[key] = nil end
+    end
+    notes[i] = copy
+  end
+  new.notes = notes
+  if row.resplit then
+    local results = data.results
+    local new_notes = K.segment(results, new.separation)
+    local matched = K.resplit_match(notes, new_notes, K.frame_step(results), is_note_modified)
+    K.resplit_features(new_notes, matched)
+    new.notes = new_notes
+  end
+  return new
+end
+
+--- The undo label of an Apply that wrote n items. label: the one value's name, or nil for every value.
+K.apply_undo_label = function(n, label)
+  if label then return string.format("Apply %s to %d items", label, n) end
+  return string.format("Apply values to %d items", n)
+end
+
+--- The closing message of an Apply. r = { written, skipped, cancelled, total }.
+K.apply_summary = function(r)
+  if r.cancelled then
+    if r.written == 0 then return "Apply cancelled. No item was changed. The starting values were saved." end
+    return string.format("Apply cancelled. %d of %d items were changed and kept (%s+Z undoes them). The starting values were saved.",
+      r.written, r.total, K.MOD_LABEL)
+  end
+  if r.skipped > 0 then return string.format("Applied to %d items. %d skipped: no audio.", r.written, r.skipped) end
+  return string.format("Applied to %d items (%s+Z undoes the items).", r.written, K.MOD_LABEL)
+end
+K.APPLY_START_ONLY = "Starting values saved for new items."
+
+--- Run an Apply: `plan` (K.apply_plan's), `keys` (the keys given), `src` (their values), label (the one value's
+--- name, or nil). The starting values are saved first (global_defaults, ExtState): they stay whatever happens to the
+--- run. Then the items that change are computed one after another (K.apply_tick), and written in one undo block
+--- when the run ends (K.apply_finish).
+K.apply_run = function(plan, keys, src, label)
+  if K.batch or state.is_analyzing then return false end
+  for _, key in ipairs(keys) do
+    if src[key] ~= nil then global_defaults[key] = src[key] end
+  end
+  K.save_settings("cascade")
+  local queue = {}
+  for _, row in ipairs(plan.items) do
+    if row.changes then queue[#queue + 1] = { guid = row.guid, name = row.name, row = row, len = 1 } end
+  end
+  if #queue == 0 then
+    set_status(K.APPLY_START_ONLY)
+    return true
+  end
+  if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge is its own undo point
+  K.batch = K.batch_new(queue, state.target_take_guid)
+  K.batch.kind, K.batch.label, K.batch.skipped = "apply", label, plan.counts.skipped
+  -- The window treats the run as an analysis: the values, the canvas and the resync wait for it
+  state.is_analyzing = true
+  state.progress = 0
+  return true
+end
+
+--- One frame of a running Apply (K.analysis_tick): compute the next items while the frame's analysis budget
+--- (K.ANALYSIS_SLICE_S) lasts, one at least. An item that cannot be computed (its model went, or raised) is left as it
+--- was and counted as skipped. With every item computed, the run ends.
+K.apply_tick = function()
+  local batch = K.batch
+  local slice_start = reaper.time_precise()
+  repeat
+    batch.index = batch.index + 1
+    local entry = batch.queue[batch.index]
+    if not entry then
+      K.apply_finish(false)
+      return
+    end
+    local data = state.session_takes[entry.guid]
+    local ok, new = false, nil
+    if data then ok, new = pcall(K.apply_item_model, data, entry.row) end
+    if ok and new then
+      batch.done[#batch.done + 1] = { guid = entry.guid, data = new }
+    else
+      batch.failed = batch.failed + 1
+    end
+    batch.done_len = batch.done_len + 1
+  until reaper.time_precise() - slice_start > K.ANALYSIS_SLICE_S
+  if batch.index >= #batch.queue then K.apply_finish(false) end
+end
+
+--- End the running Apply (its queue is done, Cancel, the window closes): every finished item is written in ONE undo
+--- block (its model becomes the session's, its envelope is rewritten); an item that is no longer in the project, or
+--- whose envelope cannot be made, keeps its model and counts as skipped. One closing message.
+K.apply_finish = function(cancelled)
+  local batch = K.batch
+  if not batch or batch.kind ~= "apply" then return end
+  K.batch = nil
+  state.is_analyzing = false
+  state.progress = 0
+
+  local ready = {}
+  for _, d in ipairs(batch.done) do
+    local take = resolve_take_by_guid(d.guid, true)
+    local item = take and K.take_item(take) or nil
+    if take and item then ready[#ready + 1] = { d = d, take = take, item = item } end
+  end
+  local written = 0
+  if #ready > 0 then
+    reaper.Undo_BeginBlock()
+    state.undo_open = true
+    for _, r in ipairs(ready) do
+      local guid = r.d.guid
+      local old = state.session_takes[guid]
+      state.session_takes[guid] = r.d.data
+      local ok, wrote = pcall(K.write_take_envelope, guid, r.d.data, false, r.take, r.item)
+      if ok and wrote then
+        written = written + 1
+      else
+        state.session_takes[guid] = old
+      end
+    end
+    reaper.UpdateArrange()
+    reaper.Undo_EndBlock(K.apply_undo_label(written, batch.label), -1)
+    state.undo_open = false
+    K.frame_view_memo.frame = nil
+    note_own_write()
+  end
+  -- The project was not followed while the run went on: the next frame reads it again
+  state.last_change_count = nil
+
+  local skipped = (batch.skipped or 0) + #batch.queue - written
+  if cancelled then skipped = (batch.skipped or 0) + #batch.done - written end
+  K.status_hold(K.apply_summary({ written = written, skipped = skipped, cancelled = cancelled and true or false,
+    total = #batch.queue }))
+end
+
 --- Header Reset. With a selection (or a single note) it acts right away; resetting every note of a
 --- phrase that has edits asks first. sel_n = selected notes, note_n = all notes.
 local function request_reset(sel_n, note_n)
@@ -11206,6 +11633,8 @@ do
   local HDR_REASON_NO_TARGET = "Select an audio item"
   local HDR_REASON_NO_NOTES = "Analyze an item first"
   local HDR_MORE_TIP = "Menu: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help"
+  -- The right-click menu of Key and Scale (hdr_key_menu)
+  local HDR_APPLY_KEY = "Apply Key to other items\xE2\x80\xA6"
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes).
   -- The Values group is the pill, then three named groups (K.BAR_GROUP: Notes, Correction, Shaping), each with
@@ -11438,6 +11867,15 @@ do
     end
   end
 
+  --- The right-click menu of the Key and Scale combos (call right after the combo): Apply Key to other items…
+  local function hdr_key_menu(id)
+    if not reaper.ImGui_BeginPopupContextItem(ctx, id) then return end
+    -- HC5: Esc closes this menu (innermost)
+    if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
+    K.apply_menu_item(ctx, HDR_APPLY_KEY, { "key_idx", "scale_idx" })
+    reaper.ImGui_EndPopup(ctx)
+  end
+
   local function hdr_draw_key(hs)
     local P, s = hs.P, hs.s
     -- Previews the short name ("C#") but lists the full one ("C# / Db"), so it stays a plain BeginCombo.
@@ -11459,6 +11897,7 @@ do
       end
       reaper.ImGui_EndCombo(ctx)
     end
+    hdr_key_menu("##ctx_key")   -- right after the combo: it asks about the last item
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       Theme.tooltip(ctx, "Key: the root note of the scale")
     end
@@ -11474,6 +11913,7 @@ do
       state.scale_idx = new_idx
       K.scale_changed("scale")
     end
+    hdr_key_menu("##ctx_scale")
   end
 
   --- The Layers submenu of More: each layer shows how it looks on the canvas, a swatch from the same canvas
@@ -11526,7 +11966,8 @@ do
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       local tip = HDR_MORE_TIP
       if batch then
-        tip = string.format("Analyzing %d of %d. Open to cancel", math.min(batch.index, #batch.queue), #batch.queue)
+        tip = string.format(batch.kind == "apply" and "Applying values to %d of %d items. Open to cancel"
+          or "Analyzing %d of %d. Open to cancel", math.min(batch.index, #batch.queue), #batch.queue)
       elseif analyzing then
         tip = "Analyzing. Open to cancel"
       end
@@ -11951,16 +12392,132 @@ do
     -- HC5: Esc closes this menu (innermost)
     if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
     local reset = reaper.ImGui_MenuItem(bctx, (sel_n > 0) and BAR_MENU_RESET_NOTES or BAR_MENU_RESET_ITEM)
-    local can_apply = K.apply_open ~= nil
-    if reaper.ImGui_MenuItem(bctx, string.format(BAR_MENU_APPLY, label), nil, false, can_apply) and can_apply then
-      K.apply_open({ key })
-    end
-    if not can_apply and reaper.ImGui_IsItemHovered(bctx, reaper.ImGui_HoveredFlags_ForTooltip()
-        | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-      Theme.tooltip(bctx, BAR_MENU_APPLY_NONE)
-    end
+    K.apply_menu_item(bctx, string.format(BAR_MENU_APPLY, label), { key })
     reaper.ImGui_EndPopup(bctx)
     return reset == true
+  end
+
+  --- Why Apply to other items cannot be opened now (nil = it can): an analysis or a batch runs, or there is no other
+  --- pitched item.
+  K.apply_reason = function()
+    if state.is_analyzing or K.batch then return BAR_REASON_ANALYZING end
+    if K.apply_other_count() == 0 then return BAR_MENU_APPLY_NONE end
+    return nil
+  end
+
+  --- A menu entry that opens the Apply confirm for `keys` (nil = every value), disabled with its reason beside it.
+  K.apply_menu_item = function(mctx, text, keys)
+    local reason = K.apply_reason()
+    if reaper.ImGui_MenuItem(mctx, text, reason, false, reason == nil) and reason == nil then
+      K.apply_open(keys)
+    end
+  end
+
+  -- The Apply confirm's copy (docs/design/pitch-correct-value-levels.md, Copy deck)
+  local APPLY_COPY = {
+    title_all = "Apply this item's values to other items?",
+    title_one = "Apply %s to other items?",
+    selected = "The %d selected items",
+    selected_none = "Select items in the arrange view",
+    all = "All %d pitched items",
+    all_none = "No other pitched items",
+    new = "New items only",
+    caption = "Apply to:",
+    check = "Keep changes already made to items and notes",
+    consequence = "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost).",
+    keep = "%d items with edited notes are not split again.",
+    footnote = "These also become the starting values for new items (that part can't be undone with %s+Z).",
+    confirm = "Apply (%d)",
+    confirm_new = "Save starting values",
+    nothing = "Nothing would change",
+  }
+  -- The name of each value in the confirm's title, its readout and its undo label
+  local APPLY_LABEL = { correct_mode = "Mode", key_idx = "Key", scale_idx = "Key" }
+  for _, spec in ipairs(BAR_VALUES) do APPLY_LABEL[spec.key] = spec.label end
+
+  --- The values given, in one line: "Key E Major · Separation 50% · Mode Natural · Tighten 40% · …".
+  K.apply_values_line = function(src, keys)
+    local given = {}
+    for _, key in ipairs(keys) do given[key] = true end
+    local parts = {}
+    if given.key_idx or given.scale_idx then
+      local key_info, scale_info = SCALE_KEYS[src.key_idx], SCALE_DEFINITIONS[src.scale_idx]
+      if key_info and scale_info then parts[#parts + 1] = "Key " .. key_info.display .. " " .. scale_info.name end
+    end
+    for _, id in ipairs({ "sep", "mode", "tight", "tol", "strength", "slide" }) do
+      if id == "mode" then
+        if given.correct_mode then
+          parts[#parts + 1] = "Mode " .. (K.MODES[(tonumber(src.correct_mode) or 0) + 1] or K.MODES[1])
+        end
+      else
+        local spec = BAR_VALUE_BY_ID[id]
+        if given[spec.key] then
+          parts[#parts + 1] = spec.label .. " " .. string.format(spec.num, (tonumber(src[spec.key]) or 0) * spec.scale)
+            .. spec.unit
+        end
+      end
+    end
+    return table.concat(parts, " \xC2\xB7 ")
+  end
+
+  --- "Apply to other items…" (keys nil: every value, Key and Scale included) or "Apply <Value> to other items…"
+  --- (keys = { key }, or Key and Scale): the confirm with its choices (the selected items, all pitched items, new
+  --- items only) and "Keep changes…". The consequence is planned when the confirm opens and again when the choice
+  --- or the check changes (HI5). HC4: the starting values are ExtState, so it always asks.
+  K.apply_open = function(keys)
+    keys = keys or K.APPLY_ALL_KEYS
+    if state.confirm or K.apply_reason() == BAR_REASON_ANALYZING then return end
+    local label = nil
+    if #keys == 1 or (#keys == 2 and keys[1] == "key_idx") then label = APPLY_LABEL[keys[1]] end
+    local src = K.apply_source(keys)
+    local old_start = K.start_values()
+    local targets = { selected = (K.apply_targets("selected")), all = (K.apply_targets("all")), new = {} }
+    local n_sel, n_all = #targets.selected, #targets.all
+    -- The starting values Apply would change (it saves them whatever the choice)
+    local start_changes = false
+    for _, key in ipairs(keys) do
+      if src[key] ~= nil and K.value_changed(old_start[key], src[key]) then start_changes = true end
+    end
+    local footnote = string.format(APPLY_COPY.footnote, K.MOD_LABEL)
+    local plan = nil
+    request_confirm({
+      id = "apply",
+      title = label and string.format(APPLY_COPY.title_one, label) or APPLY_COPY.title_all,
+      body_lines = { K.apply_values_line(src, keys) },
+      choices_caption = APPLY_COPY.caption,
+      choices = {
+        { label = string.format(APPLY_COPY.selected, n_sel), value = "selected",
+          reason = (n_sel == 0) and APPLY_COPY.selected_none or nil },
+        { label = string.format(APPLY_COPY.all, n_all), value = "all", reason = (n_all == 0) and APPLY_COPY.all_none or nil },
+        { label = APPLY_COPY.new, value = "new" },
+      },
+      choice = (n_sel >= 1 and "selected") or (n_all >= 1 and "all") or "new",
+      check = { label = APPLY_COPY.check, value = false },
+      size = Theme.layout.modal_md,
+      confirm_label = APPLY_COPY.confirm_new,
+      consequence = function(choice, checked)
+        plan = K.apply_plan(src, targets[choice] or {}, keys, checked, old_start)
+        local c = plan.counts
+        local lines = {}
+        if choice ~= "new" then
+          lines[1] = string.format(APPLY_COPY.consequence, c.items_lose, c.notes_lose, c.key_change, c.resplit, c.lost)
+          if checked then lines[#lines + 1] = string.format(APPLY_COPY.keep, c.not_resplit) end
+        end
+        lines[#lines + 1] = footnote
+        local out = { lines = lines }
+        if choice == "new" or plan.changed == 0 then
+          out.confirm_label = APPLY_COPY.confirm_new
+          if not start_changes then out.reason = APPLY_COPY.nothing end
+        else
+          out.confirm_label = string.format(APPLY_COPY.confirm, plan.changed)
+        end
+        return out
+      end,
+      on_confirm = function(choice, checked)
+        if not plan then plan = K.apply_plan(src, targets[choice] or {}, keys, checked, old_start) end
+        K.apply_run(plan, keys, src, label)
+      end,
+    })
   end
 
   --- Give every note of a bar drag back what it held when the drag began (false = no own value).
@@ -12049,6 +12606,10 @@ do
       return state.status.text
     end
     local batch = K.batch
+    if batch and batch.kind == "apply" then
+      return string.format("Applying values to %d of %d items\xE2\x80\xA6 %d%%", math.min(batch.index, #batch.queue),
+        #batch.queue, math.floor(K.analysis_progress() * 100))
+    end
     if batch then
       local entry = batch.queue[batch.index]
       return string.format("Analyzing %d of %d: %s… %d%%", math.min(batch.index, #batch.queue), #batch.queue,
@@ -12415,11 +12976,7 @@ do
       if fitted ~= line then bar_tooltip(line) end
       reaper.ImGui_Separator(bctx)
 
-      local can_apply = K.apply_open ~= nil
-      if reaper.ImGui_MenuItem(bctx, BAR_PILL_MENU.apply, (not can_apply) and BAR_MENU_APPLY_NONE or nil, false, can_apply)
-          and can_apply then
-        K.apply_open(nil)
-      end
+      K.apply_menu_item(bctx, BAR_PILL_MENU.apply, nil)
       local reset_reason = inspector_reason or (not take_data and BAR_REASON_NOT_ANALYZED)
         or ((K.item_differs(take_data) == 0) and BAR_PILL_MENU.reset_none) or nil
       if reaper.ImGui_MenuItem(bctx, BAR_PILL_MENU.reset, reset_reason, false, reset_reason == nil)
@@ -12968,7 +13525,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
-           request_confirm = request_confirm, sync_with_project = sync_with_project,
+           request_confirm = request_confirm, draw_confirm_modal = draw_confirm_modal, sync_with_project = sync_with_project,
            get_effective = get_effective, get_override_level = get_override_level, global_defaults = global_defaults,
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w }
 end
