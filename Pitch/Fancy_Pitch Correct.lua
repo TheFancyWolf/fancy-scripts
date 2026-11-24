@@ -1,17 +1,12 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.22.0
+-- @version 2.23.0
 -- @changelog
---   New and re-analysed items start at the defaults (Separation 50%, Tighten 0%, Tolerance 8 cents...)
---   Analysing an item again keeps only its Key and Scale; a new item takes the Key and Scale chosen last
---   Item values now reach every note of the item, edited or not
---   The top bar changes only this item or the selected notes, never other items; the pill says which
---   New: Apply to other items (pill menu, value right-click): only the items you tick change, one undo step
---   Apply lists the pitched items to tick; the ones selected in the arrange view start ticked
---   Apply can keep changes already made: item values that differ from the default, notes' own values
---   New: Reset this item to defaults (pill menu); a value's reset on the item goes to its default
---   New: Separation with notes selected re-splits just that stretch ("Re-split selected notes")
---   The values sit in three groups split by hairlines (Notes, Correction, Shaping), named in their tooltips
+--   New: select several Pitched Items rows (Cmd/Ctrl-click, Shift-click) and remove them in one go
+--   "Remove Selected" beside the On heading removes them; one confirm, one undo step
+--   New: right-click a row for Remove This Item, Remove Selected Items and Wipe All Items
+--   Esc clears the row selection (after the note selection) before closing the window
+--   The Analyze Item / Analyze All Selected Items button on an empty canvas is much bigger, in the accent colour
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -484,6 +479,11 @@ local state = {
   -- Multi-item Pitched Items state
   session_takes = {},  -- [guid] = take_data table
   session_order = {},  -- array of guids
+  -- Pitched Items row selection (in memory only): guid -> true, the Shift-click anchor row, and the active item the
+  -- selection was last made for (when the active item changes from elsewhere the selection becomes just that row)
+  row_sel = {},
+  row_anchor = nil,
+  row_sel_target = nil,
   sidebar_w = 200,     -- Pitched Items width: the body table's fixed column, mirrored from ImGui's live width each frame
   sidebar_open = true, -- side panel preference (defaults open); a window too narrow for it shows the canvas alone
   items_open = true,     -- the Pitched Items section of the panel is unfolded (header click)
@@ -6552,6 +6552,20 @@ K.draw_note_bar = function(dctx, draw_list, ruler_h, has_target, target_item)
   return true
 end
 
+-- The empty canvas's Analyze Item / Analyze All Selected Items button: the one thing to do there, so it is drawn
+-- well above the large preset (header font, the 2x side and large top/bottom padding: about twice as tall)
+-- accent: drawn as a solid accent face (Theme.toggle_button's "on" look: P.btn_on with P.on_text, fitted to 4.5:1 in
+-- both theme modes, with its own hover and pressed shades) to draw the eye to it
+K.ANALYZE_BTN = { pad_x = Theme.layout.xxl, pad_y = Theme.layout.lg, font = "header", accent = true }
+
+--- The height of the Analyze button (its font's line plus its padding), measured in the context it is drawn in.
+K.analyze_btn_h = function(draw_ctx)
+  local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, K.ANALYZE_BTN)
+  local frame_h = reaper.ImGui_GetFrameHeight(draw_ctx)
+  Theme.pop_button_preset(draw_ctx, var_count, pushed_font)
+  return frame_h
+end
+
 local function draw_graph(draw_ctx, w, h)
   local draw_list = reaper.ImGui_GetWindowDrawList(draw_ctx)
   local px, py = reaper.ImGui_GetCursorScreenPos(draw_ctx)
@@ -6604,19 +6618,28 @@ local function draw_graph(draw_ctx, w, h)
   -- on the large preset, centred on cx with its top edge at y (its height is Theme.layout.btn_lg.h), hand cursor and tooltip.
   -- Returns true when it was clicked (never while it is disabled). It moves the layout cursor into the canvas:
   -- whoever used it calls restore_canvas_layout() before leaving draw_graph.
+  -- preset: a Theme button preset table (default the large one); the Analyze button uses K.ANALYZE_BTN, the canvas's
+  -- one call to action, and its height is K.analyze_btn_h(draw_ctx)
   local buttons_used = false
-  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label)
+  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label, preset)
     buttons_used = true
-    local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, "lg")
-    local btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + L.btn_lg.pad_x * 2
+    preset = preset or L.btn_lg
+    local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, preset)
+    local btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + preset.pad_x * 2
     -- narrow_label: what the button reads when the canvas is narrower than its label (a narrow docker)
     if narrow_label and btn_w > full_w - L.sm * 2 then
       label = narrow_label
-      btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + L.btn_lg.pad_x * 2
+      btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + preset.pad_x * 2
     end
     reaper.ImGui_SetCursorScreenPos(draw_ctx, cx - btn_w * 0.5, y)
     if not enabled then reaper.ImGui_BeginDisabled(draw_ctx) end
-    local clicked = reaper.ImGui_Button(draw_ctx, label .. "###" .. id, btn_w, 0)
+    local clicked
+    if preset.accent then
+      -- The preset's padding and font are pushed above: only the colours come from the toggle's "on" look
+      clicked = Theme.toggle_button(draw_ctx, id, label, true, { w = btn_w })
+    else
+      clicked = reaper.ImGui_Button(draw_ctx, label .. "###" .. id, btn_w, 0)
+    end
     if not enabled then reaper.ImGui_EndDisabled(draw_ctx) end
     local hovered = reaper.ImGui_IsItemHovered(draw_ctx)
     local tip_ready = reaper.ImGui_IsItemHovered(draw_ctx,   -- a disabled button explains itself too
@@ -6655,8 +6678,9 @@ local function draw_graph(draw_ctx, w, h)
       for _, line in ipairs({ K.batch_lines(peek) }) do
         shown[#shown + 1] = K.wrap_lines(draw_ctx, line, full_w - L.sm * 2)
       end
+      local analyze_h = K.analyze_btn_h(draw_ctx)
       local function block_h()
-        local total = L.btn_lg.h
+        local total = analyze_h
         for i, rows in ipairs(shown) do
           total = total + (i == 1 and gap or L.xs) + #rows * text_h
         end
@@ -6671,12 +6695,12 @@ local function draw_graph(draw_ctx, w, h)
         or (target_take ~= nil and "Detect the pitch of the selected audio item"
           or "Select an audio item in REAPER to analyze it.")
       if canvas_button(K.batch_label(peek.n, false), "cv_analyze", cx, start_y, can_analyze, tip,
-          K.batch_label(peek.n, true)) then
+          K.batch_label(peek.n, true), K.ANALYZE_BTN) then
         if is_batch then K.batch_request() else start_analysis() end
       end
 
       -- Centred text below the button
-      local y = start_y + L.btn_lg.h
+      local y = start_y + analyze_h
       for i, rows in ipairs(shown) do
         y = y + (i == 1 and gap or L.xs)
         for _, row in ipairs(rows) do
@@ -9068,6 +9092,24 @@ local function remove_take_from_session(guid)
   return take_name, found
 end
 
+--- Remove several items (Remove Selected, after the user confirmed) as ONE undo point.
+--- Returns how many were removed and how many of them were found in the project.
+K.remove_takes_from_session = function(guids)
+  local n, found_n = 0, 0
+  if not guids or #guids == 0 then return 0, 0 end
+  reaper.Undo_BeginBlock()
+  for _, guid in ipairs(guids) do
+    if state.session_takes[guid] then
+      local _, found = remove_take_core(guid)
+      n = n + 1
+      if found then found_n = found_n + 1 end
+    end
+  end
+  reaper.Undo_EndBlock(string.format("Remove %d %s from Pitched Items", n, n == 1 and "Item" or "Items"), -1)
+  note_own_write()
+  return n, found_n
+end
+
 --- Wipe every item of the session (after the user confirmed) as ONE undo point.
 --- Returns the number of items removed.
 local function wipe_entire_session()
@@ -9214,6 +9256,92 @@ local function request_wipe_confirm()
   })
 end
 
+--- The selected Pitched Items rows, in list order. Drops any selected guid that is no longer in the list, and makes the
+--- selection just the active row when the active item changed from elsewhere (REAPER's selection, a removal, an undo).
+K.row_sel_sync = function()
+  if state.row_sel_target ~= state.target_take_guid then
+    state.row_sel = {}
+    if state.target_take_guid then state.row_sel[state.target_take_guid] = true end
+    state.row_anchor = state.target_take_guid
+    state.row_sel_target = state.target_take_guid
+  end
+  local list = {}
+  for _, g in ipairs(state.session_order) do
+    if state.row_sel[g] then list[#list + 1] = g end
+  end
+  if next(state.row_sel) ~= nil and #list ~= K.count_keys(state.row_sel) then
+    local kept = {}
+    for _, g in ipairs(list) do kept[g] = true end
+    state.row_sel = kept
+  end
+  return list
+end
+
+K.count_keys = function(t)
+  local n = 0
+  for _ in pairs(t) do n = n + 1 end
+  return n
+end
+
+--- True when the row selection holds anything other than just the active row (what Esc puts back).
+K.row_sel_extra = function()
+  for g in pairs(state.row_sel) do
+    if g ~= state.target_take_guid then return true end
+  end
+  return state.target_take_guid ~= nil and not state.row_sel[state.target_take_guid]
+end
+
+--- Make the row selection just the active row.
+K.row_sel_reset = function()
+  state.row_sel = {}
+  if state.target_take_guid then state.row_sel[state.target_take_guid] = true end
+  state.row_anchor = state.target_take_guid
+  state.row_sel_target = state.target_take_guid
+end
+
+--- "Remove Selected" (on the On line) / row menu "Remove Selected Items (N)…": confirm before removing the selected rows (count, up to
+--- five names, the pitch-algorithm resets). The guids are frozen here.
+K.request_remove_selected_confirm = function()
+  local guids = K.row_sel_sync()
+  local n = #guids
+  if n == 0 then return end
+  if n == 1 then return request_remove_confirm(guids[1]) end
+  local names = {}
+  for i = 1, math.min(n, 5) do
+    local data = state.session_takes[guids[i]]
+    names[#names + 1] = (data and data.name) or "Item"
+  end
+  local name_text = table.concat(names, ", ")
+  if n > 5 then name_text = string.format("%s and %d more", name_text, n - 5) end
+  local lines = {
+    string.format("This removes %d items from Pitched Items (%s), deletes their pitch envelope points and clears their saved analysis.",
+      n, name_text),
+  }
+  local resets = count_pitch_mode_resets(guids)
+  if resets > 0 then
+    lines[#lines + 1] = string.format("The pitch algorithm of %d %s returns to the project default.",
+      resets, plural(resets, "item", "items"))
+  end
+  request_confirm({
+    id = "remove_selected",
+    fit = true,   -- as tall as its text: a few lines, no empty block above the buttons
+    title = string.format("Remove %d items?", n),
+    body_lines = lines,
+    confirm_label = string.format("Remove %d Items", n),
+    on_confirm = function()
+      local removed, found_n = K.remove_takes_from_session(guids)
+      K.row_sel_reset()
+      -- The list does not re-adopt items after Cmd/Ctrl+Z, so no undo promise
+      if found_n > 0 then
+        set_status(string.format("Removed %d %s. Their envelopes and saved analysis were cleared.",
+          removed, plural(removed, "item", "items")))
+      else
+        set_status(string.format("Removed %d %s from Pitched Items.", removed, plural(removed, "item", "items")))
+      end
+    end,
+  })
+end
+
 --- Settings > Clear: confirm before discarding the active take's analysis and envelope points.
 local function request_clear_confirm()
   local guid = state.target_take_guid
@@ -9336,6 +9464,15 @@ local BODY = {
   -- Why REAPER's selected item is not a target (state.selection_issue)
   issue_midi = "MIDI item selected: select an audio item",
   issue_no_audio = "Selected item has no audio: select an audio item",
+  -- Row selection: the bar shown while two or more rows are selected, and the row's right-click menu
+  sel_remove = "Remove Selected",
+  sel_remove_tip_fmt = "Remove the %d selected items from Pitched Items and clear their envelopes and saved analysis (asks to confirm)",
+  menu_remove_one = "Remove This Item…",
+  menu_remove_sel_fmt = "Remove Selected Items (%d)…",
+  menu_no_selection = "no rows selected",
+  menu_wipe_fmt = "Wipe All Items (%d)…",
+  row_click_tip = string.format("Click to make this the active item · %s-click to add or remove · Shift-click for a range",
+    K.MOD_LABEL),
 }
 
 --- `text` shortened with a trailing ellipsis to at most max_w wide in the font pushed now (font_tag names
@@ -9378,13 +9515,16 @@ end
 K.INFO_SECTIONS = {
   { title = "Selection & Navigation", rows = {
     { K.MOD_LABEL .. " + A", "Select all notes in phrase", panel = { "Select", 1, "Select all" } },
-    { "Escape", "Close dialog, deselect, close if floating", panel = { "Select", 6, "Deselect", "Esc" } },
+    { "Escape", "Close dialog, deselect notes then rows, close if floating", panel = { "Select", 6, "Deselect", "Esc" } },
     { "Marquee Drag", "Box select notes (Shift=Add)", panel = { "Select", 5, "Box select", "Drag empty" } },
     { "Shift + Click", "Range select notes", panel = { "Select", 3, "Select range" } },
     { K.MOD_LABEL .. " + Click", "Toggle note in/out of selection", panel = { "Select", 4, "Add / remove" } },
     { "← / →", "Select previous / next note (Shift=Extend)", panel = { "Select", 2, "Prev / next note" } },
     { "Click empty canvas", "Deselect, move the REAPER edit cursor" },
-    { "Click a Pitched Items row", "Switch the active item" },
+    { "Click a Pitched Items row", "Switch the active item, select only that row" },
+    { K.MOD_LABEL .. " + Click a row", "Add / remove the row from the selection" },
+    { "Shift + Click a row", "Select a range of rows" },
+    { "Right-click a row", "Remove this, the selected or all items" },
     { "Select an audio item in REAPER", "Becomes the active item" },
     { "Drag the divider", "Resize Pitched Items" },
     { "H", "Show / hide the Shortcuts list", panel = { "General", 5, "Hide this list" } },
@@ -9482,6 +9622,7 @@ K.draw_items_body = function(sidebar_ctx)
   -- Row geometry: a card as tall as a table row (or a frame, when the font is larger, or the Remove target), L.xs of
   -- air above and below it, and every element centred on the card
   local to_remove = nil
+  local row_action = nil   -- the row menu's or Remove Selected's choice, run after the list is drawn
   -- While an analysis runs (one item or a batch) the list is read-only: the analysis owns the open item, and an
   -- item's envelope and stored analysis must not change under it. The reason is in each row's tooltip.
   local rows_locked = state.is_analyzing or K.batch ~= nil
@@ -9497,14 +9638,41 @@ K.draw_items_body = function(sidebar_ctx)
   local bar_w = L.sm
   local name_min_w = L.xxl
 
-  -- Column label above the bypass checkboxes (the checkbox has no text of its own)
+  -- Header line: the "On" label over the bypass checkboxes (the checkbox has no text of its own) and, while two or
+  -- more rows are selected, Remove Selected at the right end. The line is always a frame tall, so the rows do not
+  -- move when the button appears.
+  local sel_list = K.row_sel_sync()
   do
+    local line_x = reaper.ImGui_GetCursorPosX(sidebar_ctx)
+    local line_y = reaper.ImGui_GetCursorPosY(sidebar_ctx)
     local pushed = Theme.push_font(sidebar_ctx, fonts.small)
-    local label_w = reaper.ImGui_CalcTextSize(sidebar_ctx, BODY.col_on)
-    reaper.ImGui_SetCursorPosX(sidebar_ctx, reaper.ImGui_GetCursorPosX(sidebar_ctx)
-      + card_margin_x + card_pad_x + math.floor((frame_h - label_w) * 0.5))
+    local label_w, label_h = reaper.ImGui_CalcTextSize(sidebar_ctx, BODY.col_on)
+    reaper.ImGui_SetCursorPos(sidebar_ctx, line_x + card_margin_x + card_pad_x + math.floor((frame_h - label_w) * 0.5), line_y)
+    Theme.vcenter(sidebar_ctx, label_h, frame_h, line_y)
     reaper.ImGui_TextColored(sidebar_ctx, P.text_dim, BODY.col_on)
     Theme.pop_font(sidebar_ctx, pushed)
+
+    if #sel_list >= 2 then
+      local btn_w = (reaper.ImGui_CalcTextSize(sidebar_ctx, BODY.sel_remove)) + L.md * 2
+      local btn_x = line_x + avail_w - card_margin_x - card_pad_x - btn_w
+      reaper.ImGui_SetCursorPos(sidebar_ctx, math.max(line_x + card_margin_x + card_pad_x + frame_h + gap, btn_x), line_y)
+      if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
+      K.push_danger(P)
+      local remove_clicked = reaper.ImGui_Button(sidebar_ctx, BODY.sel_remove .. "###sel_remove", btn_w, frame_h)
+      K.pop_danger()
+      if rows_locked then
+        reaper.ImGui_EndDisabled(sidebar_ctx)
+        if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+          Theme.tooltip(sidebar_ctx, K.REASON_ANALYZING)
+        end
+      elseif reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        Theme.tooltip(sidebar_ctx, string.format(BODY.sel_remove_tip_fmt, #sel_list))
+      end
+      if remove_clicked and not rows_locked then row_action = { kind = "remove_selected" } end
+    end
+
+    reaper.ImGui_SetCursorPos(sidebar_ctx, line_x, line_y)
+    reaper.ImGui_Dummy(sidebar_ctx, avail_w, frame_h)
   end
 
   -- Only the rows in view are drawn, and only those ask REAPER anything: the clipper skips the rest, each of which takes
@@ -9529,6 +9697,7 @@ K.draw_items_body = function(sidebar_ctx)
       local data = guid and state.session_takes[guid]
       if data then
         local is_active = (guid == state.target_take_guid)
+        local is_selected = state.row_sel[guid] == true
         -- A take flagged missing by the project resync is not looked up again (the scan is not free)
         local flagged_missing = state.missing_takes[guid] == true
         local take_obj = nil
@@ -9556,15 +9725,18 @@ K.draw_items_body = function(sidebar_ctx)
 
         local dl = reaper.ImGui_GetWindowDrawList(sidebar_ctx)
         local is_row_hovered = reaper.ImGui_IsMouseHoveringRect(sidebar_ctx, card_x1, card_y1, card_x2, card_y2)
-        if is_active then
+        -- A selected row takes the selection tint; the active row keeps its accent bar (and bold name) either way
+        if is_selected then
           reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, P.select, L.rounding)
-          reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1 + L.xs, card_x1 + bar_w, card_y2 - L.xs, P.accent)
         elseif is_row_hovered then
           reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1, card_x2, card_y2, P.hover, L.rounding)
         end
+        if is_active then
+          reaper.ImGui_DrawList_AddRectFilled(dl, card_x1, card_y1 + L.xs, card_x1 + bar_w, card_y2 - L.xs, P.accent)
+        end
         -- P.text_dim reads at 4.5:1 on the window, not on those fills (3.8:1 on the tint, 4.0:1 on the hover fill):
         -- on a filled card the dim name and the state tag take P.text (the tag's words still say the state)
-        local dim_col = (is_active or is_row_hovered) and P.text or P.text_dim
+        local dim_col = (is_selected or is_row_hovered) and P.text or P.text_dim
 
         -- 2. Elements on one line inside the card, each centred on it
         local x_left = start_x + card_margin_x + card_pad_x
@@ -9635,7 +9807,34 @@ K.draw_items_body = function(sidebar_ctx)
         if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
         if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h)
            and not rows_locked then
-          switch_active_target(guid, take_obj)
+          -- Cmd/Ctrl-click toggles the row, Shift-click selects the range from the anchor (both leave the active item
+          -- alone); a plain click makes the row active and the only one selected
+          local mods = reaper.ImGui_GetKeyMods(sidebar_ctx) or 0
+          if (mods & reaper.ImGui_Mod_Shift()) ~= 0 then
+            row_action = { kind = "range", guid = guid, index = index }
+          elseif (mods & reaper.ImGui_Mod_Ctrl()) ~= 0 then
+            row_action = { kind = "toggle", guid = guid }
+          else
+            row_action = { kind = "click", guid = guid, take = take_obj }
+          end
+        end
+        if not rows_locked and reaper.ImGui_BeginPopupContextItem(sidebar_ctx, "##row_menu") then
+          if reaper.ImGui_Shortcut(sidebar_ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(sidebar_ctx) end
+          if reaper.ImGui_MenuItem(sidebar_ctx, BODY.menu_remove_one) then
+            row_action = { kind = "remove_one", guid = guid }
+          end
+          local sel_n = #sel_list
+          local sel_reason = sel_n == 0 and BODY.menu_no_selection or nil
+          if reaper.ImGui_MenuItem(sidebar_ctx, string.format(BODY.menu_remove_sel_fmt, sel_n) .. "###menu_remove_sel",
+               sel_reason, false, sel_reason == nil) then
+            row_action = { kind = "remove_selected" }
+          end
+          reaper.ImGui_Separator(sidebar_ctx)
+          local all_n = #state.session_order
+          if reaper.ImGui_MenuItem(sidebar_ctx, string.format(BODY.menu_wipe_fmt, all_n) .. "###menu_wipe") then
+            row_action = { kind = "wipe" }
+          end
+          reaper.ImGui_EndPopup(sidebar_ctx)
         end
         if rows_locked then reaper.ImGui_EndDisabled(sidebar_ctx) end
         reaper.ImGui_PopStyleVar(sidebar_ctx, 2)
@@ -9654,7 +9853,7 @@ K.draw_items_body = function(sidebar_ctx)
             lines[#lines + 1] = string.format("Notes: %d", data.notes and #data.notes or 0)
             if state_tip then lines[#lines + 1] = string.format("Outdated: %s", state_tip) end
           end
-          lines[#lines + 1] = "Click to make this the active item"
+          lines[#lines + 1] = BODY.row_click_tip
           Theme.tooltip(sidebar_ctx, table.concat(lines, "\n"))
         end
 
@@ -9708,6 +9907,39 @@ K.draw_items_body = function(sidebar_ctx)
 
   if to_remove then
     request_remove_confirm(to_remove)
+  end
+  K.run_row_action(row_action)
+end
+
+--- Carry out what a row click, the row menu or Remove Selected asked for (after the list was drawn).
+K.run_row_action = function(a)
+  if not a then return end
+  if a.kind == "click" then
+    switch_active_target(a.guid, a.take)
+    state.row_sel = { [a.guid] = true }
+    state.row_anchor = a.guid
+    state.row_sel_target = state.target_take_guid
+  elseif a.kind == "toggle" then
+    state.row_sel[a.guid] = (not state.row_sel[a.guid]) or nil
+    state.row_anchor = a.guid
+  elseif a.kind == "range" then
+    local anchor_i = nil
+    for i, g in ipairs(state.session_order) do
+      if g == state.row_anchor then anchor_i = i break end
+    end
+    anchor_i = anchor_i or a.index
+    local lo, hi = math.min(anchor_i, a.index), math.max(anchor_i, a.index)
+    state.row_sel = {}
+    for i = lo, hi do
+      local g = state.session_order[i]
+      if g then state.row_sel[g] = true end
+    end
+  elseif a.kind == "remove_one" then
+    request_remove_confirm(a.guid)
+  elseif a.kind == "remove_selected" then
+    K.request_remove_selected_confirm()
+  elseif a.kind == "wipe" then
+    request_wipe_confirm()
   end
 end
 
@@ -10782,9 +11014,13 @@ local function draw_confirm_modal()
     c.opened = true
   end
 
+  -- The window the confirm opens from: a confirm sized to its content is centred on it again at every resize (the
+  -- place it first opens at is not reliable for a popup that is not on screen yet)
+  local host_x, host_y = reaper.ImGui_GetWindowPos(ctx)
+  local host_w, host_h = reaper.ImGui_GetWindowSize(ctx)
   Theme.center_next_window(ctx, size.w, size.h, reaper.ImGui_Cond_Appearing())
   local _, max_h = K.fit_modal(ctx)
-  if c.fit_size then   -- sized to its content (asked last frame): same width, kept centred where it was
+  if c.fit_size then   -- sized to its content (asked last frame): same width, centred on the window it opens from
     reaper.ImGui_SetNextWindowPos(ctx, c.fit_size.x, c.fit_size.y)
     reaper.ImGui_SetNextWindowSize(ctx, c.fit_size.w, c.fit_size.h)
     c.fit_size = nil
@@ -10858,7 +11094,11 @@ local function draw_confirm_modal()
         local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
         if win_w and win_h and win_x and win_y then
           local h = K.confirm_fit_h(win_h, body_h, content_h, max_h)
-          c.fit_size = { x = win_x, y = win_y + (win_h - h) * 0.5, w = win_w, h = h }
+          if host_x and host_y and host_w and host_h then
+            c.fit_size = { x = host_x + (host_w - win_w) * 0.5, y = host_y + (host_h - h) * 0.5, w = win_w, h = h }
+          else
+            c.fit_size = { x = win_x, y = win_y + (win_h - h) * 0.5, w = win_w, h = h }
+          end
         end
       else
         c.fit_shown = true   -- measured and no resize asked: drawn in full from the next frame
@@ -13547,7 +13787,8 @@ local function loop_body()
 
     -- HC5: Esc, innermost first, only through Shortcut(). Modals own Esc while open (handled inside each
     -- BeginPopupModal); an active edit consumes it itself. What is left: the note selection, then the
-    -- window, which closes on Esc only when it is floating.
+    -- Pitched Items row selection (back to just the active row), then the window, which closes on Esc only
+    -- when it is floating.
     local esc_used = K.drag_hot.esc_used   -- this frame's Esc cancelled a slider drag: it is spent
     K.drag_hot.esc_used = false
     if not popup_open_at_start
@@ -13560,6 +13801,8 @@ local function loop_body()
         state.selected_notes = {}
         state.drag = nil
         state.marquee = nil
+      elseif K.row_sel_extra() then
+        K.row_sel_reset()
       elseif not docked then
         open = false
       end
