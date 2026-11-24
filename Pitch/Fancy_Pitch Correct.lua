@@ -196,6 +196,11 @@ DEFAULTS.hop_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].hop   -- how many
 local global_defaults = {
   retune_speed = DEFAULTS.retune_speed,
   tolerance = DEFAULTS.tolerance,
+  -- The starting values (see K.item_seed): every item copies them once, when it is first analysed or first loaded
+  separation = DEFAULTS.separation,
+  correct_mode = 0,   -- 0 Natural, 1 Classic, 2 Hard
+  tighten = 0,
+  slide_in = 0,
 }
 
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
@@ -505,32 +510,67 @@ K.set_pitch_algorithm = function(idx)
   state.pitchmode_value = entry.value
 end
 
---- Resolve an effective value through the Global → Item → Note cascade.
---- For the cascadable keys: retune_speed, tolerance.
+-- The value keys an item holds (data.overrides[key]; Separation is data.separation), each copied from the starting
+-- values (global_defaults) once, so a later change of a starting value reaches no item that has them
+K.ITEM_KEYS = { "separation", "correct_mode", "tighten", "tolerance", "retune_speed", "slide_in" }
+
+--- The item's own value of `key`, or nil (Separation is stored beside the notes, the others in data.overrides).
+K.item_value = function(data, key)
+  if not data then return nil end
+  if key == "separation" then return data.separation end
+  return data.overrides and data.overrides[key]
+end
+
+--- A copy of the starting values: every value key of global_defaults, with the key and scale.
+K.start_values = function()
+  local t = {}
+  for _, key in ipairs(K.ITEM_KEYS) do t[key] = global_defaults[key] end
+  t.key_idx, t.scale_idx = state.key_idx, state.scale_idx
+  return t
+end
+
+--- Fill every missing value of an item's model from the starting values (a model change only: it is written with
+--- the item's next save). Returns true when it filled one.
+K.item_seed = function(data)
+  local start, filled = K.start_values(), false
+  for _, key in ipairs(K.ITEM_KEYS) do
+    if K.item_value(data, key) == nil then
+      if key == "separation" then
+        data.separation = start.separation
+      else
+        data.overrides = data.overrides or {}
+        data.overrides[key] = start[key]
+      end
+      filled = true
+    end
+  end
+  if data.key_idx == nil then data.key_idx, filled = start.key_idx, true end
+  if data.scale_idx == nil then data.scale_idx, filled = start.scale_idx, true end
+  return filled
+end
+
+--- Resolve an effective value: the note's own, else the target item's, else the starting value (only for an item
+--- not yet seeded).
 local function get_effective(note, key)
-  -- 1. Per-note override
   if note and note.controls and note.controls[key] ~= nil then
     return note.controls[key]
   end
-  -- 2. Per-item override
   if state.target_take_guid then
-    local take_data = state.session_takes[state.target_take_guid]
-    if take_data and take_data.overrides and take_data.overrides[key] ~= nil then
-      return take_data.overrides[key]
-    end
+    local v = K.item_value(state.session_takes[state.target_take_guid], key)
+    if v ~= nil then return v end
   end
-  -- 3. Global default
   return global_defaults[key]
 end
 
---- Returns the override level for display: "note", "item", or "global"
+--- Returns the override level for display: "note" (the note has its own), "item" (the item differs from the
+--- starting value: the "*" mark) or "start".
 local function get_override_level(note, key)
   if note and note.controls and note.controls[key] ~= nil then return "note" end
   if state.target_take_guid then
-    local take_data = state.session_takes[state.target_take_guid]
-    if take_data and take_data.overrides and take_data.overrides[key] ~= nil then return "item" end
+    local v = K.item_value(state.session_takes[state.target_take_guid], key)
+    if v ~= nil and v ~= global_defaults[key] then return "item" end
   end
-  return "global"
+  return "start"
 end
 
 --- Show a short message on the canvas's status pill for STATUS_SECONDS (it replaces the hint there).
@@ -679,6 +719,10 @@ K.PERSIST = (function()
   -- Global cascade defaults (project-wide), saved when a drag or a typed entry is committed or reset
   number("cascade", "pitch_retune_speed", global_defaults, "retune_speed", { 0, 1 })
   number("cascade", "pitch_tolerance", global_defaults, "tolerance", K.LIMITS.tolerance)
+  number("cascade", "pitch_tighten", global_defaults, "tighten", { 0, 1 })
+  number("cascade", "pitch_slide_in", global_defaults, "slide_in", { 0, 1 })
+  choice("cascade", "pitch_correct_mode", global_defaults, "correct_mode", { 0, 1, 2 })
+  number("cascade", "pitch_start_separation", global_defaults, "separation", K.LIMITS.separation)
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
   choice("engine", "pitch_block_size", state, "block_size", BLOCK_SIZES)
@@ -686,7 +730,6 @@ K.PERSIST = (function()
   number("engine", "pitch_threshold", state, "threshold", K.LIMITS.threshold)
   number("engine", "pitch_min_freq", state, "min_freq", K.LIMITS.min_freq)
   number("engine", "pitch_max_freq", state, "max_freq", K.LIMITS.max_freq)
-  number("engine", "pitch_separation", state, "separation", K.LIMITS.separation)
   flag("engine", "pitch_keep_pitch_mode", state, "keep_pitch_mode")
   add("engine", "pitch_algorithm", function() return string.format("%.14g", state.pitchmode_value) end, function(raw)
     local value = finite(raw)
@@ -2323,7 +2366,10 @@ local function load_take_data(take, raw)
     end)
   end
   if guid then state.unreadable_takes[guid] = (not readable) or nil end
-  if readable then return data end
+  if readable then
+    K.item_seed(data)
+    return data
+  end
   return nil
 end
 
@@ -2420,6 +2466,7 @@ local function adopt_take_data(guid, data)
     state.view_t0, state.view_t1, state.view_p0, state.view_p1 = view_t0, view_t1, view_p0, view_p1
   end
 
+  if data.separation then state.separation = data.separation end
   if data.key_idx then state.key_idx = data.key_idx end
   if data.scale_idx then state.scale_idx = data.scale_idx end
   update_scale_pitch_classes()
@@ -4953,6 +5000,7 @@ local function process_analysis_step()
         scale_idx = state.scale_idx,
         separation = state.separation,
       }
+      K.item_seed(take_data)
       if K.batch then
         -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item.
         -- An item long enough to be read that gave no frame at all was not read (its media went away): it is not
@@ -12489,6 +12537,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
   return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
-           request_confirm = request_confirm, sync_with_project = sync_with_project }
+           request_confirm = request_confirm, sync_with_project = sync_with_project,
+           get_effective = get_effective, get_override_level = get_override_level, global_defaults = global_defaults }
 end
 main()

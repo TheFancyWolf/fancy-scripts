@@ -2952,6 +2952,57 @@ test("held_message_goes_when_an_analysis_changes", function()
   if not ok then error(err, 0) end
 end)
 
+-- Starting values and per-item values (copy once) -------------------------------------------------------
+test("item_seed_fills_all", function()
+  local K = S.K
+  local data = {}
+  eq(K.item_seed(data), true, "first seed fills")
+  local start = K.start_values()
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = (key == "separation") and data.separation or (data.overrides and data.overrides[key])
+    if v == nil then error("missing " .. key) end
+    eq(v, start[key], key)
+  end
+  eq(data.key_idx, start.key_idx, "key_idx")
+  eq(data.scale_idx, start.scale_idx, "scale_idx")
+  eq(K.item_seed(data), false, "second seed fills nothing")
+end)
+
+test("item_copy_once", function()
+  local st, K = S.state, S.K
+  local saved = { st.target_take_guid, st.session_takes["{seed}"] }
+  local data = { notes = {}, results = {} }
+  K.item_seed(data)
+  st.session_takes["{seed}"], st.target_take_guid = data, "{seed}"
+  local before = S.get_effective(nil, "tolerance")
+  S.global_defaults.tolerance = before + 7
+  local ok, err = pcall(function() eq(S.get_effective(nil, "tolerance"), before, "item value kept") end)
+  S.global_defaults.tolerance = before
+  st.target_take_guid, st.session_takes["{seed}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("seed_old_take_same_build", function()
+  local st, K = S.state, S.K
+  local saved = { st.target_take_guid, st.session_takes["{old}"] }
+  local n1, n2 = slide_note(1, 0), slide_note(1, 0)
+  n1.controls.retune_speed, n2.controls.retune_speed = nil, nil
+  local data = { notes = { n1 }, results = {} }
+  st.session_takes["{old}"], st.target_take_guid = data, "{old}"
+  local ok, err = pcall(function()
+    local before = K.correction_build({ n1 }, 1)
+    K.item_seed(data)
+    local after = K.correction_build({ n2 }, 1)
+    eq(#after.points, #before.points, "point count")
+    for i, p in ipairs(before.points) do
+      near(after.points[i].time, p.time, 1e-12, "time " .. i)
+      near(after.points[i].val, p.val, 1e-12, "val " .. i)
+    end
+  end)
+  st.target_take_guid, st.session_takes["{old}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
