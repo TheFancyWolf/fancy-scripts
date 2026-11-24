@@ -1,8 +1,8 @@
 -- @description Fancy Design System
 -- @author Fancy Scripts
--- @version 1.6.0
+-- @version 1.6.1
 -- @changelog
---   + Canvas: ruler_tick, ruler_text and ruler_edge; the time ruler tokens now read REAPER's timeline colours
+--   + Canvas: the note action bar readout tokens (readout_name, readout_name_tonic, readout_name_dim, readout_cents_in, readout_cents_off)
 -- @about
 --   Visual style guide that renders every design token, color, font size,
 --   icon, and widget component from the shared design system in one window.
@@ -251,6 +251,8 @@ local CANVAS_GROUPS = {
   { "Selection & overlays", "marquee, pills behind canvas text, time-ruler strip, bypass scrim", {
     "marquee_fill", "marquee_border", "marquee_text", "pill_bg", "pill_text", "ruler_bg", "ruler_tick", "ruler_text", "ruler_edge",
     "scrim" } },
+  { "Note action bar readout", "note name (root / in scale / out of scale) and cents (in tune / off), >= 4.5:1 on the panel", {
+    "readout_name", "readout_name_tonic", "readout_name_dim", "readout_cents_in", "readout_cents_off" } },
   { "Overview & range strips", "the track, the notes on it, and the thumb marking the visible window (>= 3:1 on the track)", {
     "overview_bg", "overview_note", "view_fill", "view_border", "view_grip" } },
 }

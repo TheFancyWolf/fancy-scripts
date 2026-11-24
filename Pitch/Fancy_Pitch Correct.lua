@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.24.1
+-- @version 2.24.2
 -- @changelog
---   The Tolerance band now shows while you adjust Tolerance even when Tighten is 0%
+--   Tooltips are split into short paragraphs; the note readout's name and cents are colour-coded and explained on hover
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -241,7 +241,7 @@ local K = {
   -- Analysis Cancel: More's Analyze item turns into this while an analysis runs (see hdr_draw_more)
   CANCEL_FMT = "Cancel %d%%",
   CANCEL_BATCH_FMT = "Cancel Batch %d%%",   -- ... and into this while a batch runs
-  CANCEL_BATCH_TIP = "Stops the batch. Items already finished are kept.",
+  CANCEL_BATCH_TIP = "Stops the batch.\n\nItems already finished are kept.",
   REASON_ANALYZING = "Wait for the analysis to finish",   -- why the Pitched Items rows and the batch entry are locked
   REASON_BATCH_FEW = "Select 2 or more audio items",
   CANCELLED_TEXT = "Analysis cancelled.",
@@ -1184,6 +1184,57 @@ K.note_name_cents = function(cp)
   local nearest = math.floor(cp + 0.5)
   local cents = math.floor((cp - nearest) * 100 + 0.5)
   return midi_to_name(nearest), string.format("%s%d\xC2\xA2", cents >= 0 and "+" or "", cents)
+end
+
+--- A tooltip's text from its paragraphs: the non-empty ones, a blank line between each (nil and "" are skipped).
+K.tip = function(...)
+  local out = {}
+  for i = 1, select("#", ...) do
+    local p = select(i, ...)
+    if p and p ~= "" then out[#out + 1] = p end
+  end
+  return table.concat(out, "\n\n")
+end
+
+--- The note action bar's readout of a note at centre pitch `cp`: name and cents text, their colours (P.canvas
+--- readout_*: the name as the note-name column colours it, by Key and Scale; the cents green on the semitone and
+--- yellow off it) and the tooltip that says what they are.
+K.note_readout = function(cp, C)
+  local name, cents_txt = K.note_name_cents(cp)
+  local nearest = math.floor(cp + 0.5)
+  local cents = math.floor((cp - nearest) * 100 + 0.5)
+  local pc = (nearest % 12 + 12) % 12
+  local scale = SCALE_DEFINITIONS[state.scale_idx]
+  local chromatic = (not scale) or scale.name == "Chromatic"
+  local key_name = SCALE_KEYS[state.key_idx] and SCALE_KEYS[state.key_idx].display or ""
+  local scale_name = chromatic and "" or (key_name .. " " .. scale.name)
+  local name_col, scale_line = C.readout_name, nil
+  if not chromatic then
+    if pc == (state.key_idx - 1) % 12 then
+      name_col = C.readout_name_tonic
+      scale_line = string.format("%s is the root of the scale (%s), set by Key.", name, scale_name)
+    elseif is_pitch_in_scale(pc) then
+      scale_line = string.format("%s is in the scale (%s).", name, scale_name)
+    else
+      name_col = C.readout_name_dim
+      scale_line = string.format("%s is out of the scale (%s). Quantize (Q) moves the note onto the scale.",
+        name, scale_name)
+    end
+  end
+  local cents_col = C.readout_cents_in
+  local tune_line
+  if cents == 0 then
+    tune_line = string.format("In tune (green): right on %s.", name)
+  else
+    cents_col = C.readout_cents_off
+    tune_line = string.format("%s (yellow): %d\xC2\xA2 %s %s. Snap (S) puts the note on %s at 0\xC2\xA2.",
+      cents_txt, math.abs(cents), cents > 0 and "above" or "below", name, name)
+  end
+  local tip = K.tip(name .. " " .. cents_txt,
+    "The note's pitch: the nearest note name, then how far from it in cents (100\xC2\xA2 = one semitone). "
+      .. "Until you move the note, this is the pitch that was sung.",
+    scale_line, tune_line)
+  return name, cents_txt, name_col, cents_col, tip
 end
 
 K.SCRUB_PX = 6     -- hold C + wheel: the edit cursor moves this many pixels of the current view per notch
@@ -2699,7 +2750,7 @@ end
 
 --- The canvas button's tooltip for a batch of n items.
 K.batch_tip = function(n)
-  return string.format("Detect the pitch of the %d selected audio items, one after another. One undo step for all of them.", n)
+  return string.format("Detect the pitch of the %d selected audio items, one after another.\n\nOne undo step for all of them.", n)
 end
 
 --- The lines under the canvas button for what K.batch_peek returned: the first, and the second or nil.
@@ -6058,15 +6109,22 @@ end
 --- The text for the value `zc` edits on `note`: the drag readout, or the hover tooltip (hover = true).
 K.zone_text = function(zc, note, hover)
   local text = string.format(hover and zc.hover or zc.read, K.zone_value(zc, note) * (zc.show or 1))
+  --- The note on why the value does nothing: in brackets on the drag readout's one line, its own paragraph (a
+  --- sentence) in the hover tooltip
+  local function idle(suffix)
+    if not hover then return text .. suffix end
+    local why = suffix:match("%((.*)%)") or suffix
+    return K.tip(text, why:gsub("^%l", string.upper) .. ".")
+  end
   local mode = K.mode_value(note)
   if mode ~= 0 then
     -- A Classic or Hard note: the mode says why a value does nothing (the Natural advice below does not apply)
-    if zc.key == "tolerance" or zc.key == "slide_in" then return text .. K.MODE_IDLE end
-    if zc.key == "tighten" and mode == 2 then return text .. K.HARD_IDLE end
+    if zc.key == "tolerance" or zc.key == "slide_in" then return idle(K.MODE_IDLE) end
+    if zc.key == "tighten" and mode == 2 then return idle(K.HARD_IDLE) end
     return text
   end
   if zc.key == "tolerance" and (tonumber(get_effective(note, "tighten")) or 0) <= 0 then
-    text = text .. K.TOLERANCE_IDLE
+    return idle(K.TOLERANCE_IDLE)
   end
   return text
 end
@@ -6474,14 +6532,17 @@ K.draw_note_bar = function(dctx, draw_list, ruler_h, has_target, target_item)
   local btn = icon_size + preset.pad * 2       -- Theme.icon_btn sizes the button from the icon (Small 24 px: MT1's target)
   local n = #K.NOTE_ACTIONS
   -- The readout: one note's name and cents, or the count of the selection (each note keeps its pill then)
-  local name_txt, cents_txt
+  local name_txt, cents_txt, readout_tip
+  local name_col, cents_col = P.canvas.readout_name, P.canvas.readout_name
   local one = #selected == 1 and state.notes[selected[1]].controls
   if one then
-    name_txt, cents_txt = K.note_name_cents(one.center_pitch)
+    name_txt, cents_txt, name_col, cents_col, readout_tip = K.note_readout(one.center_pitch, P.canvas)
   elseif #selected == 1 then
     name_txt, cents_txt = "", ""
   else
     name_txt, cents_txt = string.format("%d notes", #selected), ""
+    readout_tip = K.tip(string.format("%d notes selected", #selected),
+      "Select one note to see its pitch: its note name and how far from it in cents.")
   end
   local name_w, cents_w = K.note_readout_widths(dctx)
   local slot_w = math.max(name_w + L.sm + cents_w, (reaper.ImGui_CalcTextSize(dctx, name_txt)))
@@ -6496,10 +6557,19 @@ K.draw_note_bar = function(dctx, draw_list, ruler_h, has_target, target_item)
   reaper.ImGui_DrawList_AddRect(draw_list, x, y, x + bar_w, y + bar_h, P.border, L.rounding, 0, L.border)
   local _, text_h = reaper.ImGui_CalcTextSize(dctx, name_txt)
   local text_y = math.floor(y + (bar_h - text_h) * 0.5 + 0.5)
-  reaper.ImGui_DrawList_AddText(draw_list, x + text_x0, text_y, P.text, name_txt)
+  reaper.ImGui_DrawList_AddText(draw_list, x + text_x0, text_y, name_col, name_txt)
   if cents_txt ~= "" then
     local cw = reaper.ImGui_CalcTextSize(dctx, cents_txt)
-    reaper.ImGui_DrawList_AddText(draw_list, x + text_x0 + slot_w - cw, text_y, P.text, cents_txt)
+    reaper.ImGui_DrawList_AddText(draw_list, x + text_x0 + slot_w - cw, text_y, cents_col, cents_txt)
+  end
+  -- The readout's hover area (from the grip's line to the divider before the buttons): its tooltip says what the
+  -- name and cents are
+  if readout_tip then
+    reaper.ImGui_SetCursorScreenPos(dctx, x + grip_seg + L.border, y)
+    reaper.ImGui_InvisibleButton(dctx, "##note_bar_readout", math.max(1, lead_w - grip_seg - L.border), bar_h)
+    if reaper.ImGui_IsItemHovered(dctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      Theme.tooltip(dctx, readout_tip)
+    end
   end
 
   -- The grip: drag moves the bar (one offset for every note, saved on release); double-click puts it back
@@ -6529,7 +6599,7 @@ K.draw_note_bar = function(dctx, draw_list, ruler_h, has_target, target_item)
     K.save_settings("appearance")
   end
   if reaper.ImGui_IsItemHovered(dctx, reaper.ImGui_HoveredFlags_ForTooltip()) and not reaper.ImGui_IsItemActive(dctx) then
-    Theme.tooltip(dctx, "Drag to move the bar\nDouble-click: back under the note")
+    Theme.tooltip(dctx, "Drag to move the bar.\n\nDouble-click: back under the note.")
   end
   local dot_col = grip_hot and P.text or P.text_dim
   local dot_r, dot_gap = btn / 22, btn / 5        -- 2 x 3 dots, in proportion to the button
@@ -6553,7 +6623,7 @@ K.draw_note_bar = function(dctx, draw_list, ruler_h, has_target, target_item)
       { preset = preset, icon_size = icon_size, color = reason and P.text_dim or nil })
     reaper.ImGui_EndDisabled(dctx)
     if reaper.ImGui_IsItemHovered(dctx, tip_flags) and not reaper.ImGui_IsItemActive(dctx) then
-      Theme.tooltip(dctx, reason and (spec.tip .. "\n" .. reason) or spec.tip)
+      Theme.tooltip(dctx, K.tip(spec.tip, reason))
     end
     if clicked and not reason then K.note_action(spec.id, sel_idx) end
   end
@@ -6963,8 +7033,8 @@ local function draw_graph(draw_ctx, w, h)
       reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_Hand())
     end
     if canvas_tip_ready then
-      Theme.tooltip(draw_ctx, on_overview and "Drag to scroll. Drag an end to zoom. Double-click: whole item"
-        or "Drag to scroll. Drag an end to zoom. Double-click: fit the notes")
+      Theme.tooltip(draw_ctx, on_overview and "Drag to scroll. Drag an end to zoom.\n\nDouble-click: whole item."
+        or "Drag to scroll. Drag an end to zoom.\n\nDouble-click: fit the notes.")
     end
 
     if reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
@@ -8345,7 +8415,7 @@ local function draw_graph(draw_ctx, w, h)
     end
 
     if on_ruler and state.view_t0 and not gesture then
-      Theme.tooltip(draw_ctx, "Click to move the edit cursor. Double-click: whole item")
+      Theme.tooltip(draw_ctx, "Click to move the edit cursor.\n\nDouble-click: whole item.")
     end
   end
 
@@ -8391,7 +8461,7 @@ local function draw_graph(draw_ctx, w, h)
     end
   elseif canvas_tip_ready and state.hovered_point and not state.drag and not state.marquee and not state.point_drag then
     Theme.tooltip(draw_ctx, string.format(
-      "Drag to bend the pitch here (%s = fine). Double-click: reset. Right-click: menu", K.MOD_LABEL))
+      "Drag to bend the pitch here (%s-drag: fine).\n\nDouble-click: reset. Right-click: menu.", K.MOD_LABEL))
   elseif canvas_tip_ready and state.point_ghost and not state.drag and not state.marquee and not state.point_drag
       and not state.edge_drag and not state.view_drag then
     Theme.tooltip(draw_ctx, "Double-click to add a pitch point")
@@ -8402,7 +8472,7 @@ local function draw_graph(draw_ctx, w, h)
       local has_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
       local zone_ctl = K.zone_control(state.hovered_zone, has_shift)
       local tip = zone_ctl and K.zone_text(zone_ctl, h_note, true)
-        or string.format("Drag to change pitch (%s = fine)", K.MOD_LABEL)
+        or string.format("Drag to change the pitch (%s-drag: fine).", K.MOD_LABEL)
       Theme.tooltip(draw_ctx, tip)   -- the Show Tooltips preference applies
     end
   end
@@ -9437,7 +9507,7 @@ local BODY = {
   grip_tip = "Drag to resize Pitched Items",
   panel_tip_show = "Show the side panel: Pitched Items (%d) and Shortcuts",
   panel_tip_hide = "Hide the side panel",
-  panel_tip_narrow = "The side panel does not fit this window. Widen the window to show it.",
+  panel_tip_narrow = "The side panel does not fit this window.\n\nWiden the window to show it.",
   panel_narrow_status = "Widen the window to show the side panel",
   shortcuts_narrow_status = "Widen the window to show Shortcuts",
   -- Row states and the checkbox column label (a row is never told apart by colour alone)
@@ -9445,7 +9515,7 @@ local BODY = {
   tag_missing = "Item missing",
   tag_outdated = "outdated",
   tip_missing = "The item no longer exists in this project",
-  tip_outdated = "This item's envelope is not what the current settings would write (a setting changed after it was written). Edit or re-analyze it to refresh.",
+  tip_outdated = "This item's envelope is not what the current settings would write (a setting changed after it was written).\n\nEdit or re-analyze it to refresh.",
   -- The banner for items whose saved analysis cannot be read (see K.unreadable_guids) and its Clear button
   unreadable_fmt = "%d %s: saved analysis couldn't be read",
   unreadable_clear = "Clear",
@@ -9847,18 +9917,16 @@ K.draw_items_body = function(sidebar_ctx)
 
         if rows_locked then
           if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-            Theme.tooltip(sidebar_ctx, string.format("Item: %s\n%s", full_name, K.REASON_ANALYZING))
+            Theme.tooltip(sidebar_ctx, K.tip("Item: " .. full_name, K.REASON_ANALYZING))
           end
         elseif not renaming and reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-          local lines = { string.format("Item: %s", full_name) }
-          if is_missing then
-            lines[#lines + 1] = state_tip
-          else
-            lines[#lines + 1] = string.format("Notes: %d", data.notes and #data.notes or 0)
-            if state_tip then lines[#lines + 1] = string.format("Outdated: %s", state_tip) end
+          -- Name and note count, then the state, then the clicks: one paragraph each
+          local facts, state_para = "Item: " .. full_name, state_tip
+          if not is_missing then
+            facts = facts .. string.format("\nNotes: %d", data.notes and #data.notes or 0)
+            if state_tip then state_para = "Outdated: " .. state_tip end
           end
-          lines[#lines + 1] = BODY.row_click_tip
-          Theme.tooltip(sidebar_ctx, table.concat(lines, "\n"))
+          Theme.tooltip(sidebar_ctx, K.tip(facts, state_para, BODY.row_click_tip))
         end
 
         -- State tag (dim text, never colour alone), right before the X
@@ -10372,7 +10440,7 @@ K.SETTINGS_SECTIONS = {
       draw = function(w)
         local idx, changed = Theme.combo(ctx, "##settings_pitchmode", PITCHMODE_FLAT, state.preset_pitchmode_idx, {
           w = w,
-          tooltip = "Pitch Shift Algorithm — Elastique Soloist (Monophonic) is recommended for vocals.\nApplied automatically to the item when writing envelopes.",
+          tooltip = "Pitch Shift Algorithm\n\nElastique Soloist (Monophonic) is recommended for vocals.\n\nApplied automatically to the item when writing envelopes.",
         })
         if changed then
           K.set_pitch_algorithm(idx)
@@ -10392,7 +10460,7 @@ K.SETTINGS_SECTIONS = {
           K.save_settings("engine")
         end
         if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-          Theme.tooltip(ctx, "Fancy Pitch Correct then never changes the pitch algorithm of an item: the one set in REAPER stays, and the Pitch Shift Algorithm above is not used.")
+          Theme.tooltip(ctx, "Fancy Pitch Correct then never changes the pitch algorithm of an item: the one set in REAPER stays.\n\nThe Pitch Shift Algorithm above is not used.")
         end
       end },
   } },
@@ -10404,7 +10472,7 @@ K.SETTINGS_SECTIONS = {
         local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == state.min_freq and r.max == state.max_freq end)
         local idx, changed = Theme.combo(ctx, "##settings_range", VOCAL_RANGES, current, {
           w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Vocal Range — limits frequency search to avoid octave jump errors",
+          tooltip = "Vocal Range\n\nLimits the frequency search to avoid octave jump errors.",
         })
         if changed and VOCAL_RANGES[idx] then
           state.min_freq, state.max_freq = VOCAL_RANGES[idx].min, VOCAL_RANGES[idx].max
@@ -10418,7 +10486,7 @@ K.SETTINGS_SECTIONS = {
         local current = K.match_preset(DETECTION_MODES, function(m) return m.threshold == state.threshold end)
         local idx, changed = Theme.combo(ctx, "##settings_mode", DETECTION_MODES, current, {
           w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Detection Mode — confidence threshold for pitched note detection",
+          tooltip = "Detection Mode\n\nThe confidence threshold for pitched note detection.",
         })
         if changed and DETECTION_MODES[idx] then
           state.threshold = DETECTION_MODES[idx].threshold
@@ -10432,7 +10500,7 @@ K.SETTINGS_SECTIONS = {
         local current = K.match_preset(QUALITY_MODES, function(q) return q.block == state.block_size and q.hop == state.hop_size end)
         local idx, changed = Theme.combo(ctx, "##settings_quality", QUALITY_MODES, current, {
           w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Quality / CPU — time vs frequency resolution trade-off",
+          tooltip = "Quality / CPU\n\nThe trade-off between time and frequency resolution.",
         })
         if changed and QUALITY_MODES[idx] then
           state.block_size = QUALITY_MODES[idx].block
@@ -10477,7 +10545,7 @@ K.SETTINGS_SECTIONS = {
       draw = function(w)
         settings_drag("dsp_threshold", "threshold", "%.2f", w)
         if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-          Theme.tooltip(ctx, "Confidence threshold for pitch detection (lower = stricter).")
+          Theme.tooltip(ctx, "Detection Threshold\n\nThe confidence threshold for pitch detection. Lower is stricter.")
         end
       end },
     { id = "min_freq", label = "Min Freq (Hz)",
@@ -12215,7 +12283,7 @@ do
   -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = "Select an audio item"
   local HDR_REASON_NO_NOTES = "Analyze an item first"
-  local HDR_MORE_TIP = "Menu: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help"
+  local HDR_MORE_TIP = "Menu\n\nAnalyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings and Help."
   -- The right-click menu of Key and Scale (hdr_key_menu)
   local HDR_APPLY_KEY = "Apply Key to other items\xE2\x80\xA6"
 
@@ -12423,9 +12491,10 @@ do
       })
       -- The tooltip is built on hover only: it reads the item's pitch algorithm from REAPER
       if reaper.ImGui_IsItemHovered(ctx) then
-        Theme.tooltip(ctx, string.format("Active item: %s\nStatus: %s\n%s\nSelect any audio item in REAPER to switch to it.",
-          state.target_take_name, hs.has_notes and "Analyzed & Active" or "Ready to Analyze",
-          hdr_pitch_algorithm_line(hs.target_take)))
+        Theme.tooltip(ctx, K.tip("Active item: " .. state.target_take_name,
+          "Status: " .. (hs.has_notes and "Analyzed & Active" or "Ready to Analyze") .. "\n"
+            .. hdr_pitch_algorithm_line(hs.target_take),
+          "Select any audio item in REAPER to switch to it."))
       end
     else
       Theme.badge(ctx, hdr_fit_text(HDR_NO_TARGET_TEXT, hs.badge_w - s.pad_x), {
@@ -12470,7 +12539,7 @@ do
     end
     hdr_key_menu("##ctx_key")   -- right after the combo: it asks about the last item
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, "Key: the root note of the scale")
+      Theme.tooltip(ctx, "Key\n\nThe root note of the scale.\n\nRight-click: apply Key and Scale to other items.")
     end
   end
 
@@ -12478,7 +12547,7 @@ do
     local s = hs.s
     local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, state.scale_idx, {
       w = s.scale_w,
-      tooltip = "Scale: marks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to",
+      tooltip = "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\nRight-click: apply Key and Scale to other items.",
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
@@ -12511,13 +12580,13 @@ do
       reaper.ImGui_DrawList_AddLine(dl, x, cy, x + sw_w, cy, LC.preview, 2.0)
     end)
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, "The pitch after correction. Hover or drag a setting to see where it acts.")
+      Theme.tooltip(ctx, "The pitch after correction.\n\nHover or drag a setting to see where it acts.")
     end
     layer_checkbox("Pitch Points", "show_smart_spots", function(dl, x, cy)
       reaper.ImGui_DrawList_AddCircleFilled(dl, x + sw_w * 0.5, cy, K.SPOT_R, LC.spot)
     end)
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      Theme.tooltip(ctx, "The points on a note that bend its pitch: peaks and valleys, the note's start and end, and points you add")
+      Theme.tooltip(ctx, "The points on a note that bend its pitch.\n\nPeaks and valleys, the note's start and end, and points you add.")
     end
   end
 
@@ -12537,10 +12606,10 @@ do
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       local tip = HDR_MORE_TIP
       if batch then
-        tip = string.format(batch.kind == "apply" and "Applying values to %d of %d items. Open to cancel"
-          or "Analyzing %d of %d. Open to cancel", math.min(batch.index, #batch.queue), #batch.queue)
+        tip = string.format(batch.kind == "apply" and "Applying values to %d of %d items.\n\nOpen to cancel."
+          or "Analyzing %d of %d.\n\nOpen to cancel.", math.min(batch.index, #batch.queue), #batch.queue)
       elseif analyzing then
-        tip = "Analyzing. Open to cancel"
+        tip = "Analyzing.\n\nOpen to cancel."
       end
       Theme.tooltip(ctx, tip)
     end
@@ -12626,7 +12695,7 @@ do
       preset = L.icon_target,
       icon_size = L.icon_md.size,   -- the glyph of the medium icons; only the click target is 24 px
       w = s.close_sz, h = s.close_sz,   -- icon_btn sizes the button from icon_size unless told otherwise
-      tooltip = hs.docked and "Close. Your corrections stay on the items" or "Close (Esc). Your corrections stay on the items",
+      tooltip = K.tip(hs.docked and "Close" or "Close (Esc)", "Your corrections stay on the items."),
     })
   end
 
@@ -12718,8 +12787,8 @@ do
   local BAR_RANGE_SEP = "\xE2\x80\x93"   -- between the lowest and highest value of a mixed selection
   -- The selection pill: what a drag in the bar changes
   local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "This item", "1 note", "%d notes"
-  local BAR_PILL_TIP_NONE = "Your edits change this item only. Select notes to change just those notes. Click for: apply to other items."
-  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes. Esc goes back to this item. Click for: apply to other items."
+  local BAR_PILL_TIP_NONE = "Your edits change this item only.\n\nSelect notes to change just those notes.\n\nClick: apply to other items."
+  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes.\n\nEsc goes back to this item.\n\nClick: apply to other items."
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
   local BAR_REASON_NO_TARGET = "Select an audio item"
@@ -12737,9 +12806,10 @@ do
   -- The Mode dropdown (see draw_mode): its tooltip, its scope line by what it changes, the text of a mixed selection,
   -- and the line a value's tooltip gains when the selected notes' mode does not use it (key: K.mode_unused)
   local BAR_MODE = {
-    tip = "Mode: how a note is corrected.\n"
-      .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n"
-      .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n"
+    title = "Mode",
+    tip = "How a note is corrected.\n\n"
+      .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n\n"
+      .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n\n"
       .. "Hard: one flat note of the scale.",
     scope_item = "Changes this item: every note without its own mode.",
     scope_note = "Changes the selected note.",
@@ -12758,7 +12828,7 @@ do
   -- The named groups of the Values group (K.BAR_GROUP): no caption shows them, so each value's tooltip starts with
   -- its group's name (the hairline separators show where a group ends)
   local BAR_GROUP_NAMES = { notes = "Notes", correction = "Correction", shaping = "Shaping" }
-  local BAR_GROUP_TIP = "%s \xC2\xB7 "
+  local BAR_GROUP_TIP = "%s \xC2\xB7 %s"
   -- The pill's menu (see draw_pill)
   local BAR_PILL_MENU = {
     to_item = "Edits go to: this item",
@@ -12780,26 +12850,31 @@ do
   local BAR_VALUES = {
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
-      tip = "Tighten: steadies a wobbly note. Low values take out slow drift, higher values also take out wobble and then vibrato; 100% is a flat line." },
+      title = "Tighten",
+      tip = "Steadies a wobbly note. Low values take out slow drift, higher values also take out wobble and then vibrato; 100% is a flat line." },
     { id = "strength", key = "retune_speed", label = "Strength", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
-      tip = "Correction Strength: how far each note is pulled to its target pitch. 0% leaves the singing as recorded, 100% puts the note fully in tune." },
+      title = "Correction Strength",
+      tip = "How far each note is pulled to its target pitch. 0% leaves the singing as recorded, 100% puts the note fully in tune." },
     { id = "tol", key = "tolerance", label = "Tolerance", lo = K.LIMITS.tolerance[1], hi = K.LIMITS.tolerance[2], scale = 1,
       num = "%.0f", unit = "\xC2\xA2", levels = "all",
-      tip = "Tolerance: how far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement." },
+      title = "Tolerance",
+      tip = "How far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement." },
     { id = "slide", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
-      tip = "Slide In: how much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
+      title = "Slide In",
+      tip = "How much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
     { id = "sep", key = "separation", label = "Separation", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
-      tip = "Separation: how readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
+      title = "Separation",
+      tip = "How readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
   }
   -- The note actions, in the order of the note action bar (K.draw_note_bar): the same commands as the keys and the
   -- note menu. id = K.note_action's id and the Theme.icons entry; tip = the tooltip
   K.NOTE_ACTIONS = {
     { id = "snap",     tip = "Snap to nearest semitone (S)" },
     { id = "quantize", tip = "Quantize to the active scale (Q)" },
-    { id = "cursor",   tip = "Edit cursor to the middle of the note (C)\nHold C and turn the wheel to move it", icon = "cursor_to_note" },
+    { id = "cursor",   tip = "Edit cursor to the middle of the note (C)\n\nHold C and turn the wheel to move it.", icon = "cursor_to_note" },
     { id = "split",    tip = "Split at the edit cursor (X)" },
     { id = "merge",    tip = "Merge the selected notes (M)" },
   }
@@ -13222,10 +13297,10 @@ do
   --- K.bar_measure. Returns draw_unit(id) for "pill" and the ids of BAR_VALUES.
   K.bar_frame = function(bctx, has_target, s)
     local P = Theme.get_palette()
-    --- The start of the tooltip of the value `id`: its group's name (no caption shows it)
-    local function group_tip(id)
+    --- The first paragraph of the tooltip of the value `id`: its group's name (no caption shows it) and `title`
+    local function group_tip(id, title)
       local name = BAR_GROUP_NAMES[K.BAR_GROUP[id]]
-      return name and string.format(BAR_GROUP_TIP, name) or ""
+      return name and string.format(BAR_GROUP_TIP, name, title) or title
     end
     if has_target == nil then has_target = (state.target_take_guid ~= nil) end
 
@@ -13368,7 +13443,7 @@ do
       end
 
       if view.disabled then
-        bar_tooltip(group_tip(spec.id) .. spec.tip .. "\n" .. view.reason, reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(K.tip(group_tip(spec.id, spec.title), spec.tip, view.reason), reaper.ImGui_HoveredFlags_AllowWhenDisabled())
         return
       end
 
@@ -13377,14 +13452,15 @@ do
       K.value_fill(bctx, view.mixed and (view.lo_v - spec.lo) / span or 0, (view.hi_v - spec.lo) / span,
         K.param_color(key))   -- one colour per parameter, the same on the canvas
 
+      -- Paragraphs: name, what it does, why it does nothing now (if so), what a drag changes and the levels, gestures
       local scope = BAR_SCOPE_ITEM
       if view.target == "notes" then
         scope = (sel_n == 1) and BAR_SCOPE_NOTE or string.format(BAR_SCOPE_NOTES, sel_n)
       end
-      if key == "tolerance" and unused ~= "mode" and tolerance_idle() then scope = BAR_TOLERANCE_IDLE .. "\n" .. scope end
-      if unused then scope = BAR_MODE.unused[unused] .. "\n" .. scope end
-      bar_tooltip(group_tip(spec.id) .. spec.tip .. "\n" .. scope .. "\n" .. BAR_GESTURES .. "\n"
-        .. levels_line(spec, get_effective(nil, key)))
+      local idle = K.tip(unused and BAR_MODE.unused[unused],
+        (key == "tolerance" and unused ~= "mode" and tolerance_idle()) and BAR_TOLERANCE_IDLE or nil)
+      bar_tooltip(K.tip(group_tip(spec.id, spec.title), spec.tip, idle,
+        scope .. "\n" .. levels_line(spec, get_effective(nil, key)), BAR_GESTURES))
       if dead then return end
 
       if hovered or active then
@@ -13553,14 +13629,13 @@ do
       reaper.ImGui_EndDisabled(bctx)
 
       if disabled then
-        bar_tooltip(group_tip(spec.id) .. (reason and (spec.tip .. "\n" .. reason) or spec.tip),
-          reaper.ImGui_HoveredFlags_AllowWhenDisabled())
+        bar_tooltip(K.tip(group_tip(spec.id, spec.title), spec.tip, reason), reaper.ImGui_HoveredFlags_AllowWhenDisabled())
         return
       end
       local span = spec.hi - spec.lo
       K.value_fill(bctx, 0, (state[key] * spec.scale - spec.lo) / span, P.accent)
       local what = (sel_n > 0 and BAR_SEP_NOTES) or (has_data and BAR_SEP_RESPLIT) or BAR_SEP_NEXT
-      bar_tooltip(group_tip(spec.id) .. spec.tip .. "\n" .. what .. "\n" .. BAR_GESTURES .. "\n" .. levels_line(spec, state[key]))
+      bar_tooltip(K.tip(group_tip(spec.id, spec.title), spec.tip, what .. "\n" .. levels_line(spec, state[key]), BAR_GESTURES))
       local menu_reset = K.value_menu(bctx, key, spec.label, sel_n)
 
       --- The edit is done: store the item's value and split again, once, only when it changed. With notes
@@ -13624,7 +13699,7 @@ do
         mode_name(get_effective(nil, "correct_mode")))
       local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
         w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
-        tooltip = group_tip("mode") .. BAR_MODE.tip .. "\n" .. (inspector_reason or (scope .. "\n" .. levels)),
+        tooltip = K.tip(group_tip("mode", BAR_MODE.title), BAR_MODE.tip, inspector_reason or (scope .. "\n" .. levels)),
       })
       if inspector_reason then return end
       if K.value_menu(bctx, "correct_mode", "Mode", sel_n) then

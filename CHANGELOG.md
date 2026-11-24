@@ -4,6 +4,11 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.24.2 (`Pitch/Fancy_Pitch Correct.lua`)** — Easier-to-read tooltips:
+  - **Tooltips in paragraphs**: tooltips are split into short paragraphs with a blank line between them. The top bar's value tooltips now read: group and name, what the value does, any note on why it does nothing right now, what a drag changes with the default and item value, then the mouse gestures. Key and Scale say that a right-click applies them to other items.
+  - **Note name and cents explained**: hover the note name and cents in the bar under a selected note to see what they mean and how they tie to Key, Scale, Snap and Quantize.
+  - **Colour-coded readout**: the note name is coloured like the note-name column (accent for the Key's root, normal in the scale, dimmer out of the scale). The cents are green when the note is exactly on the note (0¢) and yellow when they are off it.
+- **Fancy Design System v1.6.1 (`Utility/Fancy_Design System.lua`)** — Lists the new note readout colours (`readout_*`) under the canvas palette.
 - **Fancy Pitch Correct v2.24.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Tolerance band at Tighten 0%:
   - **Tolerance band always shows**: hovering or dragging Tolerance now draws its band on the notes it reaches even when their Tighten is 0%, so you can set the band before raising Tighten. The "not used yet" note still says Tolerance has no effect until Tighten is raised.
 - **Fancy Pitch Correct v2.24.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Rename items without analysing again:

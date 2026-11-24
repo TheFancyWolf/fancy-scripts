@@ -809,6 +809,15 @@ local function build_canvas_fancy(P)
   -- BYPASSED badge on the card, over the scrim: title and border are exactly P.yellow
   C.bypass_title    = P.yellow
   C.bypass_border   = P.yellow
+  -- Note action bar readout (text on P.panel, >= 4.5:1 in both modes): the note name as the note-name column
+  -- colours it (root / in scale / out of scale), the cents green at 0 (in tune, the preview curve's hue) and yellow
+  -- off it (Tolerance's hue, the other value in cents)
+  local bar_on = { P.panel }
+  C.readout_name       = fit_contrast(P.text, bar_on, 4.5)
+  C.readout_name_tonic = fit_contrast(P.accent_l, bar_on, 4.5, nil, true)
+  C.readout_name_dim   = fit_contrast(P.text_dim, bar_on, 4.5)
+  C.readout_cents_in   = fit_contrast(P.green, bar_on, 4.5, nil, true)
+  C.readout_cents_off  = fit_contrast(P.yellow, bar_on, 4.5, nil, true)
   return C
 end
 
