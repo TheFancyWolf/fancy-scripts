@@ -525,7 +525,7 @@ end
 K.start_values = function()
   local t = {}
   for _, key in ipairs(K.ITEM_KEYS) do t[key] = global_defaults[key] end
-  t.key_idx, t.scale_idx = state.key_idx, state.scale_idx
+  t.key_idx, t.scale_idx = global_defaults.key_idx, global_defaults.scale_idx
   return t
 end
 
@@ -722,6 +722,8 @@ K.PERSIST = (function()
   number("cascade", "pitch_tighten", global_defaults, "tighten", { 0, 1 })
   number("cascade", "pitch_slide_in", global_defaults, "slide_in", { 0, 1 })
   choice("cascade", "pitch_correct_mode", global_defaults, "correct_mode", { 0, 1, 2 })
+  number("cascade", "pitch_key_idx", global_defaults, "key_idx", { 1, #SCALE_KEYS })
+  number("cascade", "pitch_scale_idx", global_defaults, "scale_idx", { 1, #SCALE_DEFINITIONS })
   number("cascade", "pitch_start_separation", global_defaults, "separation", K.LIMITS.separation)
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
@@ -790,16 +792,8 @@ end
 
 -- Initialize key, scale, sidebar, and the persisted settings from ExtState
 do
-  local saved_key = tonumber(reaper.GetExtState("FancyScripts", "pitch_key_idx"))
-  local saved_scale = tonumber(reaper.GetExtState("FancyScripts", "pitch_scale_idx"))
-  if saved_key and saved_key >= 1 and saved_key <= #SCALE_KEYS then
-    state.key_idx = saved_key
-  end
-  if saved_scale and saved_scale >= 1 and saved_scale <= #SCALE_DEFINITIONS then
-    state.scale_idx = saved_scale
-  end
-  update_scale_pitch_classes()
-
+  -- The starting Key and Scale (global_defaults, stored under pitch_key_idx / pitch_scale_idx by K.PERSIST)
+  global_defaults.key_idx, global_defaults.scale_idx = state.key_idx, state.scale_idx
   local saved_sidebar = reaper.GetExtState("FancyScripts", "pitch_sidebar_open")
   if saved_sidebar == "0" or saved_sidebar == "false" then
     state.sidebar_open = false
@@ -814,6 +808,10 @@ do
 
   -- Restore the global cascade defaults, the engine settings, the layers and the panel width
   K.load_settings()
+  -- Nothing is open yet: the window shows the starting values
+  state.key_idx, state.scale_idx, state.separation = global_defaults.key_idx, global_defaults.scale_idx,
+    global_defaults.separation
+  update_scale_pitch_classes()
   -- A panel the user never resized takes its width from the Shortcuts list (see K.panel_fit_w), on the first frame
   state.sidebar_auto = not reaper.HasExtState("FancyScripts", "pitch_sidebar_w")
 end
@@ -2853,6 +2851,13 @@ K.analysis_progress = function()
   return state.progress or 0
 end
 
+--- The open item has no stored data: Separation, Key and Scale are the starting values.
+K.adopt_start_values = function()
+  local start = K.start_values()
+  state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
+  update_scale_pitch_classes()
+end
+
 local function switch_active_target(guid, take_obj)
   -- A pending arrow-key nudge belongs to the take being left: commit it first
   flush_nudge_burst()
@@ -2873,6 +2878,7 @@ local function switch_active_target(guid, take_obj)
     adopt_take_data(guid, data)
     return true
   end
+  K.adopt_start_values()   -- not analysed yet: it shows, and its first analysis uses, the starting values
   return false
 end
 

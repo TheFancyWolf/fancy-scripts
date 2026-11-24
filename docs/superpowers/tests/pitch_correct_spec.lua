@@ -3003,6 +3003,36 @@ test("seed_old_take_same_build", function()
   if not ok then error(err, 0) end
 end)
 
+test("item_seed_keeps_existing", function()
+  local data = { separation = 0.2, overrides = { tighten = 0.3 } }
+  S.K.item_seed(data)
+  eq(data.separation, 0.2, "separation")
+  eq(data.overrides.tighten, 0.3, "tighten")
+end)
+
+test("start_values_key_from_global", function()
+  local st, g = S.state, S.global_defaults
+  local saved = { g.key_idx, st.key_idx, g.scale_idx, st.scale_idx }
+  g.key_idx, st.key_idx, g.scale_idx, st.scale_idx = 3, 7, 2, 5
+  local sv = S.K.start_values()
+  g.key_idx, st.key_idx, g.scale_idx, st.scale_idx = saved[1], saved[2], saved[3], saved[4]
+  eq(sv.key_idx, 3, "key_idx")
+  eq(sv.scale_idx, 2, "scale_idx")
+end)
+
+test("unanalysed_take_takes_start_values", function()
+  local st, g = S.state, S.global_defaults
+  local saved = { g.separation, g.key_idx, g.scale_idx, st.separation, st.key_idx, st.scale_idx }
+  g.separation, g.key_idx, g.scale_idx = 0.8, 4, 2
+  st.separation, st.key_idx, st.scale_idx = 0.1, 9, 1
+  S.K.adopt_start_values()
+  local got = { st.separation, st.key_idx, st.scale_idx }
+  g.separation, g.key_idx, g.scale_idx, st.separation, st.key_idx, st.scale_idx = table.unpack(saved)
+  eq(got[1], 0.8, "separation")
+  eq(got[2], 4, "key_idx")
+  eq(got[3], 2, "scale_idx")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
