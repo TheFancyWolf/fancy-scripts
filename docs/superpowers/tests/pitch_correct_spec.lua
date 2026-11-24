@@ -3610,43 +3610,6 @@ test("apply_refuses_when_the_open_item_changed", function() with_write_stubs({},
   if not ok then error(err, 0) end
 end) end)
 
--- Live check (Task 7): an item stored before it had values of its own (no data.overrides) is seeded when it loads.
--- When an Apply changes the starting values, such an item must not take the new ones at its next load (an undo of
--- the Apply, a relaunch): it is seeded from the starting values as they were before the first change.
-test("legacy_item_seed_survives_apply", function() with_write_stubs({}, function()
-  local st, K, G = S.state, S.K, S.global_defaults
-  local store = {}
-  local stubbed = { "HasExtState", "GetExtState", "SetExtState" }
-  reaper.HasExtState = function(_, k) return store[k] ~= nil end
-  reaper.GetExtState = function(_, k) return store[k] or "" end
-  reaper.SetExtState = function(_, k, v) store[k] = v end
-  local saved = { G.tighten, G.tolerance, st.target_take_guid, st.is_analyzing, reaper.time_precise }
-  reaper.time_precise = function() return 0 end
-  local ok, err = pcall(function()
-    G.tighten, G.tolerance = 0, 8
-    local legacy = '{"results":[],"notes":[],"separation":0.5,"key_idx":5,"scale_idx":1}'
-    eq(S.load_take_data("x", legacy).overrides.tighten, 0, "before any Apply: the starting value")
-    local plan = K.apply_plan({ tighten = 0.41 }, {}, { "tighten" }, false, K.start_values())
-    K.apply_run(plan, { "tighten" }, { tighten = 0.41 }, "Tighten")
-    eq(G.tighten, 0.41, "the starting value changed")
-    eq(S.load_take_data("x", legacy).overrides.tighten, 0, "a stored item keeps the value it was made with")
-    local fresh = {}
-    K.item_seed(fresh)
-    eq(fresh.overrides.tighten, 0.41, "a new item takes the new starting value")
-    -- A second Apply does not move the stored items' seed again
-    plan = K.apply_plan({ tighten = 0.7 }, {}, { "tighten" }, false, K.start_values())
-    K.apply_run(plan, { "tighten" }, { tighten = 0.7 }, "Tighten")
-    eq(S.load_take_data("x", legacy).overrides.tighten, 0, "still the first value")
-    eq(S.load_take_data("x", legacy).overrides.tolerance, 8, "the other values too")
-  end)
-  for _, name in ipairs(stubbed) do reaper[name] = nil end
-  reaper.GetExtState = function() return "" end   -- the harness's own stub
-  G.tighten, G.tolerance, st.target_take_guid, st.is_analyzing, reaper.time_precise = table.unpack(saved, 1, 5)
-  K.batch = nil
-  st.status.text, st.status.hold = "", nil
-  if not ok then error(err, 0) end
-end) end)
-
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

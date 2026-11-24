@@ -3,6 +3,7 @@
 -- @version 2.22.0
 -- @changelog
 --   Items keep their own copy of the starting values; changing the starting values no longer changes them
+--   Items analysed by an earlier version take the current starting values when opened: analyse them again
 --   Item values now reach every note of the item, edited or not
 --   The top bar changes only this item or the selected notes, never other items; the pill says which
 --   Key and Scale in the top bar no longer set the key for new items
@@ -538,39 +539,10 @@ K.start_values = function()
   return t
 end
 
--- ExtState key of the starting values as they were before an Apply first changed them (K.seed_values)
-K.SEED_EXT = "pitch_seed_values"
-
---- The values a stored item that has none of its own is seeded with when it loads (K.item_seed): the starting values
---- as they were before an Apply first changed them, else today's. Such an item followed the starting values until
---- then; the seed is only written to the item with its next save, so seeding it from today's values would let an
---- Apply (or the undo of one) change an item it never targeted.
-K.seed_values = function()
-  local t = K.start_values()
-  local raw = reaper.GetExtState("FancyScripts", K.SEED_EXT)
-  if raw and raw ~= "" then
-    local ok, saved = pcall(JSON.decode, raw)
-    if ok and type(saved) == "table" then
-      for key in pairs(t) do
-        if type(saved[key]) == "number" then t[key] = saved[key] end
-      end
-    end
-  end
-  return t
-end
-
---- Before the starting values change for the first time, keep what they were (K.seed_values).
-K.seed_keep = function()
-  if not reaper.HasExtState("FancyScripts", K.SEED_EXT) then
-    reaper.SetExtState("FancyScripts", K.SEED_EXT, JSON.encode(K.start_values()), true)
-  end
-end
-
---- Fill every missing value of an item's model from `start` (default: the starting values). A model change only: it
---- is written with the item's next save. Returns true when it filled one.
-K.item_seed = function(data, start)
-  start = start or K.start_values()
-  local filled = false
+--- Fill every missing value of an item's model from the starting values (a model change only: it is written with
+--- the item's next save). Returns true when it filled one.
+K.item_seed = function(data)
+  local start, filled = K.start_values(), false
   for _, key in ipairs(K.ITEM_KEYS) do
     if K.item_value(data, key) == nil then
       if key == "separation" then
@@ -2485,7 +2457,7 @@ local function load_take_data(take, raw)
   end
   if guid then state.unreadable_takes[guid] = (not readable) or nil end
   if readable then
-    K.item_seed(data, K.seed_values())
+    K.item_seed(data)
     return data
   end
   return nil
@@ -11409,7 +11381,6 @@ K.APPLY_START_ONLY = "Starting values saved for new items."
 --- when the run ends (K.apply_finish).
 K.apply_run = function(plan, keys, src, label)
   if K.batch or state.is_analyzing then return false end
-  K.seed_keep()
   for _, key in ipairs(keys) do
     if src[key] ~= nil then global_defaults[key] = src[key] end
   end
@@ -13574,7 +13545,6 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
            request_confirm = request_confirm, draw_confirm_modal = draw_confirm_modal, sync_with_project = sync_with_project,
            get_effective = get_effective, get_override_level = get_override_level, global_defaults = global_defaults,
-           measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
-           load_take_data = load_take_data }
+           measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w }
 end
 main()

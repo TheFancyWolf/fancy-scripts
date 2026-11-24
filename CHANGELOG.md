@@ -5,7 +5,7 @@ All notable changes to Fancy Scripts will be documented here.
 ## [Unreleased]
 
 - **Fancy Pitch Correct v2.22.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Value levels and Apply to other items:
-  - **Items keep their own copy of the starting values**: every item takes a copy of the starting values (Key, Scale, Separation, Mode, Tighten, Tolerance, Strength, Slide In) when it is first analysed or loaded, and keeps it. Changing the starting values later does not change any item that already has its copy. An item stored by an earlier version keeps the values it had before the starting values first changed.
+  - **Items keep their own copy of the starting values**: every item takes a copy of the starting values (Key, Scale, Separation, Mode, Tighten, Tolerance, Strength, Slide In) when it is first analysed or loaded, and keeps it. Changing the starting values later does not change any item that already has its copy. Items analysed by an earlier version take the current starting values when they are opened; analyse them again after upgrading.
   - **Item values now reach every note**: an item's value is used by every note of the item that has no value of its own, edited or not (before, a note you had not edited ignored the item's Tighten). So raising the item's Tighten on an item with no edits now writes a correction.
   - **The bar no longer changes other items**: the top bar edits only the open item, or the selected notes, and the pill at its left says which ("This item", "N notes"). Its drags and typed values no longer save the starting values.
   - **Key no longer sets the key for new items**: Key and Scale in the top bar change the open item only. New items take the starting Key and Scale.
