@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.25.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Pitched Items follows into the arrange view:
+  - **Row selection selects the items**: clicking a row in Pitched Items now also selects that item in REAPER's arrange view (and only that one). Cmd-click (Ctrl on Windows) and Shift-click select every selected row's item, and Esc, putting the rows back to just the open item, selects just its item. The open item does not change when the first selected item in REAPER is another row's.
 - **Fancy Pitch Correct v2.24.3 (`Pitch/Fancy_Pitch Correct.lua`)** — Clearer right-click menus:
   - **Tooltips in the note menu**: the note name and cents, Bypass This Note, Mode, each value (what it does, why it does nothing right now if so, what it changes, where its value comes from, and the gestures), Add Pitch Point Here and Reset Pitch Points now explain themselves on hover. The pitch point menu's Offset, Reset Point and Remove Point do too.
   - **Shorter note menu**: Snap to Semitone, Quantize to Scale, Split at Cursor and Reset to Original are no longer in the note menu. Use their keys (S, Q, X, R, listed in the Shortcuts panel) or the note action bar.

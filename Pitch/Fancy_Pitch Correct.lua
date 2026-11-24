@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.24.3
+-- @version 2.25.0
 -- @changelog
---   The note and pitch point menus get tooltips and more room between controls and labels; Snap, Quantize, Split and Reset leave the note menu (their keys are in Shortcuts)
+--   Selecting rows in Pitched Items selects their items in the arrange view
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -10064,6 +10064,31 @@ K.draw_items_body = function(sidebar_ctx)
   K.run_row_action(row_action)
 end
 
+--- Select in the arrange view the items of the selected Pitched Items rows, and only those (like a click on an item
+--- in REAPER: no undo point). The selection follower is then told what is selected now, so the first selected item
+--- (which may not be the active row after a Shift- or Cmd-click) does not switch the active item.
+K.mirror_row_sel_to_arrange = function()
+  local items = {}
+  for _, g in ipairs(state.session_order) do
+    if state.row_sel[g] then
+      local take = resolve_take_by_guid(g, true)
+      local item = take and K.take_item(take) or nil
+      if item then items[#items + 1] = item end
+    end
+  end
+  if #items == 0 then return end   -- nothing to select (items gone): leave REAPER's selection alone
+
+  reaper.PreventUIRefresh(1)
+  reaper.SelectAllMediaItems(0, false)
+  for _, item in ipairs(items) do reaper.SetMediaItemSelected(item, true) end
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+
+  local sel_item = reaper.GetSelectedMediaItem(0, 0)
+  local sel_take = sel_item and reaper.GetActiveTake(sel_item) or nil
+  state.last_seen_sel_guid = (sel_take and not reaper.TakeIsMIDI(sel_take)) and get_take_guid(sel_take) or nil
+end
+
 --- Carry out what a row click, the row menu or Remove Selected asked for (after the list was drawn).
 K.run_row_action = function(a)
   if not a then return end
@@ -10087,6 +10112,9 @@ K.run_row_action = function(a)
       local g = state.session_order[i]
       if g then state.row_sel[g] = true end
     end
+  end
+  if a.kind == "click" or a.kind == "toggle" or a.kind == "range" then
+    K.mirror_row_sel_to_arrange()
   elseif a.kind == "remove_one" then
     request_remove_confirm(a.guid)
   elseif a.kind == "remove_selected" then
@@ -13856,8 +13884,8 @@ local function loop_body()
   local popup_open_at_start = visible and reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
   if visible then
     -- Automatic selection tracking from REAPER (edge-triggered): switch target only when the first
-    -- selected audio item CHANGES (or the current target no longer exists). A sidebar click sets the
-    -- target without touching REAPER's selection, so it must not be overridden by the old selection.
+    -- selected audio item CHANGES (or the current target no longer exists). A sidebar click selects its
+    -- row's items in REAPER and records that selection as seen, so it is not taken for a change here.
     -- A batch owns the target while it runs.
     if not state.is_analyzing and not K.batch then
       local cur_sel_item = reaper.GetSelectedMediaItem(0, 0)
@@ -14000,6 +14028,7 @@ local function loop_body()
         state.marquee = nil
       elseif K.row_sel_extra() then
         K.row_sel_reset()
+        K.mirror_row_sel_to_arrange()
       elseif not docked then
         open = false
       end
