@@ -3,7 +3,8 @@
 -- @version 2.22.0
 -- @changelog
 --   Items keep their own copy of the starting values; changing the starting values no longer changes them
---   Items analysed by an earlier version take the current starting values when opened: analyse them again
+--   Items analysed by an earlier version take the current starting values when opened, until edited once
+--   The earlier Separation preference is not carried over: new items start at 50%
 --   Item values now reach every note of the item, edited or not
 --   The top bar changes only this item or the selected notes, never other items; the pill says which
 --   Key and Scale in the top bar no longer set the key for new items
