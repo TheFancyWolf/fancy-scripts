@@ -9,9 +9,9 @@
 --   The top bar changes only this item or the selected notes, never other items; the pill says which
 --   Key and Scale in the top bar no longer set the key for new items
 --   New: Apply to other items (pill menu, value right-click), with an option to keep changes already made
---   New: Reset this item to the starting values (pill menu)
+--   New: Reset this item to defaults (pill menu); a value's reset on the item goes to its default
 --   New: Separation with notes selected re-splits just that stretch ("Re-split selected notes")
---   The values sit in three named groups (Notes, Correction, Shaping)
+--   The values sit in three groups split by hairlines (Notes, Correction, Shaping), named in their tooltips
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -191,6 +191,9 @@ local DEFAULTS = {
   retune_speed = 1.0,        -- 0.0–1.0 (correction strength)
   tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
   separation = 0.5,          -- 0–1 how readily the analysis splits notes (see K.separation_params)
+  correct_mode = 0,          -- 0 Natural, 1 Classic, 2 Hard
+  tighten = 0,               -- 0–1 how much of a note's wobble is taken out
+  slide_in = 0,              -- 0–1 how much of the slide into a note is corrected
   note_bar_size = 2,         -- Settings > Appearance: the note action bar's size, an index into K.NOTE_BAR_SIZES (Medium)
 }
 -- Analysis engine (Settings > Advanced DSP): the values of the default presets, so a preset table and its default pick
@@ -207,9 +210,9 @@ local global_defaults = {
   tolerance = DEFAULTS.tolerance,
   -- The starting values (see K.item_seed): every item copies them once, when it is first analysed or first loaded
   separation = DEFAULTS.separation,
-  correct_mode = 0,   -- 0 Natural, 1 Classic, 2 Hard
-  tighten = 0,
-  slide_in = 0,
+  correct_mode = DEFAULTS.correct_mode,
+  tighten = DEFAULTS.tighten,
+  slide_in = DEFAULTS.slide_in,
 }
 
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
@@ -582,37 +585,34 @@ K.item_carry = function(data, before, all)
   end
 end
 
---- How many of the item's values (K.ITEM_KEYS, Key, Scale) differ from the starting values. A missing value
---- follows the starting value, so it does not count.
-K.item_differs = function(data)
+--- How many of the item's values (K.ITEM_KEYS) differ from the script's defaults (DEFAULTS). A missing value follows
+--- the starting value, so it counts when the starting value differs. Key and Scale are not values with a default.
+K.item_off_defaults = function(data)
   if not data then return 0 end
-  local start, n = K.start_values(), 0
+  local n = 0
   for _, key in ipairs(K.ITEM_KEYS) do
     local v = K.item_value(data, key)
-    if v ~= nil and start[key] ~= nil and K.value_changed(v, start[key]) then n = n + 1 end
+    if v == nil then v = global_defaults[key] end
+    if DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then n = n + 1 end
   end
-  if data.key_idx ~= nil and data.key_idx ~= start.key_idx then n = n + 1 end
-  if data.scale_idx ~= nil and data.scale_idx ~= start.scale_idx then n = n + 1 end
   return n
 end
 
---- The model part of "Reset this item to the starting values": every item value (Key and Scale too) becomes the
---- starting value. The notes keep their own values. A model change only (K.reset_item_all writes it).
+--- The model part of "Reset this item to defaults": every item value (K.ITEM_KEYS) becomes the script's default
+--- (DEFAULTS); Key and Scale are not changed, and the notes keep their own values. A model change only
+--- (K.reset_item_all writes it).
 K.item_reset_values = function(data)
   if not data then return end
-  local start = K.start_values()
   for _, key in ipairs(K.ITEM_KEYS) do
-    if start[key] ~= nil then
+    if DEFAULTS[key] ~= nil then
       if key == "separation" then
-        data.separation = start[key]
+        data.separation = DEFAULTS[key]
       else
         data.overrides = data.overrides or {}
-        data.overrides[key] = start[key]
+        data.overrides[key] = DEFAULTS[key]
       end
     end
   end
-  if start.key_idx ~= nil then data.key_idx = start.key_idx end
-  if start.scale_idx ~= nil then data.scale_idx = start.scale_idx end
 end
 
 --- Resolve an effective value: the note's own, else the target item's, else the starting value (only for an item
@@ -8687,7 +8687,7 @@ local function draw_graph(draw_ctx, w, h)
                state.context_edit = nil
             end
          end
-         if DEFAULTS[key] ~= nil then
+         if key == "tolerance" or key == "retune_speed" then
             reaper.ImGui_SameLine(draw_ctx)
             reaper.ImGui_TextDisabled(draw_ctx, "[" .. level .. "]")
          end
@@ -9402,9 +9402,9 @@ K.INFO_SECTIONS = {
     { "B", "Bypass the selected notes (again: turn bypass off)", panel = { "Edit", 4, "Bypass note" } },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch", panel = { "Edit", 3, "Reset pitch", "R" } },
     { "Right-click a note", "Note menu: bypass, values, Snap, Quantize, Split, Reset", panel = { "Edit", 9, "Note menu", "Right-click" } },
-    { "Click the pill", "Apply values to other items, or reset this item" },
+    { "Click the pill", "Apply values to other items, or reset this item to defaults" },
     { "Right-click a top bar value", "Reset, or apply it to other items" },
-    { "Double-click a value", "Back to the item's value (notes) or the starting value (item)" },
+    { "Double-click a value", "Back to the item's value (notes) or the default (item)" },
     { K.MOD_LABEL .. "-click a value", "Type a number" },
     { "Hover or drag a setting", "Shows on the notes where it acts" },
     { "Note action bar (under the selected note)", "Snap · Quantize · Cursor · Split · Merge (S / Q / C / X / M)" },
@@ -11094,18 +11094,19 @@ K.resplit = function(prev_separation, opts)
   })
 end
 
-K.RESET_ITEM_UNDO = "Reset item to starting values"
-K.RESET_ITEM_STATUS = "Item reset to the starting values."
+K.RESET_ITEM_UNDO = "Reset item to defaults"
+K.RESET_ITEM_STATUS = "Item reset to the defaults."
 
---- The pill menu's "Reset this item to the starting values": the open item takes every starting value (Key and
---- Scale too, K.item_reset_values); its notes keep their own values. One undo point (K.RESET_ITEM_UNDO). When
+--- The pill menu's "Reset this item to defaults": the open item takes the script's default of every value
+--- (DEFAULTS, K.item_reset_values; Key and Scale are not changed); its notes keep their own values. One undo point
+--- (K.RESET_ITEM_UNDO). When
 --- Separation differs and the analysed frames are in memory, the item is split again as part of it (K.resplit, which
 --- asks first when edits would be lost; Cancel puts every value back). Nothing differs: nothing is written (UC1).
 --- Returns true when the reset ran (or waits on the re-split's question).
 K.reset_item_all = function()
   local guid = state.target_take_guid
   local data = guid and state.session_takes[guid]
-  if not data or K.item_differs(data) == 0 then return false end
+  if not data or K.item_off_defaults(data) == 0 then return false end
   local before = { separation = data.separation, key_idx = data.key_idx, scale_idx = data.scale_idx, overrides = {} }
   for k, v in pairs(data.overrides or {}) do before.overrides[k] = v end
   local had_overrides = data.overrides ~= nil
@@ -11128,7 +11129,7 @@ K.reset_item_all = function()
     K.resplit(before.separation, {
       undo = K.RESET_ITEM_UNDO,
       status = K.RESET_ITEM_STATUS,
-      title = string.format("Reset %s to the starting values?", state.target_take_name or "this item"),
+      title = string.format("Reset %s to the defaults?", state.target_take_name or "this item"),
       confirm_label = "Reset",
       on_cancel = function()
         -- Nothing was split: every value goes back to what it was
@@ -11701,9 +11702,9 @@ end
 -- Quantize, Split and Merge are on the canvas, in the note action bar under the selected note: K.draw_note_bar):
 --   Clip          brand, target badge, Key, Scale
 --   Values        the selection pill (what a drag changes: this item, or the selected notes; a click opens its
---                 menu), then three named groups, each after a small caption while the width allows:
---                 Notes (Separation), Correction (Mode, Tighten, Tolerance), Shaping (Strength, Slide In: drawn
---                 in the small font, quieter)
+--                 menu), then three groups split by hairlines, all in the default font (no captions: each
+--                 value's tooltip names its group): Notes (Separation), Correction (Mode, Tighten, Tolerance),
+--                 Shaping (Strength, Slide In)
 --   Right         "…" (Analyze / Cancel, Reset, Layers, Note Tone, Settings, Help) and Close, right-aligned on row 1
 -- The Values units are drawn by K.bar_frame (see TOP BAR CONTROLS below); this
 -- section places them. Every width is measured from the longest text its control can show. On how many rows the
@@ -11731,8 +11732,8 @@ do
   local HDR_APPLY_KEY = "Apply Key to other items\xE2\x80\xA6"
 
   -- The units of each group, and the group every unit belongs to (a separator is drawn where the group changes).
-  -- The Values group is the pill, then three named groups (K.BAR_GROUP: Notes, Correction, Shaping), each with
-  -- its caption unit ("cap_" .. group, K.bar_caption) before its first value in the plans that show captions.
+  -- The Values group is the pill, then three named groups (K.BAR_GROUP: Notes, Correction, Shaping), split by
+  -- hairline separators.
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
   local HDR_VALUES = { "pill", "sep", "mode", "tight", "tol", "strength", "slide" }
   K.BAR_GROUP = { pill = "values", sep = "notes", mode = "correction", tight = "correction", tol = "correction",
@@ -11740,16 +11741,6 @@ do
   local HDR_GROUP = {}
   for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
   for id, group in pairs(K.BAR_GROUP) do HDR_GROUP[id] = group end
-  -- The Values units with the captions in front of each named group
-  local HDR_VALUES_CAP = {}
-  for i, id in ipairs(HDR_VALUES) do
-    local group = HDR_GROUP[id]
-    if group ~= "values" and (i == 1 or HDR_GROUP[HDR_VALUES[i - 1]] ~= group) then
-      HDR_VALUES_CAP[#HDR_VALUES_CAP + 1] = "cap_" .. group
-      HDR_GROUP["cap_" .. group] = group
-    end
-    HDR_VALUES_CAP[#HDR_VALUES_CAP + 1] = id
-  end
 
   --- One row holding the units of every list given, in order.
   local function hdr_row(...)
@@ -11760,19 +11751,17 @@ do
     return row
   end
 
-  -- From the widest to the narrowest; captions go first as the width shrinks (LG4). At the narrowest the Values
-  -- group wraps by group, Shaping on its own row, so the main controls stay together.
+  -- From the widest to the narrowest (LG4). At the narrowest the Values group wraps by group, Shaping on its own
+  -- row, so the main controls stay together.
   local HDR_PLANS = {
-    { rows = { hdr_row(HDR_CLIP, HDR_VALUES_CAP) }, captions = true },
     { rows = { hdr_row(HDR_CLIP, HDR_VALUES) } },
-    { rows = { HDR_CLIP, HDR_VALUES_CAP }, captions = true },
     { rows = { HDR_CLIP, HDR_VALUES } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "sep" }, { "mode", "tight" }, { "tol" },
       { "strength", "slide" } } },
   }
   K.HDR_PLANS = HDR_PLANS
-  -- The plan a first-use window is sized for: two rows, with the captions
-  local HDR_FIRST_USE_PLAN = HDR_PLANS[3]
+  -- The plan a first-use window is sized for: two rows
+  local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
   for _, plan in ipairs(HDR_PLANS) do
     for r, row in ipairs(plan.rows) do
       for _, id in ipairs(row) do
@@ -12183,7 +12172,7 @@ do
       reset_label = reset_label, reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
     }
     -- The Values units draw themselves (see TOP BAR CONTROLS)
-    local draw_unit = K.bar_frame(ctx, has_target, s.bar, plan.captions == true)
+    local draw_unit = K.bar_frame(ctx, has_target, s.bar)
     local draw_list = reaper.ImGui_GetWindowDrawList(ctx)
 
     local close_clicked = false
@@ -12278,9 +12267,9 @@ do
   local BAR_SEP_RESPLIT = "Letting go splits this item's notes again."
   local BAR_SEP_NEXT = "This item's first analysis uses it."
   local BAR_SEP_NOTES = "Splits the selected stretch again: only the notes from the first to the last selected one change."
-  -- The named groups of the Values group (K.BAR_GROUP): their captions (K.bar_caption), and the start of each value's
-  -- tooltip when the plan shows no captions
-  local BAR_CAPTIONS = { notes = "Notes", correction = "Correction", shaping = "Shaping" }
+  -- The named groups of the Values group (K.BAR_GROUP): no caption shows them, so each value's tooltip starts with
+  -- its group's name (the hairline separators show where a group ends)
+  local BAR_GROUP_NAMES = { notes = "Notes", correction = "Correction", shaping = "Shaping" }
   local BAR_GROUP_TIP = "%s \xC2\xB7 "
   -- The pill's menu (see draw_pill)
   local BAR_PILL_MENU = {
@@ -12289,11 +12278,11 @@ do
     to_notes = "Edits go to: the %d selected notes",
     start = "Starting values: %s",
     apply = "Apply to other items\xE2\x80\xA6",
-    reset = "Reset this item to the starting values",
-    reset_none = "Already at the starting values",
+    reset = "Reset this item to defaults",
+    reset_none = "Already at the defaults",
   }
   -- The right-click menu of a value (K.value_menu)
-  local BAR_MENU_RESET_ITEM, BAR_MENU_RESET_NOTES = "Reset to starting value", "Reset to item value"
+  local BAR_MENU_RESET_ITEM, BAR_MENU_RESET_NOTES = "Reset to default", "Reset to item value"
   local BAR_MENU_APPLY = "Apply %s to other items\xE2\x80\xA6"
   local BAR_MENU_APPLY_NONE = "No other pitched items"
 
@@ -12329,8 +12318,6 @@ do
   }
   local BAR_VALUE_BY_ID = {}
   for _, spec in ipairs(BAR_VALUES) do BAR_VALUE_BY_ID[spec.id] = spec end
-  -- The text height of a caption in the small font (K.bar_measure), to centre it on the row
-  local bar_caption_h = nil
 
   local function bar_text_w(bctx, text)
     return (reaper.ImGui_CalcTextSize(bctx, text)) or 0
@@ -12356,24 +12343,8 @@ do
         bar_text_w(bctx, spec.label .. " " .. BAR_NO_VALUE))
       return widest + mark_w + s.pad_x
     end
-    for _, spec in ipairs(BAR_VALUES) do
-      if K.BAR_GROUP[spec.id] ~= "shaping" then s.unit_w[spec.id] = measure_value(spec) end
-    end
-    -- In the small font (LG3: measured in the font they are drawn in): the Shaping values, the captions, and the
-    -- frame height the Shaping values are centred with on the row
-    local small = Theme.push_font(bctx, fonts.small, Theme.font_sizes.small)
-    for _, spec in ipairs(BAR_VALUES) do
-      if K.BAR_GROUP[spec.id] == "shaping" then s.unit_w[spec.id] = measure_value(spec) end
-    end
-    s.small_frame_h = reaper.ImGui_GetFrameHeight(bctx) or s.frame_h
-    s.caption_h = 0
-    for group, text in pairs(BAR_CAPTIONS) do
-      local w, h = reaper.ImGui_CalcTextSize(bctx, text)
-      s.unit_w["cap_" .. group] = w or 0
-      s.caption_h = math.max(s.caption_h, h or 0)
-    end
-    Theme.pop_font(bctx, small)
-    bar_caption_h = s.caption_h
+    -- Every value in the default font, the font it is drawn in (LG3)
+    for _, spec in ipairs(BAR_VALUES) do s.unit_w[spec.id] = measure_value(spec) end
     s.unit_w.pill = math.max(bar_text_w(bctx, BAR_PILL_NONE), bar_text_w(bctx, BAR_PILL_ONE),
       bar_text_w(bctx, string.format(BAR_PILL_MANY, 999))) + s.pad_x
     -- The Mode dropdown: its longest text, the frame padding and the arrow (a square of the frame height)
@@ -12381,17 +12352,6 @@ do
     for _, name in ipairs(K.MODES) do mode_text_w = math.max(mode_text_w, bar_text_w(bctx, name)) end
     s.unit_w.mode = mode_text_w + s.pad_x + s.frame_h
     return s
-  end
-
-  --- A group caption of the Values group ("notes", "correction" or "shaping"): small dim text, centred on the
-  --- row's framed widgets (LG2). Its width is s.unit_w["cap_" .. group] (K.bar_measure).
-  K.bar_caption = function(bctx, group)
-    local text = BAR_CAPTIONS[group]
-    if not text then return end
-    Theme.align(bctx, nil, bar_caption_h)
-    local small = Theme.push_font(bctx, fonts.small, Theme.font_sizes.small)
-    reaper.ImGui_TextColored(bctx, Theme.get_palette().text_dim, text)
-    Theme.pop_font(bctx, small)
   end
 
   --- The selected notes that hold values, in one reused table (no table per frame), and how many.
@@ -12455,8 +12415,9 @@ do
   end
 
   --- Reset `key` (double-click, or the right-click menu): the `sel_n` selected notes lose their own value (they
-  --- follow the item again), else this item takes the starting value. One undo point when something changed; true
-  --- when it was written. Separation is reset by draw_separation (a re-split).
+  --- follow the item again), else this item takes the script's default (DEFAULTS, HC3). One undo point when
+  --- something changed (none when the item is at the default already: UC1); true when it was written. Separation
+  --- is reset by draw_separation (a re-split).
   K.reset_target = function(key, sel_notes, sel_n)
     state.bar_edit = nil
     local changed = false
@@ -12468,9 +12429,10 @@ do
     else
       local data = state.target_take_guid and state.session_takes[state.target_take_guid]
       if not data then return false end
-      local start = global_defaults[key]
-      if start ~= nil and K.item_value(data, key) ~= start then
-        K.bar_write(key, start, sel_notes, 0)
+      local default, now = DEFAULTS[key], K.item_value(data, key)
+      if now == nil then now = global_defaults[key] end
+      if default ~= nil and K.value_changed(now, default) then
+        K.bar_write(key, default, sel_notes, 0)
         changed = true
       end
     end
@@ -12478,8 +12440,8 @@ do
     return apply_envelope_to_take("Reset " .. (PARAM_LABELS[key] or key)) == true
   end
 
-  --- The right-click menu of the value `key` named `label` (call right after its control): reset to the level above
-  --- (the item's value with notes selected, else the starting value), and apply it to other items (K.apply_open).
+  --- The right-click menu of the value `key` named `label` (call right after its control): reset (to the item's
+  --- value with notes selected, else to the script's default), and apply it to other items (K.apply_open).
   --- Returns true when Reset was chosen: the caller resets (K.reset_target, or Separation's re-split).
   K.value_menu = function(bctx, key, label, sel_n)
     if not reaper.ImGui_BeginPopupContextItem(bctx, "##ctx_" .. key) then return false end
@@ -12770,14 +12732,12 @@ do
   end
 
   --- The units of this frame. `has_target` comes from loop_body (the top bar's view of the target); `s` from
-  --- K.bar_measure; `captions`: the plan shows the group captions (without them, each value's tooltip starts with its
-  --- group). Returns draw_unit(id) for "pill", the captions ("cap_" .. group) and the ids of BAR_VALUES.
-  K.bar_frame = function(bctx, has_target, s, captions)
+  --- K.bar_measure. Returns draw_unit(id) for "pill" and the ids of BAR_VALUES.
+  K.bar_frame = function(bctx, has_target, s)
     local P = Theme.get_palette()
-    --- The start of the tooltip of the value `id`: its group's name when no caption shows it
+    --- The start of the tooltip of the value `id`: its group's name (no caption shows it)
     local function group_tip(id)
-      if captions then return "" end
-      local name = BAR_CAPTIONS[K.BAR_GROUP[id]]
+      local name = BAR_GROUP_NAMES[K.BAR_GROUP[id]]
       return name and string.format(BAR_GROUP_TIP, name) or ""
     end
     if has_target == nil then has_target = (state.target_take_guid ~= nil) end
@@ -12887,15 +12847,10 @@ do
       local unused = K.mode_unused(key, sel_notes, sel_n)
       local dim = (unused == "mode" or unused == "hard")
 
-      -- Shaping is quieter: the small font, centred on the row's framed widgets (measured in it: K.bar_measure)
-      local shaping = K.BAR_GROUP[spec.id] == "shaping"
-      if shaping then Theme.align(bctx, nil, s.small_frame_h) end
       reaper.ImGui_BeginDisabled(bctx, view.disabled == true)
       reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
       if dim then reaper.ImGui_PushStyleColor(bctx, reaper.ImGui_Col_Text(), P.text_dim) end
-      local small = shaping and Theme.push_font(bctx, fonts.small, Theme.font_sizes.small)
       local changed, v, committed, reset, cancelled = param_drag(bctx, id, nil, view.lo_v, spec.lo, spec.hi, value_format(spec, view))
-      Theme.pop_font(bctx, small)
       if dim then reaper.ImGui_PopStyleColor(bctx) end
       local back = K.drag_revert(id, view.lo_v / spec.scale, cancelled)
       local hovered, active, typed = K.drag_hot.hovered, K.drag_hot.active, K.drag_hot.typed
@@ -13060,8 +13015,8 @@ do
       return string.format(BAR_PILL_MENU.start, table.concat(parts, " \xC2\xB7 "))
     end
 
-    --- The pill's menu: where edits go, the starting values, Apply to other items… and Reset this item to the
-    --- starting values. A disabled entry says why beside it (EP2: readable with tooltips off).
+    --- The pill's menu: where edits go, the starting values, Apply to other items… and Reset this item to
+    --- defaults. A disabled entry says why beside it (EP2: readable with tooltips off).
     local function draw_pill_menu(open_x, open_y)
       -- Under the pill: set right before BeginPopup (a tooltip in between would take the position)
       if open_x then reaper.ImGui_SetNextWindowPos(bctx, open_x, open_y) end
@@ -13084,7 +13039,7 @@ do
 
       K.apply_menu_item(bctx, BAR_PILL_MENU.apply, nil)
       local reset_reason = inspector_reason or (not take_data and BAR_REASON_NOT_ANALYZED)
-        or ((K.item_differs(take_data) == 0) and BAR_PILL_MENU.reset_none) or nil
+        or ((K.item_off_defaults(take_data) == 0) and BAR_PILL_MENU.reset_none) or nil
       if reaper.ImGui_MenuItem(bctx, BAR_PILL_MENU.reset, reset_reason, false, reset_reason == nil)
           and reset_reason == nil then
         K.reset_item_all()
@@ -13111,7 +13066,7 @@ do
 
     --- Separation: this item's value (state.separation mirrors data.separation), shown whatever is selected (it has
     --- no note level of its own). A drag only moves the value; letting go (or a typed value, or the reset to the
-    --- starting value) stores it as the item's (K.bar_write) and splits the item's notes again, given the value from
+    --- default, DEFAULTS) stores it as the item's (K.bar_write) and splits the item's notes again, given the value from
     --- before (K.resplit: it may ask first, and Cancel puts the value back). With notes selected, letting go (or a
     --- typed value) splits again only their stretch at that value (K.resplit_stretch) and the bar goes back to the
     --- item's value, which is not changed; the reset splits the stretch again at the item's value. Usable whenever
@@ -13179,7 +13134,7 @@ do
         if active then bar_sep_before = state[key] end
       elseif reset or menu_reset or (changed and typed) then
         local prev = state[key]
-        state[key] = (reset or menu_reset) and start or v / spec.scale
+        state[key] = (reset or menu_reset) and DEFAULTS[key] or v / spec.scale
         commit(prev)
         -- Still held (a double-click whose second press goes on into a drag): that drag starts from the value just
         -- committed, and letting go commits it as its own edit
@@ -13229,8 +13184,6 @@ do
     return function(id)
       if id == "pill" then
         draw_pill()
-      elseif id:sub(1, 4) == "cap_" then
-        K.bar_caption(bctx, id:sub(5))
       elseif id == "mode" then
         draw_mode()
       elseif BAR_VALUE_BY_ID[id] then

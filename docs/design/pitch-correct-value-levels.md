@@ -3,12 +3,13 @@
 Target file(s): `Pitch/Fancy_Pitch Correct.lua`
 Archetype(s): main window → Editor / canvas (top bar Values group, redesigned); "Apply to other items" confirm → the window's existing confirm modal (same archetype)
 Status: Approved
+Amended 2026-11-24 after use: captions removed; item reset goes to defaults.
 Date: 2026-11-24
 Approver: TheFancyWolf (in chat, 2026-11-24)
 
 ## Summary
 
-The top bar's Values group (the scope pill, then Mode, Tighten, Strength, Tolerance, Slide In and Separation, all at the same weight) is reorganised. It now has three named groups, **Notes** (Separation), **Correction** (Mode, Tighten, Tolerance) and **Shaping** (Strength, Slide In), and Shaping is drawn quieter. Every value now has the same three levels: every item → this item → notes. The bar only ever edits **this item**, or the selected notes, and the pill says which. The "every item" values stop being something a drag changes silently: they change only through one deliberate command, **Apply to other items…**, which can also push this item's values onto other items as a starting point. Separation and Key / Scale join the same model: Separation becomes per item, plus a re-split of just the selected notes' stretch. Primary display: the note canvas (unchanged). Primary action: dragging a value in the bar, or a note on the canvas (unchanged).
+The top bar's Values group (the scope pill, then Mode, Tighten, Strength, Tolerance, Slide In and Separation, all at the same weight) is reorganised. It now has three groups split by hairline separators, **Notes** (Separation), **Correction** (Mode, Tighten, Tolerance) and **Shaping** (Strength, Slide In), all in the default font; each value's tooltip names its group. Every value now has the same three levels: every item → this item → notes. The bar only ever edits **this item**, or the selected notes, and the pill says which. The "every item" values stop being something a drag changes silently: they change only through one deliberate command, **Apply to other items…**, which can also push this item's values onto other items as a starting point. Separation and Key / Scale join the same model: Separation becomes per item, plus a re-split of just the selected notes' stretch. Primary display: the note canvas (unchanged). Primary action: dragging a value in the bar, or a note on the canvas (unchanged).
 
 ## Approaches
 
@@ -41,10 +42,10 @@ Levels used below: **starting values** (ExtState, `FancyScripts`); **item** = th
 | Changed: Key / Scale stay per item (already stored per take as `key_idx` / `scale_idx`), but choosing them **no longer changes the starting key for new items** (today every change also writes ExtState `pitch_key_idx` / `pitch_scale_idx`) | the open take | the item's key / scale; envelope | take data | **Y** for the item. Today's ExtState write is removed from this path |
 | New: pill menu → **Apply to other items…** opens a confirm; it applies all of this item's values (Key, Scale, Separation, Mode, Tighten, Tolerance, Strength, Slide In) | the arrange selection; every take with Pitch Correct data in the project (the Pitched Items list); each target's item and note values | per target item: its item values set to this item's; its notes' own values for those keys cleared; a re-split where Separation changed; its envelope. With **"Keep changes already made to items and notes"** ticked: a target's item value that differs from the *previous* starting value is kept, notes with their own value keep it, and a target whose notes carry edits (pitch moves, points, own values) is **not** re-split. Unticked: everything is overwritten, and re-splits go ahead even where edited notes are lost; the confirm counts those notes. The starting values are saved when Apply starts. A Cancel partway keeps them and the finished items, and its status says so | take data for every target in **one** undo block; **ExtState** for the starting values | **N**: the every-item values are ExtState. So HC4 requires the confirm, which names the consequence and the counts. Everything written to items is one undo step |
 | New: right-click a value → **Apply <Value> to other items…** opens the same confirm with only that value | same | same, that key only | same | **N** (as above) |
-| New: pill menu → **Reset this item to the starting values** copies the current starting values into this item (Key and Scale included; a re-split if Separation differs, with K.resplit's existing ask-first when edits would be lost). Its notes' own values are kept | the open take | item values, envelope, notes when re-split | take data | **Y**: one undo step |
+| New: pill menu → **Reset this item to defaults** sets every value of this item to the script's `DEFAULTS` (Separation 50%, Mode Natural, Tighten 0%, Tolerance 8¢, Strength 100%, Slide In 0%; Key and Scale are not changed; a re-split if Separation differs, with K.resplit's existing ask-first when edits would be lost). Its notes' own values are kept (amended after use: it used to copy the starting values, Key and Scale included) | the open take | item values, envelope, notes when re-split | take data | **Y**: one undo step |
 | New: a whole-item re-split (item Separation drag, Apply, Reset) replaces any stretch that was re-split on its own: per-note Separation is not stored. With notes selected, Separation shows the item's value. A stretch re-split leaves `data.separation` unchanged, and `K.follow_resplit_undo` learns the new label "Re-split selected notes" and does not move the item value for it | | | | |
 | Changed (engine): every non-bypassed note gets the item's values, not only edited notes; `zero_nil` storage for Tighten / Slide In goes (see the model above) | | | | |
-| Removed: right-click → "Override for this item" (the bar now always edits the item); right-click → "Reset to default" is renamed **Reset to starting value** (item) or **Reset to item value** (notes) | | | | |
+| Removed: right-click → "Override for this item" (the bar now always edits the item); right-click → "Reset to default" stays **Reset to default** on the item (it sets `DEFAULTS[key]`) and reads **Reset to item value** with notes selected | | | | |
 | Unchanged: Key / Scale combos' place in the Clip group, the target badge, "…" menu, Close, the note action bar, the canvas | | | | |
 
 ## References
@@ -67,8 +68,8 @@ Confirmed in the brainstorming conversation (2026-11-24); window context carried
 
 | Tier | Features | Why (frequency × importance) |
 |---|---|---|
-| 1 always visible | Key, Scale; the pill; Separation; Mode, Tighten, Tolerance (full weight); Strength, Slide In (quieter, Shaping) | used constantly while tuning; the user named Mode, Tighten, Tolerance and Separation as the main ones. Strength and Slide In stay visible (they are still used) but recede |
-| 2 one disclosure away | pill menu: Apply to other items…, Reset this item to the starting values, the starting values readout; value right-click: Apply <Value> to other items…, Reset | a few times per project |
+| 1 always visible | Key, Scale; the pill; Separation; Mode, Tighten, Tolerance; Strength, Slide In (Shaping, last) | used constantly while tuning; the user named Mode, Tighten, Tolerance and Separation as the main ones. Strength and Slide In stay visible (they are still used) and come last |
+| 2 one disclosure away | pill menu: Apply to other items…, Reset this item to defaults, the starting values readout; value right-click: Apply <Value> to other items…, Reset | a few times per project |
 | 3 Settings | none new | |
 
 ## Information architecture
@@ -76,34 +77,34 @@ Confirmed in the brainstorming conversation (2026-11-24); window context carried
 Top bar groups, read left to right from broad to specific:
 
 - **Clip** (unchanged): brand, target badge (names the item), Key, Scale. Key and Scale are item values: they sit with the item's name, not after the pill, because they have no note level.
-- **Values**: the pill, then three named groups, each with a small caption.
+- **Values**: the pill, then three groups split by hairline separators (no captions).
   - **Notes**: Separation. How the singing is split into notes.
   - **Correction**: Mode, Tighten, Tolerance. How a note is pulled in.
-  - **Shaping**: Strength, Slide In. Fine-tuning. Drawn in `Theme.font_sizes.small` at a narrower width, but not dim: `P.text_dim` already means "this mode does not use it" in this bar, so it cannot also mean "secondary".
+  - **Shaping**: Strength, Slide In. Fine-tuning. Drawn in the default font, the same size as the other values (amended: the small font is gone).
 - **Right** (unchanged): "…", Panel, Close.
 
 **The pill is the one statement of level.** It reads `This item` with nothing selected, or `1 note` / `N notes`. Every control right of it edits what it names, with no exceptions: Separation's note level is the re-split of the selected stretch. Clicking the pill opens its menu (disclosure level 1). "Apply to other items…" opens the confirm (level 2). IA2 is met.
 
-**Group captions** (`Notes`, `Correction`, `Shaping`) are small text before each group, so a new user can read what each group is for without hovering. They are the first thing to go as the width shrinks (LG4: width-driven hiding, never state-driven, EP5). When hidden, the hairline separators stay and each control's tooltip starts with its group name.
+**No group captions** (amended after use: the captions `Notes`, `Correction`, `Shaping` did not help, the separators did). The hairline separators and the `L.xl` group gaps show where a group ends, and each value's tooltip always starts with its group name ("Notes ·", "Correction ·", "Shaping ·").
 
 **Where the every-item values are shown:** in the pill menu (a readout line) and in each value's tooltip ("Starting value: 8¢"). The `*` mark keeps its meaning: this item's or note's value differs from the level above.
 
 ## Wireframes
 
-Default floating / wide docked (one row, captions shown):
+Default floating / wide docked (one row):
 ```
-[◆] [V_Main E251.wav] [E▾] [Major▾] │ (This item▾) │ Notes Separation 50% │ Correction Mode Natural▾  Tighten 40%*  Tolerance 8¢ │ Shaping Strength 100%  Slide In 0%  │ […][▭][×]
+[◆] [V_Main E251.wav] [E▾] [Major▾] │ (This item▾) │ Separation 50% │ Mode Natural▾  Tighten 40%*  Tolerance 8¢ │ Strength 100%  Slide In 0%  │ […][▭][×]
 ```
 With 3 notes selected (the pill turns accent, values follow the notes):
 ```
-[◆] [V_Main E251.wav] [E▾] [Major▾] │ (3 notes▾) │ Notes Separation 50% │ Correction Mode Mixed▾  Tighten 20–60%*  Tolerance 8¢ │ Shaping Strength 100%  Slide In 0%  │ […][▭][×]
+[◆] [V_Main E251.wav] [E▾] [Major▾] │ (3 notes▾) │ Separation 50% │ Mode Mixed▾  Tighten 20–60%*  Tolerance 8¢ │ Strength 100%  Slide In 0%  │ […][▭][×]
 ```
-Medium width (two rows; captions still shown when the Values row fits them, else dropped first):
+Medium width (two rows: the Clip row, then the Values row; the window a first use opens with):
 ```
 [◆] [V_Main E251.wav] [E▾] [Major▾]                                                     […][▭][×]
 (This item▾) │ Separation 50% │ Mode Natural▾  Tighten 40%*  Tolerance 8¢ │ Strength 100%  Slide In 0%
 ```
-Narrow docker (~260 px): no captions; the Values group wraps by group, Shaping on its own row, so the main controls stay together:
+Narrow docker (~260 px): the Values group wraps by group, Shaping on its own row, so the main controls stay together:
 ```
 [◆] [V_Main E25…]     […][▭][×]
 [E▾] [Major▾]
@@ -112,7 +113,7 @@ Mode Natural▾  Tighten 40%*
 Tolerance 8¢
 Strength 100%  Slide In 0%
 ```
-Wide short strip (1200×150): the one-row plan with captions; the canvas fills the rest.
+Wide short strip (1200×150): the one-row plan; the canvas fills the rest.
 
 Pill menu (a popup under the pill, sized to its content):
 ```
@@ -122,7 +123,7 @@ Pill menu (a popup under the pill, sized to its content):
 │ 0% · Tol 8¢ · Strength 100% · Slide In 0%    │
 │──────────────────────────────────────────────│
 │ Apply to other items…                        │
-│ Reset this item to the starting values       │  (disabled: "Already at the starting values")
+│ Reset this item to defaults                  │  (disabled: "Already at the defaults")
 └──────────────────────────────────────────────┘
 ```
 Apply confirm (sized to the parent; at the narrow docker its text wraps, RB9):
@@ -153,42 +154,42 @@ Apply confirm (sized to the parent; at the narrow docker its text wraps, RB9):
 | Values group | working | during an analysis or a batch Apply: values disabled with "Analyzing…"; the "…" button shows progress (existing) | ST3 |
 | Apply confirm | working | Apply over many items runs time-sliced with progress on the "…" button and Cancel in "…" (same as Analyze All Selected Items); Cancel keeps the items already done as the one undo step | ST3 |
 | Apply | error | an item that cannot be written (take gone, MIDI) is skipped and counted: "Applied to 3 items. 1 skipped: no audio." | ST7 |
-| Pill menu | disabled with reason | "Apply to other items…" disabled with "No other pitched items" when there are none; "Reset this item…" disabled with "Already at the starting values" | EP2 |
+| Pill menu | disabled with reason | "Apply to other items…" disabled with "No other pitched items" when there are none; "Reset this item to defaults" disabled with "Already at the defaults" | EP2 |
 | Apply confirm | disabled with reason | "The N selected items" disabled with "Select items in the arrange view" when 0 other items are selected; Apply disabled with "Nothing would change" | EP2, AR5 |
 | Separation | disabled with reason | with notes selected but no analysis frames for that stretch: "This stretch has no analysis: Re-analyze the item" | EP2 |
-| Pill / captions | overflow / long names | pill width fixed to its longest text (`999 notes`); captions hide before any control wraps; the starting values line truncates with a tooltip | LG4 |
+| Pill | overflow / long names | pill width fixed to its longest text (`999 notes`); the starting values line truncates with a tooltip | LG4 |
 | — | missing dependency | none beyond ReaImGui (existing check) | HI7 |
-| All | Fancy Dark / Match Theme | captions `P.text_dim`, Shaping `P.text` at the small size; pill `P.well` / `P.accent2` as today; both checked against `bg` for HC1 | CL4 |
+| All | Fancy Dark / Match Theme | every value `P.text` in the default font; pill `P.well` / `P.accent2` as today; checked against `bg` for HC1 | CL4 |
 
 ## Interaction spec
 
 | Control | Gestures (HC2, HC3, wheel EF1, context menu) | Default | Units / format / precision (RC2, CN6) | Clamp / scale (EP3) | Undo label (UC1) | Destructive policy (HC4) |
 |---|---|---|---|---|---|---|
 | Separation | drag; Ctrl/Cmd-drag fine; double-click reset; Ctrl/Cmd-click type; right-click menu (Reset, Apply Separation to other items…); no wheel (EF1: the top bar scrolls) | `DEFAULTS.separation` (50%) | `Separation %.0f%%` | 0–100, linear, `AlwaysClamp` | "Re-split item" / "Re-split selected notes" | item, notes: undoable, no confirm (existing re-split confirm only when edits would be lost) |
-| Mode | combo; right-click menu (Reset, Apply Mode to other items…) | Natural | `Mode <name>`, `Mixed` | n/a: discrete | "Set Mode" | undoable |
-| Tighten | as Separation | 0% (`zero_nil`) | `Tighten %.0f%%` | 0–100, linear | "Adjust Tighten" | undoable |
+| Mode | combo; right-click menu (Reset, Apply Mode to other items…) | `DEFAULTS.correct_mode` (Natural) | `Mode <name>`, `Mixed` | n/a: discrete | "Set Mode" | undoable |
+| Tighten | as Separation | `DEFAULTS.tighten` (0%) | `Tighten %.0f%%` | 0–100, linear | "Adjust Tighten" | undoable |
 | Tolerance | as Separation | `DEFAULTS.tolerance` (8¢) | `Tolerance %.0f¢` | 0–50, linear | "Adjust Tolerance" | undoable |
 | Strength | as Separation | `DEFAULTS.retune_speed` (100%) | `Strength %.0f%%` | 0–100, linear | "Adjust Correction Strength" | undoable |
-| Slide In | as Separation | 0% | `Slide In %.0f%%` | 0–100, linear | "Adjust Slide In" | undoable |
+| Slide In | as Separation | `DEFAULTS.slide_in` (0%) | `Slide In %.0f%%` | 0–100, linear | "Adjust Slide In" | undoable |
 | Key, Scale | combos (unchanged); right-click menu: Apply Key to other items… | last starting values | key names as today | n/a: discrete | "Set Key" / "Set Scale" | undoable (no ExtState write any more) |
 | Pill | click opens its menu; tooltip | n/a | `This item` / `1 note` / `%d notes` | n/a | n/a | n/a |
 | Pill menu: Apply to other items… | click → confirm | n/a | n/a | n/a | n/a | confirm (HC4: ExtState written) |
-| Pill menu: Reset this item… | click | n/a | n/a | n/a | "Reset item to starting values" | undoable, no confirm; status message |
+| Pill menu: Reset this item to defaults | click: every value of the item (Separation, Mode, Tighten, Tolerance, Strength, Slide In) to `DEFAULTS`; Key and Scale not changed; a re-split when Separation changes (the existing ask-first when edits would be lost: "Reset <item> to the defaults?", button "Reset") | `DEFAULTS` | n/a | n/a | "Reset item to defaults" (none when already at the defaults) | undoable, no confirm; status message |
 | Apply confirm | radio (3), checkbox, Cancel first, Apply (N); Esc = Cancel; Enter does nothing (no default button on a destructive confirm) | target: the selected items when 1 or more other items are selected, else All pitched items; checkbox off | counts in the consequence line | n/a | "Apply values to N items" | the confirm itself |
 
-What a double-click reset restores (HC3): on notes, the item's value; on the item, the starting value. That is the script's `DEFAULTS` value until the user has applied other starting values (see Open questions).
+What a double-click reset (or the right-click Reset) restores (HC3): on notes, the item's value ("Reset to item value"); on the item, the script's `DEFAULTS` value ("Reset to default"), as one undo point "Reset <Value>" (Separation: its re-split, "Re-split item"), and none when the item is at the default already (UC1). Amended after use: the item reset used to go to the starting value.
 
-Keyboard map: HC5 Esc, innermost first: the Apply confirm (Cancel) → the pill menu / value right-click menu → an active value edit (revert) → the note selection (the pill goes back to `This item`) → the window (floating only). All through `Shortcut()` (RB6). HC6 Space is unchanged and is not forwarded while the confirm or a menu is open. No new keys. The Info modal's Edit rows gain "Click the pill: apply values to other items" and the changed reset meaning (HP1).
+Keyboard map: HC5 Esc, innermost first: the Apply confirm (Cancel) → the pill menu / value right-click menu → an active value edit (revert) → the note selection (the pill goes back to `This item`) → the window (floating only). All through `Shortcut()` (RB6). HC6 Space is unchanged and is not forwarded while the confirm or a menu is open. No new keys. The Info modal's Edit rows gain "Click the pill: Apply values to other items, or reset this item to defaults" and "Double-click a value: Back to the item's value (notes) or the default (item)" (HP1).
 
 ## Copy deck
 
 | Where | String |
 |---|---|
-| labels | `This item` · `1 note` · `%d notes` · captions `Notes` · `Correction` · `Shaping` · value labels as today |
-| tooltips | pill, item: "Your edits change this item only. Select notes to change just those notes. Click for: apply to other items." · pill, notes: "Your edits change the selected notes. Esc goes back to this item. Click for: apply to other items." · Separation, notes: "Splits the selected stretch again: only the notes from the first to the last selected one change." · every value's last line: "Starting value: <v>. This item: <v>." · captions when hidden: each value's tooltip starts "Correction ·", "Shaping ·", "Notes ·" |
+| labels | `This item` · `1 note` · `%d notes` · value labels as today (no captions) |
+| tooltips | pill, item: "Your edits change this item only. Select notes to change just those notes. Click for: apply to other items." · pill, notes: "Your edits change the selected notes. Esc goes back to this item. Click for: apply to other items." · Separation, notes: "Splits the selected stretch again: only the notes from the first to the last selected one change." · every value's last line: "Starting value: <v>. This item: <v>." · each value's tooltip always starts with its group: "Notes ·", "Correction ·", "Shaping ·" |
 | empty / error / confirm | confirm title "Apply this item's values to other items?" / "Apply Tolerance to other items?" · radios "The %d selected items" / "All %d pitched items" / "New items only" · checkbox "Keep changes already made to items and notes" · consequence "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost)." (with Keep changes ticked: "%d items with edited notes are not split again.") · footnote "These also become the starting values for new items (that part can't be undone with %s+Z)." · buttons "Cancel", "Apply (%d)" (New items only: "Save starting values") · disabled reasons as in the State inventory |
-| status messages | "Applied to %d items (%s+Z undoes the items)." · "Starting values saved for new items." · "Applied to %d items. %d skipped: no audio." · "Item reset to the starting values." · "Re-split %d notes into %d." |
-| undo labels | "Adjust Tighten" etc. (as today) · "Re-split item" · "Re-split selected notes" · "Apply values to %d items" · "Apply Tolerance to %d items" · "Reset item to starting values" |
+| status messages | "Applied to %d items (%s+Z undoes the items)." · "Starting values saved for new items." · "Applied to %d items. %d skipped: no audio." · "Item reset to the defaults." · "Re-split %d notes into %d." |
+| undo labels | "Adjust Tighten" etc. (as today) · "Re-split item" · "Re-split selected notes" · "Apply values to %d items" · "Apply Tolerance to %d items" · "Reset item to defaults" · "Reset <Value>" |
 
 ## Theme mapping
 
@@ -196,10 +197,8 @@ Keyboard map: HC5 Esc, innermost first: the Apply confirm (Cancel) → the pill 
 |---|---|---|
 | pill | `Theme.badge` with `interactive = true`, `id`, then a popup (as today, now clickable) | `P.well`, `P.text`; notes: `P.accent2`, `Theme.label_on` |
 | pill menu rows | `Theme.selectable` / `reaper.ImGui_MenuItem`, readout via `reaper.ImGui_TextDisabled`-free dim text | `P.text_dim`, `L.sm` |
-| group captions | `Theme.push_font` at `Theme.font_sizes.small`, `Theme.align` then text | `P.text_dim`, `L.sm` gap after |
 | group separators | existing hairline (`P.border`) | `L.xl` group gap (existing `hdr_gap_before`) |
-| Correction values | existing `param_drag` | as today |
-| Shaping values | existing `param_drag` with the small font pushed | `Theme.font_sizes.small`; width measured with that font (LG3) |
+| Notes, Correction and Shaping values | existing `param_drag`, the default font | as today; width measured in the font drawn (LG3) |
 | Apply confirm | the existing confirm modal path (`request_confirm`), `Theme.center_next_window`, `Theme.modal_scrim` | `L.modal_md` |
 | radios / checkbox | `reaper.ImGui_RadioButton`, `reaper.ImGui_Checkbox` (stock, themed by `Theme.push`) | |
 | tooltips | `Theme.tooltip` via the bar's `bar_tooltip` (AllowWhenDisabled) | |
@@ -221,19 +220,19 @@ None.
 - UC2: Esc order as in the keyboard map.
 - UC3: item and note writes and their `P_EXT` share one undo block; the every-item values (ExtState) are never claimed as undoable.
 - UC4: Apply reads the arrange selection and never changes it; re-split reselects only notes inside the script.
-- UC5: double-click reset per value; "Reset this item to the starting values" as the group reset.
+- UC5: double-click reset per value; "Reset this item to defaults" as the group reset.
 - EP1: Apply is behind a confirm that names the consequence and counts.
 - EP2: every disabled entry and control has a reason, visible with tooltips off where it is inline (pill menu, confirm).
 - EP3: all values `AlwaysClamp`, linear.
 - EP4: target items are referenced by take GUID.
-- EP5: no control moves or hides because of selection; captions hide by width only.
+- EP5: no control moves or hides because of selection.
 - EP6: no new shortcuts.
 - CN1: only existing Theme helpers and the existing confirm path.
 - CN2: no literals; `L.modal_md`; scrim before the confirm.
 - CN3: all names exist.
 - CN4: one term each: "this item", "starting values", "pitched items", "re-split".
 - CN5: Info rows and CHANGELOG match the handlers.
-- CN6: deviations recorded (reset restores the level above).
+- CN6: deviations recorded (reset on notes restores the item's value; on the item it is `DEFAULTS`, as HC3).
 - RC1: n/a: no new icon-only controls.
 - RC2: no internal terms ("override", "cascade", "global default") in the UI.
 - HP1: the Info modal lists the pill click and the reset meaning.
@@ -242,15 +241,15 @@ None.
 - EF3: n/a: canvas unchanged.
 - IA1: tiers as in the Priority tiers table.
 - IA2: two levels: pill menu → confirm.
-- IA3: the bar uses two type sizes (default, small); Correction reads first by size and position.
+- IA3: every value uses the default font; Correction reads first by position.
 - IA4: the removed "Override for this item" leaves no dead entry.
 - LG1: group gaps (`L.xl`) are at least twice the gaps inside a group.
-- LG2: captions use `Theme.align`.
+- LG2: every value control is centred on the row as today (no captions).
 - LG3: every width comes from its longest text in the font it is drawn with.
-- LG4: one row, two rows and the narrow docker as wireframed; captions hide first.
+- LG4: one row, two rows (Clip row + Values row) and the narrow docker as wireframed.
 - MT1: the pill is at least frame height.
 - MT2: n/a: no new DrawList controls.
-- CL1: captions and Shaping text meet 4.5:1 on `bg` in both modes.
+- CL1: every value's text meets 4.5:1 on `bg` in both modes.
 - CL2: the notes state is text (`3 notes`) as well as colour.
 - CL3: no red added.
 - CL4: checked in Fancy Dark and Match Theme.
@@ -266,9 +265,9 @@ None.
 - My call (builder check): the starting values are saved when Apply starts, and survive a Cancel.
 - My call (builder check): a whole-item re-split replaces stretch-only splits. Separation with notes selected shows the item's value.
 - My call (builder check): Mode's item text changes from "Notes you edit will use it" to a statement that every note uses it.
-- My call: reset on the item restores the starting value, and reset on notes restores the item's value. HC3 says `DEFAULTS`; these are the same until you apply other starting values. This is recorded as a deviation.
+- Decided by the user (amended 2026-11-24 after use): reset on the item restores the script's `DEFAULTS` value ("Reset to default"; Separation re-splits at 50%), which is HC3-compliant; reset on notes restores the item's value. The pill menu's group reset is "Reset this item to defaults" (Key and Scale not changed). The `*` mark still means "differs from the starting value".
 - My call: Key and Scale stop updating the starting key for new items whenever they change. New items start from the starting values, which change only through Apply (including "New items only").
 - My call: "Apply to other items" applies every value, Key and Scale included. A single value is applied from its right-click menu. Quantize and other note actions across items are a later, separate design.
-- My call: the Shaping group is quieter through size (`font_sizes.small`), not colour, because dim text already means "unused by this mode".
+- Decided by the user (amended 2026-11-24 after use): no group captions, and Shaping is drawn in the default font like the other values. The hairline separators stay.
 - My call: Separation per note re-splits a stretch. It is not stored as a lasting note value, because a re-split replaces the notes themselves. Edits on surviving notes are kept, as in the auto-joins design.
 - HC6 conflicts: None.

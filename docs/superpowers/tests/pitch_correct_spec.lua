@@ -3266,12 +3266,40 @@ local function with_no_project(fn)   -- runs fn where an envelope write finds no
   if not ok then error(err, 0) end
 end
 
-test("reset_item_to_start", function()
-  with_no_project(function() with_item({ tolerance = 30 }, function()
+test("reset_item_to_default", function()
+  local G, saved = S.global_defaults, S.global_defaults.tolerance
+  G.tolerance = 20   -- a starting value other than the default: the reset goes to the default
+  local ok, err = pcall(with_no_project, function() with_item({ tolerance = 30 }, function()
     eq(type(S.K.reset_target("tolerance", {}, 0)), "boolean", "returns a boolean")
-    eq(S.state.session_takes["{IV}"].overrides.tolerance, S.global_defaults.tolerance, "the item's value")
+    eq(S.state.session_takes["{IV}"].overrides.tolerance, S.DEFAULTS.tolerance, "the item's value")
   end) end)
+  G.tolerance = saved
+  if not ok then error(err, 0) end
 end)
+
+test("value_defaults_are_the_users", function()
+  local D = S.DEFAULTS
+  eq(D.separation, 0.5); eq(D.tighten, 0); eq(D.tolerance, 8); eq(D.retune_speed, 1.0); eq(D.slide_in, 0)
+  eq(D.correct_mode, 0, "Natural")
+end)
+
+test("reset_item_at_default_no_undo", function() with_write_stubs({}, function(rec)
+  local st = S.state
+  local saved = { st.target_take_guid, st.notes, reaper.time_precise }
+  reaper.time_precise = function() return 0 end
+  local data = { guid = "{a}", name = "{a}", notes = {}, results = {}, item_len = 1, sample_rate = 48000,
+    overrides = { tolerance = S.DEFAULTS.tolerance, tighten = 0.3 } }
+  st.target_take_guid, st.session_takes["{a}"], st.notes = "{a}", data, {}
+  local ok, err = pcall(function()
+    eq(S.K.reset_target("tolerance", {}, 0), false, "already at the default")
+    eq(#rec.labels, 0, "no undo point")
+    eq(S.K.reset_target("tighten", {}, 0), true, "written")
+    eq(data.overrides.tighten, S.DEFAULTS.tighten, "Tighten to its default")
+    eq(#rec.labels, 1, "a reset that changes the value: one undo point"); eq(rec.labels[1], "Reset Tighten")
+  end)
+  st.target_take_guid, st.notes, reaper.time_precise = saved[1], saved[2], saved[3]
+  if not ok then error(err, 0) end
+end) end)
 
 test("reset_notes_to_item", function()
   with_no_project(function() with_item({ tolerance = 30 }, function()
@@ -3510,40 +3538,63 @@ test("hdr_plan_widths_ordered", function()
   local ok, err = pcall(function()
     local s = S.measure_header_static()
     local plans = S.K.HDR_PLANS
-    eq(#plans, 5, "plans")
+    eq(#plans, 3, "plans")
     for i = 1, #plans - 1 do
       local a, b = S.hdr_min_content_w(s, false, i), S.hdr_min_content_w(s, false, i + 1)
       if a <= b then error(string.format("plan %d (%g) is not wider than plan %d (%g)", i, a, i + 1, b), 0) end
     end
-    eq(plans[1].captions and plans[3].captions and not plans[2].captions and not plans[4].captions
-      and not plans[5].captions, true, "captions in plans 1 and 3 only")
+    eq(#plans[1].rows, 1, "one row"); eq(#plans[2].rows, 2, "Clip row + Values row"); eq(#plans[3].rows, 6, "narrow")
+    for pi, plan in ipairs(plans) do
+      eq(plan.captions, nil, "plan " .. pi .. " has no captions")
+      for _, row in ipairs(plan.rows) do
+        for _, id in ipairs(row) do
+          if id:sub(1, 4) == "cap_" then error("plan " .. pi .. " has a caption unit " .. id, 0) end
+        end
+      end
+    end
+    -- The first-use window is sized for the two-row plan
+    local w2, rows = S.hdr_min_content_w(s, true)
+    eq(w2, S.hdr_min_content_w(s, false, 2), "first use: plan 2"); eq(rows, 2, "first use: two rows")
+    -- Strength and Slide In are measured in the default font, as the other values: nothing pushes a font
+    local Theme, pushes = package.loaded["theme"], 0
+    local push = Theme.push_font
+    Theme.push_font = function(...) pushes = pushes + 1; return push(...) end
+    local ok2, err2 = pcall(S.K.bar_measure, nil)
+    Theme.push_font = push
+    if not ok2 then error(err2, 0) end
+    eq(pushes, 0, "fonts pushed while measuring the values")
   end)
   reaper.ImGui_CalcTextSize, reaper.ImGui_GetFrameHeight = saved[1], saved[2]
   if not ok then error(err, 0) end
 end)
 
 test("reset_item_all_counts", function()
-  local K = S.K
-  local data = {}
-  K.item_seed(data)
-  eq(K.item_differs(data), 0, "seeded")
-  data.overrides.tolerance = data.overrides.tolerance + 5
-  eq(K.item_differs(data), 1, "tolerance changed")
+  local K, D = S.K, S.DEFAULTS
+  local data = { separation = D.separation, key_idx = 3, scale_idx = 2, overrides = {} }
+  for _, key in ipairs(K.ITEM_KEYS) do
+    if key ~= "separation" then data.overrides[key] = D[key] end
+  end
+  eq(K.item_off_defaults(data), 0, "at the defaults")
+  data.overrides.tolerance = D.tolerance + 5
+  data.overrides.retune_speed = 0.4
+  data.key_idx, data.scale_idx = 5, 1
+  eq(K.item_off_defaults(data), 2, "Tolerance and Strength differ; Key and Scale do not count")
   K.item_reset_values(data)
-  eq(K.item_differs(data), 0, "reset")
-  eq(data.overrides.tolerance, K.start_values().tolerance, "starting value back")
+  eq(K.item_off_defaults(data), 0, "reset")
+  eq(data.overrides.tolerance, D.tolerance, "the default back"); eq(data.overrides.retune_speed, D.retune_speed)
+  eq(data.key_idx, 5, "Key untouched"); eq(data.scale_idx, 1, "Scale untouched")
 end)
 
 test("reset_item_all_one_undo", function() with_write_stubs({}, function(rec)
   local st, K = S.state, S.K
   local fr = stretch_frames(slide_segs(62))
-  local start = K.start_values()
-  local other_sep = (start.separation > 0.5) and 0.2 or 0.9
+  local start, D = K.start_values(), S.DEFAULTS
+  local other_sep = 0.9
   local old, old_splits = K.segment(fr, other_sep)
   local data = { guid = "{a}", name = "{a}", notes = old, results = fr, item_len = 2, sample_rate = 44100 }
   K.item_seed(data)
   data.separation = other_sep
-  data.overrides.tolerance = start.tolerance + 5
+  data.overrides.tolerance = D.tolerance + 5
   data.key_idx = (start.key_idx % 12) + 1
   local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.separation, st.key_idx,
     st.scale_idx, reaper.time_precise, st.status.text }
@@ -3554,11 +3605,13 @@ test("reset_item_all_one_undo", function() with_write_stubs({}, function(rec)
   local ok, err = pcall(function()
     K.reset_item_all()
     eq(#rec.labels, 1, "one undo point")
-    eq(rec.labels[1], "Reset item to starting values", "undo label")
-    eq(st.status.text, "Item reset to the starting values.", "status")
-    eq(K.item_differs(data), 0, "every value back")
-    eq(st.separation, start.separation, "bar Separation follows")
-    eq(st.key_idx, start.key_idx, "bar Key follows")
+    eq(rec.labels[1], "Reset item to defaults", "undo label")
+    eq(st.status.text, "Item reset to the defaults.", "status")
+    eq(K.item_off_defaults(data), 0, "every value back")
+    eq(data.overrides.tolerance, D.tolerance, "Tolerance at its default")
+    eq(st.separation, D.separation, "bar Separation follows")
+    eq(data.key_idx, (start.key_idx % 12) + 1, "Key untouched")
+    eq(st.key_idx, data.key_idx, "bar Key untouched")
     eq(st.notes ~= old, true, "re-split")
     K.reset_item_all()
     eq(#rec.labels, 1, "nothing differs: no undo point")
@@ -3587,7 +3640,7 @@ test("reset_item_all_asks_in_reset_words", function() with_write_stubs({}, funct
     K.reset_item_all()
     local c = st.confirm
     eq(c ~= nil and c.id, "resplit", "asks first")
-    eq(c.title, "Reset Lead Vox to the starting values?")
+    eq(c.title, "Reset Lead Vox to the defaults?")
     eq(c.confirm_label, "Reset")
     eq(#rec.labels, 0, "nothing written yet")
     -- a plain Separation re-split keeps its own words
