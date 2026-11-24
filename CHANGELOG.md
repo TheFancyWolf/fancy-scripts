@@ -4,6 +4,10 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.24.3 (`Pitch/Fancy_Pitch Correct.lua`)** — Clearer right-click menus:
+  - **Tooltips in the note menu**: the note name and cents, Bypass This Note, Mode, each value (what it does, why it does nothing right now if so, what it changes, where its value comes from, and the gestures), Add Pitch Point Here and Reset Pitch Points now explain themselves on hover. The pitch point menu's Offset, Reset Point and Remove Point do too.
+  - **Shorter note menu**: Snap to Semitone, Quantize to Scale, Split at Cursor and Reset to Original are no longer in the note menu. Use their keys (S, Q, X, R, listed in the Shortcuts panel) or the note action bar.
+  - **More room for labels**: the note and pitch point menus leave a wider gap between each control and its label.
 - **Fancy Pitch Correct v2.24.2 (`Pitch/Fancy_Pitch Correct.lua`)** — Easier-to-read tooltips:
   - **Tooltips in paragraphs**: tooltips are split into short paragraphs with a blank line between them. The top bar's value tooltips now read: group and name, what the value does, any note on why it does nothing right now, what a drag changes with the default and item value, then the mouse gestures. Key and Scale say that a right-click applies them to other items.
   - **Note name and cents explained**: hover the note name and cents in the bar under a selected note to see what they mean and how they tie to Key, Scale, Snap and Quantize.

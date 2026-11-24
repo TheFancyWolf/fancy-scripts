@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.24.2
+-- @version 2.24.3
 -- @changelog
---   Tooltips are split into short paragraphs; the note readout's name and cents are colour-coded and explained on hover
+--   The note and pitch point menus get tooltips and more room between controls and labels; Snap, Quantize, Split and Reset leave the note menu (their keys are in Shortcuts)
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -1236,6 +1236,37 @@ K.note_readout = function(cp, C)
     scale_line, tune_line)
   return name, cents_txt, name_col, cents_col, tip
 end
+
+--- What each value does to the sound: the first paragraph of its tooltip in the top bar and in the note menu.
+K.VALUE_TIP = {
+  tighten = "Steadies a wobbly note. Low values take out slow drift, higher values also take out wobble and then vibrato; 100% is a flat line.",
+  retune_speed = "How far each note is pulled to its target pitch. 0% leaves the singing as recorded, 100% puts the note fully in tune.",
+  tolerance = "How far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement.",
+  slide_in = "How much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it.",
+  separation = "How readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up.",
+}
+--- Mode: what it does, and the line a value's tooltip gains when the note's mode does not use it (K.mode_unused).
+K.MODE_TIP = "How a note is corrected.\n\n"
+  .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n\n"
+  .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n\n"
+  .. "Hard: one flat note of the scale."
+K.MODE_UNUSED_TIP = {
+  mode = "Not used in Classic or Hard mode.",
+  hard = "Not used in Hard mode.",
+  classic = "In Classic mode: how fast the pitch jumps between scale notes. 0% glides, 100% steps at once.",
+}
+K.TOLERANCE_IDLE_TIP = "Not used yet: raise Tighten first."
+-- The note menu's value tooltips: what a change reaches, where the value comes from (the [level] tag), the gestures
+K.CM_SCOPE_NOTE = "Changes this note."
+K.CM_SCOPE_NOTES = "Changes the %d selected notes."
+K.CM_LEVEL = {
+  note = "[note]: this note has its own value.",
+  item = "[item]: this note uses the item's value.",
+  default = "[default]: this note uses the default value.",
+}
+K.CM_LEVEL_MODE_ITEM = "[item]: this note uses the item's mode."
+K.CM_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: back to the item's value. "
+  .. "%s-click: type a value.", K.MOD_LABEL, K.MOD_LABEL)
 
 K.SCRUB_PX = 6     -- hold C + wheel: the edit cursor moves this many pixels of the current view per notch
 K.SCRUB_FINE = 5   -- ... and this many times less with Ctrl/Cmd held (HC2)
@@ -8685,11 +8716,23 @@ local function draw_graph(draw_ctx, w, h)
       local pushed = Theme.push_font(draw_ctx, fonts.medium_bold)
       reaper.ImGui_Text(draw_ctx, header)
       Theme.pop_font(draw_ctx, pushed)
+      if reaper.ImGui_IsItemHovered(draw_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        Theme.tooltip(draw_ctx, select(5, K.note_readout(cp, Theme.get_palette().canvas)))
+      end
 
       reaper.ImGui_Separator(draw_ctx)
 
+      -- A wider gap between each control and its label on the right (the menu's rows read as label pairs)
+      local _, inner_y = reaper.ImGui_GetStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing())
+      reaper.ImGui_PushStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing(), L.md, inner_y)
+
       local bp = ctrl.bypassed or false
       local changed, new_bp = reaper.ImGui_Checkbox(draw_ctx, "Bypass This Note", bp)
+      if reaper.ImGui_IsItemHovered(draw_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        Theme.tooltip(draw_ctx, K.tip("Bypass This Note",
+          "Turns the correction off for this note: it plays as sung. Its values and pitch points are kept.",
+          "B bypasses the selected notes."))
+      end
       if changed then
         ctrl.bypassed = new_bp
         apply_envelope_to_take("Toggle Note Bypass")
@@ -8726,6 +8769,17 @@ local function draw_graph(draw_ctx, w, h)
          -- The top bar's range fill (K.value_fill), in the parameter's colour
          K.value_fill(draw_ctx, 0, (cur_val - min_v) / (max_v - min_v), K.param_color(key),
             reaper.ImGui_CalcItemWidth(draw_ctx))
+         -- Tooltip of the drag (no item was submitted since): name, what it does, why it does nothing now (if so),
+         -- what it changes and where its value comes from, the gestures
+         if reaper.ImGui_IsItemHovered(draw_ctx, reaper.ImGui_HoveredFlags_ForTooltip())
+            and not reaper.ImGui_IsItemActive(draw_ctx) then
+            local idle = K.tip(unused and K.MODE_UNUSED_TIP[unused],
+               (key == "tolerance" and unused ~= "mode" and (tonumber(get_effective(note, "tighten")) or 0) <= 0)
+                  and K.TOLERANCE_IDLE_TIP or nil)
+            local scope = spread and string.format(K.CM_SCOPE_NOTES, spread_n) or K.CM_SCOPE_NOTE
+            Theme.tooltip(draw_ctx, K.tip(name, K.VALUE_TIP[key], idle,
+               scope .. "\n" .. (K.CM_LEVEL[level] or ""), K.CM_GESTURES))
+         end
          if K.drag_hot.hovered or K.drag_hot.active then
             -- The canvas shades where this value acts on the menu's note
             local set = state.setting_hint.menu_set
@@ -8794,7 +8848,10 @@ local function draw_graph(draw_ctx, w, h)
       -- is one of several (as the value rows do), as one undo point. Choosing what every one already has does nothing
       do
         local choice, m_changed = Theme.combo(draw_ctx, "##cm_mode", K.MODES, K.mode_value(note) + 1,
-          { w = reaper.ImGui_CalcItemWidth(draw_ctx) })
+          { w = reaper.ImGui_CalcItemWidth(draw_ctx),
+            tooltip = K.tip("Mode", K.MODE_TIP,
+              (spread_n > 1 and string.format(K.CM_SCOPE_NOTES, spread_n) or K.CM_SCOPE_NOTE) .. "\n"
+                .. (ctrl.correct_mode ~= nil and K.CM_LEVEL.note or K.CM_LEVEL_MODE_ITEM)) })
         -- The label sits where a value row's label does: the inner spacing right of the control
         local inner = reaper.ImGui_GetStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing())
         reaper.ImGui_SameLine(draw_ctx, 0, inner)
@@ -8829,17 +8886,12 @@ local function draw_graph(draw_ctx, w, h)
       draw_cm_slider(PARAM_LABELS.retune_speed, "retune_speed", 0, 100, "%.0f%%", 100, nil, true)
 
       reaper.ImGui_PopItemWidth(draw_ctx)
+      reaper.ImGui_PopStyleVar(draw_ctx)
       reaper.ImGui_Separator(draw_ctx)
 
-      if reaper.ImGui_MenuItem(draw_ctx, "Snap to Semitone", "S") then
-        K.note_action("snap")
-      end
-      if reaper.ImGui_MenuItem(draw_ctx, "Quantize to Scale", "Q") then
-        K.note_action("quantize")
-      end
-      if reaper.ImGui_MenuItem(draw_ctx, "Split at Cursor", "X") then
-        K.note_action("split", note_idx)
-      end
+      -- Snap, Quantize, Split and Reset are not repeated here: their keys are in the Shortcuts list and on the
+      -- note action bar. A disabled entry still explains itself.
+      local item_tip_flags = reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()
       -- Pitch points: add one where the menu was opened, or put the note's points back (disabled with the reason)
       local _, add_reason = K.point_can_add(note, state.context_menu_time or note.start_time)
       local add_why = (not state.show_smart_spots) and "layer is off"
@@ -8847,7 +8899,13 @@ local function draw_graph(draw_ctx, w, h)
         or (not state.context_menu_live) and "zoom in first"
         or add_reason == "no_pitch" and "no pitch here"
         or add_reason == "too_close" and "a point is already here" or nil
-      if reaper.ImGui_MenuItem(draw_ctx, "Add Pitch Point Here", add_why, false, add_why == nil) then
+      local add_clicked = reaper.ImGui_MenuItem(draw_ctx, "Add Pitch Point Here", add_why, false, add_why == nil)
+      if reaper.ImGui_IsItemHovered(draw_ctx, item_tip_flags) then
+        Theme.tooltip(draw_ctx, K.tip("Add Pitch Point Here",
+          "Adds a point where you right-clicked. Drag it up or down to bend the pitch at that moment.",
+          "You can also double-click the pitch line."))
+      end
+      if add_clicked then
         local knot, reason = K.point_add(note, state.context_menu_time or note.start_time)
         if knot then
           apply_envelope_to_take("Add Pitch Point")
@@ -8856,16 +8914,19 @@ local function draw_graph(draw_ctx, w, h)
         end
       end
       local n_points = K.points_count(note)
-      if reaper.ImGui_MenuItem(draw_ctx, string.format("Reset Pitch Points (%d)###reset_points", n_points),
-          n_points == 0 and "none moved or added" or nil, false, n_points > 0) then
+      local reset_points = reaper.ImGui_MenuItem(draw_ctx, string.format("Reset Pitch Points (%d)###reset_points", n_points),
+          n_points == 0 and "none moved or added" or nil, false, n_points > 0)
+      if reaper.ImGui_IsItemHovered(draw_ctx, item_tip_flags) then
+        Theme.tooltip(draw_ctx, K.tip("Reset Pitch Points",
+          "Puts this note's moved points back to 0 and removes the points you added.",
+          "One undo step."))
+      end
+      if reset_points then
         local n_done = K.points_reset(note)
         if n_done > 0 and apply_envelope_to_take("Reset Pitch Points") then
           set_status(string.format("Reset %d pitch %s on %s. %s+Z to undo", n_done, plural(n_done, "point", "points"),
             note_name, K.MOD_LABEL))
         end
-      end
-      if reaper.ImGui_MenuItem(draw_ctx, "Reset to Original", "R") then
-        reset_selected_note()
       end
     end
     reaper.ImGui_EndPopup(draw_ctx)
@@ -8903,8 +8964,18 @@ local function draw_graph(draw_ctx, w, h)
     else
       local pt_hint = string.format(" %s+Z to undo", K.MOD_LABEL)
       reaper.ImGui_PushItemWidth(draw_ctx, 120)
+      local _, inner_y = reaper.ImGui_GetStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing())
+      reaper.ImGui_PushStyleVar(draw_ctx, reaper.ImGui_StyleVar_ItemInnerSpacing(), Theme.layout.md, inner_y)
       local ch, val, committed, reset = param_drag(draw_ctx, "pt_offset", "Offset", pt_knot.st * 100,
         -K.POINT_MAX_ST * 100, K.POINT_MAX_ST * 100, "%+.0f \xC2\xA2")
+      if reaper.ImGui_IsItemHovered(draw_ctx, reaper.ImGui_HoveredFlags_ForTooltip())
+          and not reaper.ImGui_IsItemActive(draw_ctx) then
+        Theme.tooltip(draw_ctx, K.tip("Offset",
+          "How far this point bends the pitch, in cents (100\xC2\xA2 = one semitone). + bends up, - bends down.",
+          string.format("Drag to change (%s-drag: fine). Double-click: back to 0. %s-click: type a value.",
+            K.MOD_LABEL, K.MOD_LABEL)))
+      end
+      reaper.ImGui_PopStyleVar(draw_ctx)
       reaper.ImGui_PopItemWidth(draw_ctx)
       cpt.active = K.drag_hot.active   -- the Offset is being dragged or typed (the Preview Curve follows it)
       if reset then
@@ -8930,13 +9001,23 @@ local function draw_graph(draw_ctx, w, h)
       reaper.ImGui_Separator(draw_ctx)
 
       local cur = K.point_knot_at(pt_note, cpt.frame) or pt_knot
-      if reaper.ImGui_MenuItem(draw_ctx, "Reset Point", cur.st == 0 and "already at 0" or nil, false, cur.st ~= 0) then
+      local pt_tip_flags = reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()
+      local reset_pt = reaper.ImGui_MenuItem(draw_ctx, "Reset Point", cur.st == 0 and "already at 0" or nil, false, cur.st ~= 0)
+      if reaper.ImGui_IsItemHovered(draw_ctx, pt_tip_flags) then
+        Theme.tooltip(draw_ctx, "Puts this point back to 0\xC2\xA2: the pitch there is as sung.")
+      end
+      if reset_pt then
         K.point_set(pt_note, cur, 0)
         cpt.start_st, cpt.live = 0, nil
         if apply_envelope_to_take("Reset Pitch Point") then set_status("Reset the pitch point." .. pt_hint) end
       end
       local can_remove = cur.kind == "added"
-      if reaper.ImGui_MenuItem(draw_ctx, "Remove Point", not can_remove and "detected points stay" or nil, false, can_remove) then
+      local remove_pt = reaper.ImGui_MenuItem(draw_ctx, "Remove Point", not can_remove and "detected points stay" or nil, false, can_remove)
+      if reaper.ImGui_IsItemHovered(draw_ctx, pt_tip_flags) then
+        Theme.tooltip(draw_ctx, K.tip("Removes this point.",
+          "Only points you added can be removed. Points found by the analysis stay: reset them to 0 instead."))
+      end
+      if remove_pt then
         if K.point_remove(pt_note, cur) then
           if apply_envelope_to_take("Remove Pitch Point") then set_status("Removed the pitch point." .. pt_hint) end
           state.context_point = nil
@@ -9619,7 +9700,7 @@ K.INFO_SECTIONS = {
     { "Q", "Quantize selected note(s) to scale", panel = { "Edit", 6, "Quantize to scale" } },
     { "B", "Bypass the selected notes (again: turn bypass off)", panel = { "Edit", 4, "Bypass note" } },
     { "R / Backspace / Delete", "Reset note(s) to original detected pitch", panel = { "Edit", 3, "Reset pitch", "R" } },
-    { "Right-click a note", "Note menu: bypass, values, Snap, Quantize, Split, Reset", panel = { "Edit", 9, "Note menu", "Right-click" } },
+    { "Right-click a note", "Note menu: bypass, mode, values, pitch points", panel = { "Edit", 9, "Note menu", "Right-click" } },
     { "Click the pill", "Apply values to other items, or reset this item to defaults" },
     { "Right-click a top bar value", "Reset, or apply it to other items" },
     { "Double-click a value", "Back to the item's value (notes) or the default (item)" },
@@ -12802,24 +12883,17 @@ do
   local BAR_LEVELS = "Default: %s. This item: %s."
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
-  local BAR_TOLERANCE_IDLE = "Not used yet: raise Tighten first."
+  local BAR_TOLERANCE_IDLE = K.TOLERANCE_IDLE_TIP
   -- The Mode dropdown (see draw_mode): its tooltip, its scope line by what it changes, the text of a mixed selection,
   -- and the line a value's tooltip gains when the selected notes' mode does not use it (key: K.mode_unused)
   local BAR_MODE = {
     title = "Mode",
-    tip = "How a note is corrected.\n\n"
-      .. "Natural: Tighten, Tolerance, Slide In and Strength shape the note.\n\n"
-      .. "Classic: the auto-tuned effect. The pitch jumps between the notes of the scale; Tighten sets how fast.\n\n"
-      .. "Hard: one flat note of the scale.",
+    tip = K.MODE_TIP,
     scope_item = "Changes this item: every note without its own mode.",
     scope_note = "Changes the selected note.",
     scope_notes = "Changes the %d selected notes.",
     mixed = "Mixed",
-    unused = {
-      mode = "Not used in Classic or Hard mode.",
-      hard = "Not used in Hard mode.",
-      classic = "In Classic mode: how fast the pitch jumps between scale notes. 0% glides, 100% steps at once.",
-    },
+    unused = K.MODE_UNUSED_TIP,
   }
   -- Separation (see draw_separation): what letting go does
   local BAR_SEP_RESPLIT = "Letting go splits this item's notes again."
@@ -12851,23 +12925,23 @@ do
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
       title = "Tighten",
-      tip = "Steadies a wobbly note. Low values take out slow drift, higher values also take out wobble and then vibrato; 100% is a flat line." },
+      tip = K.VALUE_TIP.tighten },
     { id = "strength", key = "retune_speed", label = "Strength", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
       title = "Correction Strength",
-      tip = "How far each note is pulled to its target pitch. 0% leaves the singing as recorded, 100% puts the note fully in tune." },
+      tip = K.VALUE_TIP.retune_speed },
     { id = "tol", key = "tolerance", label = "Tolerance", lo = K.LIMITS.tolerance[1], hi = K.LIMITS.tolerance[2], scale = 1,
       num = "%.0f", unit = "\xC2\xA2", levels = "all",
       title = "Tolerance",
-      tip = "How far a tightened note may wander from its centre before Tighten pulls it in. Higher values keep more natural movement." },
+      tip = K.VALUE_TIP.tolerance },
     { id = "slide", key = "slide_in", label = "Slide In", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
       title = "Slide In",
-      tip = "How much of the slide into the note is corrected. 0% keeps the slide as sung, 100% removes it." },
+      tip = K.VALUE_TIP.slide_in },
     { id = "sep", key = "separation", label = "Separation", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
       levels = "all",
       title = "Separation",
-      tip = "How readily the analysis splits the singing into notes. Raise it when separate notes are joined, lower it when one note is cut up." },
+      tip = K.VALUE_TIP.separation },
   }
   -- The note actions, in the order of the note action bar (K.draw_note_bar): the same commands as the keys and the
   -- note menu. id = K.note_action's id and the Theme.icons entry; tip = the tooltip
