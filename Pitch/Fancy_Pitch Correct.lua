@@ -1,12 +1,9 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.23.0
+-- @version 2.23.1
 -- @changelog
---   New: select several Pitched Items rows (Cmd/Ctrl-click, Shift-click) and remove them in one go
---   "Remove Selected" beside the On heading removes them; one confirm, one undo step
---   New: right-click a row for Remove This Item, Remove Selected Items and Wipe All Items
---   Esc clears the row selection (after the note selection) before closing the window
---   The Analyze Item / Analyze All Selected Items button on an empty canvas is much bigger, in the accent colour
+--   Note rows use two greys: every in-key row (every row in Chromatic) one grey, out-of-key rows dark
+--   Black-key rows no longer get their own shade; the accent tint on in-key rows is gone
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -7839,7 +7836,7 @@ local function draw_graph(draw_ctx, w, h)
   K.canvas_cache_begin(px, py, w, h, vt0, vt1, min_note, note_range)
 
   ---------------------------------------------------------------------------
-  -- DRAW ROWS (one quiet surface: in-scale rows a tint, out-of-scale rows a step darker, the root row marked)
+  -- DRAW ROWS (two greys: in-key rows one grey, out-of-key rows a darker one, a hairline between rows)
   ---------------------------------------------------------------------------
   -- Everything from here to the playhead is clipped to the note area: the note-name column and the two strips
   -- are drawn after it, and a block that runs past the window's edge must not reach them.
@@ -7850,35 +7847,15 @@ local function draw_graph(draw_ctx, w, h)
   for n = math.floor(min_note), math.ceil(max_note) do
     local key_top = py + h - ((n + 0.5 - min_note) / note_range) * h
     local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
-    local is_black_key = (n % 12 == 1 or n % 12 == 3 or n % 12 == 6
-                          or n % 12 == 8 or n % 12 == 10)
     local pc = (n % 12 + 12) % 12
-    local in_scale = is_pitch_in_scale(pc)
 
-    local row_bg
-    local row_tint = nil
-    local grid_color
-
-    if is_chromatic then
-      row_bg = is_black_key and C.row_plain_black or C.row_plain
-      grid_color = is_black_key and C.grid_plain_black or C.grid_plain
-    elseif in_scale then
-      -- In-scale note row (the root too: only its name in the note column is marked, a tinted row got in the way)
-      row_bg = is_black_key and C.row_black or C.row
-      row_tint = C.row_tint
-      grid_color = C.grid
-    else
-      -- Out-of-scale note row: dimmed
-      row_bg = is_black_key and C.row_dim_black or C.row_dim
-      grid_color = C.grid_dim
-    end
+    -- Two greys only: every in-key row (every row in Chromatic) is the same grey, an out-of-key row the dark one.
+    -- Black and white keys are not told apart here, and no tint is laid over: a hairline separates the rows.
+    local in_key = is_chromatic or is_pitch_in_scale(pc)
+    local row_bg = in_key and C.row or C.row_dim
 
     reaper.ImGui_DrawList_AddRectFilled(draw_list, px, key_top, px + w, key_bot, row_bg)
-    if row_tint then
-      reaper.ImGui_DrawList_AddRectFilled(draw_list, px, key_top, px + w, key_bot, row_tint)
-    end
-    -- A hairline along the row's lower edge (the rows differ little in colour: the line tells them apart)
-    reaper.ImGui_DrawList_AddLine(draw_list, px, key_bot, px + w, key_bot, grid_color)
+    reaper.ImGui_DrawList_AddLine(draw_list, px, key_bot, px + w, key_bot, C.grid_plain)
   end
 
   ---------------------------------------------------------------------------
