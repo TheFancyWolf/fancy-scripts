@@ -3896,6 +3896,26 @@ test("batch_with_no_buildable_item_makes_no_undo_point", function() with_point_s
   eq(st.session_takes["{a}"], nil); eq(st.session_takes["{b}"], nil)
 end) end)
 
+test("batch_carries_on_when_a_write_raises", function() with_point_stubs(function(rec)
+  local K, st = S.K, S.state
+  local insert, said = reaper.InsertEnvelopePointEx, nil
+  reaper.InsertEnvelopePointEx = function(env, ...) if env == "env_a" then error("disk full") end return insert(env, ...) end
+  reaper.ShowConsoleMsg = function(msg) said = msg end
+  local d = done2()
+  for _, e in ipairs(d) do
+    e.data.notes = { wobbly_untouched(0.1) }; K.item_seed(e.data); e.data.overrides.tighten = 0.3
+    e.data.overrides.tolerance = 0; e.json = K.take_json(e.data)
+  end
+  local ok, written = pcall(K.batch_write, d)
+  reaper.ShowConsoleMsg = nil
+  if not ok then error(written, 0) end
+  eq(#written, 1, "b is written"); eq(written[1].guid, "{b}"); eq(rec.stored.b, d[2].json)
+  eq(rec.begin, 1, "one undo block"); eq(#rec.labels, 1, "closed once"); eq(rec.labels[1], "Analyze Pitch (1 item)")
+  eq(st.undo_open, false); eq(st.session_takes["{a}"], nil, "a's session entry comes back")
+  eq(rec.stored.a, nil, "a's model is not stored")
+  eq(tostring(said):find("disk full", 1, true) ~= nil, true, "the console says why")
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

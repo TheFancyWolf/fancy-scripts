@@ -2833,18 +2833,21 @@ K.batch_write = function(done)
   state.undo_open = true
   for _, r in ipairs(buildable) do
     local guid, data = r.entry.guid, r.entry.data
-    -- Without its Pitch envelope the item cannot be corrected: it is left as it was (not written)
-    local env = ensure_take_pitch_envelope(r.take, r.item, true)
-    local wrote = false
-    if env then
+    -- Without its Pitch envelope the item cannot be corrected: it is left out (not written). A write that raises
+    -- leaves that item out too; the batch carries on and its block still closes once
+    local old = state.session_takes[guid]
+    local ok, wrote = pcall(function()
+      if not ensure_take_pitch_envelope(r.take, r.item, true) then return false end
       -- The pitch mode is kept, as for a single analysis (process_analysis_step)
-      local old = state.session_takes[guid]
       state.session_takes[guid] = data
-      wrote = K.write_take_envelope(guid, data, true, r.take, r.item,
+      return K.write_take_envelope(guid, data, true, r.take, r.item,
         { json = r.entry.json, built = true, build = r.build })
-      if not wrote then state.session_takes[guid] = old end
+    end)
+    if not ok then
+      reaper.ShowConsoleMsg("Fancy Pitch Correct: an item could not be written: " .. tostring(wrote) .. "\n")
     end
-    if wrote then
+    if not (ok and wrote) then state.session_takes[guid] = old end
+    if ok and wrote then
       local listed = false
       for _, g in ipairs(state.session_order) do
         if g == guid then listed = true; break end
