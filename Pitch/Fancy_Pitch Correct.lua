@@ -10969,8 +10969,9 @@ end
 --- (K.RESPLIT_UNDO) holds the envelope and the stored notes; the view stays, the selection is cleared.
 --- Without analysed frames (or while analysing) only the value is stored: the next analysis uses it.
 --- `opts` (optional), for a re-split that is part of a larger edit (K.reset_item_all): undo = the undo label in place
---- of K.RESPLIT_UNDO; status = the status message in place of "Split into …"; on_cancel = called whenever nothing is
---- split after all (Cancel, the item changed or is gone), after Separation is put back.
+--- of K.RESPLIT_UNDO; status = the status message in place of "Split into …"; title / confirm_label = the question's
+--- title and button in place of "Re-split <item>?" / "Re-Split"; on_cancel = called whenever nothing is split after
+--- all (Cancel, the item changed or is gone), after Separation is put back.
 K.resplit = function(prev_separation, opts)
   local results = state.results
   if state.is_analyzing or not state.target_take_guid or not results or #results < 2 then return end
@@ -11023,12 +11024,12 @@ K.resplit = function(prev_separation, opts)
   end
   request_confirm({
     id = "resplit",
-    title = string.format("Re-split %s?", state.target_take_name or "this item"),
+    title = opts and opts.title or string.format("Re-split %s?", state.target_take_name or "this item"),
     body_lines = {
       string.format("This re-splits the notes and discards your edits to %d %s.", lost, plural(lost, "note", "notes")),
       string.format("%s+Z restores them.", K.MOD_LABEL),
     },
-    confirm_label = "Re-Split",
+    confirm_label = opts and opts.confirm_label or "Re-Split",
     on_confirm = function()
       -- The modal names one item, and the match was made against its notes as they were (an undo reloads them)
       if state.target_take_guid ~= guid or state.results ~= results or state.notes ~= old_notes
@@ -11077,6 +11078,8 @@ K.reset_item_all = function()
     K.resplit(before.separation, {
       undo = K.RESET_ITEM_UNDO,
       status = K.RESET_ITEM_STATUS,
+      title = string.format("Reset %s to the starting values?", state.target_take_name or "this item"),
+      confirm_label = "Reset",
       on_cancel = function()
         -- Nothing was split: every value goes back to what it was
         data.separation, data.key_idx, data.scale_idx = before.separation, before.key_idx, before.scale_idx
@@ -11158,7 +11161,7 @@ K.resplit_stretch = function(sep)
 
     -- Written as an edit (the take's pitch mode is set) when an edit survived, else like a fresh analysis
     if apply_envelope_to_take(K.RESPLIT_STRETCH_UNDO, not any_edited) then
-      set_status(string.format("Re-split %d notes into %d.", #old_in, #new_in))
+      set_status(string.format("Re-split %d %s into %d.", #old_in, plural(#old_in, "note", "notes"), #new_in))
     end
   end
 

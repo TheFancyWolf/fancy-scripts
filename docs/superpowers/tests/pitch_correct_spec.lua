@@ -3407,7 +3407,7 @@ test("resplit_stretch_keeps_item_value", function() with_write_stubs({}, functio
   eq(data.separation, 0.2, "item value unchanged")
   eq(sep, 0.2, "bar value unchanged")
   eq(rec.labels[#rec.labels], "Re-split selected notes", "undo label")
-  eq(status, "Re-split 1 notes into 2.", "status")
+  eq(status, "Re-split 1 note into 2.", "status (singular)")
 end) end)
 
 -- A stretch at the item's own Separation splits as the item did, also where the stretch is quiet: the silence
@@ -3536,6 +3536,38 @@ test("reset_item_all_one_undo", function() with_write_stubs({}, function(rec)
   end)
   st.target_take_guid, st.results, st.notes, st.split_points, st.separation, st.key_idx,
     st.scale_idx, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+end) end)
+
+test("reset_item_all_asks_in_reset_words", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(62))
+  local start = K.start_values()
+  local other_sep = (start.separation > 0.5) and 0.2 or 0.9
+  local old, old_splits = K.segment(fr, other_sep)
+  -- an edited note no new note matches: a re-split asks first
+  old[#old + 1] = { start_time = 5, end_time = 6, avg_note = 60, controls = { bypassed = true, center_pitch = 60 } }
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, item_len = 2, sample_rate = 44100 }
+  K.item_seed(data)
+  data.separation = other_sep
+  local saved = { st.target_take_guid, st.target_take_name, st.results, st.notes, st.split_points, st.separation,
+    st.confirm }
+  st.target_take_guid, st.target_take_name, st.session_takes["{a}"] = "{a}", "Lead Vox", data
+  st.results, st.notes, st.split_points, st.separation, st.confirm = fr, old, old_splits, other_sep, nil
+  local ok, err = pcall(function()
+    K.reset_item_all()
+    local c = st.confirm
+    eq(c ~= nil and c.id, "resplit", "asks first")
+    eq(c.title, "Reset Lead Vox to the starting values?")
+    eq(c.confirm_label, "Reset")
+    eq(#rec.labels, 0, "nothing written yet")
+    -- a plain Separation re-split keeps its own words
+    st.confirm = nil
+    K.resplit(start.separation)
+    eq(st.confirm.title, "Re-split Lead Vox?"); eq(st.confirm.confirm_label, "Re-Split")
+  end)
+  st.target_take_guid, st.target_take_name, st.results, st.notes, st.split_points, st.separation,
+    st.confirm = table.unpack(saved, 1, 7)
   if not ok then error(err, 0) end
 end) end)
 
