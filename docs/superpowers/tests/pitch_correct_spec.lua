@@ -3667,7 +3667,7 @@ test("write_take_envelope_keeps_the_old_envelope_when_the_build_fails", function
   eq(pitchmode_set, false, "the pitch mode is not changed either")
 end) end)
 
--- Apply to other items (K.apply_plan, the confirm's choices)
+-- Apply to other items (K.apply_plan, the confirm's checklist)
 -- A target of K.apply_plan: a model with notes split from `fr` at `sep`, each note with its controls
 local function apply_target(id, fr, sep, tol)
   local notes = S.K.segment(fr, sep)
@@ -3745,21 +3745,138 @@ test("confirm_consequence_cached", function()
   local calls = 0
   local ok, err = pcall(function()
     S.request_confirm({ id = "t", title = "T", on_confirm = function() end,
-      choices = { { label = "One", value = "one" }, { label = "Two", value = "two" } },
+      checklist = { caption = "To:", rows = { { id = "a", name = "A" }, { id = "b", name = "B" } },
+        ticked = { a = true } },
+      only = { label = "Only", value = false },
       check = { label = "Keep", value = false },
-      consequence = function(choice, checked) calls = calls + 1; return { lines = { choice .. tostring(checked) } } end })
+      consequence = function(only, checked, ticked)
+        calls = calls + 1
+        local n = 0
+        for _ in pairs(ticked) do n = n + 1 end
+        return { lines = { tostring(only) .. tostring(checked) .. n } }
+      end })
     S.draw_confirm_modal(); S.draw_confirm_modal()
-    eq(calls, 1, "same choice: computed once")
-    eq(st.confirm.cons.lines[1], "onefalse", "cached in state.confirm")
-    st.confirm.choice = "two"; S.draw_confirm_modal()
-    eq(calls, 2, "a new choice: computed again")
-    st.confirm.checked = true; S.draw_confirm_modal(); S.draw_confirm_modal()
-    eq(calls, 3, "the check changed: computed again, once")
+    eq(calls, 1, "same ticks: computed once")
+    eq(st.confirm.cons.lines[1], "falsefalse1", "cached in state.confirm")
+    S.K.confirm_tick(st.confirm, "b", true); S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(calls, 2, "a row ticked: computed again, once")
+    eq(st.confirm.cons.lines[1], "falsefalse2")
+    S.K.confirm_tick(st.confirm, "b", true); S.draw_confirm_modal()
+    eq(calls, 2, "ticking a ticked row changes nothing")
+    st.confirm.checked = true; S.draw_confirm_modal()
+    eq(calls, 3, "the check changed: computed again")
+    st.confirm.only_on = true; S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(calls, 4, "New items only changed: computed again, once")
+    S.K.confirm_tick_all(st.confirm, false); S.draw_confirm_modal()
+    eq(calls, 5, "None: computed again"); eq(next(st.confirm.ticked), nil, "nothing ticked")
   end)
   for k in pairs(stubs) do reaper[k] = nil end
   st.confirm = nil
   if not ok then error(err, 0) end
 end)
+
+test("confirm_skipped_rows_are_not_tickable", function()
+  local c = { checklist = { rows = { { id = "a", name = "A" }, { id = "m", name = "M", reason = "Not an audio item" } } },
+    ticked = {}, ticks_rev = 0 }
+  S.K.confirm_tick(c, "m", true)
+  eq(c.ticked.m, nil, "a skipped row stays unticked"); eq(c.ticks_rev, 0, "and nothing is recomputed")
+  S.K.confirm_tick_all(c, true)
+  eq(c.ticked.a, true, "All ticks the audio row"); eq(c.ticked.m, nil, "All skips the skipped row")
+end)
+
+-- The Apply checklist: its rows, the rows ticked at first, the targets of the ticked rows
+local function apply_row(id, reason) return { id = "{" .. id .. "}", guid = "{" .. id .. "}", name = id, reason = reason } end
+
+test("apply_initial_ticks_follow_the_selection", function()
+  local rows = { apply_row("a"), apply_row("b"), apply_row("c") }
+  local ticked = S.K.apply_initial_ticks(rows, { ["{b}"] = true, ["{x}"] = true })
+  eq(ticked["{b}"], true, "the selected row"); eq(ticked["{a}"], nil); eq(ticked["{c}"], nil)
+  eq(ticked["{x}"], nil, "a selected item that is not in the list is not a row")
+end)
+
+test("apply_initial_ticks_all_when_none_selected", function()
+  local rows = { apply_row("a"), apply_row("m", "Not an audio item"), apply_row("b") }
+  local ticked = S.K.apply_initial_ticks(rows, {})
+  eq(ticked["{a}"], true); eq(ticked["{b}"], true, "none of the rows is selected: every row")
+  eq(ticked["{m}"], nil, "a skipped row is never ticked")
+  ticked = S.K.apply_initial_ticks(rows, { ["{m}"] = true })
+  eq(ticked["{m}"], nil, "selected but skipped: not ticked")
+  eq(ticked["{a}"], true, "the only selected row is skipped: every audio row")
+end)
+
+test("apply_rows_and_ticked_entries", function() with_write_stubs({ ["{g}"] = true }, function()
+  local st, K = S.state, S.K
+  local saved = { st.target_take_guid, reaper.TakeIsMIDI }
+  local ok, err = pcall(function()
+    for _, g in ipairs({ "{open}", "{a}", "{m}", "{g}", "{b}" }) do
+      st.session_takes[g] = { guid = g, name = g:gsub("[{}]", ""), notes = {} }
+      st.session_order[#st.session_order + 1] = g
+    end
+    st.target_take_guid = "{open}"
+    reaper.TakeIsMIDI = function(take) return take == "m" end
+    local rows = K.apply_rows()
+    eq(#rows, 4, "every pitched item but the open one")
+    eq(rows[1].guid, "{a}"); eq(rows[1].reason, nil)
+    eq(rows[2].guid, "{m}"); eq(rows[2].reason, "Not an audio item")
+    eq(rows[3].guid, "{g}"); eq(rows[3].reason, "No longer in the project")
+    eq(rows[4].guid, "{b}"); eq(rows[4].name, "b")
+    local entries = K.apply_ticked_entries(rows, { ["{b}"] = true, ["{m}"] = true })
+    eq(#entries, 1, "only ticked rows that can be written"); eq(entries[1].guid, "{b}")
+    eq(entries[1].data, st.session_takes["{b}"])
+  end)
+  for _, g in ipairs({ "{open}", "{m}", "{g}" }) do st.session_takes[g] = nil end
+  st.target_take_guid, reaper.TakeIsMIDI = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_consequence_follows_the_ticked_rows", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(#c.checklist.rows, 2, "one row per other pitched item")
+    eq(c.ticked["{a}"] and c.ticked["{b}"], true, "nothing selected: every row ticked")
+    eq(c.only_on, false, "New items only starts off")
+    eq(c.consequence(false, false, { ["{a}"] = true, ["{b}"] = true }).confirm_label, "Apply (2)")
+    local one = c.consequence(false, false, { ["{b}"] = true })
+    eq(one.confirm_label, "Apply (1)", "the count follows the ticked rows"); eq(one.reason, nil)
+    local none = c.consequence(false, false, {})
+    eq(none.reason, "Tick at least one item", "nothing ticked: Apply disabled")
+    local only = c.consequence(true, false, {})
+    eq(only.confirm_label, "Save starting values", "New items only")
+  end)
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_open_ticks_the_selected_rows", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    reaper.CountSelectedMediaItems = function() return 1 end
+    reaper.GetSelectedMediaItem = function() return "item_b" end
+    reaper.GetActiveTake = function() return "b" end
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.ticked["{b}"], true, "the selected item is ticked"); eq(c.ticked["{a}"], nil, "the other is not")
+  end)
+  reaper.GetSelectedMediaItem, reaper.GetActiveTake = nil, nil
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
 
 test("apply_run_one_undo_and_cancel", function() with_write_stubs({}, function(rec)
   local st, K, G = S.state, S.K, S.global_defaults
@@ -3806,7 +3923,7 @@ test("apply_keep_line_only_when_separation_is_given", function() with_write_stub
       K.apply_open(keys)
       local c = st.confirm
       st.confirm = nil
-      for _, line in ipairs(c.consequence("all", true).lines) do
+      for _, line in ipairs(c.consequence(false, true, c.ticked).lines) do
         if line:find("not split again", 1, true) then return true end
       end
       return false
@@ -3833,9 +3950,9 @@ test("apply_refuses_when_the_open_item_changed", function() with_write_stubs({},
     K.apply_open({ "tolerance" })
     local c = st.confirm
     eq(c ~= nil and c.id, "apply", "the confirm is open")
-    eq(c.choice, "all", "nothing selected: all pitched items")
+    eq(c.ticked["{a}"] and c.ticked["{b}"], true, "nothing selected: every row ticked")
     st.target_take_guid = "{a}"   -- the user clicked a target in the arrange view
-    c.on_confirm(c.choice, c.checked)
+    c.on_confirm(c.only_on, c.checked, c.ticked)
     eq(#rec.labels, 0, "no undo point"); eq(K.batch, nil, "no run")
     eq(st.session_takes["{a}"], a.data, "a untouched"); eq(G.tolerance, start_tol, "starting values untouched")
     eq(st.status.text, "The item changed meanwhile. Nothing was applied.")

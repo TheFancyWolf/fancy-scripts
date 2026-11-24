@@ -9,6 +9,7 @@
 --   The top bar changes only this item or the selected notes, never other items; the pill says which
 --   Key and Scale in the top bar no longer set the key for new items
 --   New: Apply to other items (pill menu, value right-click), with an option to keep changes already made
+--   Apply lists the pitched items to tick; the ones selected in the arrange view start ticked
 --   New: Reset this item to defaults (pill menu); a value's reset on the item goes to its default
 --   New: Separation with notes selected re-splits just that stretch ("Re-split selected notes")
 --   The values sit in three groups split by hairlines (Notes, Correction, Shaping), named in their tooltips
@@ -702,23 +703,25 @@ end
 --- The modal names the consequence, Cancel comes first and Esc cancels; on_confirm runs once, or on_cancel once when
 --- the modal closes without confirming. list: the things the action replaces, shown under body_lines in a region
 --- that scrolls (K.confirm_list); after_lines follow it.
---- Optional choices (the Apply confirm):
----   choices = { { label, value, reason } ... }: radio buttons under the body (choices_caption above them); a choice with a `reason` is drawn
----             disabled with the reason beside it (EP2). choice = the value chosen at first (default: the first
----             choice without a reason).
----   check = { label, value }: a checkbox under the choices.
----   consequence = function(choice, checked) -> { lines = { string... }, confirm_label = string | nil,
----             reason = string | nil }: what the chosen action does, drawn after the check. It is called only when
----             the choice or the check changes (HI5) and its answer is kept in state.confirm.cons; its confirm_label
----             replaces the request's, and a `reason` disables the confirm button and is shown above it.
---- on_confirm(choice, checked) receives the choice and the check.
+--- Optional targets (the Apply confirm):
+---   checklist = { caption, all_label, none_label, rows = { { id, name, reason } ... }, ticked = { [id] = true } }:
+---             a list of rows with a checkbox each (K.confirm_checklist), "All" / "None" beside the caption. A row with
+---             a `reason` is drawn disabled with the reason beside it (EP2) and is never ticked.
+---   only = { label, value, reason }: a checkbox under the list; while it is on, the list and `check` are disabled
+---             and `reason` is shown above the list.
+---   check = { label, value }: a checkbox under the list.
+---   consequence = function(only_on, checked, ticked) -> { lines = { string... }, confirm_label = string | nil,
+---             reason = string | nil }: what the action does, drawn after the checkboxes. It is called only when
+---             the ticked rows, `only` or the check change (HI5) and its answer is kept in state.confirm.cons; its
+---             confirm_label replaces the request's, and a `reason` disables the confirm button and is shown above it.
+--- on_confirm(only_on, checked, ticked) receives the state of `only`, the check and the ticked rows.
 --- size = a Theme.layout modal size (default L.modal_sm).
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
-  local choice = req.choice
-  if choice == nil and req.choices then
-    for _, ch in ipairs(req.choices) do
-      if ch.reason == nil then choice = ch.value break end
+  local ticked = {}
+  if req.checklist then
+    for _, row in ipairs(req.checklist.rows) do
+      if not row.reason and req.checklist.ticked and req.checklist.ticked[row.id] then ticked[row.id] = true end
     end
   end
   state.confirm = {
@@ -730,9 +733,11 @@ local function request_confirm(req)
     confirm_label = req.confirm_label or "Confirm",
     on_confirm = req.on_confirm,
     on_cancel = req.on_cancel,
-    choices = req.choices,
-    choices_caption = req.choices_caption,
-    choice = choice,
+    checklist = req.checklist,
+    ticked = ticked,
+    ticks_rev = 0,    -- counts the changes to `ticked` (the consequence's cache key)
+    only = req.only,
+    only_on = req.only and req.only.value == true or false,
     check = req.check,
     checked = req.check and req.check.value == true or false,
     consequence = req.consequence,
@@ -744,16 +749,35 @@ local function request_confirm(req)
   }
 end
 
---- The consequence of the confirm `c` for its current choice and check: computed again only when one of them
+--- The consequence of the confirm `c` for its ticked rows, `only` and check: computed again only when one of them
 --- changed since the last call (HI5), else the kept answer. nil when the request has no consequence.
 K.confirm_consequence = function(c)
   if not c.consequence then return nil end
-  local key = tostring(c.choice) .. "|" .. tostring(c.checked)
+  local key = tostring(c.only_on) .. "|" .. tostring(c.checked) .. "|" .. tostring(c.ticks_rev)
   if c.cons_key ~= key then
-    c.cons = c.consequence(c.choice, c.checked) or { lines = {} }
+    c.cons = c.consequence(c.only_on, c.checked, c.ticked) or { lines = {} }
     c.cons_key = key
   end
   return c.cons
+end
+
+--- Tick (on) or untick the row `id` of the confirm `c`'s checklist. A row with a reason cannot be ticked. The
+--- consequence follows on the next frame (only when the ticked rows really changed).
+K.confirm_tick = function(c, id, on)
+  local row = nil
+  for _, r in ipairs(c.checklist and c.checklist.rows or {}) do
+    if r.id == id then row = r break end
+  end
+  if not row or (on and row.reason) then return end
+  local was = c.ticked[id] == true
+  if was == (on == true) then return end
+  c.ticked[id] = on and true or nil
+  c.ticks_rev = c.ticks_rev + 1
+end
+
+--- Tick every row of the confirm `c`'s checklist that can be ticked (on), or untick every row.
+K.confirm_tick_all = function(c, on)
+  for _, row in ipairs(c.checklist and c.checklist.rows or {}) do K.confirm_tick(c, row.id, on) end
 end
 
 local function update_scale_pitch_classes()
@@ -10618,30 +10642,94 @@ K.confirm_list = function(c)
   reaper.ImGui_PopStyleColor(ctx, 1)
 end
 
---- The choices of a confirm dialog (request_confirm's `choices` and `check`): a caption, one radio button per
---- choice (a choice with a reason is disabled, the reason beside it in dim text that wraps at a narrow docker,
---- RB9), then the checkbox. The caption is request_confirm's choices_caption (none when nil). A click changes c.choice / c.checked; the consequence follows on the next frame.
-K.confirm_choices = function(c, P, L)
-  reaper.ImGui_Dummy(ctx, 0, L.sm)
-  if c.choices_caption then reaper.ImGui_Text(ctx, c.choices_caption) end
-  for i, ch in ipairs(c.choices) do
-    if ch.reason then reaper.ImGui_BeginDisabled(ctx) end
-    if reaper.ImGui_RadioButton(ctx, ch.label .. "###confirm_choice_" .. i, c.choice == ch.value)
-        and not ch.reason then
-      c.choice = ch.value
-    end
-    if ch.reason then
-      reaper.ImGui_EndDisabled(ctx)
+-- The most rows a confirm's checklist shows before it scrolls
+K.CHECKLIST_MAX_ROWS = 6
+
+--- The targets of a confirm dialog (request_confirm's `checklist`, `only` and `check`): the caption with "All" and
+--- "None" beside it, the rows in a region that scrolls past K.CHECKLIST_MAX_ROWS (only the rows in view are drawn),
+--- then the checkboxes. A row's name that does not fit is shortened (its tooltip has it in full); a row with a reason
+--- is disabled, the reason beside it in dim text. While `only` is on, the list and the check are disabled and
+--- only.reason says why. A click changes c.ticked / c.only_on / c.checked; the consequence follows on the next frame.
+K.confirm_targets = function(c, P, L)
+  local list = c.checklist
+  if list then
+    reaper.ImGui_Dummy(ctx, 0, L.sm)
+    if c.only_on then reaper.ImGui_BeginDisabled(ctx) end
+    if list.caption then
+      reaper.ImGui_AlignTextToFramePadding(ctx)
+      reaper.ImGui_Text(ctx, list.caption)
       reaper.ImGui_SameLine(ctx, 0, L.md)
+    end
+    if reaper.ImGui_SmallButton(ctx, (list.all_label or "All") .. "###confirm_tick_all") then
+      K.confirm_tick_all(c, true)
+    end
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
+    if reaper.ImGui_SmallButton(ctx, (list.none_label or "None") .. "###confirm_tick_none") then
+      K.confirm_tick_all(c, false)
+    end
+    if c.only_on then reaper.ImGui_EndDisabled(ctx) end
+    if c.only_on and c.only.reason then
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-      reaper.ImGui_TextWrapped(ctx, ch.reason)
+      reaper.ImGui_TextWrapped(ctx, c.only.reason)
       reaper.ImGui_PopStyleColor(ctx, 1)
     end
+
+    local rows = list.rows
+    local row_h = reaper.ImGui_GetFrameHeightWithSpacing(ctx)
+    local _, pad_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+    local list_h = math.max(1, math.min(#rows, K.CHECKLIST_MAX_ROWS)) * row_h + (pad_y or L.sm) * 2
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.well)
+    if reaper.ImGui_BeginChild(ctx, "##confirm_checklist", 0, list_h, reaper.ImGui_ChildFlags_Borders()) then
+      if c.only_on then reaper.ImGui_BeginDisabled(ctx) end
+      -- A clipper of its own, attached to the context (see K.confirm_list)
+      if not K.checklist_clipper or not reaper.ImGui_ValidatePtr(K.checklist_clipper, "ImGui_ListClipper*") then
+        K.checklist_clipper = reaper.ImGui_CreateListClipper(ctx)
+        reaper.ImGui_Attach(ctx, K.checklist_clipper)
+      end
+      local clipper = K.checklist_clipper
+      local inner_w = reaper.ImGui_GetContentRegionAvail(ctx)
+      local inner_x = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemInnerSpacing())
+      local box_w = reaper.ImGui_GetFrameHeight(ctx) + (inner_x or L.sm)
+      reaper.ImGui_ListClipper_Begin(clipper, #rows, row_h)
+      while reaper.ImGui_ListClipper_Step(clipper) do
+        local first_row, end_row = reaper.ImGui_ListClipper_GetDisplayRange(clipper)   -- 0-based, end exclusive
+        for index = first_row + 1, end_row do
+          local row = rows[index]
+          local name = row.name or "Item"
+          local reason_w = row.reason and (reaper.ImGui_CalcTextSize(ctx, row.reason)) + L.md or 0
+          local shown = fit_text(ctx, name, math.max(L.xxxl, inner_w - box_w - reason_w), "regular")
+          if row.reason then reaper.ImGui_BeginDisabled(ctx) end
+          local changed, on = reaper.ImGui_Checkbox(ctx, shown .. "###confirm_row_" .. index,
+            c.ticked[row.id] == true and not row.reason)
+          if changed and not row.reason then K.confirm_tick(c, row.id, on == true) end
+          if shown ~= name and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()
+              | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+            Theme.tooltip(ctx, name)
+          end
+          if row.reason then
+            reaper.ImGui_EndDisabled(ctx)
+            reaper.ImGui_SameLine(ctx, 0, L.md)
+            reaper.ImGui_TextColored(ctx, P.text_dim, row.reason)
+          end
+        end
+      end
+      if c.only_on then reaper.ImGui_EndDisabled(ctx) end
+      reaper.ImGui_EndChild(ctx)
+    end
+    reaper.ImGui_PopStyleColor(ctx, 1)
   end
+  local lock_check = c.only_on and c.only ~= nil
   if c.check then
     reaper.ImGui_Dummy(ctx, 0, L.xs)
+    if lock_check then reaper.ImGui_BeginDisabled(ctx) end
     local changed, on = reaper.ImGui_Checkbox(ctx, c.check.label .. "###confirm_check", c.checked)
-    if changed then c.checked = on == true end
+    if changed and not lock_check then c.checked = on == true end
+    if lock_check then reaper.ImGui_EndDisabled(ctx) end
+  end
+  if c.only then
+    reaper.ImGui_Dummy(ctx, 0, L.xs)
+    local changed, on = reaper.ImGui_Checkbox(ctx, c.only.label .. "###confirm_only", c.only_on)
+    if changed then c.only_on = on == true end
   end
 end
 
@@ -10682,7 +10770,7 @@ local function draw_confirm_modal()
       reaper.ImGui_Dummy(ctx, 0, L.sm)
       reaper.ImGui_TextWrapped(ctx, line)
     end
-    if c.choices then K.confirm_choices(c, P, L) end
+    if c.checklist or c.check or c.only then K.confirm_targets(c, P, L) end
     if cons then
       for _, line in ipairs(cons.lines or {}) do
         reaper.ImGui_Dummy(ctx, 0, L.sm)
@@ -10734,7 +10822,7 @@ local function draw_confirm_modal()
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
   if confirmed then
     c.confirmed = true
-    c.on_confirm(c.choice, c.checked)
+    c.on_confirm(c.only_on, c.checked, c.ticked)
   end
 
   if c.opened and not reaper.ImGui_IsPopupOpen(ctx, popup_name) then
@@ -11286,43 +11374,63 @@ K.apply_other_count = function()
   return n
 end
 
---- The targets of a choice of the Apply confirm, as entries { guid, take (nil: not in the project), midi, name,
---- data (the session model) }:
----   "selected": REAPER's selected audio items that are analysed, but the open item (the selection is only read, UC4);
----   "all": every analysed item of the Pitched Items list (state.session_order) but the open item;
----   "new": none.
---- skipped = the selected items that are not targets (not audio, or not analysed); 0 for the other choices.
-K.apply_targets = function(choice)
-  local entries, skipped = {}, 0
+-- Why a row of the Apply checklist cannot be ticked (docs/design/pitch-correct-value-levels.md, Copy deck)
+K.APPLY_ROW_MIDI = "Not an audio item"
+K.APPLY_ROW_GONE = "No longer in the project"
+
+--- The rows of the Apply checklist: every analysed item of the Pitched Items list (state.session_order) but the open
+--- item, in the list's order, as { id = guid, guid, take (nil: not in the project), midi, name, data (the session
+--- model), reason } — reason (K.APPLY_ROW_MIDI / K.APPLY_ROW_GONE) when the item cannot be written (it is skipped).
+K.apply_rows = function()
+  local rows = {}
   local open = state.target_take_guid
-  if choice == "selected" then
-    local sel = K.batch_selection()
-    skipped = sel.skipped
-    for _, e in ipairs(sel.takes) do
-      local data = state.session_takes[e.guid]
-      if e.guid ~= open then
-        if data then
-          entries[#entries + 1] = { guid = e.guid, take = e.take, midi = false, name = e.name, data = data }
-        else
-          skipped = skipped + 1
-        end
-      end
-    end
-  elseif choice == "all" then
-    for _, guid in ipairs(state.session_order) do
-      local data = state.session_takes[guid]
-      if guid ~= open and data then
-        local take = resolve_take_by_guid(guid, true)
-        entries[#entries + 1] = { guid = guid, take = take or nil, midi = take and reaper.TakeIsMIDI(take) or false,
-          name = data.name or guid, data = data }
-      end
+  for _, guid in ipairs(state.session_order) do
+    local data = state.session_takes[guid]
+    if guid ~= open and data then
+      local take = resolve_take_by_guid(guid, true)
+      local midi = take and reaper.TakeIsMIDI(take) or false
+      rows[#rows + 1] = { id = guid, guid = guid, take = take or nil, midi = midi, name = data.name or guid, data = data,
+        reason = (not take and K.APPLY_ROW_GONE) or (midi and K.APPLY_ROW_MIDI) or nil }
     end
   end
-  return entries, skipped
+  return rows
+end
+
+--- The guids of REAPER's selected audio items, as a set (the selection is only read, UC4).
+K.apply_selected_guids = function()
+  local set = {}
+  for _, e in ipairs(K.batch_selection().takes) do set[e.guid] = true end
+  return set
+end
+
+--- The rows ticked when the Apply confirm opens. Pure: the rows (K.apply_rows's) that are selected in the arrange
+--- view (`selected` = a set of guids); when none of them is, every row. A row with a reason is never ticked.
+K.apply_initial_ticks = function(rows, selected)
+  local ticked, any = {}, false
+  for _, row in ipairs(rows) do
+    if not row.reason and selected[row.guid] then ticked[row.id] = true any = true end
+  end
+  if not any then
+    for _, row in ipairs(rows) do
+      if not row.reason then ticked[row.id] = true end
+    end
+  end
+  return ticked
+end
+
+--- The targets of the ticked rows, as K.apply_plan's entries. Pure: a row with a reason is never one.
+K.apply_ticked_entries = function(rows, ticked)
+  local entries = {}
+  for _, row in ipairs(rows) do
+    if ticked[row.id] and not row.reason then
+      entries[#entries + 1] = { guid = row.guid, take = row.take, midi = row.midi, name = row.name, data = row.data }
+    end
+  end
+  return entries
 end
 
 --- What Apply would do. Pure: reads its arguments only (and the note splitter for the edited notes a re-split
---- loses). src = the values given ({ key = v }); entries = K.apply_targets's; keys = the keys given; keep = "Keep
+--- loses). src = the values given ({ key = v }); entries = K.apply_ticked_entries's; keys = the keys given; keep = "Keep
 --- changes already made to items and notes"; old_start = the starting values before Apply (K.start_values()).
 --- Returns plan = { items = { { guid, name, set = { key = v }, clear_note_keys = { key ... }, resplit, key_change,
 --- lost, changes } ... }, counts = { items_lose, notes_lose, key_change, resplit, lost, not_resplit, skipped },
@@ -12473,12 +12581,12 @@ do
   local APPLY_COPY = {
     title_all = "Apply this item's values to other items?",
     title_one = "Apply %s to other items?",
-    selected = "The %d selected items",
-    selected_none = "Select items in the arrange view",
-    all = "All %d pitched items",
-    all_none = "No other pitched items",
-    new = "New items only",
     caption = "Apply to:",
+    tick_all = "All",
+    tick_none = "None",
+    only = "New items only: change no item, just save the starting values",
+    only_reason = "Untick \"New items only\" to pick items.",
+    tick_some = "Tick at least one item",
     check = "Keep changes already made to items and notes",
     consequence = "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost).",
     keep = "%d items with edited notes are not split again.",
@@ -12518,9 +12626,10 @@ do
   end
 
   --- "Apply to other items…" (keys nil: every value, Key and Scale included) or "Apply <Value> to other items…"
-  --- (keys = { key }, or Key and Scale): the confirm with its choices (the selected items, all pitched items, new
-  --- items only) and "Keep changes…". The consequence is planned when the confirm opens and again when the choice
-  --- or the check changes (HI5). HC4: the starting values are ExtState, so it always asks.
+  --- (keys = { key }, or Key and Scale): the confirm with its checklist of the other pitched items (ticked at first:
+  --- the ones selected in the arrange view, or every one when none is), "Keep changes…" and "New items only". The
+  --- consequence is planned when the confirm opens and again when the ticked rows, the check or "New items only"
+  --- change (HI5). HC4: the starting values are ExtState, so it always asks.
   K.apply_open = function(keys)
     keys = keys or K.APPLY_ALL_KEYS
     if state.confirm or K.apply_reason() == BAR_REASON_ANALYZING then return end
@@ -12528,9 +12637,9 @@ do
     if #keys == 1 or (#keys == 2 and keys[1] == "key_idx") then label = APPLY_LABEL[keys[1]] end
     local src = K.apply_source(keys)
     local old_start = K.start_values()
-    local targets = { selected = (K.apply_targets("selected")), all = (K.apply_targets("all")), new = {} }
-    local n_sel, n_all = #targets.selected, #targets.all
-    -- The starting values Apply would change (it saves them whatever the choice)
+    local rows = K.apply_rows()
+    local ticked = K.apply_initial_ticks(rows, K.apply_selected_guids())
+    -- The starting values Apply would change (it saves them whatever is ticked)
     local start_changes = false
     for _, key in ipairs(keys) do
       if src[key] ~= nil and K.value_changed(old_start[key], src[key]) then start_changes = true end
@@ -12539,35 +12648,36 @@ do
     -- Only a Separation given splits items again: the keep line is about that alone
     local gives_sep = false
     for _, key in ipairs(keys) do if key == "separation" then gives_sep = true end end
-    local plan = nil
     -- The item the values come from: it must still be the open item when the user confirms
     local open_guid = state.target_take_guid
+    local function plan_for(only_on, checked, ticks)
+      local entries = only_on and {} or K.apply_ticked_entries(rows, ticks or {})
+      return K.apply_plan(src, entries, keys, checked, old_start), #entries
+    end
     request_confirm({
       id = "apply",
       title = label and string.format(APPLY_COPY.title_one, label) or APPLY_COPY.title_all,
       body_lines = { K.apply_values_line(src, keys) },
-      choices_caption = APPLY_COPY.caption,
-      choices = {
-        { label = string.format(APPLY_COPY.selected, n_sel), value = "selected",
-          reason = (n_sel == 0) and APPLY_COPY.selected_none or nil },
-        { label = string.format(APPLY_COPY.all, n_all), value = "all", reason = (n_all == 0) and APPLY_COPY.all_none or nil },
-        { label = APPLY_COPY.new, value = "new" },
-      },
-      choice = (n_sel >= 1 and "selected") or (n_all >= 1 and "all") or "new",
+      checklist = { caption = APPLY_COPY.caption, all_label = APPLY_COPY.tick_all, none_label = APPLY_COPY.tick_none,
+        rows = rows, ticked = ticked },
+      only = { label = APPLY_COPY.only, value = next(ticked) == nil, reason = APPLY_COPY.only_reason },
       check = { label = APPLY_COPY.check, value = false },
       size = Theme.layout.modal_md,
       confirm_label = APPLY_COPY.confirm_new,
-      consequence = function(choice, checked)
-        plan = K.apply_plan(src, targets[choice] or {}, keys, checked, old_start)
+      consequence = function(only_on, checked, ticks)
+        local plan, n_ticked = plan_for(only_on, checked, ticks)
         local c = plan.counts
         local lines = {}
-        if choice ~= "new" then
+        if not only_on and n_ticked > 0 then
           lines[1] = string.format(APPLY_COPY.consequence, c.items_lose, c.notes_lose, c.key_change, c.resplit, c.lost)
           if checked and gives_sep then lines[#lines + 1] = string.format(APPLY_COPY.keep, c.not_resplit) end
         end
         lines[#lines + 1] = footnote
         local out = { lines = lines }
-        if choice == "new" or plan.changed == 0 then
+        if not only_on and n_ticked == 0 then
+          out.confirm_label = string.format(APPLY_COPY.confirm, 0)
+          out.reason = APPLY_COPY.tick_some
+        elseif only_on or plan.changed == 0 then
           out.confirm_label = APPLY_COPY.confirm_new
           if not start_changes then out.reason = APPLY_COPY.nothing end
         else
@@ -12575,14 +12685,15 @@ do
         end
         return out
       end,
-      on_confirm = function(choice, checked)
+      on_confirm = function(only_on, checked, ticks)
         -- The open item changed while the confirm was up (the selection follower): the values and the targets were
         -- read for another item, and the new open item may be one of the targets
         if state.target_take_guid ~= open_guid then
           set_status(APPLY_COPY.changed)
           return
         end
-        if not plan then plan = K.apply_plan(src, targets[choice] or {}, keys, checked, old_start) end
+        local plan, n_ticked = plan_for(only_on, checked, ticks)
+        if not only_on and n_ticked == 0 then return end
         K.apply_run(plan, keys, src, label)
       end,
     })

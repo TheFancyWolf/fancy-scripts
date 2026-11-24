@@ -3,7 +3,7 @@
 Target file(s): `Pitch/Fancy_Pitch Correct.lua`
 Archetype(s): main window → Editor / canvas (top bar Values group, redesigned); "Apply to other items" confirm → the window's existing confirm modal (same archetype)
 Status: Approved
-Amended 2026-11-24 after use: captions removed; item reset goes to defaults.
+Amended 2026-11-24 after use: captions removed; item reset goes to defaults; the Apply confirm's target radios became a checklist of the pitched items.
 Date: 2026-11-24
 Approver: TheFancyWolf (in chat, 2026-11-24)
 
@@ -40,7 +40,7 @@ Levels used below: **starting values** (ExtState, `FancyScripts`); **item** = th
 | Changed: Separation with no note selected re-splits **this item** at its own Separation (today: one value for every item, ExtState `pitch_separation`) | the take's stored analysis frames | the item's notes and the Separation they were split at (already stored per take as `data.separation`); envelope | take data | **Y**: one undo step, as today's re-split. Its existing "may ask first" confirm (K.resplit) is kept |
 | New: Separation with **notes selected** re-splits only the stretch from the first selected note's start to the last selected note's end; the notes outside it are untouched; the new notes come back selected | the take's analysis frames inside that stretch | the notes inside the stretch; envelope | take data | **Y**: one undo step "Re-split selected notes" |
 | Changed: Key / Scale stay per item (already stored per take as `key_idx` / `scale_idx`), but choosing them **no longer changes the starting key for new items** (today every change also writes ExtState `pitch_key_idx` / `pitch_scale_idx`) | the open take | the item's key / scale; envelope | take data | **Y** for the item. Today's ExtState write is removed from this path |
-| New: pill menu → **Apply to other items…** opens a confirm; it applies all of this item's values (Key, Scale, Separation, Mode, Tighten, Tolerance, Strength, Slide In) | the arrange selection; every take with Pitch Correct data in the project (the Pitched Items list); each target's item and note values | per target item: its item values set to this item's; its notes' own values for those keys cleared; a re-split where Separation changed; its envelope. With **"Keep changes already made to items and notes"** ticked: a target's item value that differs from the *previous* starting value is kept, notes with their own value keep it, and a target whose notes carry edits (pitch moves, points, own values) is **not** re-split. Unticked: everything is overwritten, and re-splits go ahead even where edited notes are lost; the confirm counts those notes. The starting values are saved when Apply starts. A Cancel partway keeps them and the finished items, and its status says so | take data for every target in **one** undo block; **ExtState** for the starting values | **N**: the every-item values are ExtState. So HC4 requires the confirm, which names the consequence and the counts. Everything written to items is one undo step |
+| New: pill menu → **Apply to other items…** opens a confirm; it applies all of this item's values (Key, Scale, Separation, Mode, Tighten, Tolerance, Strength, Slide In) | every take with Pitch Correct data in the project (the Pitched Items list) but the open item, shown as a checklist in the confirm; the arrange selection only decides which rows start ticked; each ticked target's item and note values | per ticked target item: its item values set to this item's; its notes' own values for those keys cleared; a re-split where Separation changed; its envelope. With **"Keep changes already made to items and notes"** ticked: a target's item value that differs from the *previous* starting value is kept, notes with their own value keep it, and a target whose notes carry edits (pitch moves, points, own values) is **not** re-split. Unticked: everything is overwritten, and re-splits go ahead even where edited notes are lost; the confirm counts those notes. The starting values are saved when Apply starts. A Cancel partway keeps them and the finished items, and its status says so | take data for every target in **one** undo block; **ExtState** for the starting values | **N**: the every-item values are ExtState. So HC4 requires the confirm, which names the consequence and the counts. Everything written to items is one undo step |
 | New: right-click a value → **Apply <Value> to other items…** opens the same confirm with only that value | same | same, that key only | same | **N** (as above) |
 | New: pill menu → **Reset this item to defaults** sets every value of this item to the script's `DEFAULTS` (Separation 50%, Mode Natural, Tighten 0%, Tolerance 8¢, Strength 100%, Slide In 0%; Key and Scale are not changed; a re-split if Separation differs, with K.resplit's existing ask-first when edits would be lost). Its notes' own values are kept (amended after use: it used to copy the starting values, Key and Scale included) | the open take | item values, envelope, notes when re-split | take data | **Y**: one undo step |
 | New: a whole-item re-split (item Separation drag, Apply, Reset) replaces any stretch that was re-split on its own: per-note Separation is not stored. With notes selected, Separation shows the item's value. A stretch re-split leaves `data.separation` unchanged, and `K.follow_resplit_undo` learns the new label "Re-split selected notes" and does not move the item value for it | | | | |
@@ -50,7 +50,7 @@ Levels used below: **starting values** (ExtState, `FancyScripts`); **item** = th
 
 ## References
 
-- Native REAPER analogues: Item Properties (F2), which edits the selected item's own pitch and playrate and has no hidden global; Project Settings → "Default for new items", which only affects items created later; actions on all selected items that report once (Item: Normalize). Conventions matched (CN6): the arrange selection is the scope of "selected items" and is never changed (UC4); one undo point named with the count; right-click menus on values; Ctrl/Cmd-drag fine and double-click reset (HC2, HC3); no Alt or Shift given a new meaning.
+- Native REAPER analogues: Item Properties (F2), which edits the selected item's own pitch and playrate and has no hidden global; Project Settings → "Default for new items", which only affects items created later; actions on all selected items that report once (Item: Normalize). Conventions matched (CN6): the arrange selection only pre-ticks the Apply list and is never changed (UC4); one undo point named with the count; right-click menus on values; Ctrl/Cmd-drag fine and double-click reset (HC2, HC3); no Alt or Shift given a new meaning.
 - Redesigns only: baseline capture **not taken**: the script was not running in the user's REAPER session (2026-11-24), and launching it would clear their selection and zoom. The baseline is read from code: `HDR_VALUES = { "pill", "mode", "tight", "strength", "tol", "slide", "sep" }` drawn by `K.bar_frame`, pill texts `Defaults` / `1 note` / `%d notes`. `ds-lint.py` summary: **did not run** ("theme.lua palette drifted from ds-lint's port of build_palette", 22 unknown keys), a tool fault noted in earlier Pitch Correct designs too.
 
 ## Context and job stories
@@ -59,7 +59,7 @@ Confirmed in the brainstorming conversation (2026-11-24); window context carried
 
 1. When I open a new vocal item, I want to see at a glance which controls find the notes, which correct them and which fine-tune them, so I can start with the few that matter (Mode, Tighten, Tolerance, Separation).
 2. When a take needs different settings from my usual (a breathy verse), I want my drags to change only this item, so my other items are not changed behind my back.
-3. When a vocal is cut into many items, I want to push one item's values (or just its Tolerance) onto the selected items as a starting point, so I can then go through each item and fix it.
+3. When a vocal is cut into many items, I want to push one item's values (or just its Tolerance) onto the items I tick (the selected ones to begin with) as a starting point, so I can then go through each item and fix it.
 4. When I've already hand-tuned some items, I want an "apply to all" to leave that work alone if I say so, so a batch never wipes careful edits.
 5. When two notes are wrongly joined in one phrase, I want to raise Separation for just those notes, so the rest of the item stays split as it is.
 6. When a song changes key between sections that are separate items, I want each item to keep its own key.
@@ -126,25 +126,34 @@ Pill menu (a popup under the pill, sized to its content):
 │ Reset this item to defaults                  │  (disabled: "Already at the defaults")
 └──────────────────────────────────────────────┘
 ```
-Apply confirm (sized to the parent; at the narrow docker its text wraps, RB9):
+Apply confirm (sized to the parent; at the narrow docker its text wraps, RB9; the list scrolls past 6 rows, RB13):
 ```
 ┌ Apply this item's values to other items? ─────────────────┐
 │ Key E Major · Separation 50% · Mode Natural · Tighten 40% │
 │ Tolerance 8¢ · Strength 100% · Slide In 0%                │
 │                                                           │
-│ Apply to:  (•) The 4 selected items                       │
-│            ( ) All 12 pitched items                       │
-│            ( ) New items only                             │
+│ Apply to:  [All] [None]                                   │
+│ ┌───────────────────────────────────────────────────────┐ │
+│ │ [x] Verse 1 Lead                                      │ │
+│ │ [x] Verse 2 Lead                                      │ │
+│ │ [ ] Chorus Lead Double (take 3, comped from the bes…  │ │  (tooltip: full name)
+│ │ [ ] Synth Pad                    Not an audio item    │ │  (disabled, dim reason)
+│ │ [ ] Old Bridge Take              No longer in the pr… │ │  (disabled)
+│ │ [x] Outro Lead                                        │▒│
+│ └───────────────────────────────────────────────────────┘ │
 │ [ ] Keep changes already made to items and notes          │
+│ [ ] New items only: change no item, just save the         │
+│     starting values                                       │
 │                                                           │
 │ 3 items lose their own values, 41 notes lose theirs,      │
 │ 2 items change key, 2 are split again (7 edited notes     │
 │ in them are lost).                                        │
 │ These also become the starting values for new items       │
 │ (that part can't be undone with Cmd+Z).                   │
-│                                        [Cancel] [Apply (4)]│
+│                                        [Cancel] [Apply (3)]│
 └───────────────────────────────────────────────────────────┘
 ```
+Rows start ticked from REAPER's arrange-view selection (the listed items that are selected); when none of them is selected, every row starts ticked. With "New items only" ticked, the list, All / None and "Keep changes…" are disabled and `Untick "New items only" to pick items.` shows under the caption.
 
 ## State inventory
 
@@ -155,7 +164,8 @@ Apply confirm (sized to the parent; at the narrow docker its text wraps, RB9):
 | Apply confirm | working | Apply over many items runs time-sliced with progress on the "…" button and Cancel in "…" (same as Analyze All Selected Items); Cancel keeps the items already done as the one undo step | ST3 |
 | Apply | error | an item that cannot be written (take gone, MIDI) is skipped and counted: "Applied to 3 items. 1 skipped: no audio." | ST7 |
 | Pill menu | disabled with reason | "Apply to other items…" disabled with "No other pitched items" when there are none; "Reset this item to defaults" disabled with "Already at the defaults" | EP2 |
-| Apply confirm | disabled with reason | "The N selected items" disabled with "Select items in the arrange view" when 0 other items are selected; Apply disabled with "Nothing would change" | EP2, AR5 |
+| Apply confirm | disabled with reason | a row whose item cannot be written is disabled, never ticked, with its reason beside the name: "Not an audio item" (MIDI take), "No longer in the project" (take gone); with "New items only" on, the list is disabled with `Untick "New items only" to pick items.`; Apply disabled with "Tick at least one item" when no row is ticked, or "Nothing would change" when neither the ticked items nor the starting values would change | EP2, AR5 |
+| Apply confirm | many items | the checklist is a bordered region of at most 6 rows (`K.CHECKLIST_MAX_ROWS`) that scrolls; only the rows in view are drawn (ListClipper); a long name is shortened with an ellipsis and its tooltip shows it in full (LG4) | RB13, LG4 |
 | Separation | disabled with reason | with notes selected but no analysis frames for that stretch: "This stretch has no analysis: Re-analyze the item" | EP2 |
 | Pill | overflow / long names | pill width fixed to its longest text (`999 notes`); the starting values line truncates with a tooltip | LG4 |
 | — | missing dependency | none beyond ReaImGui (existing check) | HI7 |
@@ -175,7 +185,7 @@ Apply confirm (sized to the parent; at the narrow docker its text wraps, RB9):
 | Pill | click opens its menu; tooltip | n/a | `This item` / `1 note` / `%d notes` | n/a | n/a | n/a |
 | Pill menu: Apply to other items… | click → confirm | n/a | n/a | n/a | n/a | confirm (HC4: ExtState written) |
 | Pill menu: Reset this item to defaults | click: every value of the item (Separation, Mode, Tighten, Tolerance, Strength, Slide In) to `DEFAULTS`; Key and Scale not changed; a re-split when Separation changes (the existing ask-first when edits would be lost: "Reset <item> to the defaults?", button "Reset") | `DEFAULTS` | n/a | n/a | "Reset item to defaults" (none when already at the defaults) | undoable, no confirm; status message |
-| Apply confirm | radio (3), checkbox, Cancel first, Apply (N); Esc = Cancel; Enter does nothing (no default button on a destructive confirm) | target: the selected items when 1 or more other items are selected, else All pitched items; checkbox off | counts in the consequence line | n/a | "Apply values to N items" | the confirm itself |
+| Apply confirm | checklist (one checkbox per other pitched item; click the box or the name), All / None small buttons, two checkboxes, Cancel first, Apply (N); Esc = Cancel; Enter does nothing (no default button on a destructive confirm). The consequence and Apply (N) follow the ticked rows, recomputed only when the ticked set, "Keep changes…" or "New items only" changes (HI5). The arrange selection is only read when the confirm opens (UC4) | ticked: the listed items selected in the arrange view, else every row that can be written; "Keep changes…" off; "New items only" off (on only when no row can be written) | counts in the consequence line | n/a | "Apply values to N items" | the confirm itself |
 
 What a double-click reset (or the right-click Reset) restores (HC3): on notes, the item's value ("Reset to item value"); on the item, the script's `DEFAULTS` value ("Reset to default"), as one undo point "Reset <Value>" (Separation: its re-split, "Re-split item"), and none when the item is at the default already (UC1). Amended after use: the item reset used to go to the starting value.
 
@@ -187,7 +197,7 @@ Keyboard map: HC5 Esc, innermost first: the Apply confirm (Cancel) → the pill 
 |---|---|
 | labels | `This item` · `1 note` · `%d notes` · value labels as today (no captions) |
 | tooltips | pill, item: "Your edits change this item only. Select notes to change just those notes. Click for: apply to other items." · pill, notes: "Your edits change the selected notes. Esc goes back to this item. Click for: apply to other items." · Separation, notes: "Splits the selected stretch again: only the notes from the first to the last selected one change." · every value's last line: "Starting value: <v>. This item: <v>." · each value's tooltip always starts with its group: "Notes ·", "Correction ·", "Shaping ·" |
-| empty / error / confirm | confirm title "Apply this item's values to other items?" / "Apply Tolerance to other items?" · radios "The %d selected items" / "All %d pitched items" / "New items only" · checkbox "Keep changes already made to items and notes" · consequence "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost)." (with Keep changes ticked: "%d items with edited notes are not split again.") · footnote "These also become the starting values for new items (that part can't be undone with %s+Z)." · buttons "Cancel", "Apply (%d)" (New items only: "Save starting values") · disabled reasons as in the State inventory |
+| empty / error / confirm | confirm title "Apply this item's values to other items?" / "Apply Tolerance to other items?" · list heading "Apply to:" · buttons "All" / "None" · row reasons "Not an audio item" / "No longer in the project" · checkbox "New items only: change no item, just save the starting values" (while on: `Untick "New items only" to pick items.`) · checkbox "Keep changes already made to items and notes" · consequence "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost)." (with Keep changes ticked: "%d items with edited notes are not split again.") · footnote "These also become the starting values for new items (that part can't be undone with %s+Z)." · buttons "Cancel", "Apply (%d)" (New items only: "Save starting values") · disabled reasons as in the State inventory, including "Tick at least one item" |
 | status messages | "Applied to %d items (%s+Z undoes the items)." · "Starting values saved for new items." · "Applied to %d items. %d skipped: no audio." · "Item reset to the defaults." · "Re-split %d notes into %d." |
 | undo labels | "Adjust Tighten" etc. (as today) · "Re-split item" · "Re-split selected notes" · "Apply values to %d items" · "Apply Tolerance to %d items" · "Reset item to defaults" · "Reset <Value>" |
 
@@ -219,7 +229,7 @@ None.
 - UC1: one named undo point per drag, typed entry, reset, re-split and Apply; none when nothing changed.
 - UC2: Esc order as in the keyboard map.
 - UC3: item and note writes and their `P_EXT` share one undo block; the every-item values (ExtState) are never claimed as undoable.
-- UC4: Apply reads the arrange selection and never changes it; re-split reselects only notes inside the script.
+- UC4: Apply reads the arrange selection (to tick the first rows) and never changes it; re-split reselects only notes inside the script.
 - UC5: double-click reset per value; "Reset this item to defaults" as the group reset.
 - EP1: Apply is behind a confirm that names the consequence and counts.
 - EP2: every disabled entry and control has a reason, visible with tooltips off where it is inline (pill menu, confirm).
@@ -254,7 +264,7 @@ None.
 - CL3: no red added.
 - CL4: checked in Fancy Dark and Match Theme.
 - DV1: n/a: Editor / canvas excludes it.
-- HI1–HI7: unchanged window lifecycle; HI5: Apply's counts are computed when the confirm opens, not every frame.
+- HI1–HI7: unchanged window lifecycle; HI5: Apply's counts are computed when the confirm opens and again only when the ticked rows or a checkbox change, not every frame.
 - RB6: Esc via `Shortcut()`. RB9: the confirm fits the parent at the narrow docker. RB15: tooltips through `Theme.tooltip`. RB17: pill label uses `###bar_pill`.
 - HC1: as CL1. HC2, HC3: on every value control. HC4: Apply confirm; the other writes are undoable. HC5: as the keyboard map. HC6: unchanged.
 
@@ -267,6 +277,7 @@ None.
 - My call (builder check): Mode's item text changes from "Notes you edit will use it" to a statement that every note uses it.
 - Decided by the user (amended 2026-11-24 after use): reset on the item restores the script's `DEFAULTS` value ("Reset to default"; Separation re-splits at 50%), which is HC3-compliant; reset on notes restores the item's value. The pill menu's group reset is "Reset this item to defaults" (Key and Scale not changed). The `*` mark still means "differs from the starting value".
 - My call: Key and Scale stop updating the starting key for new items whenever they change. New items start from the starting values, which change only through Apply (including "New items only").
+- My call (amended 2026-11-24): "New items only" is a checkbox under the list rather than a third target, so the list is the one place to pick items; while it is on the list and "Keep changes…" are disabled with a reason.
 - My call: "Apply to other items" applies every value, Key and Scale included. A single value is applied from its right-click menu. Quantize and other note actions across items are a later, separate design.
 - Decided by the user (amended 2026-11-24 after use): no group captions, and Shaping is drawn in the default font like the other values. The hairline separators stay.
 - My call: Separation per note re-splits a stretch. It is not stored as a lasting note value, because a re-split replaces the notes themselves. Edits on surviving notes are kept, as in the auto-joins design.
