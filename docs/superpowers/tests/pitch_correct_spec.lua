@@ -1,10 +1,15 @@
 -- Run from the repo root: lua docs/superpowers/tests/pitch_correct_spec.lua
 local SCRIPT = "Pitch/Fancy_Pitch Correct.lua"
 
-local function load_script()
+-- ext (optional): what REAPER's ExtState holds for the load, { [key] = string }; asked keys are recorded in ext_asked
+local ext_asked = {}
+local function load_script(ext)
   reaper = setmetatable({
     ImGui_CreateContext = function() end,
-    GetExtState = function() return "" end,   -- top-level code tonumber()s this
+    GetExtState = function(_, key)   -- top-level code tonumber()s this
+      ext_asked[key] = true
+      return ext and ext[key] or ""
+    end,
   },
     { __index = function() return function() end end })
   FANCY_PITCH_TEST = true   -- luacheck: ignore 111 (the script returns its internals instead of running)
@@ -1185,24 +1190,20 @@ test("natural_same_text", function()
   local now_src = f:read("a")
   f:close()
   local ref, now = text_lines(ref_src), text_lines(now_src)
-  for _, prefix in ipairs({ "K.tighten_line = function(", "K.note_body = function(", "K.points_offsets = function(",
-      "local function is_note_modified(", "K.controls_edited = function(", "K.ZONE_CONTROLS = {",
-      "local function param_drag(", "  local BAR_VALUES = {" }) do
+  -- Value levels (2026-11-24) changed the build, K.tighten_line, K.ZONE_CONTROLS and the Tighten line of
+  -- K.controls_load on purpose (item values reach every note; 0 is a note value of its own). Their numbers stay
+  -- pinned by natural_same_numbers. The bar's BAR_VALUES changed on purpose too (Task 3: every value has an item
+  -- level, and 0 is stored as a value).
+  for _, prefix in ipairs({ "K.note_body = function(", "K.points_offsets = function(",
+      "local function is_note_modified(", "K.controls_edited = function(",
+      "local function param_drag(" }) do
     text_same(ref, now, prefix, prefix, false, prefix)
   end
-  -- The build may be renamed (natural_build) but not changed; its first line carries the name
-  local build = "K.correction_build = function(notes, item_len)"
-  local renamed = "K.natural_build = function(notes, item_len)"
-  local has_renamed = false
-  for _, l in ipairs(now) do if l:sub(1, #renamed) == renamed then has_renamed = true break end end
-  text_same(ref, now, build, has_renamed and renamed or build, true, "the build")
   text_single(ref, now, "K.JOIN = {", "K.JOIN")
   local loaded = text_block(now, "K.controls_load = function(")
   local ref_loaded = text_block(ref, "K.controls_load = function(")
   if not (loaded and ref_loaded) then error("K.controls_load not found") end
-  for _, prefix in ipairs({ "  if ctrl.tighten then", "  if ctrl.tolerance then" }) do
-    text_single(ref_loaded, loaded, prefix, "K.controls_load " .. prefix)
-  end
+  text_single(ref_loaded, loaded, "  if ctrl.tolerance then", "K.controls_load   if ctrl.tolerance then")
 end)
 
 if arg and arg[1] == "--record-natural" then natural_record() os.exit(0) end
@@ -1245,7 +1246,7 @@ test("mode_value_and_note_mode", function()
   with_item_mode(1, function()
     eq(S.K.mode_value(nil), 1, "the item's")
     eq(S.K.note_mode(moved), "classic", "edited note takes the item's mode")
-    eq(S.K.note_mode(untouched), nil, "an untouched note is never corrected")
+    eq(S.K.note_mode(untouched), "classic", "the item's mode reaches an untouched note too")
     moved.controls.correct_mode = 0
     eq(S.K.note_mode(moved), nil, "its own Natural wins")
     moved.controls.correct_mode = 2
@@ -1468,14 +1469,12 @@ test("build_mode_note_at_item_edges", function() chromatic(function()
   eq(#build.points, 0, "a note without frames writes nothing")
 end) end)
 
-test("build_item_mode_reaches_edited_notes_only", function() chromatic(function()
+test("build_item_mode_reaches_every_note", function() chromatic(function()
   with_item_mode(2, function()
     local moved, untouched = mode_note(0.1, 0.3, 60.3, 60.3, { center_pitch = 61.3 }), mode_note(1, 0.3, 60.3, 60.3)
-    local build = S.K.correction_build({ moved, untouched }, 10)
+    S.K.correction_build({ moved, untouched }, 10)
     near(moved.frame_shifts[1], 61 - 60.3, 1e-9, "Hard, around where it was moved")
-    for _, p in ipairs(build.points) do
-      if p.time >= untouched.start_time - 0.05 and math.abs(p.val) > 1e-9 then error("the untouched note is corrected") end
-    end
+    near(untouched.frame_shifts[1], 60 - 60.3, 1e-9, "the untouched note is Hard too")
   end)
 end) end)
 
@@ -1553,17 +1552,8 @@ test("mode_note_count", function()
   local a, b, c = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
   a.controls.correct_mode = 1
   eq(S.K.mode_note_count({ a, b, c }), 1)
-  with_item_mode(2, function() eq(S.K.mode_note_count({ a, b, c }), 2, "the item's mode reaches the edited note") end)
+  with_item_mode(2, function() eq(S.K.mode_note_count({ a, b, c }), 3, "the item's mode reaches every note") end)
   eq(S.K.mode_note_count({}), 0)
-end)
-
-test("mode_reach_and_status", function()
-  local own, moved, untouched = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
-  own.controls.correct_mode = 0
-  eq(S.K.mode_reach_count({ own, moved, untouched }), 1)
-  eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 edited notes)")
-  eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 edited note)")
-  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Notes you edit will use it")
 end)
 
 test("zone_text_mode_suffix", function()
@@ -2512,7 +2502,9 @@ test("batch_confirm_copy", function()
   eq(c.title, "Analyze 12 items?"); eq(c.confirm_label, "Analyze 12 Items")
   eq(c.body_lines[1], "3 of them already have notes. Analyzing replaces their notes and any edits:")
   eq(#c.list, 3); eq(c.list[2].name, "N2"); eq(c.list[2].track, "T"); eq(c.list[2].pos, 2)
-  eq(c.after_lines[1], MOD .. "+Z restores all 12 items in one step once the batch has finished.")
+  eq(c.after_lines[1], "Their values go back to the defaults; Key and Scale stay.")
+  eq(c.after_lines[2], MOD .. "+Z restores all 12 items in one step once the batch has finished.")
+  eq(K.batch_confirm(entries(12, 1)).after_lines[1], "Its values go back to the defaults; Key and Scale stay.")
   eq(K.batch_confirm(entries(12, 1)).body_lines[1], "1 of them already has notes. Analyzing replaces its notes and any edits:")
   eq(K.batch_confirm(entries(12, 12)).body_lines[1], "All 12 already have notes. Analyzing replaces their notes and any edits:")
 end)
@@ -2549,7 +2541,8 @@ local function with_batch(fn)
   local saved_model = { st.results, st.notes, st.split_points, st.analysis_empty, st.progress }
   local rec = { begun = {}, writes = {} }
   K.analysis_begin = function(take, _, opts)
-    rec.begun[#rec.begun + 1] = { take = take, sr = opts and opts.sample_rate, defer = opts and opts.defer_envelope }
+    rec.begun[#rec.begun + 1] = { take = take, sr = opts and opts.sample_rate, defer = opts and opts.defer_envelope,
+      sep = st.separation, key_idx = st.key_idx, scale_idx = st.scale_idx }
     if rec.refuse and rec.refuse[take] then return false, "accessor" end
     st.is_analyzing = true
     return true
@@ -2744,7 +2737,12 @@ test("take_json_is_what_save_writes", function() with_write_stubs({}, function(r
     eq(json:find(part, 1, true) ~= nil, true, "stored text holds " .. part)
   end
   eq(json:find('"count"', 1, true), nil, "only what a note needs to be loaded again is stored")
-  S.K.batch_write({ { guid = "{a}", data = data } })   -- no text prepared: made at the write
+  -- no text prepared: made at the write (the note above is not one a correction can be built from)
+  local build = S.K.correction_build
+  S.K.correction_build = function() return { points = {} } end
+  local ok, err = pcall(S.K.batch_write, { { guid = "{a}", data = data } })
+  S.K.correction_build = build
+  if not ok then error(err, 0) end
   eq(rec.stored.a, json)
 end) end)
 
@@ -2815,6 +2813,150 @@ test("batch_fails_a_long_item_that_gave_no_audio", function() with_batch(functio
   eq(rec.begun[#rec.begun].take, "b")
 end) end)
 
+-- A new analysis starts the item at the defaults (spec: "Always defaults", 2026-11-24): its values go back to
+-- DEFAULTS, Separation included (it splits at 50%), and only its Key and Scale are kept
+local ITEM_VALS = { correct_mode = 2, tighten = 0.3, tolerance = 33, retune_speed = 77, slide_in = 0.4 }
+-- The running analysis reaches its end on the next tick (nothing left to read)
+local function at_analysis_end(st)
+  st.is_analyzing, st.results, st.sample_rate, st.end_time, st.current_time = true, {}, 48000, 0, 0
+  st.analysis_params = { block_size = 1024, hop_size = 512, threshold = 0.1, min_freq = 65, max_freq = 1000 }
+end
+local function analysed_before(guid)
+  local ov = {}
+  for k, v in pairs(ITEM_VALS) do ov[k] = v end
+  return { guid = guid, name = guid, overrides = ov, separation = 0.8, key_idx = 5, scale_idx = 3, notes = {}, results = {} }
+end
+local function check_defaults(data, what)
+  for _, k in ipairs(S.K.ITEM_KEYS) do eq(S.K.item_value(data, k), S.DEFAULTS[k], what .. ": " .. k .. " at its default") end
+end
+
+test("reanalyse_resets_the_values_and_keeps_key_and_scale", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate,
+    st.end_time, st.current_time, #st.session_order, K.open_accessor }
+  local ok, err = pcall(function()
+    st.session_takes["{z}"] = analysed_before("{z}")
+    st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{z}", 0.8, 5, 3   -- adopt_take_data's mirrors
+    reaper.GetMediaItemTake_Source = function() return "src" end
+    reaper.GetMediaSourceSampleRate = function() return 48000 end
+    reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{z}" end return true, "" end
+    K.open_accessor = function() return "acc" end
+    eq(K.analysis_begin("z", "item_z", { defer_envelope = true }), true, "the re-analysis starts")
+    eq(st.separation, S.DEFAULTS.separation, "it splits at the default Separation, not the item's 80%")
+    eq(st.key_idx, 5, "the bar keeps the item's Key"); eq(st.scale_idx, 3)
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = st.session_takes["{z}"]
+    eq(st.is_analyzing, false, "the analysis ended")
+    check_defaults(data, "a re-analysed item")
+    eq(data.separation, S.DEFAULTS.separation, "Separation 50%")
+    eq(data.key_idx, 5, "its own Key"); eq(data.scale_idx, 3, "its own Scale")
+  end)
+  reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{z}"], st.missing_takes["{z}"], st.stale_takes["{z}"] = nil, nil, nil
+  st.raw_cache["{z}"], st.unreadable_takes["{z}"] = nil, nil
+  while #st.session_order > saved[10] do table.remove(st.session_order) end
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate, st.end_time,
+    st.current_time = table.unpack(saved, 1, 9)
+  K.open_accessor = saved[11]
+  st.is_analyzing, st.analysis_params, st.accessor = false, nil, nil
+  if not ok then error(err, 0) end
+end)
+
+test("first_analysis_of_a_new_item_uses_the_defaults", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate,
+    st.end_time, st.current_time, #st.session_order }
+  local ok, err = pcall(function()
+    st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{n}", S.DEFAULTS.separation, 4, 2
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = st.session_takes["{n}"]
+    check_defaults(data, "a new item")
+    eq(data.key_idx, 4, "the Key the bar shows"); eq(data.scale_idx, 2)
+  end)
+  st.session_takes["{n}"], st.missing_takes["{n}"], st.stale_takes["{n}"] = nil, nil, nil
+  while #st.session_order > saved[10] do table.remove(st.session_order) end
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate, st.end_time,
+    st.current_time = table.unpack(saved, 1, 9)
+  st.is_analyzing, st.analysis_params = false, nil
+  if not ok then error(err, 0) end
+end)
+
+test("batch_reanalyse_resets_the_values_and_keeps_key_and_scale", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local saved = { st.separation, st.key_idx, st.scale_idx }
+  local ok, err = pcall(function()
+    st.session_takes["{a}"] = analysed_before("{a}")
+    st.separation, st.key_idx, st.scale_idx = 0.2, 1, 1   -- the open item (not a) when the batch starts
+    K.batch_start(entries3())
+    eq(rec.begun[1].sep, S.DEFAULTS.separation, "a is split at the default Separation, not its own 80%")
+    eq(rec.begun[1].key_idx, 5, "its own Key"); eq(rec.begun[1].scale_idx, 3)
+    at_analysis_end(st)
+    K.analysis_tick()   -- a is finished through the real path (process_analysis_step, batch_item_done)
+    local data = K.batch.done[1].data
+    check_defaults(data, "an item of a batch")
+    eq(data.key_idx, 5); eq(data.scale_idx, 3)
+    -- the model handed over lacks Key and Scale (it was built some other way): they still come from the item
+    st.session_takes["{b}"] = analysed_before("{b}")
+    K.batch_item_done(model("{b}"))
+    local b = K.batch.done[2].data
+    eq(b.key_idx, 5, "b's Key"); eq(b.scale_idx, 3, "b's Scale")
+    eq(K.item_value(b, "tighten"), nil, "no value of the old model is carried")
+  end)
+  st.session_takes["{a}"], st.session_takes["{b}"] = nil, nil
+  st.separation, st.key_idx, st.scale_idx = table.unpack(saved, 1, 3)
+  st.analysis_params = nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("batch_stored_analysis_not_loaded_yet_keeps_only_its_key", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local saved = { st.separation, st.key_idx, st.scale_idx }
+  local stored = K.take_json(analysed_before("{a}"))   -- a holds an analysis the window has not loaded (pasted later)
+  reaper.GetSetMediaItemTakeInfo_String = function(take, key)
+    if key == "GUID" then return true, "{" .. take .. "}" end
+    return true, take == "a" and stored or ""
+  end
+  local ok, err = pcall(function()
+    eq(st.session_takes["{a}"], nil, "not loaded")
+    K.batch_start(entries3())
+    eq(rec.begun[1].sep, S.DEFAULTS.separation, "split at the default"); eq(rec.begun[1].key_idx, 5, "its stored Key")
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = K.batch.done[1].data
+    check_defaults(data, "a stored item"); eq(data.key_idx, 5); eq(data.scale_idx, 3)
+  end)
+  reaper.GetSetMediaItemTakeInfo_String = nil
+  st.raw_cache["{a}"], st.unreadable_takes["{a}"] = nil, nil
+  st.separation, st.key_idx, st.scale_idx = table.unpack(saved, 1, 3)
+  st.analysis_params = nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("batch_first_analysis_takes_the_defaults_and_the_last_key", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local NK = K.new_key
+  local saved = { st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx }
+  local ok, err = pcall(function()
+    NK.key_idx, NK.scale_idx = 2, 4   -- the Key and Scale last chosen in the bar
+    st.session_takes["{o}"] = analysed_before("{o}")   -- the open item, with values of its own
+    st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{o}", 0.8, 5, 3
+    K.batch_start(entries3())
+    eq(rec.begun[1].sep, S.DEFAULTS.separation, "a new item is split at the default Separation")
+    eq(rec.begun[1].key_idx, 2); eq(rec.begun[1].scale_idx, 4)
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = K.batch.done[1].data
+    check_defaults(data, "a new item of a batch")
+    eq(data.key_idx, 2, "the last chosen Key"); eq(data.scale_idx, 4)
+  end)
+  st.session_takes["{o}"] = nil
+  st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx = table.unpack(saved, 1, 5)
+  st.analysis_params = nil
+  if not ok then error(err, 0) end
+end) end)
+
 test("batch_request_asks_about_notes_the_list_does_not_know", function()
   local st = S.state
   with_selection({ { take = "a", name = "A" }, { take = "b", name = "B", track = "Dbl" } }, function()
@@ -2865,7 +3007,8 @@ test("confirm_carries_the_list", function()
   req.id, req.on_confirm = "batch", function() end
   S.request_confirm(req)
   eq(st.confirm.id, "batch"); eq(#st.confirm.list, 1); eq(st.confirm.list[1].name, "A")
-  eq(st.confirm.after_lines[1], MOD .. "+Z restores all 2 items in one step once the batch has finished.")
+  eq(st.confirm.after_lines[1], "Its values go back to the defaults; Key and Scale stay.")
+  eq(st.confirm.after_lines[2], MOD .. "+Z restores all 2 items in one step once the batch has finished.")
   st.confirm = nil
 end)
 
@@ -2950,6 +3093,1386 @@ test("held_message_goes_when_an_analysis_changes", function()
   st.target_take_guid, st.last_change_count, st.status.text, st.status.hold = saved[1], saved[2], "", nil
   K.drop_project_cache()
   if not ok then error(err, 0) end
+end)
+
+-- New items start at the defaults; per-item values ("Always defaults", 2026-11-24) ---------------------------------
+test("item_seed_fills_all_with_the_defaults", function()
+  local K = S.K
+  local data = {}
+  eq(K.item_seed(data), true, "first seed fills")
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = (key == "separation") and data.separation or (data.overrides and data.overrides[key])
+    if v == nil then error("missing " .. key) end
+    eq(v, S.DEFAULTS[key], key)
+  end
+  eq(data.key_idx, K.new_key.key_idx, "key_idx: the last chosen")
+  eq(data.scale_idx, K.new_key.scale_idx, "scale_idx: the last chosen")
+  eq(K.item_seed(data), false, "second seed fills nothing")
+end)
+
+test("new_item_ignores_old_starting_values_in_extstate", function()
+  -- ExtState written by 2.22 builds before "Always defaults": the user's old starting values
+  local old = { pitch_tighten = "0.85", pitch_slide_in = "0.5", pitch_tolerance = "12", pitch_start_separation = "1",
+    pitch_correct_mode = "1", pitch_retune_speed = "0.4", pitch_key_idx = "5", pitch_scale_idx = "3" }
+  for k in pairs(ext_asked) do ext_asked[k] = nil end
+  local T = load_script(old)
+  reaper.GetExtState = function() return "" end   -- the harness's own stub again
+  local K, st, D = T.K, T.state, T.DEFAULTS
+  for _, key in ipairs({ "pitch_tighten", "pitch_slide_in", "pitch_tolerance", "pitch_start_separation",
+      "pitch_correct_mode", "pitch_retune_speed" }) do
+    eq(ext_asked[key], nil, key .. " is not read any more")
+  end
+  eq(T.global_defaults, nil, "no starting values")
+  eq(st.separation, D.separation, "the window shows the default Separation")
+  eq(st.key_idx, 5, "the Key last chosen in the bar"); eq(st.scale_idx, 3)
+  local data = { notes = {}, results = {} }
+  K.item_seed(data)
+  for _, key in ipairs(K.ITEM_KEYS) do eq(K.item_value(data, key), D[key], "a new item's " .. key) end
+  eq(data.key_idx, 5); eq(data.scale_idx, 3)
+  eq(T.get_effective(nil, "tighten"), D.tighten, "nothing open: the default")
+end)
+
+test("seed_old_take_same_build", function()
+  local st, K = S.state, S.K
+  local saved = { st.target_take_guid, st.session_takes["{old}"] }
+  local n1, n2 = slide_note(1, 0), slide_note(1, 0)
+  n1.controls.retune_speed, n2.controls.retune_speed = nil, nil
+  local data = { notes = { n1 }, results = {} }
+  st.session_takes["{old}"], st.target_take_guid = data, "{old}"
+  local ok, err = pcall(function()
+    local before = K.correction_build({ n1 }, 1)
+    K.item_seed(data)
+    local after = K.correction_build({ n2 }, 1)
+    eq(#after.points, #before.points, "point count")
+    for i, p in ipairs(before.points) do
+      near(after.points[i].time, p.time, 1e-12, "time " .. i)
+      near(after.points[i].val, p.val, 1e-12, "val " .. i)
+    end
+  end)
+  st.target_take_guid, st.session_takes["{old}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("item_seed_keeps_existing", function()
+  local data = { separation = 0.2, overrides = { tighten = 0.3 } }
+  S.K.item_seed(data)
+  eq(data.separation, 0.2, "separation")
+  eq(data.overrides.tighten, 0.3, "tighten")
+end)
+
+test("unanalysed_take_takes_the_defaults", function()
+  local st, NK = S.state, S.K.new_key
+  local saved = { NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx }
+  NK.key_idx, NK.scale_idx = 4, 2
+  st.separation, st.key_idx, st.scale_idx = 0.1, 9, 1
+  S.K.adopt_new_item_values()
+  local got = { st.separation, st.key_idx, st.scale_idx }
+  NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx = table.unpack(saved)
+  eq(got[1], S.DEFAULTS.separation, "separation")
+  eq(got[2], 4, "key_idx: the last chosen")
+  eq(got[3], 2, "scale_idx")
+end)
+
+-- Item values reach every note (value levels, Task 2) --------------------------------------------------------------
+local function with_item(overrides, fn)   -- runs fn with an open item whose own values are `overrides`
+  local st = S.state
+  local saved = { st.target_take_guid, st.session_takes["{IV}"] }
+  st.target_take_guid = "{IV}"
+  st.session_takes["{IV}"] = { overrides = overrides }
+  local ok, err = pcall(fn)
+  st.target_take_guid, st.session_takes["{IV}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end
+
+local function wobbly_untouched(t0)   -- an unedited note whose body wobbles (so Tighten has something to take)
+  return wobbly(untouched_note(t0 or 0.1, 0.4, 60), nil, nil)
+end
+
+test("item_tighten_reaches_unedited", function()
+  with_item({ tighten = 1, tolerance = 0 }, function()
+    local n = wobbly_untouched()
+    local build = S.K.correction_build({ n }, 10)
+    if #build.points == 0 then error("the unedited note is not corrected") end
+    local a, b = S.K.note_body(n)
+    for i = a, b do near(n.frames[i].note + n.frame_shifts[i], 60, 1e-9, "flat at frame " .. i) end
+  end)
+end)
+
+test("note_zero_survives_load", function()
+  local ctrl = {}
+  S.K.controls_load(ctrl, { tighten = 0 })
+  eq(ctrl.tighten, 0, "0 is a value of its own")
+  with_item({ tighten = 0.4, tolerance = 0 }, function()
+    local n = wobbly_untouched()
+    n.controls.tighten = ctrl.tighten
+    S.K.correction_build({ n }, 10)
+    for i = 1, #n.frames do near(n.frame_shifts[i], 0, 1e-12, "as sung at frame " .. i) end
+    local follows = wobbly_untouched()
+    S.K.correction_build({ follows }, 10)
+    local moved = false
+    for i = 1, #follows.frames do if math.abs(follows.frame_shifts[i]) > 1e-6 then moved = true end end
+    eq(moved, true, "a note without its own Tighten takes the item's")
+  end)
+end)
+
+test("bypassed_untouched", function()
+  with_item({ tighten = 1, tolerance = 0, slide_in = 1 }, function()
+    local n = wobbly_untouched()
+    n.controls.bypassed = true
+    local build = S.K.correction_build({ n }, 10)
+    for i = 1, #n.frames do eq(n.frame_shifts[i], 0, "frame " .. i) end
+    eq(#build.points, 0, "points")
+  end)
+end)
+
+test("item_mode_reaches_unedited", function()
+  with_item_mode(2, function()
+    eq(S.K.note_mode(untouched_note(0.5)), "hard")
+    local b = untouched_note(0.9)
+    b.controls.bypassed = true
+    eq(S.K.note_mode(b), nil, "bypassed")
+  end)
+end)
+
+test("fresh_item_as_sung", function()
+  local st = S.state
+  local notes = { wobbly_untouched(0.1) }
+  notes[2] = untouched_note(notes[1].end_time, 0.3, 62, { from = 60, dur = 0.04 })
+  notes[3] = wobbly(untouched_note(notes[2].end_time + 0.3, 0.4, 64), nil, nil)
+  local data = { notes = notes, results = {} }
+  S.K.item_seed(data)
+  local saved = { st.target_take_guid, st.session_takes["{fresh}"] }
+  st.target_take_guid, st.session_takes["{fresh}"] = "{fresh}", data
+  local ok, err = pcall(function()
+    local build = S.K.correction_build(notes, 10)
+    for i, p in ipairs(build.points) do near(p.val, 0, 1e-12, "point " .. i) end
+    for k, n in ipairs(notes) do
+      for i = 1, #n.frames do near(n.frame_shifts[i], 0, 1e-12, "note " .. k .. " frame " .. i) end
+    end
+  end)
+  st.target_take_guid, st.session_takes["{fresh}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("item_slide_in_reaches_unedited", function()
+  with_item({ slide_in = 1 }, function()
+    local n = slide_note(1, nil)
+    n.controls.center_pitch, n.controls.retune_speed = 60, nil
+    S.K.correction_build({ n }, 1)
+    local target = n.frames[7].note + n.frame_shifts[7]
+    for i = 1, 6 do near(n.frames[i].note + n.frame_shifts[i], target, 1e-9, "frame " .. i) end
+  end)
+end)
+
+test("merge_tighten_effective", function()
+  with_item({ tighten = 1 }, function()
+    local a, b = join_note(0.1, 0.3, 60, 0), join_note(0.4, 0.3, 60, 0)
+    a.controls.tighten = 0.5
+    near(S.K.controls_merge({ a, b }).tighten, 0.75, 1e-9, "the other note's is the item's")
+    a.controls.tighten = nil
+    eq(S.K.controls_merge({ a, b }).tighten, nil, "no own value: the merged note follows the item")
+    a.controls.tighten = 0
+    near(S.K.controls_merge({ a, b }).tighten, 0.5, 1e-9, "an own 0 counts")
+  end)
+end)
+
+test("mode_unused_item_level", function()
+  with_item_mode(2, function() eq(S.K.mode_unused("tighten", {}, 0), "hard", "the item's mode, nothing selected") end)
+  with_item_mode(1, function() eq(S.K.mode_unused("tolerance", {}, 0), "mode") end)
+  eq(S.K.mode_unused("tighten", {}, 0), nil, "Natural uses it")
+end)
+
+test("mode_own_and_status", function()
+  local own, moved, untouched = join_note(0.1, 0.3, 60, 0.3), join_note(0.5, 0.3, 60, 0.3), untouched_note(0.9)
+  own.controls.correct_mode = 0
+  local byp = untouched_note(1.3)
+  byp.controls.correct_mode, byp.controls.bypassed = 1, true
+  eq(S.K.mode_own_count({ own, moved, untouched, byp }), 1, "notes with a mode of their own, not bypassed")
+  eq(S.K.mode_item_status(0, 0), "Mode: Natural for this item. Every note uses it")
+  eq(S.K.mode_item_status(1, 12), "Mode: Classic for this item (12 notes with their own mode)")
+  eq(S.K.mode_item_status(2, 1), "Mode: Hard for this item (1 note with its own mode)")
+end)
+
+-- The bar edits this item or the notes; its values never reach ExtState (value levels, Task 3) ---------------------
+local function with_no_project(fn)   -- runs fn where an envelope write finds no take (it says so and writes nothing)
+  local saved = { reaper.time_precise, reaper.CountMediaItems }
+  reaper.time_precise = function() return 0 end
+  reaper.CountMediaItems = function() return 0 end
+  local ok, err = pcall(fn)
+  reaper.time_precise, reaper.CountMediaItems = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end
+
+test("reset_item_to_default", function()
+  with_no_project(function() with_item({ tolerance = 30 }, function()
+    eq(type(S.K.reset_target("tolerance", {}, 0)), "boolean", "returns a boolean")
+    eq(S.state.session_takes["{IV}"].overrides.tolerance, S.DEFAULTS.tolerance, "the item's value")
+  end) end)
+end)
+
+test("value_defaults_are_the_users", function()
+  local D = S.DEFAULTS
+  eq(D.separation, 0.5); eq(D.tighten, 0); eq(D.tolerance, 8); eq(D.retune_speed, 1.0); eq(D.slide_in, 0)
+  eq(D.correct_mode, 0, "Natural")
+end)
+
+test("reset_item_at_default_no_undo", function() with_write_stubs({}, function(rec)
+  local st = S.state
+  local saved = { st.target_take_guid, st.notes, reaper.time_precise }
+  reaper.time_precise = function() return 0 end
+  local data = { guid = "{a}", name = "{a}", notes = {}, results = {}, item_len = 1, sample_rate = 48000,
+    overrides = { tolerance = S.DEFAULTS.tolerance, tighten = 0.3 } }
+  st.target_take_guid, st.session_takes["{a}"], st.notes = "{a}", data, {}
+  local ok, err = pcall(function()
+    eq(S.K.reset_target("tolerance", {}, 0), false, "already at the default")
+    eq(#rec.labels, 0, "no undo point")
+    eq(S.K.reset_target("tighten", {}, 0), true, "written")
+    eq(data.overrides.tighten, S.DEFAULTS.tighten, "Tighten to its default")
+    eq(#rec.labels, 1, "a reset that changes the value: one undo point"); eq(rec.labels[1], "Reset Tighten")
+  end)
+  st.target_take_guid, st.notes, reaper.time_precise = saved[1], saved[2], saved[3]
+  if not ok then error(err, 0) end
+end) end)
+
+test("reset_notes_to_item", function()
+  with_no_project(function() with_item({ tolerance = 30 }, function()
+    local a, b = { controls = { tolerance = 5 } }, { controls = { tolerance = 9, tighten = 0 } }
+    S.K.reset_target("tolerance", { a, b }, 2)
+    eq(a.controls.tolerance, nil, "first note follows the item")
+    eq(b.controls.tolerance, nil, "second note follows the item")
+    eq(b.controls.tighten, 0, "other values kept")
+    eq(S.state.session_takes["{IV}"].overrides.tolerance, 30, "the item's value is untouched")
+  end) end)
+end)
+
+test("bar_values_write_no_extstate", function()
+  local K = S.K
+  local saves, ext = 0, 0
+  local save, set_ext, sep = K.save_settings, reaper.SetExtState, S.state.separation
+  K.save_settings = function() saves = saves + 1 end
+  reaper.SetExtState = function() ext = ext + 1 end
+  local ok, err = pcall(with_no_project, function() with_item({ tolerance = 8 }, function()
+    local data = S.state.session_takes["{IV}"]
+    K.bar_write("tolerance", 20, {}, 0)
+    eq(data.overrides.tolerance, 20, "the item's value")
+    K.bar_write("correct_mode", 0, {}, 0)
+    eq(data.overrides.correct_mode, 0, "Natural is stored as the item's mode")
+    K.bar_write("separation", 0.7, {}, 0)
+    eq(data.separation, 0.7, "the item's Separation")
+    K.reset_target("tolerance", {}, 0)
+  end) end)
+  K.save_settings, reaper.SetExtState, S.state.separation = save, set_ext, sep
+  if not ok then error(err, 0) end
+  eq(saves, 0, "K.save_settings calls")
+  eq(ext, 0, "SetExtState calls")
+end)
+
+test("bar_write_note_zero", function()
+  with_item({ tighten = 0.4 }, function()
+    local n = { controls = {} }
+    S.K.bar_write("tighten", 0, { n }, 1)
+    eq(n.controls.tighten, 0, "0 is the note's own value")
+    S.K.bar_write("slide_in", 0, { n }, 1)
+    eq(n.controls.slide_in, 0, "Slide In 0 too")
+    eq(S.state.session_takes["{IV}"].overrides.tighten, 0.4, "the item is untouched")
+  end)
+end)
+
+test("scale_change_stores_the_key_for_new_items", function()
+  local st, K, NK = S.state, S.K, S.K.new_key
+  local writes = {}
+  local set_ext = reaper.SetExtState
+  reaper.SetExtState = function(_, key, value) writes[key] = value end
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.separation }
+  st.target_take_guid = nil
+  st.key_idx = (NK.key_idx or 1) % 12 + 1
+  local want = st.key_idx
+  local ok, err = pcall(function()
+    K.scale_changed("key")
+    eq(NK.key_idx, want, "the Key last chosen")
+    eq(writes.pitch_key_idx, tostring(want), "stored under pitch_key_idx")
+    -- the next new item takes it
+    st.key_idx = 1
+    K.adopt_new_item_values()
+    eq(st.key_idx, want, "a new item starts in that Key")
+  end)
+  reaper.SetExtState = set_ext
+  st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.separation = table.unpack(saved, 1, 6)
+  K.save_settings("key")   -- the stored mirror follows the put-back value
+  if not ok then error(err, 0) end
+end)
+
+test("star_mark_means_differs_from_the_default", function()
+  with_item({ tolerance = S.DEFAULTS.tolerance, tighten = 0.4 }, function()
+    eq(S.get_override_level(nil, "tolerance"), "default", "at the default: no mark")
+    eq(S.get_override_level(nil, "tighten"), "item", "differs from the default: the mark")
+    eq(S.get_override_level({ controls = { tighten = 0.1 } }, "tighten"), "note", "a note's own value")
+  end)
+end)
+
+test("value_changed_no_op", function()
+  local vc = S.K.value_changed
+  eq(vc(8, 8), false, "same value")
+  eq(vc(8, 8 + 1e-12), false, "float noise")
+  eq(vc(8, 20), true, "moved")
+  eq(vc(0, 0), false, "zero to zero")
+  eq(vc(nil, 0), true, "no value to 0")
+  eq(vc(nil, nil), false, "nothing to nothing")
+end)
+
+test("key_scale_undo_labels", function()
+  local st, K = S.state, S.K
+  local labels = {}
+  local saved = { st.target_take_guid, st.session_takes["{KL}"], st.key_idx, st.scale_idx,
+    reaper.GetMediaItemTakeByGUID, reaper.Undo_EndBlock }
+  reaper.GetMediaItemTakeByGUID = function() return "TAKE" end
+  reaper.Undo_EndBlock = function(label) labels[#labels + 1] = label end
+  st.target_take_guid, st.session_takes["{KL}"] = "{KL}", { notes = {}, results = {} }
+  local ok, err = pcall(function()
+    K.scale_changed("key")
+    K.scale_changed("scale")
+  end)
+  st.target_take_guid, st.session_takes["{KL}"], st.key_idx, st.scale_idx,
+    reaper.GetMediaItemTakeByGUID, reaper.Undo_EndBlock = table.unpack(saved, 1, 6)
+  if not ok then error(err, 0) end
+  eq(labels[1], "Set Key", "key")
+  eq(labels[2], "Set Scale", "scale")
+end)
+
+-- Stretch re-split (K.segment_stretch): three phrases apart; the middle one is a slide
+local STRETCH_GAP = { dur = 0.1 }
+local function stretch_frames(mid)
+  local segs = { { dur = 0.4, note = 55 }, STRETCH_GAP }
+  for _, s in ipairs(mid) do segs[#segs + 1] = s end
+  segs[#segs + 1] = STRETCH_GAP
+  segs[#segs + 1] = { dur = 0.4, note = 67 }
+  return frames(segs, HOP)
+end
+
+test("segment_stretch_outside_untouched", function()
+  local fr = stretch_frames({ { dur = 0.4, note = 64 } })
+  local old, old_splits = S.K.segment(fr, 0.5)
+  eq(#old, 3, "old notes")
+  local new, splits, i0, i1 = S.K.segment_stretch(fr, 0.5, old, old[2].start_time, old[2].end_time, old_splits)
+  eq(#new, 3, "new notes")
+  eq(rawequal(new[1], old[1]), true, "before is the same table")
+  eq(rawequal(new[3], old[3]), true, "after is the same table")
+  eq(rawequal(new[2], old[2]), false, "the stretch is split again")
+  near(new[2].start_time, old[2].start_time, 1e-9, "stretch start")
+  near(new[2].end_time, old[2].end_time, 1e-9, "stretch end")
+  eq(i0, 2, "first new")
+  eq(i1, 2, "last new")
+  eq(#splits, 3, "split points")
+  eq(rawequal(splits[1], old_splits[1]), true, "split before kept")
+  eq(rawequal(splits[3], old_splits[3]), true, "split after kept")
+end)
+
+test("segment_stretch_higher_sep_more_notes", function()
+  local fr = stretch_frames(slide_segs(60.6))
+  local old, old_splits = S.K.segment(fr, 0.2)
+  eq(#old, 3, "joined at 0.2")
+  local new, splits, i0, i1 = S.K.segment_stretch(fr, 0.9, old, old[2].start_time, old[2].end_time, old_splits)
+  eq(#new, 4, "two notes in the stretch at 0.9")
+  eq(rawequal(new[1], old[1]), true, "before")
+  eq(rawequal(new[4], old[3]), true, "after")
+  eq(i0, 2, "first new")
+  eq(i1, 3, "last new")
+  eq(#splits, 4, "split points")
+  for i = 2, 4 do
+    if splits[i].time <= splits[i - 1].time then error("split points out of order at " .. i) end
+  end
+end)
+
+test("segment_stretch_too_few_frames", function()
+  local fr = stretch_frames({ { dur = 0.4, note = 64 } })
+  local old = S.K.segment(fr, 0.5)
+  local new = S.K.segment_stretch(fr, 0.5, old, 0.45, 0.45 + HOP / 2)
+  eq(new, nil, "nothing to split")
+end)
+
+test("resplit_stretch_keeps_item_value", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(60.6))
+  local old, old_splits = K.segment(fr, 0.2)
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, separation = 0.2, item_len = 2,
+    sample_rate = 44100 }
+  local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text }
+  reaper.time_precise = function() return 0 end
+  st.target_take_guid, st.session_takes["{a}"] = "{a}", data
+  st.results, st.notes, st.split_points, st.separation = fr, old, old_splits, 0.2
+  st.selected_notes, st.selected_note = { [2] = true }, 2
+  local ok, err = pcall(function() K.resplit_stretch(0.9) end)
+  local notes, sel, sep, status = st.notes, st.selected_notes, st.separation, st.status.text
+  st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+  eq(#notes, 4, "notes")
+  eq(rawequal(notes[1], old[1]) and rawequal(notes[4], old[3]), true, "outside untouched")
+  eq(sel[2] and sel[3] and not sel[1] and not sel[4], true, "the new notes are selected")
+  eq(data.separation, 0.2, "item value unchanged")
+  eq(sep, 0.2, "bar value unchanged")
+  eq(rec.labels[#rec.labels], "Re-split selected notes", "undo label")
+  eq(status, "Re-split 1 note into 2.", "status (singular)")
+end) end)
+
+-- A stretch at the item's own Separation splits as the item did, also where the stretch is quiet: the silence
+-- floor is the whole item's
+local function quiet_frames()
+  local q, hush = 10 ^ (-45 / 20), 10 ^ (-70 / 20)
+  return frames({ { dur = 0.4, note = 55 }, STRETCH_GAP,
+    { dur = 0.3, note = 60, lvl = q }, { dur = 0.1, note = 60, lvl = hush }, { dur = 0.3, note = 62, lvl = q },
+    STRETCH_GAP, { dur = 0.4, note = 67 } }, HOP)
+end
+
+test("segment_stretch_same_sep_same_notes", function()
+  for _, case in ipairs({ { stretch_frames(slide_segs(62)), "loud" }, { quiet_frames(), "quiet" } }) do
+    local fr, name = case[1], case[2]
+    for _, sep in ipairs({ 0.2, 0.5, 0.9 }) do
+      local old, old_splits = S.K.segment(fr, sep)
+      local first, last = 2, #old - 1
+      local new, _, i0, i1 = S.K.segment_stretch(fr, sep, old, old[first].start_time, old[last].end_time, old_splits)
+      local tag = name .. " sep " .. sep
+      eq(#new, #old, tag .. ": notes")
+      eq(i1 - i0, last - first, tag .. ": notes in the stretch")
+      for i = i0, i1 do
+        eq(new[i].start_time, old[i].start_time, tag .. ": start " .. i)
+        eq(new[i].end_time, old[i].end_time, tag .. ": end " .. i)
+      end
+    end
+  end
+end)
+
+test("segment_floor_matches_segment", function()
+  local fr = quiet_frames()
+  local a = S.K.segment(fr, 0.5)
+  local b = S.K.segment(fr, 0.5, S.K.segment_floor(fr))
+  eq(#b, #a, "notes")
+  for i = 1, #a do
+    eq(b[i].start_time, a[i].start_time, "start " .. i)
+    eq(b[i].end_time, a[i].end_time, "end " .. i)
+  end
+  eq(S.K.segment_floor({ { time = 0, rms = 0.1, lvl = 0.1 } }), nil, "no pitched frame")
+end)
+
+test("resplit_stretch_unchanged_no_undo", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(60.6))
+  local old, old_splits = K.segment(fr, 0.2)
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, separation = 0.2, item_len = 2,
+    sample_rate = 44100 }
+  local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text }
+  reaper.time_precise = function() return 0 end
+  st.target_take_guid, st.session_takes["{a}"] = "{a}", data
+  st.results, st.notes, st.split_points, st.separation = fr, old, old_splits, 0.2
+  st.selected_notes, st.selected_note = { [2] = true }, 2
+  -- the item's own value (Reset with notes selected), and another value that gives the same notes
+  local ok, err = pcall(function() K.resplit_stretch(0.2); K.resplit_stretch(0.25) end)
+  local notes, sel, status = st.notes, st.selected_notes, st.status.text
+  st.target_take_guid, st.results, st.notes, st.split_points, st.selected_notes, st.selected_note,
+    st.separation, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+  eq(#rec.labels, 0, "no undo point")
+  eq(rawequal(notes, old), true, "the notes stay")
+  eq(sel[2], true, "the selection stays")
+  eq(status, "Nothing to re-split.", "status")
+end) end)
+
+-- The Values group in three named groups, and the pill menu's reset (task 5) ------------------------------------
+test("hdr_plan_widths_ordered", function()
+  local saved = { reaper.ImGui_CalcTextSize, reaper.ImGui_GetFrameHeight }
+  reaper.ImGui_CalcTextSize = function(_, text) return #text * 7, 13 end
+  reaper.ImGui_GetFrameHeight = function() return 20 end
+  local ok, err = pcall(function()
+    local s = S.measure_header_static()
+    local plans = S.K.HDR_PLANS
+    eq(#plans, 3, "plans")
+    for i = 1, #plans - 1 do
+      local a, b = S.hdr_min_content_w(s, false, i), S.hdr_min_content_w(s, false, i + 1)
+      if a <= b then error(string.format("plan %d (%g) is not wider than plan %d (%g)", i, a, i + 1, b), 0) end
+    end
+    eq(#plans[1].rows, 1, "one row"); eq(#plans[2].rows, 2, "Clip row + Values row"); eq(#plans[3].rows, 6, "narrow")
+    for pi, plan in ipairs(plans) do
+      eq(plan.captions, nil, "plan " .. pi .. " has no captions")
+      for _, row in ipairs(plan.rows) do
+        for _, id in ipairs(row) do
+          if id:sub(1, 4) == "cap_" then error("plan " .. pi .. " has a caption unit " .. id, 0) end
+        end
+      end
+    end
+    -- The first-use window is sized for the two-row plan
+    local w2, rows = S.hdr_min_content_w(s, true)
+    eq(w2, S.hdr_min_content_w(s, false, 2), "first use: plan 2"); eq(rows, 2, "first use: two rows")
+    -- Strength and Slide In are measured in the default font, as the other values: nothing pushes a font
+    local Theme, pushes = package.loaded["theme"], 0
+    local push = Theme.push_font
+    Theme.push_font = function(...) pushes = pushes + 1; return push(...) end
+    local ok2, err2 = pcall(S.K.bar_measure, nil)
+    Theme.push_font = push
+    if not ok2 then error(err2, 0) end
+    eq(pushes, 0, "fonts pushed while measuring the values")
+  end)
+  reaper.ImGui_CalcTextSize, reaper.ImGui_GetFrameHeight = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("reset_item_all_counts", function()
+  local K, D = S.K, S.DEFAULTS
+  local data = { separation = D.separation, key_idx = 3, scale_idx = 2, overrides = {} }
+  for _, key in ipairs(K.ITEM_KEYS) do
+    if key ~= "separation" then data.overrides[key] = D[key] end
+  end
+  eq(K.item_off_defaults(data), 0, "at the defaults")
+  data.overrides.tolerance = D.tolerance + 5
+  data.overrides.retune_speed = 0.4
+  data.key_idx, data.scale_idx = 5, 1
+  eq(K.item_off_defaults(data), 2, "Tolerance and Strength differ; Key and Scale do not count")
+  K.item_reset_values(data)
+  eq(K.item_off_defaults(data), 0, "reset")
+  eq(data.overrides.tolerance, D.tolerance, "the default back"); eq(data.overrides.retune_speed, D.retune_speed)
+  eq(data.key_idx, 5, "Key untouched"); eq(data.scale_idx, 1, "Scale untouched")
+end)
+
+test("reset_item_all_one_undo", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(62))
+  local start, D = K.new_item_values(), S.DEFAULTS
+  local other_sep = 0.9
+  local old, old_splits = K.segment(fr, other_sep)
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, item_len = 2, sample_rate = 44100 }
+  K.item_seed(data)
+  data.separation = other_sep
+  data.overrides.tolerance = D.tolerance + 5
+  data.key_idx = (start.key_idx % 12) + 1
+  local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.separation, st.key_idx,
+    st.scale_idx, reaper.time_precise, st.status.text }
+  reaper.time_precise = function() return 0 end
+  st.target_take_guid, st.session_takes["{a}"] = "{a}", data
+  st.results, st.notes, st.split_points, st.separation = fr, old, old_splits, other_sep
+  st.key_idx = data.key_idx
+  local ok, err = pcall(function()
+    K.reset_item_all()
+    eq(#rec.labels, 1, "one undo point")
+    eq(rec.labels[1], "Reset item to defaults", "undo label")
+    eq(st.status.text, "Item reset to the defaults.", "status")
+    eq(K.item_off_defaults(data), 0, "every value back")
+    eq(data.overrides.tolerance, D.tolerance, "Tolerance at its default")
+    eq(st.separation, D.separation, "bar Separation follows")
+    eq(data.key_idx, (start.key_idx % 12) + 1, "Key untouched")
+    eq(st.key_idx, data.key_idx, "bar Key untouched")
+    eq(st.notes ~= old, true, "re-split")
+    K.reset_item_all()
+    eq(#rec.labels, 1, "nothing differs: no undo point")
+  end)
+  st.target_take_guid, st.results, st.notes, st.split_points, st.separation, st.key_idx,
+    st.scale_idx, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+end) end)
+
+test("reset_item_all_asks_in_reset_words", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(62))
+  local start = K.new_item_values()
+  local other_sep = (start.separation > 0.5) and 0.2 or 0.9
+  local old, old_splits = K.segment(fr, other_sep)
+  -- an edited note no new note matches: a re-split asks first
+  old[#old + 1] = { start_time = 5, end_time = 6, avg_note = 60, controls = { bypassed = true, center_pitch = 60 } }
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, item_len = 2, sample_rate = 44100 }
+  K.item_seed(data)
+  data.separation = other_sep
+  local saved = { st.target_take_guid, st.target_take_name, st.results, st.notes, st.split_points, st.separation,
+    st.confirm }
+  st.target_take_guid, st.target_take_name, st.session_takes["{a}"] = "{a}", "Lead Vox", data
+  st.results, st.notes, st.split_points, st.separation, st.confirm = fr, old, old_splits, other_sep, nil
+  local ok, err = pcall(function()
+    K.reset_item_all()
+    local c = st.confirm
+    eq(c ~= nil and c.id, "resplit", "asks first")
+    eq(c.title, "Reset Lead Vox to the defaults?")
+    eq(c.confirm_label, "Reset")
+    eq(#rec.labels, 0, "nothing written yet")
+    -- a plain Separation re-split keeps its own words
+    st.confirm = nil
+    K.resplit(start.separation)
+    eq(st.confirm.title, "Re-split Lead Vox?"); eq(st.confirm.confirm_label, "Re-Split")
+  end)
+  st.target_take_guid, st.target_take_name, st.results, st.notes, st.split_points, st.separation,
+    st.confirm = table.unpack(saved, 1, 7)
+  if not ok then error(err, 0) end
+end) end)
+
+test("write_take_envelope_keeps_the_old_envelope_when_the_build_fails", function() with_write_stubs({}, function(rec)
+  local K = S.K
+  local saved_build = K.correction_build
+  local pitchmode_set = false
+  reaper.SetMediaItemTakeInfo_Value = function() pitchmode_set = true end
+  K.correction_build = function() error("bad note") end
+  local data = { notes = { { start_time = 0, end_time = 1, avg_note = 60, controls = { center_pitch = 60 } } } }
+  local ok, err = pcall(K.write_take_envelope, "{a}", data, false)
+  K.correction_build, reaper.SetMediaItemTakeInfo_Value = saved_build, nil
+  eq(ok, false, "the error is passed on"); eq(tostring(err):find("bad note", 1, true) ~= nil, true)
+  eq(#rec.cleared, 0, "the old points are still there")
+  eq(pitchmode_set, false, "the pitch mode is not changed either")
+end) end)
+
+-- Apply to other items (K.apply_plan, the confirm's checklist)
+-- A target of K.apply_plan: a model with notes split from `fr` at `sep`, each note with its controls
+local function apply_target(id, fr, sep, tol)
+  local notes = S.K.segment(fr, sep)
+  S.K.resplit_features(notes, {})
+  local data = { guid = "{" .. id .. "}", name = id, notes = notes, results = fr, item_len = 2, sample_rate = 44100,
+    separation = sep, overrides = { tolerance = tol } }
+  return { guid = data.guid, take = id, name = id, data = data }
+end
+
+test("apply_plan_overwrites", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+  for _, e in ipairs({ a, b }) do e.data.notes[1].controls.tolerance = 30 end
+  local plan = S.K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, false)
+  eq(#plan.items, 2, "both items")
+  eq(plan.items[1].set.tolerance, 40, "a set"); eq(plan.items[2].set.tolerance, 40, "b set")
+  eq(plan.items[1].clear_note_keys[1], "tolerance", "note keys cleared")
+  eq(plan.counts.items_lose, 2, "items_lose"); eq(plan.counts.notes_lose, 2, "notes_lose")
+  eq(plan.items[1].resplit, false, "no Separation: no re-split")
+end)
+
+test("apply_plan_keep", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local a, b = apply_target("a", fr, 0.5, 8), apply_target("b", fr, 0.5, 20)
+  for _, e in ipairs({ a, b }) do e.data.notes[1].controls.tolerance = 30 end
+  local plan = S.K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, true)
+  eq(plan.items[1].set.tolerance, 40, "a was at the default (8): set")
+  eq(plan.items[2].set.tolerance, nil, "b differs from the default: the user's, kept")
+  eq(#plan.items[1].clear_note_keys, 0, "notes keep their own"); eq(plan.counts.notes_lose, 0)
+  eq(plan.counts.items_lose, 0, "a held the default: nothing of its own is lost"); eq(plan.changed, 1)
+end)
+
+test("apply_plan_keep_no_resplit", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local function target()
+    local t = apply_target("a", fr, 0.5, 8)
+    eq(#t.data.notes, 2, "split at 0.5")
+    t.data.notes[1].controls.center_pitch = t.data.notes[1].controls.center_pitch + 1   -- an edit
+    return t
+  end
+  local keep = S.K.apply_plan({ separation = 0 }, { target() }, { "separation" }, true)
+  eq(keep.items[1].resplit, false, "keep: not split again"); eq(keep.counts.not_resplit, 1)
+  local over = S.K.apply_plan({ separation = 0 }, { target() }, { "separation" }, false)
+  eq(over.items[1].resplit, true, "overwrite: split again"); eq(over.counts.resplit, 1)
+  eq(over.counts.lost > 0, true, "the edited note is lost")
+end)
+
+test("apply_plan_skips_missing", function()
+  local fr = frames(REARTIC_SEGS, HOP)
+  local gone = apply_target("a", fr, 0.5, 8); gone.take = nil
+  local midi = apply_target("m", fr, 0.5, 8); midi.midi = true
+  local plan = S.K.apply_plan({ tolerance = 40 }, { gone, midi }, { "tolerance" }, false)
+  eq(#plan.items, 0, "no rows"); eq(plan.counts.skipped, 2, "counted")
+end)
+
+test("apply_plan_keep_is_against_the_default", function()
+  -- Keep: an item value that differs from the script's default is the user's; at the default it is taken
+  local fr = frames(REARTIC_SEGS, HOP)
+  local D = S.DEFAULTS
+  local at, own = apply_target("a", fr, 0.5, D.tolerance), apply_target("b", fr, 0.5, D.tolerance + 4)
+  at.data.overrides.tighten, own.data.overrides.tighten = D.tighten, 0.85
+  local plan = S.K.apply_plan({ tolerance = 40, tighten = 0.2 }, { at, own }, { "tolerance", "tighten" }, true)
+  eq(plan.items[1].set.tolerance, 40, "a at the default Tolerance: set"); eq(plan.items[1].set.tighten, 0.2)
+  eq(plan.items[2].set.tolerance, nil, "b's 12 cents: kept"); eq(plan.items[2].set.tighten, nil, "b's 85%: kept")
+  local over = S.K.apply_plan({ tolerance = 40 }, { own }, { "tolerance" }, false)
+  eq(over.items[1].set.tolerance, 40, "without Keep: set"); eq(over.counts.items_lose, 1, "b loses a value of its own")
+end)
+
+test("confirm_consequence_cached", function()
+  local st = S.state
+  local stubs = {
+    ImGui_IsPopupOpen = function() return true end,
+    ImGui_GetWindowSize = function() return 800, 600 end,
+    ImGui_GetWindowPos = function() return 0, 0 end,
+    ImGui_Viewport_GetPos = function() return 0, 0 end,
+    ImGui_Viewport_GetSize = function() return 800, 600 end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local calls = 0
+  local ok, err = pcall(function()
+    S.request_confirm({ id = "t", title = "T", on_confirm = function() end,
+      checklist = { caption = "To:", rows = { { id = "a", name = "A" }, { id = "b", name = "B" } },
+        ticked = { a = true } },
+      check = { label = "Keep", value = false },
+      consequence = function(checked, ticked)
+        calls = calls + 1
+        local n = 0
+        for _ in pairs(ticked) do n = n + 1 end
+        return { lines = { tostring(checked) .. n } }
+      end })
+    S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(calls, 1, "same ticks: computed once")
+    eq(st.confirm.cons.lines[1], "false1", "cached in state.confirm")
+    S.K.confirm_tick(st.confirm, "b", true); S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(calls, 2, "a row ticked: computed again, once")
+    eq(st.confirm.cons.lines[1], "false2")
+    S.K.confirm_tick(st.confirm, "b", true); S.draw_confirm_modal()
+    eq(calls, 2, "ticking a ticked row changes nothing")
+    st.confirm.checked = true; S.draw_confirm_modal()
+    eq(calls, 3, "the check changed: computed again")
+    S.draw_confirm_modal()
+    eq(calls, 3, "nothing changed: not computed again")
+    S.K.confirm_tick_all(st.confirm, false); S.draw_confirm_modal()
+    eq(calls, 4, "None: computed again"); eq(next(st.confirm.ticked), nil, "nothing ticked")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  st.confirm = nil
+  if not ok then error(err, 0) end
+end)
+
+test("confirm_skipped_rows_are_not_tickable", function()
+  local c = { checklist = { rows = { { id = "a", name = "A" }, { id = "m", name = "M", reason = "Not an audio item" } } },
+    ticked = {}, ticks_rev = 0 }
+  S.K.confirm_tick(c, "m", true)
+  eq(c.ticked.m, nil, "a skipped row stays unticked"); eq(c.ticks_rev, 0, "and nothing is recomputed")
+  S.K.confirm_tick_all(c, true)
+  eq(c.ticked.a, true, "All ticks the audio row"); eq(c.ticked.m, nil, "All skips the skipped row")
+end)
+
+-- The Apply checklist: its rows, the rows ticked at first, the targets of the ticked rows
+local function apply_row(id, reason) return { id = "{" .. id .. "}", guid = "{" .. id .. "}", name = id, reason = reason } end
+
+test("apply_initial_ticks_follow_the_selection", function()
+  local rows = { apply_row("a"), apply_row("b"), apply_row("c") }
+  local ticked = S.K.apply_initial_ticks(rows, { ["{b}"] = true, ["{x}"] = true })
+  eq(ticked["{b}"], true, "the selected row"); eq(ticked["{a}"], nil); eq(ticked["{c}"], nil)
+  eq(ticked["{x}"], nil, "a selected item that is not in the list is not a row")
+end)
+
+test("apply_initial_ticks_all_when_none_selected", function()
+  local rows = { apply_row("a"), apply_row("m", "Not an audio item"), apply_row("b") }
+  local ticked = S.K.apply_initial_ticks(rows, {})
+  eq(ticked["{a}"], true); eq(ticked["{b}"], true, "none of the rows is selected: every row")
+  eq(ticked["{m}"], nil, "a skipped row is never ticked")
+  ticked = S.K.apply_initial_ticks(rows, { ["{m}"] = true })
+  eq(ticked["{m}"], nil, "selected but skipped: not ticked")
+  eq(ticked["{a}"], true, "the only selected row is skipped: every audio row")
+end)
+
+test("apply_rows_and_ticked_entries", function() with_write_stubs({ ["{g}"] = true }, function()
+  local st, K = S.state, S.K
+  local saved = { st.target_take_guid, reaper.TakeIsMIDI }
+  local ok, err = pcall(function()
+    for _, g in ipairs({ "{open}", "{a}", "{m}", "{g}", "{b}" }) do
+      st.session_takes[g] = { guid = g, name = g:gsub("[{}]", ""), notes = {} }
+      st.session_order[#st.session_order + 1] = g
+    end
+    st.target_take_guid = "{open}"
+    reaper.TakeIsMIDI = function(take) return take == "m" end
+    local rows = K.apply_rows()
+    eq(#rows, 4, "every pitched item but the open one")
+    eq(rows[1].guid, "{a}"); eq(rows[1].reason, nil)
+    eq(rows[2].guid, "{m}"); eq(rows[2].reason, "Not an audio item")
+    eq(rows[3].guid, "{g}"); eq(rows[3].reason, "No longer in the project")
+    eq(rows[4].guid, "{b}"); eq(rows[4].name, "b")
+    local entries = K.apply_ticked_entries(rows, { ["{b}"] = true, ["{m}"] = true })
+    eq(#entries, 1, "only ticked rows that can be written"); eq(entries[1].guid, "{b}")
+    eq(entries[1].data, st.session_takes["{b}"])
+  end)
+  for _, g in ipairs({ "{open}", "{m}", "{g}" }) do st.session_takes[g] = nil end
+  st.target_take_guid, reaper.TakeIsMIDI = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_consequence_follows_the_ticked_rows", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(#c.checklist.rows, 2, "one row per other pitched item")
+    eq(c.ticked["{a}"] and c.ticked["{b}"], true, "nothing selected: every row ticked")
+    eq(c.only, nil, "no \"New items only\"")
+    local all = c.consequence(false, { ["{a}"] = true, ["{b}"] = true })
+    eq(all.confirm_label, "Apply (2)")
+    for _, line in ipairs(all.lines) do
+      eq(line:find("starting", 1, true), nil, "no line about starting values: " .. line)
+      eq(line:find("can't be undone", 1, true), nil, "no line about what can't be undone: " .. line)
+    end
+    local one = c.consequence(false, { ["{b}"] = true })
+    eq(one.confirm_label, "Apply (1)", "the count follows the ticked rows"); eq(one.reason, nil)
+    local none = c.consequence(false, {})
+    eq(none.reason, "Tick at least one item", "nothing ticked: Apply disabled")
+    eq(none.confirm_label, "Apply (0)")
+
+  end)
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_open_ticks_the_selected_rows", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    reaper.CountSelectedMediaItems = function() return 1 end
+    reaper.GetSelectedMediaItem = function() return "item_b" end
+    reaper.GetActiveTake = function() return "b" end
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.ticked["{b}"], true, "the selected item is ticked"); eq(c.ticked["{a}"], nil, "the other is not")
+  end)
+  reaper.GetSelectedMediaItem, reaper.GetActiveTake = nil, nil
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_run_one_undo_and_cancel", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, reaper.time_precise, st.is_analyzing, reaper.SetExtState, K.save_settings }
+  local ext, saves = 0, 0
+  reaper.time_precise = function() return 0 end
+  reaper.SetExtState = function() ext = ext + 1 end
+  K.save_settings = function() saves = saves + 1 end
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid = "{open}"
+    local plan = K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, false)
+    K.apply_run(plan, "Tolerance")
+    eq(K.batch ~= nil, true, "runs as a batch")
+    for _ = 1, 10 do if K.batch then K.analysis_tick() end end
+    eq(K.batch, nil, "done"); eq(st.is_analyzing, false)
+    eq(rec.begin, 1, "one undo block"); eq(#rec.labels, 1, "one undo point")
+    eq(rec.labels[1], "Apply Tolerance to 2 items")
+    eq(st.session_takes["{a}"].overrides.tolerance, 40, "a written"); eq(a.data.overrides.tolerance, 12, "old model untouched")
+    eq(st.status.text, "Applied to 2 items (" .. MOD .. "+Z undoes them).")
+    eq(ext, 0, "Apply writes no ExtState: one undo restores everything"); eq(saves, 0, "no setting saved")
+    -- Cancel before the first item: nothing written
+    plan = K.apply_plan({ tolerance = 50 }, { a, b }, { "tolerance" }, false)
+    K.apply_run(plan, "Tolerance")
+    eq(K.cancel_analysis(), true)
+    eq(#rec.labels, 1, "no new undo point"); eq(ext, 0, "still no ExtState")
+    eq(st.status.text, "Apply cancelled. No item was changed.")
+  end)
+  st.target_take_guid, reaper.time_precise, st.is_analyzing, reaper.SetExtState, K.save_settings = table.unpack(saved, 1, 5)
+  K.batch = nil
+  st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_keep_line_only_when_separation_is_given", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    local function keep_shown(keys)
+      st.target_take_guid, st.confirm = "{open}", nil
+      K.apply_open(keys)
+      local c = st.confirm
+      st.confirm = nil
+      for _, line in ipairs(c.consequence(true, c.ticked).lines) do
+        if line:find("not split again", 1, true) then return true end
+      end
+      return false
+    end
+    eq(keep_shown({ "tolerance" }), false, "Tolerance never splits again: no keep line")
+    eq(keep_shown({ "separation" }), true, "Separation: the keep line")
+    eq(keep_shown(nil), true, "every value: the keep line")
+  end)
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_refuses_when_the_open_item_changed", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, reaper.time_precise, st.is_analyzing, st.confirm }
+  reaper.time_precise = function() return 0 end
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    eq(c ~= nil and c.id, "apply", "the confirm is open")
+    eq(c.ticked["{a}"] and c.ticked["{b}"], true, "nothing selected: every row ticked")
+    st.target_take_guid = "{a}"   -- the user clicked a target in the arrange view
+    c.on_confirm(c.checked, c.ticked)
+    eq(#rec.labels, 0, "no undo point"); eq(K.batch, nil, "no run")
+    eq(st.session_takes["{a}"], a.data, "a untouched")
+    eq(st.status.text, "The item changed meanwhile. Nothing was applied.")
+    -- Defence in depth: a row for the open item is never run
+    local plan = K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, false)
+    K.apply_run(plan, "Tolerance")
+    for _ = 1, 10 do if K.batch then K.analysis_tick() end end
+    eq(rec.labels[1], "Apply Tolerance to 1 items", "only b")
+    eq(st.session_takes["{a}"], a.data, "the open item is not written")
+    eq(st.session_takes["{b}"].overrides.tolerance, 40, "b written")
+  end)
+  st.target_take_guid, reaper.time_precise, st.is_analyzing, st.confirm = table.unpack(saved, 1, 4)
+  K.batch = nil
+  st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
+-- A batch writes each item's envelope from its model and its own values (what K.envelope_check expects)
+-- fn(rec, pts) runs K.batch_write with envelope points recorded per envelope: pts[env] = { { time, val, shape } ... }
+local function with_point_stubs(fn)
+  with_write_stubs({}, function(rec)
+    local st = S.state
+    local pts, modes = {}, {}
+    local clear = reaper.DeleteEnvelopePointRange
+    reaper.DeleteEnvelopePointRange = function(env, ...) clear(env, ...); pts[env] = {} end
+    reaper.InsertEnvelopePointEx = function(env, _, t, v, shape)
+      pts[env] = pts[env] or {}
+      table.insert(pts[env], { time = t, val = v, shape = shape })
+    end
+    reaper.CountEnvelopePointsEx = function(env) return #(pts[env] or {}) end
+    reaper.GetEnvelopePointEx = function(env, _, i)
+      local p = (pts[env] or {})[i + 1]
+      if not p then return false end
+      return true, p.time, p.val, p.shape
+    end
+    reaper.GetMediaItemInfo_Value = function(_, key) if key == "D_LENGTH" then return 10 end return 0 end
+    reaper.SetMediaItemTakeInfo_Value = function(take, key) modes[#modes + 1] = { take = take, key = key } end
+    local saved_target = st.target_take_guid
+    st.target_take_guid = "{other}"   -- the window has another item open
+    local ok, err = pcall(fn, rec, pts, modes)
+    st.target_take_guid = saved_target
+    for _, name in ipairs({ "InsertEnvelopePointEx", "CountEnvelopePointsEx", "GetEnvelopePointEx",
+      "GetMediaItemInfo_Value", "SetMediaItemTakeInfo_Value" }) do reaper[name] = nil end
+    if not ok then error(err, 0) end
+  end)
+end
+
+test("batch_writes_the_correction_of_kept_item_values", function() with_point_stubs(function(rec, pts, modes)
+  local K, st = S.K, S.state
+  local data = { guid = "{a}", name = "A", results = {}, item_len = 10, sample_rate = 44100,
+    notes = { wobbly_untouched(0.1) } }
+  K.item_seed(data)
+  data.overrides.tighten, data.overrides.tolerance = 0.3, 0   -- the item kept its own Tighten 30%
+  local written = K.batch_write({ { guid = "{a}", data = data, json = K.take_json(data), empty = false } })
+  eq(#written, 1); eq(rec.begin, 1, "one undo block"); eq(rec.labels[1], "Analyze Pitch (1 item)")
+  eq(st.undo_open, false)
+  local moved = false
+  for _, p in ipairs(pts.env_a or {}) do if math.abs(p.val) > 1e-6 then moved = true end end
+  eq(moved, true, "the item's Tighten corrects its note: the envelope holds the correction")
+  eq(K.envelope_check("{a}"), false, "the envelope is what the model and the item's values produce: not Outdated")
+  eq(rec.stored.a, written[1].json, "the model is stored with the text the batch prepared")
+  eq(#modes, 0, "the take's pitch mode is left alone, as for a single analysis")
+  eq(st.target_take_guid, "{other}", "the open item is still the target")
+end) end)
+
+test("batch_leaves_a_fresh_item_uncorrected", function() with_point_stubs(function(rec, pts, modes)
+  local K = S.K
+  local data = { guid = "{a}", name = "A", results = {}, item_len = 10, sample_rate = 44100,
+    notes = { wobbly_untouched(0.1) } }
+  K.item_seed(data)   -- the starting values: they correct nothing
+  local written = K.batch_write({ { guid = "{a}", data = data, json = K.take_json(data), empty = false } })
+  eq(#written, 1); eq(rec.begin, 1)
+  eq(#(pts.env_a or {}), 0, "no points: a cleared envelope, as before")
+  eq(K.envelope_check("{a}"), false, "not Outdated")
+  eq(#modes, 0, "pitch mode left alone")
+end) end)
+
+-- Runs K.batch_write(d) with the correction of every model that has notes failing; returns what it wrote, what the
+-- console said and the takes whose Pitch envelope was looked up (ensure_take_pitch_envelope)
+local function batch_write_failing(d)
+  local K = S.K
+  local build, said, looked = K.correction_build, nil, {}
+  local lookup = reaper.GetTakeEnvelopeByName
+  K.correction_build = function() error("bad note") end
+  reaper.ShowConsoleMsg = function(msg) said = msg end
+  reaper.GetTakeEnvelopeByName = function(take, ...) looked[take] = true; return lookup(take, ...) end
+  local ok, res = pcall(K.batch_write, d)
+  K.correction_build, reaper.ShowConsoleMsg, reaper.GetTakeEnvelopeByName = build, nil, lookup
+  if not ok then error(res, 0) end
+  return res, said, looked
+end
+
+test("batch_leaves_out_an_item_whose_correction_cannot_be_built", function() with_point_stubs(function(rec, pts)
+  local K, st = S.K, S.state
+  local d = done2()
+  d[1].data.notes = { wobbly_untouched(0.1) }; K.item_seed(d[1].data)
+  local written, said, looked = batch_write_failing(d)
+  eq(#written, 1, "only b is written"); eq(written[1].guid, "{b}"); eq(rec.stored.a, nil, "a left as it was")
+  eq(looked.a, nil, "a's envelope is not created, shown or switched on"); eq(pts.env_a, nil, "nor cleared")
+  eq(st.session_takes["{a}"], nil); eq(rec.labels[1], "Analyze Pitch (1 item)"); eq(st.undo_open, false)
+  eq(tostring(said):find("bad note", 1, true) ~= nil, true, "the console says why")
+end) end)
+
+test("batch_with_no_buildable_item_makes_no_undo_point", function() with_point_stubs(function(rec)
+  local K, st = S.K, S.state
+  local d = done2()
+  for _, e in ipairs(d) do e.data.notes = { wobbly_untouched(0.1) }; K.item_seed(e.data) end
+  local written, _, looked = batch_write_failing(d)
+  eq(#written, 0); eq(rec.begin, 0, "no undo block"); eq(#rec.labels, 0, "no undo point")
+  eq(looked.a, nil); eq(looked.b, nil); eq(st.undo_open, false)
+  eq(st.session_takes["{a}"], nil); eq(st.session_takes["{b}"], nil)
+end) end)
+
+test("batch_carries_on_when_a_write_raises", function() with_point_stubs(function(rec)
+  local K, st = S.K, S.state
+  local insert, said = reaper.InsertEnvelopePointEx, nil
+  reaper.InsertEnvelopePointEx = function(env, ...) if env == "env_a" then error("disk full") end return insert(env, ...) end
+  reaper.ShowConsoleMsg = function(msg) said = msg end
+  local d = done2()
+  for _, e in ipairs(d) do
+    e.data.notes = { wobbly_untouched(0.1) }; K.item_seed(e.data); e.data.overrides.tighten = 0.3
+    e.data.overrides.tolerance = 0; e.json = K.take_json(e.data)
+  end
+  local ok, written = pcall(K.batch_write, d)
+  reaper.ShowConsoleMsg = nil
+  if not ok then error(written, 0) end
+  eq(#written, 1, "b is written"); eq(written[1].guid, "{b}"); eq(rec.stored.b, d[2].json)
+  eq(rec.begin, 1, "one undo block"); eq(#rec.labels, 1, "closed once"); eq(rec.labels[1], "Analyze Pitch (1 item)")
+  eq(st.undo_open, false); eq(st.session_takes["{a}"], nil, "a's session entry comes back")
+  eq(rec.stored.a, nil, "a's model is not stored")
+  eq(tostring(said):find("disk full", 1, true) ~= nil, true, "the console says why")
+end) end)
+
+-- The confirm's layout: the button row (and the line that says why Apply is off) is outside the scrolling body
+test("confirm_body_h_leaves_room_for_the_reason_and_the_buttons", function()
+  local K = S.K
+  -- avail 400, buttons 20, gap 12, a reason line 14, item spacing 4
+  local body = K.confirm_body_h(400, 20, 12, 14, 4)
+  eq(body, 400 - (4 + 12 + 4 + 14 + 4 + 20), "the body leaves the gap, the reason line and the button row")
+  eq(K.confirm_body_h(400, 20, 12, 0, 4), 400 - (4 + 12 + 4 + 20), "no reason slot: only the gap and the buttons")
+  eq(K.confirm_body_h(30, 20, 12, 14, 4), 1, "too little room: the body is one pixel, the buttons stay in view")
+end)
+
+test("apply_carry_ticks_by_guid", function()
+  local rows = { apply_row("a"), apply_row("m", "Not an audio item"), apply_row("b") }
+  local carried = S.K.apply_carry_ticks(rows, { ["{a}"] = true, ["{m}"] = true, ["{x}"] = true })
+  eq(carried["{a}"], true, "a ticked row carried over")
+  eq(carried["{m}"], nil, "a row that cannot be written any more drops out")
+  eq(carried["{x}"], nil, "a row that is no longer in the list drops out")
+  eq(carried["{b}"], nil, "an unticked row stays unticked")
+end)
+
+test("apply_confirm_plans_with_the_rows_of_now", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm, K.apply_run }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.ticked["{a}"] and c.ticked["{b}"], true, "every row ticked")
+    -- Cmd+Z in the arrange view while the confirm is up: a is gone, b's model is reloaded with another value
+    reaper.GetMediaItemTakeByGUID = function(_, guid) if guid == "{a}" then return nil end return (guid:gsub("[{}]", "")) end
+    K.drop_project_cache()
+    local b2 = apply_target("b", fr, 0.5, K.apply_source({ "tolerance" }).tolerance)
+    st.session_takes["{b}"] = b2.data
+    local ran = nil
+    K.apply_run = function(plan) ran = plan end
+    c.on_confirm(c.checked, c.ticked)
+    eq(ran ~= nil, true, "Apply runs")
+    eq(#ran.items, 1, "only b"); eq(ran.items[1].guid, "{b}")
+    eq(ran.items[1].set.tolerance, nil, "planned from b's reloaded model (it already holds the value given)")
+  end)
+  st.target_take_guid, st.confirm, K.apply_run = table.unpack(saved, 1, 3)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_confirm_says_when_no_row_can_be_ticked", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm, reaper.TakeIsMIDI }
+  local ok, err = pcall(function()
+    local a = apply_target("a", fr, 0.5, 12)
+    st.session_takes["{a}"] = a.data
+    st.session_order[#st.session_order + 1] = "{a}"
+    reaper.TakeIsMIDI = function() return true end
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(next(c.ticked), nil, "nothing can be ticked")
+    eq(c.consequence(false, {}).reason, "No item here can be changed", "nothing tickable: Apply disabled")
+  end)
+  st.target_take_guid, st.confirm, reaper.TakeIsMIDI = table.unpack(saved, 1, 3)
+  if not ok then error(err, 0) end
+end) end)
+
+-- An open item that loses its analysis (Clear, Remove, Wipe, unreadable data cleared, the analysis undone away) is
+-- not analysed any more: it shows a new item's values, so its next analysis is a first one and splits at 50%
+local function open_analysed_at_70(st, NK)
+  st.session_takes["{a}"] = { guid = "{a}", name = "A", separation = 0.7, key_idx = 5, scale_idx = 3,
+    notes = {}, results = { { time = 0, note = 60 } }, item_len = 1, sample_rate = 48000 }
+  st.session_order[#st.session_order + 1] = "{a}"
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{a}", 0.7, 5, 3   -- adopt_take_data's mirrors
+  NK.key_idx, NK.scale_idx = 2, 1
+end
+
+test("clearing_the_open_item_starts_it_at_a_new_items_values", function() with_write_stubs({}, function()
+  local K, st, NK = S.K, S.state, S.K.new_key
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+    K.open_accessor, st.results, st.notes, st.sample_rate, st.end_time, st.current_time }
+  local ok, err = pcall(function()
+    open_analysed_at_70(st, NK)
+    reaper.GetMediaItemInfo_Value = function() return 1 end
+    S.clear_take_analysis("{a}")
+    eq(st.separation, S.DEFAULTS.separation, "Separation back to the default, not the cleared 70%")
+    eq(st.key_idx, 2, "the Key last chosen"); eq(st.scale_idx, 1)
+    reaper.GetMediaItemTake_Source = function() return "src" end
+    reaper.GetMediaSourceSampleRate = function() return 48000 end
+    K.open_accessor = function() return "acc" end
+    eq(K.analysis_begin("a", "item_a", { defer_envelope = true }), true, "the next analysis starts")
+    eq(st.separation, S.DEFAULTS.separation, "it splits at 50%")
+  end)
+  reaper.GetMediaItemInfo_Value, reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate = nil, nil, nil
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, K.open_accessor,
+    st.results, st.notes, st.sample_rate, st.end_time, st.current_time = table.unpack(saved, 1, 12)
+  st.is_analyzing, st.analysis_params, st.accessor = false, nil, nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("wiping_the_session_starts_the_open_item_at_a_new_items_values", function() with_write_stubs({}, function()
+  local st, NK = S.state, S.K.new_key
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+    st.session_order, st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes }
+  local ok, err = pcall(function()
+    st.session_order, st.session_takes = {}, {}
+    open_analysed_at_70(st, NK)
+    reaper.GetMediaItemInfo_Value = function() return 1 end
+    reaper.CountAutomationItems = function() return 0 end
+    eq(S.wipe_entire_session(), 1)
+    eq(st.separation, S.DEFAULTS.separation, "Separation back to the default")
+    eq(st.key_idx, 2, "the Key last chosen")
+  end)
+  reaper.GetMediaItemInfo_Value, reaper.CountAutomationItems = nil, nil
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.session_order,
+    st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes = table.unpack(saved, 1, 11)
+  if not ok then error(err, 0) end
+end) end)
+
+test("an_analysis_undone_away_starts_the_open_item_at_a_new_items_values", function()
+  local K, st, NK = S.K, S.state, S.K.new_key
+  local raw, changes = "", 2
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+    st.last_change_count, #st.session_order, st.results, st.notes }
+  local ok, err = pcall(function()
+    open_analysed_at_70(st, NK)
+    st.raw_cache["{a}"] = K.take_json(st.session_takes["{a}"])
+    K.drop_project_cache()
+    st.last_change_count = 1
+    S.sync_with_project()   -- Cmd+Z took the item's first analysis away
+    eq(st.session_takes["{a}"], nil, "undone: not analysed")
+    eq(st.separation, S.DEFAULTS.separation, "Separation back to the default")
+    eq(st.key_idx, 2, "the Key last chosen")
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"], st.undone_takes["{a}"] = nil, nil, nil, nil
+  while #st.session_order > saved[8] do table.remove(st.session_order) end
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.last_change_count,
+    st.results, st.notes = saved[1], saved[2], saved[3], saved[4], saved[5], saved[6], saved[7], saved[9], saved[10]
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
+-- Re-analysing puts an item's values back to the defaults: the confirm says so, and with no confirm (no edited
+-- note) the status line says it once the new analysis is written (HC4)
+local function reanalyse_stubs(K)
+  reaper.GetMediaItemTake_Source = function() return "src" end
+  reaper.GetMediaSourceSampleRate = function() return 48000 end
+  reaper.GetMediaItemInfo_Value = function() return 0 end
+  reaper.GetTakeName = function(take) return take end
+  reaper.time_precise = function() return 0 end
+  local saved = { K.open_accessor, K.write_take_envelope }
+  K.open_accessor = function() return "acc" end
+  K.write_take_envelope = function() return true end
+  return function()
+    reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate, reaper.GetMediaItemInfo_Value = nil, nil, nil
+    reaper.GetTakeName, reaper.time_precise = nil, nil
+    K.open_accessor, K.write_take_envelope = saved[1], saved[2]
+  end
+end
+
+test("reanalyze_confirm_says_the_values_go_back", function() with_write_stubs({}, function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.notes, st.confirm }
+  local ok, err = pcall(function()
+    st.session_takes["{a}"] = analysed_before("{a}")
+    st.target_take_guid, st.target_take_name = "{a}", "A"
+    st.notes = { { avg_note = 60, controls = { bypassed = true } } }   -- one edited note: the confirm
+    st.confirm = nil
+    K.request_analyze()
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.id, "reanalyze")
+    eq(c.body_lines[2], "Its values go back to the defaults; Key and Scale stay.")
+    eq(c.body_lines[3], MOD .. "+Z restores them once the analysis has finished.")
+  end)
+  st.target_take_guid, st.target_take_name, st.notes, st.confirm = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
+end) end)
+
+test("reanalyze_without_confirm_says_the_values_went_back", function() with_write_stubs({}, function()
+  local K, st = S.K, S.state
+  local undo = reanalyse_stubs(K)
+  local saved = { st.target_take_guid, st.target_take_name, st.separation, st.key_idx, st.scale_idx, st.results,
+    st.notes, st.sample_rate, st.end_time, st.current_time, st.confirm }
+  local ok, err = pcall(function()
+    local function reanalyse(data)
+      st.session_takes["{a}"] = data
+      st.target_take_guid, st.notes, st.confirm = "{a}", {}, nil   -- no edited note: no confirm
+      st.status.text = ""
+      K.request_analyze()
+      eq(st.confirm, nil, "no confirm")
+      eq(st.is_analyzing, true, "the analysis starts")
+      eq(st.status.text, "", "nothing said before the write")
+      at_analysis_end(st)
+      K.analysis_tick()
+      eq(st.is_analyzing, false, "the analysis ended")
+      return st.status.text
+    end
+    eq(reanalyse(analysed_before("{a}")), "Re-analyzed: values back to the defaults (" .. MOD .. "+Z undoes).",
+      "values that differed from the defaults: said")
+    local at_defaults = analysed_before("{a}")
+    at_defaults.overrides, at_defaults.separation = {}, S.DEFAULTS.separation
+    eq(reanalyse(at_defaults), "", "already at the defaults: nothing to say")
+  end)
+  undo()
+  st.target_take_guid, st.target_take_name, st.separation, st.key_idx, st.scale_idx, st.results, st.notes,
+    st.sample_rate, st.end_time, st.current_time, st.confirm = table.unpack(saved, 1, 11)
+  st.is_analyzing, st.analysis_params, st.accessor = false, nil, nil
+  st.stale_takes["{a}"], st.missing_takes["{a}"] = nil, nil
+  st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_keep_says_key_and_scale_are_still_applied", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a = apply_target("a", fr, 0.5, 12)
+    st.session_takes["{a}"] = a.data
+    st.session_order[#st.session_order + 1] = "{a}"
+    local function key_line(keys, keep)
+      st.target_take_guid, st.confirm = "{open}", nil
+      K.apply_open(keys)
+      local c = st.confirm
+      st.confirm = nil
+      eq(c.fit, true, "the Apply confirm takes its content's height")
+      for _, line in ipairs(c.consequence(keep, c.ticked).lines) do
+        if line == "Key and Scale are still applied." then return true end
+      end
+      return false
+    end
+    eq(key_line({ "key_idx", "scale_idx" }, true), true, "Key given, Keep on: said")
+    eq(key_line(nil, true), true, "every value (Key included), Keep on: said")
+    eq(key_line({ "key_idx", "scale_idx" }, false), false, "Keep off: not said")
+    eq(key_line({ "tolerance" }, true), false, "no Key given: not said")
+  end)
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
+  if not ok then error(err, 0) end
+end) end)
+
+-- The Apply confirm takes its content's height: no empty band above the footer, the buttons never clipped
+test("confirm_fit_h_puts_the_footer_under_the_content", function()
+  local K = S.K
+  -- a modal 480 tall whose body is 380: 100 of title bar, padding and footer
+  eq(K.confirm_fit_h(480, 380, 150, 1000), 250, "short content: the modal shrinks to it")
+  eq(K.confirm_fit_h(480, 380, 600, 1000), 700, "long content: the modal grows to it")
+  eq(K.confirm_fit_h(480, 380, 2000, 900), 900, "never taller than the window it opens from allows")
+  eq(K.confirm_fit_h(480, 380, 0, 1000), 101, "no content: the body keeps one pixel, the footer stays")
+  eq(K.confirm_fit_h(480, 380, 150, 50), 101, "a tiny host: the footer is never cut (the constraint caps the rest)")
+end)
+
+test("confirm_fit_due_only_when_the_content_changes", function()
+  local K, c = S.K, {}
+  eq(K.confirm_fit_due(c, "k1", 380, 150), true, "first sight: fit")
+  eq(K.confirm_fit_due(c, "k1", 150, 150), false, "fitted: nothing to do")
+  eq(K.confirm_fit_due(c, "k2", 150, 150), false, "a row ticked, same content size: no move")
+  eq(K.confirm_fit_due(c, "k3", 150, 170), true, "a line more: fit again")
+  eq(K.confirm_fit_due(c, "k3", 160, 170), true, "still off (capped, re-wrapped): once more")
+  eq(K.confirm_fit_due(c, "k3", 160, 170), false, "never a third time for one content: no resize every frame")
+  eq(K.confirm_fit_due(c, "k4", 160, 300), true, "new content: fit again")
+end)
+
+test("confirm_sized_to_its_content_resizes_once_before_it_begins", function()
+  local K, st, L = S.K, S.state, package.loaded["theme"].layout
+  local sizes, cursor, alphas, pops = {}, 0, {}, 0
+  local stubs = {
+    ImGui_IsPopupOpen = function() return true end,
+    ImGui_BeginPopupModal = function() return true, true end,
+    ImGui_BeginChild = function() return true end,
+    ImGui_GetWindowSize = function() return 560, 480 end,
+    ImGui_GetWindowPos = function() return 100, 50 end,
+    ImGui_Viewport_GetPos = function() return 0, 0 end,
+    ImGui_Viewport_GetSize = function() return 800, 600 end,
+    ImGui_GetContentRegionAvail = function() return 520, 400 end,
+    ImGui_GetStyleVar = function() return 4, 4 end,
+    ImGui_GetFrameHeight = function() return 20 end,
+    ImGui_GetTextLineHeight = function() return 14 end,
+    ImGui_CalcTextSize = function() return 40, 14 end,
+    ImGui_GetCursorPosX = function() return 0 end,
+    ImGui_GetCursorPosY = function() cursor = cursor + 1; return (cursor % 2 == 1) and 0 or 104 end,
+    -- the fit's own (no condition): Theme.center_next_window's, at Cond_Appearing, are not counted
+    ImGui_Cond_Appearing = function() return 4 end,
+    ImGui_SetNextWindowSize = function(_, w, h, cond) if cond == nil then sizes[#sizes + 1] = { w = w, h = h } end end,
+    ImGui_StyleVar_Alpha = function() return 99 end,
+    ImGui_PushStyleVar = function(_, var, v) if var == 99 then alphas[#alphas + 1] = v end end,
+    ImGui_PopStyleVar = function() pops = pops + 1 end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local ok, err = pcall(function()
+    S.request_confirm({ id = "fit", title = "T", body_lines = { "One line" }, on_confirm = function() end,
+      fit = true, size = { w = 560, h = 480 },
+      consequence = function() return { lines = {} } end })
+    S.draw_confirm_modal()   -- opens at size.h (Theme.center_next_window) and measures its content: 100
+    local opened = #sizes
+    eq(opened, 0, "nothing resized before it was measured")
+    S.draw_confirm_modal()   -- resized before it begins
+    eq(#sizes, opened + 1, "one resize asked")
+    local body_h = 400 - (4 + L.lg + 4 + 20) - (14 + 4)   -- K.confirm_body_h with the reason's line kept
+    eq(sizes[#sizes].w, 560, "the same width (a narrow docker's fit is kept)")
+    eq(sizes[#sizes].h, K.confirm_fit_h(480, body_h, 100, 480 - L.xl * 2), "the footer right under the content")
+    S.draw_confirm_modal(); S.draw_confirm_modal(); S.draw_confirm_modal()
+    eq(#sizes, opened + 2, "the stubbed body never matches: tried twice for one content, then left alone")
+    eq(#alphas, S.K.CONFIRM_FIT_HIDDEN_MAX, "see-through while it resizes, at most the cap")
+    eq(alphas[1], 0, "alpha 0"); eq(pops >= #alphas, true, "every push popped")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  st.confirm = nil
+  if not ok then error(err, 0) end
+end)
+
+test("confirm_fit_hidden_until_measured", function()
+  local K = S.K
+  eq(K.confirm_fit_hidden({}), false, "a confirm of a fixed size is always drawn")
+  eq(K.confirm_fit_hidden({ fit = true }), true, "not measured yet: see-through")
+  eq(K.confirm_fit_hidden({ fit = true, fit_key = "k", fit_hidden_frames = 1 }), true, "a resize asked: still")
+  eq(K.confirm_fit_hidden({ fit = true, fit_shown = true }), false, "measured with no resize asked: drawn")
+  eq(K.confirm_fit_hidden({ fit = true, fit_hidden_frames = K.CONFIRM_FIT_HIDDEN_MAX }), false,
+    "never measured: shown anyway after a few frames")
 end)
 
 -- Tests appended by later tasks go above this line.

@@ -26,7 +26,7 @@ Pitch Correct analyses one item at a time today. This design adds a batch: every
 
 **Which items qualify.** A selected item qualifies when its active take exists and is audio. Items with a MIDI active take and items with no take are skipped and counted, never analysed. The order of the batch is REAPER's own order of the selection (by track, then by position). "N" below is always the number of qualifying items.
 
-**One undo step.** The models of finished items are held in memory and written together when the batch ends: note model, cleared pitch envelope and, where an item had no visible pitch envelope, creating and showing it. A batch therefore never adds a separate "Show Pitch Envelope" step. The take's pitch mode is left alone, as for a single analysis.
+**One undo step.** The models of finished items are held in memory and written together when the batch ends: note model, pitch envelope written from the model and the item's own values (no points at the starting values: an item that kept its own values, such as a Tighten, gets their correction, as a single Re-Analyze writes) and, where an item had no visible pitch envelope, creating and showing it. A batch therefore never adds a separate "Show Pitch Envelope" step. The take's pitch mode is left alone, as for a single analysis.
 
 ## References
 
