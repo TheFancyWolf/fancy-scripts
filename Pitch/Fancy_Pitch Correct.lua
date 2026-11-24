@@ -2,14 +2,13 @@
 -- @author Fancy Scripts
 -- @version 2.22.0
 -- @changelog
---   Items keep their own copy of the starting values; changing the starting values no longer changes them
---   Items analysed by an earlier version take the current starting values when opened, until edited once
---   The earlier Separation preference is not carried over: new items start at 50%
+--   New and re-analysed items start at the defaults (Separation 50%, Tighten 0%, Tolerance 8 cents...)
+--   Analysing an item again keeps only its Key and Scale; a new item takes the Key and Scale chosen last
 --   Item values now reach every note of the item, edited or not
 --   The top bar changes only this item or the selected notes, never other items; the pill says which
---   Key and Scale in the top bar no longer set the key for new items
---   New: Apply to other items (pill menu, value right-click), with an option to keep changes already made
+--   New: Apply to other items (pill menu, value right-click): only the items you tick change, one undo step
 --   Apply lists the pitched items to tick; the ones selected in the arrange view start ticked
+--   Apply can keep changes already made: item values that differ from the default, notes' own values
 --   New: Reset this item to defaults (pill menu); a value's reset on the item goes to its default
 --   New: Separation with notes selected re-splits just that stretch ("Re-split selected notes")
 --   The values sit in three groups split by hairlines (Notes, Correction, Shaping), named in their tooltips
@@ -179,8 +178,8 @@ end
 -------------------------------------------------------------------------------
 
 -- Factory values of every value control: the single place these numbers live. Double-click on a
--- control, every Settings "Reset" and "Reset section" restore its entry here; the initial `state`
--- and `global_defaults` read from it.
+-- control, every Settings "Reset" and "Reset section" restore its entry here; the initial `state` reads from it,
+-- and every new or re-analysed item starts at these values (K.new_item_values).
 local DEFAULTS = {
   -- Settings presets: the default pick of each list (an index into its table above; the algorithm into PITCHMODE_FLAT)
   preset_range_idx = 1,
@@ -188,7 +187,7 @@ local DEFAULTS = {
   preset_quality_idx = 2,
   preset_pitchmode_idx = DEFAULT_PITCH_MODE_IDX,
   keep_pitch_mode = false,   -- Settings: leave each item's own pitch algorithm alone
-  -- Cascade parameters (Global -> Item -> Note)
+  -- Item values (Item -> Note): every new or re-analysed item starts at these
   retune_speed = 1.0,        -- 0.0–1.0 (correction strength)
   tolerance = 8,             -- 0–50 cents a tightened note may stray from its centre untouched
   separation = 0.5,          -- 0–1 how readily the analysis splits notes (see K.separation_params)
@@ -204,17 +203,6 @@ DEFAULTS.max_freq = VOCAL_RANGES[DEFAULTS.preset_range_idx].max
 DEFAULTS.threshold = DETECTION_MODES[DEFAULTS.preset_mode_idx].threshold
 DEFAULTS.block_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].block
 DEFAULTS.hop_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].hop   -- how many samples to advance per block
-
--- Global cascade defaults (project-wide, persisted in ExtState)
-local global_defaults = {
-  retune_speed = DEFAULTS.retune_speed,
-  tolerance = DEFAULTS.tolerance,
-  -- The starting values (see K.item_seed): every item copies them once, when it is first analysed or first loaded
-  separation = DEFAULTS.separation,
-  correct_mode = DEFAULTS.correct_mode,
-  tighten = DEFAULTS.tighten,
-  slide_in = DEFAULTS.slide_in,
-}
 
 -- User-facing names for the value controls (used in undo labels; never show raw keys)
 local PARAM_LABELS = {
@@ -525,9 +513,13 @@ K.set_pitch_algorithm = function(idx)
   state.pitchmode_value = entry.value
 end
 
--- The value keys an item holds (data.overrides[key]; Separation is data.separation), each copied from the starting
--- values (global_defaults) once, so a later change of a starting value reaches no item that has them
+-- The value keys an item holds (data.overrides[key]; Separation is data.separation). A new item, and an item analysed
+-- again, starts at the script's DEFAULTS for every one of them (K.new_item_values)
 K.ITEM_KEYS = { "separation", "correct_mode", "tighten", "tolerance", "retune_speed", "slide_in" }
+
+-- The Key and Scale last chosen in the bar (K.scale_changed): a new item starts in them. Stored under pitch_key_idx /
+-- pitch_scale_idx (K.PERSIST); an item analysed again keeps its own
+K.new_key = { key_idx = 1, scale_idx = 1 }
 
 --- The item's own value of `key`, or nil (Separation is stored beside the notes, the others in data.overrides).
 K.item_value = function(data, key)
@@ -536,18 +528,20 @@ K.item_value = function(data, key)
   return data.overrides and data.overrides[key]
 end
 
---- A copy of the starting values: every value key of global_defaults, with the key and scale.
-K.start_values = function()
+--- The values a new item starts with: the script's DEFAULTS for every value key, and the Key and Scale last chosen
+--- in the bar (K.new_key).
+K.new_item_values = function()
   local t = {}
-  for _, key in ipairs(K.ITEM_KEYS) do t[key] = global_defaults[key] end
-  t.key_idx, t.scale_idx = global_defaults.key_idx, global_defaults.scale_idx
+  for _, key in ipairs(K.ITEM_KEYS) do t[key] = DEFAULTS[key] end
+  t.key_idx, t.scale_idx = K.new_key.key_idx, K.new_key.scale_idx
   return t
 end
 
---- Fill every missing value of an item's model from the starting values (a model change only: it is written with
---- the item's next save). Returns true when it filled one.
+--- Fill every missing value of an item's model with a new item's (K.new_item_values: the defaults; a model change
+--- only: it is written with the item's next save). A new analysis, and an item analysed before 2.22 that holds no
+--- values, get them here. Returns true when it filled one.
 K.item_seed = function(data)
-  local start, filled = K.start_values(), false
+  local start, filled = K.new_item_values(), false
   for _, key in ipairs(K.ITEM_KEYS) do
     if K.item_value(data, key) == nil then
       if key == "separation" then
@@ -564,37 +558,22 @@ K.item_seed = function(data)
   return filled
 end
 
---- A new analysis of an item analysed before (`before`, its previous model) keeps the item's values: every value
---- `before` holds is copied onto the new model `data`; with `all`, its Separation, Key and Scale too (a single
---- analysis has those already, from the state mirrors). A model change only.
-K.item_carry = function(data, before, all)
+--- A new analysis of an item analysed before (`before`, its previous model) keeps only the item's Key and Scale
+--- (they describe the song, not the analysis); its values start at the defaults (K.item_seed). A model change only.
+K.item_carry_key = function(data, before)
   if not before then return end
-  for _, key in ipairs(K.ITEM_KEYS) do
-    local v = K.item_value(before, key)
-    if v ~= nil then
-      if key == "separation" then
-        if all then data.separation = v end
-      else
-        data.overrides = data.overrides or {}
-        data.overrides[key] = v
-      end
-    end
-  end
-  if all then
-    if before.key_idx ~= nil then data.key_idx = before.key_idx end
-    if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
-  end
+  if before.key_idx ~= nil then data.key_idx = before.key_idx end
+  if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
 end
 
---- How many of the item's values (K.ITEM_KEYS) differ from the script's defaults (DEFAULTS). A missing value follows
---- the starting value, so it counts when the starting value differs. Key and Scale are not values with a default.
+--- How many of the item's values (K.ITEM_KEYS) differ from the script's defaults (DEFAULTS). A missing value is the
+--- default. Key and Scale are not values with a default.
 K.item_off_defaults = function(data)
   if not data then return 0 end
   local n = 0
   for _, key in ipairs(K.ITEM_KEYS) do
     local v = K.item_value(data, key)
-    if v == nil then v = global_defaults[key] end
-    if DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then n = n + 1 end
+    if v ~= nil and DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then n = n + 1 end
   end
   return n
 end
@@ -616,8 +595,8 @@ K.item_reset_values = function(data)
   end
 end
 
---- Resolve an effective value: the note's own, else the target item's, else the starting value (only for an item
---- not yet seeded).
+--- Resolve an effective value: the note's own, else the target item's, else the script's default (an item not
+--- analysed yet, or not seeded).
 local function get_effective(note, key)
   if note and note.controls and note.controls[key] ~= nil then
     return note.controls[key]
@@ -626,18 +605,18 @@ local function get_effective(note, key)
     local v = K.item_value(state.session_takes[state.target_take_guid], key)
     if v ~= nil then return v end
   end
-  return global_defaults[key]
+  return DEFAULTS[key]
 end
 
 --- Returns the override level for display: "note" (the note has its own), "item" (the item differs from the
---- starting value: the "*" mark) or "start".
+--- script's default: the "*" mark) or "default".
 local function get_override_level(note, key)
   if note and note.controls and note.controls[key] ~= nil then return "note" end
   if state.target_take_guid then
     local v = K.item_value(state.session_takes[state.target_take_guid], key)
-    if v ~= nil and v ~= global_defaults[key] then return "item" end
+    if v ~= nil and DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then return "item" end
   end
-  return "start"
+  return "default"
 end
 
 --- Show a short message on the canvas's status pill for STATUS_SECONDS (it replaces the hint there).
@@ -707,14 +686,12 @@ end
 ---   checklist = { caption, all_label, none_label, rows = { { id, name, reason } ... }, ticked = { [id] = true } }:
 ---             a list of rows with a checkbox each (K.confirm_checklist), "All" / "None" beside the caption. A row with
 ---             a `reason` is drawn disabled with the reason beside it (EP2) and is never ticked.
----   only = { label, value, reason }: a checkbox under the list; while it is on, the list and `check` are disabled
----             and `reason` is shown above the list.
 ---   check = { label, value }: a checkbox under the list.
----   consequence = function(only_on, checked, ticked) -> { lines = { string... }, confirm_label = string | nil,
----             reason = string | nil }: what the action does, drawn after the checkboxes. It is called only when
----             the ticked rows, `only` or the check change (HI5) and its answer is kept in state.confirm.cons; its
+---   consequence = function(checked, ticked) -> { lines = { string... }, confirm_label = string | nil,
+---             reason = string | nil }: what the action does, drawn after the checkbox. It is called only when
+---             the ticked rows or the check change (HI5) and its answer is kept in state.confirm.cons; its
 ---             confirm_label replaces the request's, and a `reason` disables the confirm button and is shown above it.
---- on_confirm(only_on, checked, ticked) receives the state of `only`, the check and the ticked rows.
+--- on_confirm(checked, ticked) receives the state of the check and the ticked rows.
 --- size = a Theme.layout modal size (default L.modal_sm).
 local function request_confirm(req)
   if not req or not req.on_confirm then return end
@@ -736,8 +713,6 @@ local function request_confirm(req)
     checklist = req.checklist,
     ticked = ticked,
     ticks_rev = 0,    -- counts the changes to `ticked` (the consequence's cache key)
-    only = req.only,
-    only_on = req.only and req.only.value == true or false,
     check = req.check,
     checked = req.check and req.check.value == true or false,
     consequence = req.consequence,
@@ -749,15 +724,14 @@ local function request_confirm(req)
   }
 end
 
---- The consequence of the confirm `c` for its ticked rows, `only` and check: computed again only when one of them
+--- The consequence of the confirm `c` for its ticked rows and check: computed again only when one of them
 --- (or the project state) changed since the last call (HI5), else the kept answer. nil when the request has no consequence.
 K.confirm_consequence = function(c)
   if not c.consequence then return nil end
   -- The project state counts too: an undo in the arrange view can change what the consequence reads
-  local key = tostring(c.only_on) .. "|" .. tostring(c.checked) .. "|" .. tostring(c.ticks_rev) .. "|"
-    .. tostring(state.cache.count)
+  local key = tostring(c.checked) .. "|" .. tostring(c.ticks_rev) .. "|" .. tostring(state.cache.count)
   if c.cons_key ~= key then
-    c.cons = c.consequence(c.only_on, c.checked, c.ticked) or { lines = {} }
+    c.cons = c.consequence(c.checked, c.ticked) or { lines = {} }
     c.cons_key = key
   end
   return c.cons
@@ -846,15 +820,9 @@ K.PERSIST = (function()
     end)
   end
 
-  -- Global cascade defaults (project-wide), saved when a drag or a typed entry is committed or reset
-  number("cascade", "pitch_retune_speed", global_defaults, "retune_speed", { 0, 1 })
-  number("cascade", "pitch_tolerance", global_defaults, "tolerance", K.LIMITS.tolerance)
-  number("cascade", "pitch_tighten", global_defaults, "tighten", { 0, 1 })
-  number("cascade", "pitch_slide_in", global_defaults, "slide_in", { 0, 1 })
-  choice("cascade", "pitch_correct_mode", global_defaults, "correct_mode", { 0, 1, 2 })
-  number("cascade", "pitch_key_idx", global_defaults, "key_idx", { 1, #SCALE_KEYS })
-  number("cascade", "pitch_scale_idx", global_defaults, "scale_idx", { 1, #SCALE_DEFINITIONS })
-  number("cascade", "pitch_start_separation", global_defaults, "separation", K.LIMITS.separation)
+  -- The Key and Scale a new item starts in (K.new_key), saved when Key or Scale is changed in the bar
+  number("key", "pitch_key_idx", K.new_key, "key_idx", { 1, #SCALE_KEYS })
+  number("key", "pitch_scale_idx", K.new_key, "scale_idx", { 1, #SCALE_DEFINITIONS })
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
   choice("engine", "pitch_block_size", state, "block_size", BLOCK_SIZES)
@@ -922,8 +890,6 @@ end
 
 -- Initialize key, scale, sidebar, and the persisted settings from ExtState
 do
-  -- The starting Key and Scale (global_defaults, stored under pitch_key_idx / pitch_scale_idx by K.PERSIST)
-  global_defaults.key_idx, global_defaults.scale_idx = state.key_idx, state.scale_idx
   local saved_sidebar = reaper.GetExtState("FancyScripts", "pitch_sidebar_open")
   if saved_sidebar == "0" or saved_sidebar == "false" then
     state.sidebar_open = false
@@ -936,11 +902,10 @@ do
   local saved_shortcuts = reaper.GetExtState("FancyScripts", "pitch_shortcuts_open")
   state.shortcuts_open = not (saved_shortcuts == "0" or saved_shortcuts == "false")
 
-  -- Restore the global cascade defaults, the engine settings, the layers and the panel width
+  -- Restore the Key for new items, the engine settings, the layers and the panel width
   K.load_settings()
-  -- Nothing is open yet: the window shows the starting values
-  state.key_idx, state.scale_idx, state.separation = global_defaults.key_idx, global_defaults.scale_idx,
-    global_defaults.separation
+  -- Nothing is open yet: the window shows a new item's values
+  state.key_idx, state.scale_idx, state.separation = K.new_key.key_idx, K.new_key.scale_idx, DEFAULTS.separation
   update_scale_pitch_classes()
   -- A panel the user never resized takes its width from the Shortcuts list (see K.panel_fit_w), on the first frame
   state.sidebar_auto = not reaper.HasExtState("FancyScripts", "pitch_sidebar_w")
@@ -1650,6 +1615,10 @@ K.analysis_begin = function(take, item, opts)
   local guid = get_take_guid(take)
   if guid then state.target_take_guid = guid end
   state.target_take_name = reaper.GetTakeName(take) or state.target_take_name
+  -- An item analysed before starts again at the defaults: it is split at the default Separation, not its own (its
+  -- Key and Scale stay). An item not analysed yet uses the Separation the bar shows for it (the default, unless it
+  -- was set for this item before its first analysis)
+  if guid and state.session_takes[guid] then state.separation = DEFAULTS.separation end
 
   state.start_time = 0 -- Relative to item start
   state.item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
@@ -2454,9 +2423,8 @@ local function save_take_data(take, data, json)
 end
 
 --- Save the active Key/Scale as the open item's own (one named undo point, so Cmd+Z reverts it together with the
---- Key/Scale selection). It is not a starting value: new items start from those (K.start_values). An item not
---- analysed yet keeps it in state.key_idx / state.scale_idx, and its first analysis stores it. `undo_label`: "Set Key"
---- or "Set Scale" (K.scale_changed).
+--- Key/Scale selection). An item not analysed yet keeps it in state.key_idx / state.scale_idx, and its first
+--- analysis stores it. `undo_label`: "Set Key" or "Set Scale" (K.scale_changed).
 local function save_current_scale_settings(undo_label)
   if state.target_take_guid and state.session_takes[state.target_take_guid] then
     local data = state.session_takes[state.target_take_guid]
@@ -2822,8 +2790,8 @@ end
 
 --- Write the finished items of a batch: `done` = { { guid, data, json | nil, empty } ... }. Everything goes into
 --- ONE undo block: per item, its Pitch envelope is created and shown where it was missing and written from its model
---- and its own values (K.write_take_envelope: item values reach every note, so an item that kept a Tighten of its
---- own is corrected; at the starting values nothing is, and the envelope is left with no points), and its model is
+--- and its own values (K.write_take_envelope: item values reach every note; at the defaults nothing is corrected,
+--- and the envelope is left with no points), and its model is
 --- stored on the take; the take's pitch mode is left alone, as for a single analysis. An item that is no longer in
 --- the project, whose Pitch envelope cannot be made or whose correction cannot be built, is left out and stays as
 --- it was.
@@ -2920,9 +2888,9 @@ K.batch_finish = function(cancelled)
   if open_guid then
     adopt_take_data(open_guid, state.session_takes[open_guid])
   else
-    -- Nothing written and the item that was open has no analysis: back to it, not analysed (the starting values)
+    -- Nothing written and the item that was open has no analysis: back to it, not analysed (a new item's values)
     reset_analysis_model()
-    K.adopt_start_values()
+    K.adopt_new_item_values()
     state.target_take_guid, state.target_take_name = batch.prev_guid, batch.prev_name
     local take = batch.prev_guid and resolve_take_by_guid(batch.prev_guid, true) or nil
     local item = take and K.take_item(take) or nil
@@ -2962,15 +2930,13 @@ K.batch_next = function()
       -- The canvas follows the item in progress: it becomes the open item, with nothing analysed yet
       reset_analysis_model()
       state.target_take_guid, state.target_take_name = entry.guid, entry.name
-      -- It is split at, and stores, its own Separation, Key and Scale (an item analysed for the first time: the
-      -- starting values), never those of the item that was open. An analysis stored on the item that the window has
-      -- not loaded (pasted later) counts too: it is read here and kept on the entry for K.batch_item_done
-      local before, start = state.session_takes[entry.guid], K.start_values()
+      -- It is split at the default Separation and keeps its own Key and Scale (an item analysed for the first time:
+      -- the ones last chosen), never those of the item that was open. An analysis stored on the item that the window
+      -- has not loaded (pasted later) counts too: it is read here and kept on the entry for K.batch_item_done
+      local before, start = state.session_takes[entry.guid], K.new_item_values()
       if not before then before = load_take_data(take) end
       entry.before = before
-      local sep = K.item_value(before, "separation")
-      if sep == nil then sep = start.separation end
-      state.separation = sep
+      state.separation = start.separation
       state.key_idx = before and before.key_idx or start.key_idx
       state.scale_idx = before and before.scale_idx or start.scale_idx
       update_scale_pitch_classes()
@@ -2993,9 +2959,9 @@ K.batch_item_done = function(take_data)
     K.batch_item_failed(nil)
     return
   end
-  -- An item analysed before keeps every value of its own (Separation, Key and Scale too: K.batch_next set them
-  -- before it was read); an item analysed for the first time has the starting values
-  K.item_carry(take_data, state.session_takes[entry.guid] or entry.before, true)
+  -- An item analysed before keeps its Key and Scale (K.batch_next set them before it was read); its values are the
+  -- defaults, as for an item analysed for the first time
+  K.item_carry_key(take_data, state.session_takes[entry.guid] or entry.before)
   batch.done[#batch.done + 1] = {
     guid = take_data.guid, data = take_data, json = K.take_json(take_data),
     empty = (take_data.notes == nil or #take_data.notes == 0),
@@ -3034,9 +3000,9 @@ K.analysis_progress = function()
   return state.progress or 0
 end
 
---- The open item has no stored data: Separation, Key and Scale are the starting values.
-K.adopt_start_values = function()
-  local start = K.start_values()
+--- The open item has no stored data: Separation is the default, Key and Scale the ones last chosen.
+K.adopt_new_item_values = function()
+  local start = K.new_item_values()
   state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
   update_scale_pitch_classes()
 end
@@ -3061,7 +3027,7 @@ local function switch_active_target(guid, take_obj)
     adopt_take_data(guid, data)
     return true
   end
-  K.adopt_start_values()   -- not analysed yet: it shows, and its first analysis uses, the starting values
+  K.adopt_new_item_values()   -- not analysed yet: it shows, and its first analysis uses, a new item's values
   return false
 end
 
@@ -3921,6 +3887,9 @@ end
 K.scale_changed = function(what)
   local undo_label = (what == "scale") and "Set Scale" or "Set Key"
   update_scale_pitch_classes()
+  -- The next new item starts in this Key and Scale (ExtState: a preference, not part of the item's undo point)
+  K.new_key.key_idx, K.new_key.scale_idx = state.key_idx, state.scale_idx
+  K.save_settings("key")
   local data = state.target_take_guid and state.session_takes[state.target_take_guid]
   local count = data and K.mode_note_count(state.notes or {}) or 0
   if count == 0 then
@@ -5275,9 +5244,9 @@ local function process_analysis_step()
         scale_idx = state.scale_idx,
         separation = state.separation,
       }
-      -- An item analysed before keeps its values (its Separation, Key and Scale are the state mirrors above, set by
-      -- adopt_take_data or, in a batch, by K.batch_next); a first analysis copies the starting values
-      K.item_carry(take_data, state.session_takes[state.target_take_guid], false)
+      -- Every new analysis starts at the defaults (K.item_seed); its Separation, Key and Scale are the state mirrors
+      -- above (K.analysis_begin or, in a batch, K.batch_next put the default Separation; the Key and Scale are the
+      -- item's own, or for a new item the ones last chosen)
       K.item_seed(take_data)
       if K.batch then
         -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item.
@@ -9453,7 +9422,7 @@ K.INFO_SECTIONS = {
     { "▾ / ▸ (section header)", "Collapse / expand the section" },
     { "Checkbox (item row)", "Pitch envelope active / bypassed" },
     { "× (item row)", "Remove the item from Pitched Items" },
-    { "* after a value", "Set for this item only" },
+    { "* after a value", "Differs from the default (a note: from its item)" },
   } },
 }
 K.INFO_TERMS = "Reset reverts note edits · Clear discards analysis · Remove drops an item · Wipe removes all"
@@ -10657,16 +10626,15 @@ end
 -- The most rows a confirm's checklist shows before it scrolls
 K.CHECKLIST_MAX_ROWS = 6
 
---- The targets of a confirm dialog (request_confirm's `checklist`, `only` and `check`): the caption with "All" and
---- "None" beside it, the rows in a region that scrolls past K.CHECKLIST_MAX_ROWS (only the rows in view are drawn),
---- then the checkboxes. A row's name that does not fit is shortened (its tooltip has it in full); a row with a reason
---- is disabled, the reason beside it in dim text (shortened too when the row is narrow, its tooltip in full). While `only` is on, the list and the check are disabled and
---- only.reason says why. A click changes c.ticked / c.only_on / c.checked; the consequence follows on the next frame.
+--- The targets of a confirm dialog (request_confirm's `checklist` and `check`): the caption with "All" and "None"
+--- beside it, the rows in a region that scrolls past K.CHECKLIST_MAX_ROWS (only the rows in view are drawn), then the
+--- checkbox. A row's name that does not fit is shortened (its tooltip has it in full); a row with a reason is
+--- disabled, the reason beside it in dim text (shortened too when the row is narrow, its tooltip in full). A click
+--- changes c.ticked / c.checked; the consequence follows on the next frame.
 K.confirm_targets = function(c, P, L)
   local list = c.checklist
   if list then
     reaper.ImGui_Dummy(ctx, 0, L.sm)
-    if c.only_on then reaper.ImGui_BeginDisabled(ctx) end
     if list.caption then
       reaper.ImGui_AlignTextToFramePadding(ctx)
       reaper.ImGui_Text(ctx, list.caption)
@@ -10679,12 +10647,6 @@ K.confirm_targets = function(c, P, L)
     if reaper.ImGui_SmallButton(ctx, (list.none_label or "None") .. "###confirm_tick_none") then
       K.confirm_tick_all(c, false)
     end
-    if c.only_on then reaper.ImGui_EndDisabled(ctx) end
-    if c.only_on and c.only.reason then
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
-      reaper.ImGui_TextWrapped(ctx, c.only.reason)
-      reaper.ImGui_PopStyleColor(ctx, 1)
-    end
 
     local rows = list.rows
     local row_h = reaper.ImGui_GetFrameHeightWithSpacing(ctx)
@@ -10692,7 +10654,6 @@ K.confirm_targets = function(c, P, L)
     local list_h = math.max(1, math.min(#rows, K.CHECKLIST_MAX_ROWS)) * row_h + (pad_y or L.sm) * 2
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.well)
     if reaper.ImGui_BeginChild(ctx, "##confirm_checklist", 0, list_h, reaper.ImGui_ChildFlags_Borders()) then
-      if c.only_on then reaper.ImGui_BeginDisabled(ctx) end
       -- A clipper of its own, attached to the context (see K.confirm_list)
       if not K.checklist_clipper or not reaper.ImGui_ValidatePtr(K.checklist_clipper, "ImGui_ListClipper*") then
         K.checklist_clipper = reaper.ImGui_CreateListClipper(ctx)
@@ -10741,23 +10702,14 @@ K.confirm_targets = function(c, P, L)
           reaper.ImGui_PopID(ctx)
         end
       end
-      if c.only_on then reaper.ImGui_EndDisabled(ctx) end
       reaper.ImGui_EndChild(ctx)
     end
     reaper.ImGui_PopStyleColor(ctx, 1)
   end
-  local lock_check = c.only_on and c.only ~= nil
   if c.check then
     reaper.ImGui_Dummy(ctx, 0, L.xs)
-    if lock_check then reaper.ImGui_BeginDisabled(ctx) end
     local changed, on = reaper.ImGui_Checkbox(ctx, c.check.label .. "###confirm_check", c.checked)
-    if changed and not lock_check then c.checked = on == true end
-    if lock_check then reaper.ImGui_EndDisabled(ctx) end
-  end
-  if c.only then
-    reaper.ImGui_Dummy(ctx, 0, L.xs)
-    local changed, on = reaper.ImGui_Checkbox(ctx, c.only.label .. "###confirm_only", c.only_on)
-    if changed then c.only_on = on == true end
+    if changed then c.checked = on == true end
   end
 end
 
@@ -10817,7 +10769,7 @@ local function draw_confirm_modal()
         reaper.ImGui_Dummy(ctx, 0, L.sm)
         reaper.ImGui_TextWrapped(ctx, line)
       end
-      if c.checklist or c.check or c.only then K.confirm_targets(c, P, L) end
+      if c.checklist or c.check then K.confirm_targets(c, P, L) end
       if cons then
         for _, line in ipairs(cons.lines or {}) do
           reaper.ImGui_Dummy(ctx, 0, L.sm)
@@ -10864,7 +10816,7 @@ local function draw_confirm_modal()
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
   if confirmed then
     c.confirmed = true
-    c.on_confirm(c.only_on, c.checked, c.ticked)
+    c.on_confirm(c.checked, c.ticked)
   end
 
   if c.opened and not reaper.ImGui_IsPopupOpen(ctx, popup_name) then
@@ -11375,7 +11327,7 @@ end
 -- 3c. APPLY TO OTHER ITEMS
 -------------------------------------------------------------------------------
 -- Design: docs/design/pitch-correct-value-levels.md (Apply). The open item's values (all of them, or one) are given
--- to other pitched items and become the starting values for new items. The confirm (K.apply_open, in the GUI
+-- to the other pitched items the user ticks; nothing else is changed (no ExtState). The confirm (K.apply_open, in the GUI
 -- section) names the consequence from a pure plan (K.apply_plan); the run (K.apply_run) computes one item at a time
 -- while the window keeps answering, then writes every finished item in ONE undo block. It runs as K.batch with
 -- kind = "apply", so the window treats it as a batch: values and rows locked, progress on the "…" button, Cancel
@@ -11483,21 +11435,21 @@ end
 
 --- What Apply would do. Pure: reads its arguments only (and the note splitter for the edited notes a re-split
 --- loses). src = the values given ({ key = v }); entries = K.apply_ticked_entries's; keys = the keys given; keep = "Keep
---- changes already made to items and notes"; old_start = the starting values before Apply (K.start_values()).
+--- changes already made to items and notes".
 --- Returns plan = { items = { { guid, name, set = { key = v }, clear_note_keys = { key ... }, resplit, key_change,
 --- lost, changes } ... }, counts = { items_lose, notes_lose, key_change, resplit, lost, not_resplit, skipped },
 --- changed = how many items change }.
----   set: the values that differ from the item's. With keep, a value the item holds that differs from old_start is
----        left out (the user's), and so is Separation on an item whose notes carry edits (it is not split again:
----        counted in not_resplit).
----   items_lose: the items whose own values (ones that differ from old_start) are replaced; key_change: the items
+---   set: the values that differ from the item's. With keep, a value the item holds that differs from the script's
+---        default (DEFAULTS) is left out (the user's), and so is Separation on an item whose notes carry edits (it is
+---        not split again: counted in not_resplit). Key and Scale have no default: Keep never holds them back.
+---   items_lose: the items whose own values (ones that differ from the default) are replaced; key_change: the items
 ---        whose Key or Scale is set.
 ---   clear_note_keys: without keep, the given note keys that any note holds a value of its own for (notes_lose
 ---        counts those notes); with keep, none.
 ---   resplit: Separation is set and the item has analysed frames; lost = its edited notes the new split does not
 ---        match (K.resplit_match).
 --- An entry whose take is not in the project, or is MIDI, or has no model, gets no row: it is counted in skipped.
-K.apply_plan = function(src, entries, keys, keep, old_start)
+K.apply_plan = function(src, entries, keys, keep)
   local plan = { items = {}, changed = 0,
     counts = { items_lose = 0, notes_lose = 0, key_change = 0, resplit = 0, lost = 0, not_resplit = 0, skipped = 0 } }
   local counts = plan.counts
@@ -11516,7 +11468,9 @@ K.apply_plan = function(src, entries, keys, keep, old_start)
       local item_lose = false
       for _, key in ipairs(keys) do
         local v, cur = src[key], K.apply_item_get(data, key)
-        local own = keep and cur ~= nil and old_start[key] ~= nil and K.value_changed(cur, old_start[key])
+        -- A value of the item's own: it differs from the script's default
+        local differs = cur ~= nil and DEFAULTS[key] ~= nil and K.value_changed(cur, DEFAULTS[key])
+        local own = keep and differs
         if v ~= nil and not own and K.value_changed(cur, v) then
           if key == "separation" and keep and edited then
             counts.not_resplit = counts.not_resplit + 1
@@ -11524,8 +11478,8 @@ K.apply_plan = function(src, entries, keys, keep, old_start)
             row.set[key] = v
             if key == "key_idx" or key == "scale_idx" then
               row.key_change = true
-            elseif cur ~= nil and old_start[key] ~= nil and K.value_changed(cur, old_start[key]) then
-              item_lose = true   -- a value of its own (not the starting value) is replaced
+            elseif differs then
+              item_lose = true   -- a value of its own (not the default) is replaced
             end
           end
         end
@@ -11612,32 +11566,26 @@ end
 --- The closing message of an Apply. r = { written, skipped, cancelled, total }.
 K.apply_summary = function(r)
   if r.cancelled then
-    if r.written == 0 then return "Apply cancelled. No item was changed. The starting values were saved." end
-    return string.format("Apply cancelled. %d of %d items were changed and kept (%s+Z undoes them). The starting values were saved.",
+    if r.written == 0 then return "Apply cancelled. No item was changed." end
+    return string.format("Apply cancelled. %d of %d items were changed and kept (%s+Z undoes them).",
       r.written, r.total, K.MOD_LABEL)
   end
   if r.skipped > 0 then return string.format("Applied to %d items. %d skipped: no audio.", r.written, r.skipped) end
-  return string.format("Applied to %d items (%s+Z undoes the items).", r.written, K.MOD_LABEL)
+  return string.format("Applied to %d items (%s+Z undoes them).", r.written, K.MOD_LABEL)
 end
-K.APPLY_START_ONLY = "Starting values saved for new items."
+K.APPLY_NOTHING = "Nothing was changed: the ticked items already have these values."
 
---- Run an Apply: `plan` (K.apply_plan's), `keys` (the keys given), `src` (their values), label (the one value's
---- name, or nil). The starting values are saved first (global_defaults, ExtState): they stay whatever happens to the
---- run. Then the items that change are computed one after another (K.apply_tick), and written in one undo block
---- when the run ends (K.apply_finish).
-K.apply_run = function(plan, keys, src, label)
+--- Run an Apply: `plan` (K.apply_plan's), label (the one value's name, or nil). The items that change are computed one after another (K.apply_tick), and written in one undo
+--- block when the run ends (K.apply_finish). Nothing outside the items is written: one Cmd+Z undoes all of it.
+K.apply_run = function(plan, label)
   if K.batch or state.is_analyzing then return false end
-  for _, key in ipairs(keys) do
-    if src[key] ~= nil then global_defaults[key] = src[key] end
-  end
-  K.save_settings("cascade")
   local queue = {}
   for _, row in ipairs(plan.items) do
     -- Never the open item: its canvas holds its model (K.apply_open's on_confirm already refuses a changed item)
     if row.changes and row.guid ~= state.target_take_guid then queue[#queue + 1] = { guid = row.guid, name = row.name, row = row, len = 1 } end
   end
   if #queue == 0 then
-    set_status(K.APPLY_START_ONLY)
+    set_status(K.APPLY_NOTHING)
     return true
   end
   if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge is its own undo point
@@ -12374,15 +12322,15 @@ end
 -- the selection pill and one value control per entry of BAR_VALUES (a drag with its text inside and a range fill
 -- under it). The note actions (Snap, Quantize, Split, Merge) share the bar's enable rules and reasons
 -- (K.note_actions_frame) but are drawn on the canvas, under the selected note (K.draw_note_bar). A value control edits what the
--- pill names: the selected notes, else this item. The bar never changes the starting values (the values a new
--- item copies once, global_defaults): only "Apply to other items" does.
+-- pill names: the selected notes, else this item. The bar never changes other items: only "Apply to other items"
+-- does. A new or re-analysed item starts at the script's DEFAULTS.
 -- K.bar_measure gives their widths, each from its longest label, so a value, an override mark or a selection
 -- never changes the layout; K.bar_frame returns the function that draws one unit this frame. The top bar
 -- (above) decides where they go. The status line that used to sit beside them is a pill on the canvas
 -- (K.canvas_status).
 
 do
-  -- Appended to a value that differs from the level above it: this item's from the starting value, a selected
+  -- Appended to a value that differs from the level above it: this item's from the script's default, a selected
   -- note's from the item's
   local BAR_OVERRIDE_MARK = "*"
   -- Shown in place of a value that does not exist for what is selected
@@ -12402,7 +12350,7 @@ do
   local BAR_SCOPE_ITEM = "Changes this item."
   local BAR_SCOPE_NOTE = "Changes the selected note."
   local BAR_SCOPE_NOTES = "Changes the %d selected notes; each keeps its difference from the others."
-  local BAR_LEVELS = "Starting value: %s. This item: %s."
+  local BAR_LEVELS = "Default: %s. This item: %s."
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = "Not used yet: raise Tighten first."
@@ -12436,7 +12384,6 @@ do
     to_item = "Edits go to: this item",
     to_note = "Edits go to: the selected note",
     to_notes = "Edits go to: the %d selected notes",
-    start = "Starting values: %s",
     apply = "Apply to other items\xE2\x80\xA6",
     reset = "Reset this item to defaults",
     reset_none = "Already at the defaults",
@@ -12448,7 +12395,7 @@ do
 
   -- The values of the bar, in the order they are shown. key = the model's key; label = the name on the control;
   -- lo / hi / num / unit = the range and the text in display units (scale x the stored value); levels = where the
-  -- value exists: "all" (starting value, item, note; Separation has no note level of its own: see draw_separation);
+  -- value exists: "all" (default, item, note; Separation has no note level of its own: see draw_separation);
   -- tip = what the value does to the sound.
   local BAR_VALUES = {
     { id = "tight", key = "tighten", label = "Tighten", lo = 0, hi = 100, scale = 100, num = "%.0f", unit = "%",
@@ -12558,7 +12505,7 @@ do
   --- The bar's write path: give the `sel_n` notes of `sel_notes` their own value `v` of `key` (stored units; 0 is a
   --- value of its own), or, with none, this item (data.overrides, Separation data.separation and state.separation;
   --- an item not analysed yet keeps its Separation in state.separation, and its first analysis stores it). A model
-  --- change only: the caller writes the envelope (one undo point). Never a starting value, never ExtState.
+  --- change only: the caller writes the envelope (one undo point). Never another item, never ExtState.
   K.bar_write = function(key, v, sel_notes, sel_n)
     if sel_n > 0 then
       for i = 1, sel_n do sel_notes[i].controls[key] = v end
@@ -12590,7 +12537,7 @@ do
       local data = state.target_take_guid and state.session_takes[state.target_take_guid]
       if not data then return false end
       local default, now = DEFAULTS[key], K.item_value(data, key)
-      if now == nil then now = global_defaults[key] end
+      if now == nil then now = default end
       if default ~= nil and K.value_changed(now, default) then
         K.bar_write(key, default, sel_notes, 0)
         changed = true
@@ -12636,16 +12583,12 @@ do
     caption = "Apply to:",
     tick_all = "All",
     tick_none = "None",
-    only = "New items only: change no item, just save the starting values",
-    only_reason = "Untick \"New items only\" to pick items.",
     tick_some = "Tick at least one item",
     none_tickable = "No item here can be changed",
     check = "Keep changes already made to items and notes",
     consequence = "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost).",
     keep = "%d items with edited notes are not split again.",
-    footnote = "These also become the starting values for new items (that part can't be undone with %s+Z).",
     confirm = "Apply (%d)",
-    confirm_new = "Save starting values",
     nothing = "Nothing would change",
     changed = "The item changed meanwhile. Nothing was applied.",
   }
@@ -12680,24 +12623,17 @@ do
 
   --- "Apply to other items…" (keys nil: every value, Key and Scale included) or "Apply <Value> to other items…"
   --- (keys = { key }, or Key and Scale): the confirm with its checklist of the other pitched items (ticked at first:
-  --- the ones selected in the arrange view, or every one when none is), "Keep changes…" and "New items only". The
-  --- consequence is planned when the confirm opens and again when the ticked rows, the check or "New items only"
-  --- change (HI5). HC4: the starting values are ExtState, so it always asks.
+  --- the ones selected in the arrange view, or every one when none is) and "Keep changes…". The consequence is
+  --- planned when the confirm opens and again when the ticked rows or the check change (HI5). Apply writes only the
+  --- ticked items, in one undo block (HC4: one Cmd+Z restores it); the confirm stays, as the place to pick them.
   K.apply_open = function(keys)
     keys = keys or K.APPLY_ALL_KEYS
     if state.confirm or K.apply_reason() == BAR_REASON_ANALYZING then return end
     local label = nil
     if #keys == 1 or (#keys == 2 and keys[1] == "key_idx") then label = APPLY_LABEL[keys[1]] end
     local src = K.apply_source(keys)
-    local old_start = K.start_values()
     local rows = K.apply_rows()
     local ticked = K.apply_initial_ticks(rows, K.apply_selected_guids())
-    -- The starting values Apply would change (it saves them whatever is ticked)
-    local start_changes = false
-    for _, key in ipairs(keys) do
-      if src[key] ~= nil and K.value_changed(old_start[key], src[key]) then start_changes = true end
-    end
-    local footnote = string.format(APPLY_COPY.footnote, K.MOD_LABEL)
     -- Only a Separation given splits items again: the keep line is about that alone
     local gives_sep = false
     for _, key in ipairs(keys) do if key == "separation" then gives_sep = true end end
@@ -12706,12 +12642,12 @@ do
     -- Planned from the rows of now: an undo in the arrange view while the confirm is up reloads the pitched items
     -- (state.session_takes) and may take one out of the project. The ticks carry over by guid. Also says whether
     -- any row can be ticked at all
-    local function plan_for(only_on, checked, ticks)
+    local function plan_for(checked, ticks)
       local now_rows = K.apply_rows()
       local tickable = false
       for _, row in ipairs(now_rows) do if not row.reason then tickable = true end end
-      local entries = only_on and {} or K.apply_ticked_entries(now_rows, K.apply_carry_ticks(now_rows, ticks or {}))
-      return K.apply_plan(src, entries, keys, checked, old_start), #entries, tickable
+      local entries = K.apply_ticked_entries(now_rows, K.apply_carry_ticks(now_rows, ticks or {}))
+      return K.apply_plan(src, entries, keys, checked), #entries, tickable
     end
     request_confirm({
       id = "apply",
@@ -12719,41 +12655,35 @@ do
       body_lines = { K.apply_values_line(src, keys) },
       checklist = { caption = APPLY_COPY.caption, all_label = APPLY_COPY.tick_all, none_label = APPLY_COPY.tick_none,
         rows = rows, ticked = ticked },
-      only = { label = APPLY_COPY.only, value = next(ticked) == nil, reason = APPLY_COPY.only_reason },
       check = { label = APPLY_COPY.check, value = false },
       size = Theme.layout.modal_md,
-      confirm_label = APPLY_COPY.confirm_new,
-      consequence = function(only_on, checked, ticks)
-        local plan, n_ticked, tickable = plan_for(only_on, checked, ticks)
+      confirm_label = string.format(APPLY_COPY.confirm, 0),
+      consequence = function(checked, ticks)
+        local plan, n_ticked, tickable = plan_for(checked, ticks)
         local c = plan.counts
         local lines = {}
-        if not only_on and n_ticked > 0 then
+        if n_ticked > 0 then
           lines[1] = string.format(APPLY_COPY.consequence, c.items_lose, c.notes_lose, c.key_change, c.resplit, c.lost)
           if checked and gives_sep then lines[#lines + 1] = string.format(APPLY_COPY.keep, c.not_resplit) end
         end
-        lines[#lines + 1] = footnote
-        local out = { lines = lines }
-        if not only_on and n_ticked == 0 then
-          out.confirm_label = string.format(APPLY_COPY.confirm, 0)
+        local out = { lines = lines, confirm_label = string.format(APPLY_COPY.confirm, plan.changed) }
+        if n_ticked == 0 then
           out.reason = tickable and APPLY_COPY.tick_some or APPLY_COPY.none_tickable
-        elseif only_on or plan.changed == 0 then
-          out.confirm_label = APPLY_COPY.confirm_new
-          if not start_changes then out.reason = APPLY_COPY.nothing end
-        else
-          out.confirm_label = string.format(APPLY_COPY.confirm, plan.changed)
+        elseif plan.changed == 0 then
+          out.reason = APPLY_COPY.nothing
         end
         return out
       end,
-      on_confirm = function(only_on, checked, ticks)
+      on_confirm = function(checked, ticks)
         -- The open item changed while the confirm was up (the selection follower): the values and the targets were
         -- read for another item, and the new open item may be one of the targets
         if state.target_take_guid ~= open_guid then
           set_status(APPLY_COPY.changed)
           return
         end
-        local plan, n_ticked = plan_for(only_on, checked, ticks)
-        if not only_on and n_ticked == 0 then return end
-        K.apply_run(plan, keys, src, label)
+        local plan, n_ticked = plan_for(checked, ticks)
+        if n_ticked == 0 then return end
+        K.apply_run(plan, label)
       end,
     })
   end
@@ -12925,7 +12855,7 @@ do
     ---   lo_v, hi_v  the value in display units; with several notes, their lowest and highest
     ---   mixed       the selected notes do not all show the same value
     ---   marked      the value differs from the level above: a selected note's from the item's, else this item's
-    ---               from the starting value (the "*" mark)
+    ---               from the script's default (the "*" mark)
     ---   target      "item" or "notes": what a drag changes
     ---   blank       there is no value to show; disabled / reason: the control cannot be used, and why
     local views = {}
@@ -12952,7 +12882,7 @@ do
       else
         view.lo_v, view.hi_v = item_v, item_v
         view.marked = get_override_level(nil, key) == "item"
-          and differs(item_v, (tonumber(global_defaults[key]) or 0) * spec.scale)
+          and differs(item_v, (tonumber(DEFAULTS[key]) or 0) * spec.scale)
       end
       if inspector_reason then
         view.disabled, view.reason = true, inspector_reason
@@ -12974,10 +12904,10 @@ do
       return spec.label .. " " .. spec.num .. unit .. mark
     end
 
-    --- The last line of a value's tooltip: its starting value and this item's (stored units).
+    --- The last line of a value's tooltip: its default and this item's (stored units).
     local function levels_line(spec, item_raw)
       local function text(raw) return string.format(spec.num, (tonumber(raw) or 0) * spec.scale) .. spec.unit end
-      return string.format(BAR_LEVELS, text(global_defaults[spec.key]), text(item_raw))
+      return string.format(BAR_LEVELS, text(DEFAULTS[spec.key]), text(item_raw))
     end
 
     --- Tooltip for the item just drawn, gated on the hover delay. A disabled item passes
@@ -13165,46 +13095,17 @@ do
       end
     end
 
-    --- The starting values in one line (the pill menu's readout): Key and Scale, then every value of the bar.
-    local function start_values_line()
-      local start = K.start_values()
-      local function value_text(id, short)
-        local spec = BAR_VALUE_BY_ID[id]
-        return (short or spec.label) .. " " .. string.format(spec.num, (tonumber(start[spec.key]) or 0) * spec.scale)
-          .. spec.unit
-      end
-      local key_info, scale_info = SCALE_KEYS[start.key_idx], SCALE_DEFINITIONS[start.scale_idx]
-      local parts = {}
-      if key_info and scale_info then parts[#parts + 1] = key_info.display .. " " .. scale_info.name end
-      parts[#parts + 1] = value_text("sep", "Sep")
-      parts[#parts + 1] = K.MODES[(tonumber(start.correct_mode) or 0) + 1] or K.MODES[1]
-      parts[#parts + 1] = value_text("tight")
-      parts[#parts + 1] = value_text("tol", "Tol")
-      parts[#parts + 1] = value_text("strength")
-      parts[#parts + 1] = value_text("slide")
-      return string.format(BAR_PILL_MENU.start, table.concat(parts, " \xC2\xB7 "))
-    end
-
-    --- The pill's menu: where edits go, the starting values, Apply to other items… and Reset this item to
-    --- defaults. A disabled entry says why beside it (EP2: readable with tooltips off).
+    --- The pill's menu: where edits go, Apply to other items… and Reset this item to defaults. A disabled entry says
+    --- why beside it (EP2: readable with tooltips off).
     local function draw_pill_menu(open_x, open_y)
       -- Under the pill: set right before BeginPopup (a tooltip in between would take the position)
       if open_x then reaper.ImGui_SetNextWindowPos(bctx, open_x, open_y) end
       if not reaper.ImGui_BeginPopup(bctx, "##bar_pill_menu") then return end
       -- HC5: Esc closes this menu (innermost)
       if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
-      local L = Theme.layout
       local to = (sel_n == 0) and BAR_PILL_MENU.to_item or (sel_n == 1) and BAR_PILL_MENU.to_note
         or string.format(BAR_PILL_MENU.to_notes, sel_n)
       reaper.ImGui_TextColored(bctx, P.text_dim, to)
-      -- The readout is as wide as the menu's widest entry with its reason; the full line is in its tooltip
-      local menu_w = math.max(bar_text_w(bctx, to),
-        bar_text_w(bctx, BAR_PILL_MENU.reset) + L.xl + bar_text_w(bctx, BAR_PILL_MENU.reset_none),
-        bar_text_w(bctx, BAR_PILL_MENU.apply) + L.xl + bar_text_w(bctx, BAR_MENU_APPLY_NONE))
-      local line = start_values_line()
-      local fitted = hdr_fit_text(line, menu_w)
-      reaper.ImGui_TextColored(bctx, P.text_dim, fitted)
-      if fitted ~= line then bar_tooltip(line) end
       reaper.ImGui_Separator(bctx)
 
       K.apply_menu_item(bctx, BAR_PILL_MENU.apply, nil)
@@ -13252,9 +13153,9 @@ do
         bar_sep_before = nil
       end
 
-      local start = tonumber(global_defaults[key]) or DEFAULTS[key]
+      local default = DEFAULTS[key]
       local marked = has_target
-        and string.format(spec.num, state[key] * spec.scale) ~= string.format(spec.num, start * spec.scale)
+        and string.format(spec.num, state[key] * spec.scale) ~= string.format(spec.num, default * spec.scale)
       reaper.ImGui_BeginDisabled(bctx, disabled)
       reaper.ImGui_PushItemWidth(bctx, s.unit_w[spec.id])
       local fmt = spec.label .. " " .. spec.num .. (spec.unit:gsub("%%", "%%%%")) .. (marked and (" " .. BAR_OVERRIDE_MARK) or "")
@@ -13332,7 +13233,7 @@ do
       local scope = (sel_n == 0) and BAR_MODE.scope_item or (sel_n == 1) and BAR_MODE.scope_note
         or string.format(BAR_MODE.scope_notes, sel_n)
       local function mode_name(raw) return K.MODES[(tonumber(raw) or 0) + 1] or K.MODES[1] end
-      local levels = string.format(BAR_LEVELS, mode_name(global_defaults.correct_mode),
+      local levels = string.format(BAR_LEVELS, mode_name(DEFAULTS.correct_mode),
         mode_name(get_effective(nil, "correct_mode")))
       local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
         w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
@@ -13755,7 +13656,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
            request_confirm = request_confirm, draw_confirm_modal = draw_confirm_modal, sync_with_project = sync_with_project,
-           get_effective = get_effective, get_override_level = get_override_level, global_defaults = global_defaults,
+           get_effective = get_effective, get_override_level = get_override_level,
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w }
 end
 main()
