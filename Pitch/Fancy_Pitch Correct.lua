@@ -559,6 +559,28 @@ K.item_seed = function(data)
   return filled
 end
 
+--- A new analysis of an item analysed before (`before`, its previous model) keeps the item's values: every value
+--- `before` holds is copied onto the new model `data`; with `all`, its Separation, Key and Scale too (a single
+--- analysis has those already, from the state mirrors). A model change only.
+K.item_carry = function(data, before, all)
+  if not before then return end
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = K.item_value(before, key)
+    if v ~= nil then
+      if key == "separation" then
+        if all then data.separation = v end
+      else
+        data.overrides = data.overrides or {}
+        data.overrides[key] = v
+      end
+    end
+  end
+  if all then
+    if before.key_idx ~= nil then data.key_idx = before.key_idx end
+    if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
+  end
+end
+
 --- How many of the item's values (K.ITEM_KEYS, Key, Scale) differ from the starting values. A missing value
 --- follows the starting value, so it does not count.
 K.item_differs = function(data)
@@ -2842,8 +2864,9 @@ K.batch_finish = function(cancelled)
   if open_guid then
     adopt_take_data(open_guid, state.session_takes[open_guid])
   else
-    -- Nothing written and the item that was open has no analysis: back to it, not analysed
+    -- Nothing written and the item that was open has no analysis: back to it, not analysed (the starting values)
     reset_analysis_model()
+    K.adopt_start_values()
     state.target_take_guid, state.target_take_name = batch.prev_guid, batch.prev_name
     local take = batch.prev_guid and resolve_take_by_guid(batch.prev_guid, true) or nil
     local item = take and K.take_item(take) or nil
@@ -2883,6 +2906,15 @@ K.batch_next = function()
       -- The canvas follows the item in progress: it becomes the open item, with nothing analysed yet
       reset_analysis_model()
       state.target_take_guid, state.target_take_name = entry.guid, entry.name
+      -- It is split at, and stores, its own Separation, Key and Scale (an item analysed for the first time: the
+      -- starting values), never those of the item that was open
+      local before, start = state.session_takes[entry.guid], K.start_values()
+      local sep = K.item_value(before, "separation")
+      if sep == nil then sep = start.separation end
+      state.separation = sep
+      state.key_idx = before and before.key_idx or start.key_idx
+      state.scale_idx = before and before.scale_idx or start.scale_idx
+      update_scale_pitch_classes()
       if K.analysis_begin(take, item, { sample_rate = entry.sample_rate, defer_envelope = true }) then return end
     end
     batch.failed = batch.failed + 1
@@ -2902,13 +2934,9 @@ K.batch_item_done = function(take_data)
     K.batch_item_failed(nil)
     return
   end
-  -- An item analysed before keeps its own Key and Scale (the model was built with those of the item that was
-  -- open when the batch started); an item analysed for the first time takes the current ones, as a single analysis does
-  local before = state.session_takes[entry.guid]
-  if before then
-    take_data.key_idx = before.key_idx or take_data.key_idx
-    take_data.scale_idx = before.scale_idx or take_data.scale_idx
-  end
+  -- An item analysed before keeps every value of its own (Separation, Key and Scale too: K.batch_next set them
+  -- before it was read); an item analysed for the first time has the starting values
+  K.item_carry(take_data, state.session_takes[entry.guid], true)
   batch.done[#batch.done + 1] = {
     guid = take_data.guid, data = take_data, json = K.take_json(take_data),
     empty = (take_data.notes == nil or #take_data.notes == 0),
@@ -5170,6 +5198,9 @@ local function process_analysis_step()
         scale_idx = state.scale_idx,
         separation = state.separation,
       }
+      -- An item analysed before keeps its values (its Separation, Key and Scale are the state mirrors above, set by
+      -- adopt_take_data or, in a batch, by K.batch_next); a first analysis copies the starting values
+      K.item_carry(take_data, state.session_takes[state.target_take_guid], false)
       K.item_seed(take_data)
       if K.batch then
         -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item.

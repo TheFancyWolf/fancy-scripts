@@ -2534,7 +2534,8 @@ local function with_batch(fn)
   local saved_model = { st.results, st.notes, st.split_points, st.analysis_empty, st.progress }
   local rec = { begun = {}, writes = {} }
   K.analysis_begin = function(take, _, opts)
-    rec.begun[#rec.begun + 1] = { take = take, sr = opts and opts.sample_rate, defer = opts and opts.defer_envelope }
+    rec.begun[#rec.begun + 1] = { take = take, sr = opts and opts.sample_rate, defer = opts and opts.defer_envelope,
+      sep = st.separation, key_idx = st.key_idx, scale_idx = st.scale_idx }
     if rec.refuse and rec.refuse[take] then return false, "accessor" end
     st.is_analyzing = true
     return true
@@ -2798,6 +2799,94 @@ test("batch_fails_a_long_item_that_gave_no_audio", function() with_batch(functio
   st.analysis_params = nil
   eq(#K.batch.done, 0, "never stored as an analysis without notes"); eq(K.batch.failed, 1)
   eq(rec.begun[#rec.begun].take, "b")
+end) end)
+
+-- The item values survive a new analysis (spec: an item holds a value for every key; only a first analysis copies
+-- the starting values)
+local ITEM_VALS = { correct_mode = 2, tighten = 0.3, tolerance = 33, retune_speed = 77, slide_in = 0.4 }
+-- The running analysis reaches its end on the next tick (nothing left to read)
+local function at_analysis_end(st)
+  st.is_analyzing, st.results, st.sample_rate, st.end_time, st.current_time = true, {}, 48000, 0, 0
+  st.analysis_params = { block_size = 1024, hop_size = 512, threshold = 0.1, min_freq = 65, max_freq = 1000 }
+end
+local function analysed_before(guid)
+  local ov = {}
+  for k, v in pairs(ITEM_VALS) do ov[k] = v end
+  return { guid = guid, name = guid, overrides = ov, separation = 0.8, key_idx = 5, scale_idx = 3, notes = {}, results = {} }
+end
+local function check_item_vals(data, what)
+  for k, v in pairs(ITEM_VALS) do eq(S.K.item_value(data, k), v, what .. " keeps its " .. k) end
+end
+
+test("reanalyse_keeps_the_items_values", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate,
+    st.end_time, st.current_time, #st.session_order }
+  local ok, err = pcall(function()
+    st.session_takes["{z}"] = analysed_before("{z}")
+    st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{z}", 0.8, 5, 3   -- adopt_take_data's mirrors
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = st.session_takes["{z}"]
+    eq(st.is_analyzing, false, "the analysis ended")
+    check_item_vals(data, "a re-analysed item")
+    eq(data.separation, 0.8); eq(data.key_idx, 5); eq(data.scale_idx, 3)
+  end)
+  st.session_takes["{z}"], st.missing_takes["{z}"], st.stale_takes["{z}"] = nil, nil, nil
+  while #st.session_order > saved[10] do table.remove(st.session_order) end
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate, st.end_time,
+    st.current_time = table.unpack(saved, 1, 9)
+  st.is_analyzing, st.analysis_params = false, nil
+  if not ok then error(err, 0) end
+end)
+
+test("batch_keeps_a_previously_analysed_items_values", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local saved = { st.separation, st.key_idx, st.scale_idx }
+  local ok, err = pcall(function()
+    st.session_takes["{a}"] = analysed_before("{a}")
+    st.separation, st.key_idx, st.scale_idx = 0.2, 1, 1   -- the open item (not a) when the batch starts
+    K.batch_start(entries3())
+    eq(rec.begun[1].sep, 0.8, "a is split at its own Separation")
+    eq(rec.begun[1].key_idx, 5); eq(rec.begun[1].scale_idx, 3)
+    at_analysis_end(st)
+    K.analysis_tick()   -- a is finished through the real path (process_analysis_step, batch_item_done)
+    local data = K.batch.done[1].data
+    check_item_vals(data, "an item of a batch")
+    eq(data.separation, 0.8, "its Separation"); eq(data.key_idx, 5); eq(data.scale_idx, 3)
+    -- the same, when the model handed over lacks them (it was built some other way)
+    st.session_takes["{b}"] = analysed_before("{b}")
+    K.batch_item_done(model("{b}"))
+    check_item_vals(K.batch.done[2].data, "b"); eq(K.batch.done[2].data.separation, 0.8)
+  end)
+  st.session_takes["{a}"], st.session_takes["{b}"] = nil, nil
+  st.separation, st.key_idx, st.scale_idx = table.unpack(saved, 1, 3)
+  st.analysis_params = nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("batch_first_analysis_takes_the_starting_values", function() with_batch(function(rec)
+  local K, st = S.K, S.state
+  local G = S.global_defaults
+  local saved = { st.separation, st.key_idx, st.scale_idx, G.key_idx, G.scale_idx }
+  local ok, err = pcall(function()
+    G.key_idx, G.scale_idx = 2, 4
+    st.session_takes["{o}"] = analysed_before("{o}")   -- the open item, with values of its own
+    st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{o}", 0.8, 5, 3
+    K.batch_start(entries3())
+    local start = K.start_values()
+    eq(rec.begun[1].sep, start.separation, "a new item is split at the starting Separation")
+    eq(rec.begun[1].key_idx, 2); eq(rec.begun[1].scale_idx, 4)
+    at_analysis_end(st)
+    K.analysis_tick()
+    local data = K.batch.done[1].data
+    eq(data.separation, start.separation); eq(data.key_idx, 2, "the starting Key"); eq(data.scale_idx, 4)
+    for _, key in ipairs(K.ITEM_KEYS) do eq(K.item_value(data, key), start[key], "the starting " .. key) end
+  end)
+  st.session_takes["{o}"] = nil
+  st.separation, st.key_idx, st.scale_idx, G.key_idx, G.scale_idx = table.unpack(saved, 1, 5)
+  st.analysis_params = nil
+  if not ok then error(err, 0) end
 end) end)
 
 test("batch_request_asks_about_notes_the_list_does_not_know", function()
