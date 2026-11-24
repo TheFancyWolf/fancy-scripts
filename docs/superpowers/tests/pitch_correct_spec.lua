@@ -4419,7 +4419,7 @@ end)
 
 test("confirm_sized_to_its_content_resizes_once_before_it_begins", function()
   local K, st, L = S.K, S.state, package.loaded["theme"].layout
-  local sizes, cursor = {}, 0
+  local sizes, cursor, alphas, pops = {}, 0, {}, 0
   local stubs = {
     ImGui_IsPopupOpen = function() return true end,
     ImGui_BeginPopupModal = function() return true, true end,
@@ -4438,6 +4438,9 @@ test("confirm_sized_to_its_content_resizes_once_before_it_begins", function()
     -- the fit's own (no condition): Theme.center_next_window's, at Cond_Appearing, are not counted
     ImGui_Cond_Appearing = function() return 4 end,
     ImGui_SetNextWindowSize = function(_, w, h, cond) if cond == nil then sizes[#sizes + 1] = { w = w, h = h } end end,
+    ImGui_StyleVar_Alpha = function() return 99 end,
+    ImGui_PushStyleVar = function(_, var, v) if var == 99 then alphas[#alphas + 1] = v end end,
+    ImGui_PopStyleVar = function() pops = pops + 1 end,
   }
   for k, v in pairs(stubs) do reaper[k] = v end
   local ok, err = pcall(function()
@@ -4454,10 +4457,22 @@ test("confirm_sized_to_its_content_resizes_once_before_it_begins", function()
     eq(sizes[#sizes].h, K.confirm_fit_h(480, body_h, 100, 480 - L.xl * 2), "the footer right under the content")
     S.draw_confirm_modal(); S.draw_confirm_modal(); S.draw_confirm_modal()
     eq(#sizes, opened + 2, "the stubbed body never matches: tried twice for one content, then left alone")
+    eq(#alphas, S.K.CONFIRM_FIT_HIDDEN_MAX, "see-through while it resizes, at most the cap")
+    eq(alphas[1], 0, "alpha 0"); eq(pops >= #alphas, true, "every push popped")
   end)
   for k in pairs(stubs) do reaper[k] = nil end
   st.confirm = nil
   if not ok then error(err, 0) end
+end)
+
+test("confirm_fit_hidden_until_measured", function()
+  local K = S.K
+  eq(K.confirm_fit_hidden({}), false, "a confirm of a fixed size is always drawn")
+  eq(K.confirm_fit_hidden({ fit = true }), true, "not measured yet: see-through")
+  eq(K.confirm_fit_hidden({ fit = true, fit_key = "k", fit_hidden_frames = 1 }), true, "a resize asked: still")
+  eq(K.confirm_fit_hidden({ fit = true, fit_shown = true }), false, "measured with no resize asked: drawn")
+  eq(K.confirm_fit_hidden({ fit = true, fit_hidden_frames = K.CONFIRM_FIT_HIDDEN_MAX }), false,
+    "never measured: shown anyway after a few frames")
 end)
 
 -- Tests appended by later tasks go above this line.

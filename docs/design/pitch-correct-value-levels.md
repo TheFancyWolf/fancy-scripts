@@ -205,7 +205,7 @@ Keyboard map: HC5 Esc, innermost first: the Apply confirm (Cancel) → the pill 
 | pill menu rows | `Theme.selectable` / `reaper.ImGui_MenuItem`, readout via `reaper.ImGui_TextDisabled`-free dim text | `P.text_dim`, `L.sm` |
 | group separators | existing hairline (`P.border`) | `L.xl` group gap (existing `hdr_gap_before`) |
 | Notes, Correction and Shaping values | existing `param_drag`, the default font | as today; width measured in the font drawn (LG3) |
-| Apply confirm | the existing confirm modal path (`request_confirm` with `fit`), `Theme.center_next_window`, `Theme.modal_scrim` | `L.modal_md` where it opens; then its content's height (`K.confirm_fit_h`), up to what the window it opens from allows (`K.fit_modal`), the footer right under the content |
+| Apply confirm | the existing confirm modal path (`request_confirm` with `fit`), `Theme.center_next_window`, `Theme.modal_scrim` | `L.modal_md` where it opens; then its content's height (`K.confirm_fit_h`), up to what the window it opens from allows (`K.fit_modal`), the footer right under the content; drawn see-through (`StyleVar_Alpha` 0, scrim as usual) until measured (`K.confirm_fit_hidden`), so the opening size never flashes |
 | radios / checkbox | `reaper.ImGui_RadioButton`, `reaper.ImGui_Checkbox` (stock, themed by `Theme.push`) | |
 | tooltips | `Theme.tooltip` via the bar's `bar_tooltip` (AllowWhenDisabled) | |
 

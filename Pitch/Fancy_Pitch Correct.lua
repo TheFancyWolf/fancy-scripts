@@ -10594,6 +10594,15 @@ end
 --- one content (the second try mends a first frame measured short), so a body capped by max_h or a scrollbar that
 --- re-wraps the text never makes it resize every frame, and ticking rows that keep the content's size never moves
 --- it. Returns true when it should be resized now.
+--- True while the confirm `c` (sized to its content) is drawn see-through: from its first frame until a frame has
+--- measured its content and asked for no resize (c.fit_shown), so the size it opens at and a second try never
+--- flash. At most K.CONFIRM_FIT_HIDDEN_MAX frames (c.fit_hidden_frames), so a body never measured still shows.
+--- Only the opening: a later change of content resizes in view. Pure.
+K.CONFIRM_FIT_HIDDEN_MAX = 3
+K.confirm_fit_hidden = function(c)
+  return c.fit == true and not c.fit_shown and (c.fit_hidden_frames or 0) < K.CONFIRM_FIT_HIDDEN_MAX
+end
+
 K.confirm_fit_due = function(c, key, body_h, content_h)
   if c.fit_key ~= key then c.fit_key, c.fit_tries = key, 0 end
   if (c.fit_tries or 0) >= 2 or math.abs(content_h - body_h) < 1 then return false end
@@ -10781,6 +10790,12 @@ local function draw_confirm_modal()
     c.fit_size = nil
   end
   Theme.modal_scrim(ctx, popup_name)
+  -- Not measured yet: drawn see-through (the scrim as usual) until it has its content's height
+  local hidden = K.confirm_fit_hidden(c)
+  if hidden then
+    c.fit_hidden_frames = (c.fit_hidden_frames or 0) + 1
+    reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_Alpha(), 0)
+  end
   local visible, open = reaper.ImGui_BeginPopupModal(ctx, popup_name, true, reaper.ImGui_WindowFlags_NoResize())
   local confirmed = false
   local confirm_label = (cons and cons.confirm_label) or c.confirm_label
@@ -10845,6 +10860,8 @@ local function draw_confirm_modal()
           local h = K.confirm_fit_h(win_h, body_h, content_h, max_h)
           c.fit_size = { x = win_x, y = win_y + (win_h - h) * 0.5, w = win_w, h = h }
         end
+      else
+        c.fit_shown = true   -- measured and no resize asked: drawn in full from the next frame
       end
     end
 
@@ -10881,6 +10898,7 @@ local function draw_confirm_modal()
 
     reaper.ImGui_EndPopup(ctx)
   end
+  if hidden then reaper.ImGui_PopStyleVar(ctx, 1) end
 
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
   if confirmed then
