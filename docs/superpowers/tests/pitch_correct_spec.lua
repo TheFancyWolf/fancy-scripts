@@ -1740,6 +1740,22 @@ test("octave_fix_at_phrase_start_and_end", function()
   all_near(fr, 60, 1e-9, "pitch")
 end)
 
+test("octave_fix_spike_left_by_a_glide", function()   -- 01_Vox1 at 193.84: down 12.4 st, back up only 10.7 st
+  local fr = oct_frames({ { 30, 60 } })
+  for i, f in ipairs(fr) do f.note = 62 + (i <= 12 and 0 or 1.7) end
+  fr[11].note, fr[12].note = 62 - 12.4, 62 - 12.4 + 0.2
+  eq(S.K.octave_fix(fr), 2, "frames changed")
+  near(fr[11].note, 61.6, 1e-9, "put back by an octave")
+  near(fr[12].note, 61.8, 1e-9, "put back by an octave")
+  -- the same return long after the jump down is a sung leap, not a return: the jump down does not count either way
+  local held = oct_frames({ { 40, 60 } })
+  for x = 21, 40 do held[x].note = x <= 36 and 48 or 58.7 end
+  eq(S.K.octave_fix(held), 0, "a return after 171 ms is judged with JUMP_TOL_ST")
+  -- a jump into the wrong octave still needs JUMP_TOL_ST
+  local enter = oct_frames({ { 20, 60 }, { 3, 70.5 }, { 20, 60 } })
+  eq(S.K.octave_fix(enter), 0, "a 10.5 st jump up is not an octave")
+end)
+
 test("octave_fix_two_octaves", function()
   local fr = oct_frames({ { 20, 60 }, { 3, 84 }, { 20, 60 } })
   eq(S.K.octave_fix(fr), 3, "frames changed")

@@ -4,6 +4,9 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.21.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Octave spikes on a moving pitch:
+  - **Put back while the voice glides**: a short spike an octave too low or too high inside a note was left in when the pitch moved during the spike, so the jump back was not a whole octave (down 12.4 semitones, back up 10.7). A jump back soon after counts as one if it is within 2 semitones of an octave; a jump into the wrong octave still has to be within 1.
+  - **Analyze again**: items analysed before keep their old readings until you analyze them again.
 - **Fancy Pitch Correct v2.21.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Analyze All Selected Items:
   - **Analyze many items at once**: with two or more audio items selected in REAPER, the button on an item that is not analysed yet reads "Analyze All Selected Items" and analyses them one after another. The lines under it say how many items it will take; MIDI and empty items are skipped. With one item selected it is "Analyze Item" as before, and a note says that several can be analysed at once.
   - **From any item**: "Analyze Selected Items (N)" in the "…" menu does the same from an item that already has notes. With fewer than two audio items selected it is greyed out and says why. Analyze / Re-Analyze still acts on the open item only.

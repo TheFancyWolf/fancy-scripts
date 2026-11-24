@@ -1,12 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.21.0
+-- @version 2.21.1
 -- @changelog
---   Analyze All Selected Items: with two or more audio items selected in REAPER, the button on an empty item analyzes all of them, one after another, as one undo step. The same command is in the "…" menu as "Analyze Selected Items (N)"
---   Before a batch replaces notes you already have, it asks once and lists those items
---   Cancel during a batch keeps the items already finished; a closing message says how many were analyzed
---   Re-Analyze now reads the true pitch of an item that has corrections (it used to read the corrected sound)
---   The Pitched Items list cannot be changed while an analysis runs
+--   A short octave spike inside a gliding note is now put back: the pitch may move a little while it is read an octave off
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -4406,14 +4402,15 @@ K.pitch_track = function(results, sample_rate)
 end
 
 --- Octave errors of the pitch detection (K.octave_fix): JUMP_TOL_ST = how far from a whole number of octaves a
---- frame-to-frame jump may be and still count as an octave jump; MAX_RUN_S = the longest stretch that is put back (a
---- longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames are in;
---- MIN_MAJORITY_S = how much of that window those frames must fill to be trusted (fewer are no majority).
-K.OCTAVE = { JUMP_TOL_ST = 1.0, MAX_RUN_S = 0.15, WINDOW_S = 0.25, MIN_MAJORITY_S = 0.03 }
+--- frame-to-frame jump may be and still count as an octave jump; RETURN_TOL_ST = the same for a jump that undoes the
+--- last octave jump within MAX_RUN_S (the pitch may have glided meanwhile); MAX_RUN_S = the longest stretch that is
+--- put back (a longer one may be a sung leap); WINDOW_S = how far each way a stretch looks for the octave most frames
+--- are in; MIN_MAJORITY_S = how much of that window those frames must fill to be trusted (fewer are no majority).
+K.OCTAVE = { JUMP_TOL_ST = 1.0, RETURN_TOL_ST = 2.0, MAX_RUN_S = 0.15, WINDOW_S = 0.25, MIN_MAJORITY_S = 0.03 }
 
 --- Puts short octave-off stretches of analysed frames back (`results`: time-ordered { time, note | nil, freq | nil }).
 --- Within each stretch of frames that all have a pitch, a frame-to-frame jump of a whole number of octaves (within
---- JUMP_TOL_ST) starts a new octave class. A run of one class no longer than MAX_RUN_S belongs to the class that
+--- JUMP_TOL_ST, or RETURN_TOL_ST when it undoes the last such jump soon after) starts a new octave class. A run of one class no longer than MAX_RUN_S belongs to the class that
 --- strictly most frames within WINDOW_S of it are in (with no such class, or one of fewer frames than MIN_MAJORITY_S,
 --- it stays). Each frame of the run then moves
 --- by the octaves between the two classes only when that brings it closer to the middle pitch of that majority's
@@ -4432,10 +4429,20 @@ K.octave_fix = function(results)
       local j = i   -- the stretch i..j
       while j + 1 <= n and results[j + 1].note do j = j + 1 end
       local class = { [i] = 0 }
+      local entry_k, entry_t   -- the last octave jump: its octaves and the time of its frame
       for q = i + 1, j do
         local d = results[q].note - results[q - 1].note
         local k = math.floor(d / 12 + 0.5)
-        class[q] = class[q - 1] + ((k ~= 0 and math.abs(d - 12 * k) <= O.JUMP_TOL_ST) and k or 0)
+        local err = math.abs(d - 12 * k)
+        -- a jump back that undoes the last octave jump soon after counts with RETURN_TOL_ST: the voice may have
+        -- glided while the reading was off
+        local back = entry_k and k == -entry_k and results[q].time - entry_t <= O.MAX_RUN_S
+        if k ~= 0 and (err <= O.JUMP_TOL_ST or (back and err <= O.RETURN_TOL_ST)) then
+          class[q] = class[q - 1] + k
+          entry_k, entry_t = k, results[q].time
+        else
+          class[q] = class[q - 1]
+        end
       end
       local moves, q = {}, i   -- decided on the classes as detected, applied afterwards
       while q <= j do
