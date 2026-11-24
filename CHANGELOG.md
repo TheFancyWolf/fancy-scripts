@@ -4,6 +4,12 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.23.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Remove several Pitched Items at once:
+  - **Select rows**: in the Pitched Items list, a click still opens the item and now selects only that row; Cmd-click (Ctrl on Windows) adds or removes a row and Shift-click selects a range, without changing the open item. Selected rows are tinted; the open item keeps its accent bar and bold name.
+  - **Remove the selected rows**: with two or more rows selected, a "Remove Selected" button appears on the line of the "On" heading. One confirm names how many items and up to five of them, and the removal is one undo step, "Remove N Items from Pitched Items".
+  - **Row menu**: right-click any row for Remove This Item…, Remove Selected Items (N)… and Wipe All Items (N)… (the same Wipe as in Settings).
+  - **Esc**: after the note selection, Esc puts the row selection back to just the open item, then closes the window when it is floating.
+  - **Bigger Analyze button**: the Analyze Item / Analyze All Selected Items button on an item that is not analysed yet is about twice as tall, in a larger font, and filled with the accent colour so it stands out.
 - **Fancy Pitch Correct v2.22.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Value levels and Apply to other items:
   - **New and re-analysed items start at the defaults**: a new item starts at Separation 50%, Mode Natural, Tighten 0%, Tolerance 8¢, Strength 100% and Slide In 0%. Analysing an item again starts it at the defaults too, and splits it at Separation 50%; only its Key and Scale are kept. The Re-Analyze and Analyze Selected Items confirms say so, and with no confirm the status line does once the analysis is written. Clearing or removing the open item's analysis (or undoing it away) also brings it back to a new item's values, so its next analysis splits at 50%. Items analysed by an earlier version keep the values stored with them, and an item with none uses the defaults.
   - **Item values now reach every note**: an item's value is used by every note of the item that has no value of its own, edited or not (before, a note you had not edited ignored the item's Tighten). So raising the item's Tighten on an item with no edits now writes a correction.
