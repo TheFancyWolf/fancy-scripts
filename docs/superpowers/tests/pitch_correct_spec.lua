@@ -2730,7 +2730,11 @@ test("take_json_is_what_save_writes", function() with_write_stubs({}, function(r
     eq(json:find(part, 1, true) ~= nil, true, "stored text holds " .. part)
   end
   eq(json:find('"count"', 1, true), nil, "only what a note needs to be loaded again is stored")
-  S.K.batch_write({ { guid = "{a}", data = data } })   -- no text prepared: made at the write
+  -- no text prepared: made at the write (the note above is not one a correction can be built from)
+  local build = S.K.correction_build
+  S.K.correction_build = function() return { points = {} } end
+  S.K.batch_write({ { guid = "{a}", data = data } })
+  S.K.correction_build = build
   eq(rec.stored.a, json)
 end) end)
 
@@ -3793,6 +3797,81 @@ test("apply_refuses_when_the_open_item_changed", function() with_write_stubs({},
   K.batch = nil
   st.status.text, st.status.hold = "", nil
   if not ok then error(err, 0) end
+end) end)
+
+-- A batch writes each item's envelope from its model and its own values (what K.envelope_check expects)
+-- fn(rec, pts) runs K.batch_write with envelope points recorded per envelope: pts[env] = { { time, val, shape } ... }
+local function with_point_stubs(fn)
+  with_write_stubs({}, function(rec)
+    local st = S.state
+    local pts, modes = {}, {}
+    local clear = reaper.DeleteEnvelopePointRange
+    reaper.DeleteEnvelopePointRange = function(env, ...) clear(env, ...); pts[env] = {} end
+    reaper.InsertEnvelopePointEx = function(env, _, t, v, shape)
+      pts[env] = pts[env] or {}
+      table.insert(pts[env], { time = t, val = v, shape = shape })
+    end
+    reaper.CountEnvelopePointsEx = function(env) return #(pts[env] or {}) end
+    reaper.GetEnvelopePointEx = function(env, _, i)
+      local p = (pts[env] or {})[i + 1]
+      if not p then return false end
+      return true, p.time, p.val, p.shape
+    end
+    reaper.GetMediaItemInfo_Value = function(_, key) if key == "D_LENGTH" then return 10 end return 0 end
+    reaper.SetMediaItemTakeInfo_Value = function(take, key) modes[#modes + 1] = { take = take, key = key } end
+    local saved_target = st.target_take_guid
+    st.target_take_guid = "{other}"   -- the window has another item open
+    local ok, err = pcall(fn, rec, pts, modes)
+    st.target_take_guid = saved_target
+    for _, name in ipairs({ "InsertEnvelopePointEx", "CountEnvelopePointsEx", "GetEnvelopePointEx",
+      "GetMediaItemInfo_Value", "SetMediaItemTakeInfo_Value" }) do reaper[name] = nil end
+    if not ok then error(err, 0) end
+  end)
+end
+
+test("batch_writes_the_correction_of_kept_item_values", function() with_point_stubs(function(rec, pts, modes)
+  local K, st = S.K, S.state
+  local data = { guid = "{a}", name = "A", results = {}, item_len = 10, sample_rate = 44100,
+    notes = { wobbly_untouched(0.1) } }
+  K.item_seed(data)
+  data.overrides.tighten, data.overrides.tolerance = 0.3, 0   -- the item kept its own Tighten 30%
+  local written = K.batch_write({ { guid = "{a}", data = data, json = K.take_json(data), empty = false } })
+  eq(#written, 1); eq(rec.begin, 1, "one undo block"); eq(rec.labels[1], "Analyze Pitch (1 item)")
+  eq(st.undo_open, false)
+  local moved = false
+  for _, p in ipairs(pts.env_a or {}) do if math.abs(p.val) > 1e-6 then moved = true end end
+  eq(moved, true, "the item's Tighten corrects its note: the envelope holds the correction")
+  eq(K.envelope_check("{a}"), false, "the envelope is what the model and the item's values produce: not Outdated")
+  eq(rec.stored.a, written[1].json, "the model is stored with the text the batch prepared")
+  eq(#modes, 0, "the take's pitch mode is left alone, as for a single analysis")
+  eq(st.target_take_guid, "{other}", "the open item is still the target")
+end) end)
+
+test("batch_leaves_a_fresh_item_uncorrected", function() with_point_stubs(function(rec, pts, modes)
+  local K = S.K
+  local data = { guid = "{a}", name = "A", results = {}, item_len = 10, sample_rate = 44100,
+    notes = { wobbly_untouched(0.1) } }
+  K.item_seed(data)   -- the starting values: they correct nothing
+  local written = K.batch_write({ { guid = "{a}", data = data, json = K.take_json(data), empty = false } })
+  eq(#written, 1); eq(rec.begin, 1)
+  eq(#(pts.env_a or {}), 0, "no points: a cleared envelope, as before")
+  eq(K.envelope_check("{a}"), false, "not Outdated")
+  eq(#modes, 0, "pitch mode left alone")
+end) end)
+
+test("batch_leaves_out_an_item_whose_correction_cannot_be_built", function() with_point_stubs(function(rec)
+  local K, st = S.K, S.state
+  local build, said = K.correction_build, nil
+  K.correction_build = function() error("bad note") end
+  reaper.ShowConsoleMsg = function(msg) said = msg end
+  local d = done2()
+  d[1].data.notes = { wobbly_untouched(0.1) }; K.item_seed(d[1].data)
+  local ok, err = pcall(K.batch_write, d)
+  K.correction_build, reaper.ShowConsoleMsg = build, nil
+  if not ok then error(err, 0) end
+  eq(#err, 1, "only b is written"); eq(err[1].guid, "{b}"); eq(rec.stored.a, nil, "a left as it was")
+  eq(st.session_takes["{a}"], nil); eq(rec.labels[1], "Analyze Pitch (1 item)"); eq(st.undo_open, false)
+  eq(tostring(said):find("bad note", 1, true) ~= nil, true, "the console says why")
 end) end)
 
 -- Tests appended by later tasks go above this line.

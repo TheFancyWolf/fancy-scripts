@@ -2795,9 +2795,12 @@ K.batch_summary = function(r)
 end
 
 --- Write the finished items of a batch: `done` = { { guid, data, json | nil, empty } ... }. Everything goes into
---- ONE undo block: per item, its Pitch envelope is created and shown where it was missing and cleared of points (a
---- fresh analysis corrects nothing), and its model is stored on the take; the take's pitch mode is left alone. An
---- item that is no longer in the project, or whose Pitch envelope cannot be made, is left out and stays as it was.
+--- ONE undo block: per item, its Pitch envelope is created and shown where it was missing and written from its model
+--- and its own values (K.write_take_envelope: item values reach every note, so an item that kept a Tighten of its
+--- own is corrected; at the starting values nothing is, and the envelope is left with no points), and its model is
+--- stored on the take; the take's pitch mode is left alone, as for a single analysis. An item that is no longer in
+--- the project, whose Pitch envelope cannot be made or whose correction cannot be built, is left out and stays as
+--- it was.
 --- With no item left in the project no undo block is opened. Returns the entries of `done` that were written.
 K.batch_write = function(done)
   local ready = {}
@@ -2813,13 +2816,21 @@ K.batch_write = function(done)
   state.undo_open = true
   for _, r in ipairs(ready) do
     local guid, data = r.entry.guid, r.entry.data
+    -- Without its Pitch envelope the item cannot be corrected: it is left as it was (not written)
     local env = ensure_take_pitch_envelope(r.take, r.item, true)
-    if env then   -- without its Pitch envelope the item cannot be corrected: it is left as it was (not written)
-      local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(r.item, "D_LENGTH") or 0)
-      reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
-      reaper.Envelope_SortPointsEx(env, -1)
-      save_take_data(r.take, data, r.entry.json)
+    local ok, wrote = false, false
+    if env then
+      -- The correction reads the item's values from its session model: it is the item's model while it is built.
+      -- The pitch mode is kept, as for a single analysis (process_analysis_step)
+      local old = state.session_takes[guid]
       state.session_takes[guid] = data
+      ok, wrote = pcall(K.write_take_envelope, guid, data, true, r.take, r.item, r.entry.json)
+      if not ok then
+        reaper.ShowConsoleMsg("Fancy Pitch Correct: an item could not be written: " .. tostring(wrote) .. "\n")
+      end
+      if not (ok and wrote) then state.session_takes[guid] = old end
+    end
+    if ok and wrote then
       local listed = false
       for _, g in ipairs(state.session_order) do
         if g == guid then listed = true; break end
@@ -3749,15 +3760,16 @@ end
 --- the target (get_effective and K.item_scale read the target's item values), as K.envelope_check does; the
 --- target comes back even when the build raises. The model is stored only when it is the session's model of
 --- `guid` (state.session_takes[guid] == data). The take's pitch mode is set as for an edit unless keep_pitch_mode
---- (or the Settings option state.keep_pitch_mode). take / item: the caller's, when it resolved them already.
+--- (or the Settings option state.keep_pitch_mode). take / item: the caller's, when it resolved them already. json:
+--- the model's text when the caller prepared it already (K.take_json).
 --- Returns false when the take or its Pitch envelope is not there (nothing written but the pitch mode).
-K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item)
+K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item, json)
   if not data then return false end
   take = take or (guid and resolve_take_by_guid(guid, true)) or nil
   item = item or (take and K.take_item(take)) or nil
   if not take or not item then return false end
 
-  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
+  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0)
 
   -- Does the correction reach any note? (the item's values reach unedited notes too.) A take whose notes are all
   -- bypassed, or that has none, gets a clean envelope
@@ -3805,7 +3817,7 @@ K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item)
   reaper.Envelope_SortPointsEx(env, -1)
 
   -- Model (P_EXT) with the points, so Cmd+Z reverts the envelope and the note model together
-  if guid and state.session_takes[guid] == data then save_take_data(take, data) end
+  if guid and state.session_takes[guid] == data then save_take_data(take, data, json) end
   -- The envelope is rewritten from the model with today's values: the take is current again
   if guid then state.stale_takes[guid], state.stale_env[guid] = nil, nil end
   return true
