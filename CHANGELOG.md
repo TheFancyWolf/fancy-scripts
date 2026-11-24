@@ -4,6 +4,8 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.24.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Tolerance band at Tighten 0%:
+  - **Tolerance band always shows**: hovering or dragging Tolerance now draws its band on the notes it reaches even when their Tighten is 0%, so you can set the band before raising Tighten. The "not used yet" note still says Tolerance has no effect until Tighten is raised.
 - **Fancy Pitch Correct v2.24.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Rename items without analysing again:
   - **Rename in Pitched Items**: double-click a row's name, or right-click the row and choose Rename…, type the new name and press Enter. The take is renamed in REAPER too, as one undo step "Rename Take". Esc or a click elsewhere keeps the old name.
   - **Names follow REAPER**: a take renamed in the arrange view (or a rename undone) shows its new name in Pitched Items right away. The analysis is not touched.

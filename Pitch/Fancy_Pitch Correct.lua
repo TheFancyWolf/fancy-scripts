@@ -1,10 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.24.0
+-- @version 2.24.1
 -- @changelog
---   Rename a Pitched Items row in place (double-click its name, or Rename… in its right-click menu): the take is
---   renamed in REAPER as one undo step, with no re-analysis
---   A take renamed in REAPER's arrange view shows its new name in Pitched Items right away
+--   The Tolerance band now shows while you adjust Tolerance even when Tighten is 0%
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -6224,7 +6222,7 @@ K.HINT_KINDS = {
 }
 
 --- Shade where the hovered / dragged setting `hint` (state.setting_hint) acts, on the notes in view: an outline
---- on every note Strength reaches, the Tolerance band of each tightened note, a span over each slide for Slide In.
+--- on every note Strength reaches, the Tolerance band of each note, a span over each slide for Slide In.
 --- A span is as tall as the block(s) of its note(s); one narrower than two pixels is a single edge line.
 --- `build` is K.correction_view's result. Returns how many marks were drawn.
 --- Also returns `skipped`: how many notes in view the value reaches that got no mark because they are Classic or
@@ -6280,13 +6278,13 @@ K.draw_setting_hint = function(draw_list, hint, build)
   end
 
   if key == "tolerance" then
-    -- The band a tightened note may stray in untouched: centre - Tolerance .. centre + Tolerance across its block
+    -- The band a note may stray in untouched once tightened: centre - Tolerance .. centre + Tolerance across its block
+    -- (shown at Tighten 0 too, so the band can be set before Tighten is raised)
     for idx = 1, #notes do
       local n = notes[idx]
       local skip = K.mode_value(n) ~= 0   -- a Classic or Hard note gets no band
       tally(idx, skip)
-      if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true)
-          and (tonumber(get_effective(n, "tighten")) or 0) > 0 then
+      if not skip and n.end_time >= m.vt0 and n.start_time <= m.vt1 and reached(idx, true) then
         local cp = n.controls.center_pitch
         local tol = (tonumber(get_effective(n, "tolerance")) or 0) / 100
         local top = m.py + m.h - ((cp + tol - m.min) / m.range) * m.h
