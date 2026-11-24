@@ -2809,28 +2809,42 @@ K.batch_write = function(done)
     local item = take and K.take_item(take) or nil
     if take and item then ready[#ready + 1] = { entry = entry, take = take, item = item } end
   end
-  if #ready == 0 then return {} end
+  -- Each item's correction is built first, before anything is changed: an item whose correction cannot be built
+  -- is left out untouched (its envelope is not created, shown or switched on). The build reads the item's values
+  -- from its session model, so the new model stands in for its length
+  local buildable = {}
+  for _, r in ipairs(ready) do
+    local guid = r.entry.guid
+    local old = state.session_takes[guid]
+    state.session_takes[guid] = r.entry.data
+    local ok, build = pcall(K.take_correction, guid, r.entry.data, K.take_len(r.item))
+    state.session_takes[guid] = old
+    if ok then
+      r.build = build
+      buildable[#buildable + 1] = r
+    else
+      reaper.ShowConsoleMsg("Fancy Pitch Correct: an item could not be written: " .. tostring(build) .. "\n")
+    end
+  end
+  if #buildable == 0 then return {} end
 
   local written = {}
   reaper.Undo_BeginBlock()
   state.undo_open = true
-  for _, r in ipairs(ready) do
+  for _, r in ipairs(buildable) do
     local guid, data = r.entry.guid, r.entry.data
     -- Without its Pitch envelope the item cannot be corrected: it is left as it was (not written)
     local env = ensure_take_pitch_envelope(r.take, r.item, true)
-    local ok, wrote = false, false
+    local wrote = false
     if env then
-      -- The correction reads the item's values from its session model: it is the item's model while it is built.
       -- The pitch mode is kept, as for a single analysis (process_analysis_step)
       local old = state.session_takes[guid]
       state.session_takes[guid] = data
-      ok, wrote = pcall(K.write_take_envelope, guid, data, true, r.take, r.item, r.entry.json)
-      if not ok then
-        reaper.ShowConsoleMsg("Fancy Pitch Correct: an item could not be written: " .. tostring(wrote) .. "\n")
-      end
-      if not (ok and wrote) then state.session_takes[guid] = old end
+      wrote = K.write_take_envelope(guid, data, true, r.take, r.item,
+        { json = r.entry.json, built = true, build = r.build })
+      if not wrote then state.session_takes[guid] = old end
     end
-    if ok and wrote then
+    if wrote then
       local listed = false
       for _, g in ipairs(state.session_order) do
         if g == guid then listed = true; break end
@@ -2842,7 +2856,8 @@ K.batch_write = function(done)
     end
   end
   reaper.UpdateArrange()
-  reaper.Undo_EndBlock(K.batch_undo_label(#written), -1)
+  -- No item could get its envelope: no "Analyze Pitch (0 items)" step is named for it
+  reaper.Undo_EndBlock(#written > 0 and K.batch_undo_label(#written) or "Analyze Pitch", -1)
   state.undo_open = false
   K.frame_view_memo.frame = nil   -- the canvas fetches the correction again
   note_own_write()
@@ -3755,44 +3770,54 @@ K.correction_build = function(notes, item_len)
   return { points = points, spans = A.spans, ranges = merged }
 end
 
---- Write the take pitch envelope of the take `guid` from the notes of its model `data`, and store `data` on the take,
---- with no undo block of its own (the caller holds one open). The correction is built with `guid` standing in as
---- the target (get_effective and K.item_scale read the target's item values), as K.envelope_check does; the
---- target comes back even when the build raises. The model is stored only when it is the session's model of
---- `guid` (state.session_takes[guid] == data). The take's pitch mode is set as for an edit unless keep_pitch_mode
---- (or the Settings option state.keep_pitch_mode). take / item: the caller's, when it resolved them already. json:
---- the model's text when the caller prepared it already (K.take_json).
---- Returns false when the take or its Pitch envelope is not there (nothing written but the pitch mode).
-K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item, json)
-  if not data then return false end
-  take = take or (guid and resolve_take_by_guid(guid, true)) or nil
-  item = item or (take and K.take_item(take)) or nil
-  if not take or not item then return false end
+--- The length the envelope of `item` is written over, in seconds (at least 0.1).
+K.take_len = function(item)
+  return math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0)
+end
 
-  local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH") or 0)
-
-  -- Does the correction reach any note? (the item's values reach unedited notes too.) A take whose notes are all
-  -- bypassed, or that has none, gets a clean envelope
-  local notes = data.notes
+--- The correction K.write_take_envelope writes for the model `data` of the take `guid`, built with `guid` standing in
+--- as the target (get_effective and K.item_scale read the target's item values from state.session_takes[guid]): nil
+--- when it reaches no note (all bypassed, or none: the item's values reach unedited notes too). Raises when it cannot
+--- be built; the target comes back either way.
+K.take_correction = function(guid, data, item_len)
   local any_reached = false
-  for _, n in ipairs(notes or {}) do
+  for _, n in ipairs(data.notes or {}) do
     if K.note_reached(n) then
       any_reached = true
       break
     end
   end
+  if not any_reached then return nil end
+  local saved = state.target_take_guid
+  state.target_take_guid = guid
+  local ok, res = pcall(K.correction_build, data.notes, item_len)
+  state.target_take_guid = saved
+  if not ok then error(res, 0) end
+  return res
+end
+
+--- Write the take pitch envelope of the take `guid` from the notes of its model `data`, and store `data` on the take,
+--- with no undo block of its own (the caller holds one open). The correction is built with `guid` standing in as
+--- the target (get_effective and K.item_scale read the target's item values), as K.envelope_check does; the
+--- target comes back even when the build raises. The model is stored only when it is the session's model of
+--- `guid` (state.session_takes[guid] == data). The take's pitch mode is set as for an edit unless keep_pitch_mode
+--- (or the Settings option state.keep_pitch_mode). take / item: the caller's, when it resolved them already. opts
+--- (optional): json = the model's text when the caller prepared it already (K.take_json); built = true when the
+--- caller built the correction already (K.take_correction), build = its result (nil: it reaches no note).
+--- Returns false when the take or its Pitch envelope is not there (nothing written but the pitch mode).
+K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item, opts)
+  if not data then return false end
+  take = take or (guid and resolve_take_by_guid(guid, true)) or nil
+  item = item or (take and K.take_item(take)) or nil
+  if not take or not item then return false end
+
+  opts = opts or {}
+  local item_len = K.take_len(item)
 
   -- 1-2. The trajectory (frame shifts, scoop, ramps, glides): the same one the canvas draws. Built before anything
   -- is written, so a build that fails leaves the take's envelope and pitch mode as they were
-  local build
-  if any_reached then
-    local saved = state.target_take_guid
-    state.target_take_guid = guid
-    local ok, res = pcall(K.correction_build, notes, item_len)
-    state.target_take_guid = saved
-    if not ok then error(res, 0) end
-    build = res
-  end
+  local build = opts.build
+  if not opts.built then build = K.take_correction(guid, data, item_len) end
 
   -- Set pitch shift mode (Elastique Soloist Monophonic by default), unless the user keeps each item's own
   if not keep_pitch_mode and not state.keep_pitch_mode and state.pitchmode_value ~= -1 then
@@ -3817,7 +3842,7 @@ K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item, json)
   reaper.Envelope_SortPointsEx(env, -1)
 
   -- Model (P_EXT) with the points, so Cmd+Z reverts the envelope and the note model together
-  if guid and state.session_takes[guid] == data then save_take_data(take, data, json) end
+  if guid and state.session_takes[guid] == data then save_take_data(take, data, opts.json) end
   -- The envelope is rewritten from the model with today's values: the take is current again
   if guid then state.stale_takes[guid], state.stale_env[guid] = nil, nil end
   return true
@@ -5247,7 +5272,7 @@ local function process_analysis_step()
 
       -- Re-apply the envelope from the fresh (untouched) notes: this clears every stale point left by
       -- a previous analysis and writes the new model to the take inside the same "Analyze Pitch" block.
-      -- The take's pitch mode is left alone (no correction is applied yet).
+      -- The take's pitch mode is left alone, as for any analysis.
       if resolve_take_by_guid(state.target_take_guid, true) then
         apply_envelope_to_take("Analyze Pitch", true)
       else

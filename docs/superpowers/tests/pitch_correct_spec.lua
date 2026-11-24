@@ -2733,8 +2733,9 @@ test("take_json_is_what_save_writes", function() with_write_stubs({}, function(r
   -- no text prepared: made at the write (the note above is not one a correction can be built from)
   local build = S.K.correction_build
   S.K.correction_build = function() return { points = {} } end
-  S.K.batch_write({ { guid = "{a}", data = data } })
+  local ok, err = pcall(S.K.batch_write, { { guid = "{a}", data = data } })
   S.K.correction_build = build
+  if not ok then error(err, 0) end
   eq(rec.stored.a, json)
 end) end)
 
@@ -3859,19 +3860,40 @@ test("batch_leaves_a_fresh_item_uncorrected", function() with_point_stubs(functi
   eq(#modes, 0, "pitch mode left alone")
 end) end)
 
-test("batch_leaves_out_an_item_whose_correction_cannot_be_built", function() with_point_stubs(function(rec)
-  local K, st = S.K, S.state
-  local build, said = K.correction_build, nil
+-- Runs K.batch_write(d) with the correction of every model that has notes failing; returns what it wrote, what the
+-- console said and the takes whose Pitch envelope was looked up (ensure_take_pitch_envelope)
+local function batch_write_failing(d)
+  local K = S.K
+  local build, said, looked = K.correction_build, nil, {}
+  local lookup = reaper.GetTakeEnvelopeByName
   K.correction_build = function() error("bad note") end
   reaper.ShowConsoleMsg = function(msg) said = msg end
+  reaper.GetTakeEnvelopeByName = function(take, ...) looked[take] = true; return lookup(take, ...) end
+  local ok, res = pcall(K.batch_write, d)
+  K.correction_build, reaper.ShowConsoleMsg, reaper.GetTakeEnvelopeByName = build, nil, lookup
+  if not ok then error(res, 0) end
+  return res, said, looked
+end
+
+test("batch_leaves_out_an_item_whose_correction_cannot_be_built", function() with_point_stubs(function(rec, pts)
+  local K, st = S.K, S.state
   local d = done2()
   d[1].data.notes = { wobbly_untouched(0.1) }; K.item_seed(d[1].data)
-  local ok, err = pcall(K.batch_write, d)
-  K.correction_build, reaper.ShowConsoleMsg = build, nil
-  if not ok then error(err, 0) end
-  eq(#err, 1, "only b is written"); eq(err[1].guid, "{b}"); eq(rec.stored.a, nil, "a left as it was")
+  local written, said, looked = batch_write_failing(d)
+  eq(#written, 1, "only b is written"); eq(written[1].guid, "{b}"); eq(rec.stored.a, nil, "a left as it was")
+  eq(looked.a, nil, "a's envelope is not created, shown or switched on"); eq(pts.env_a, nil, "nor cleared")
   eq(st.session_takes["{a}"], nil); eq(rec.labels[1], "Analyze Pitch (1 item)"); eq(st.undo_open, false)
   eq(tostring(said):find("bad note", 1, true) ~= nil, true, "the console says why")
+end) end)
+
+test("batch_with_no_buildable_item_makes_no_undo_point", function() with_point_stubs(function(rec)
+  local K, st = S.K, S.state
+  local d = done2()
+  for _, e in ipairs(d) do e.data.notes = { wobbly_untouched(0.1) }; K.item_seed(e.data) end
+  local written, _, looked = batch_write_failing(d)
+  eq(#written, 0); eq(rec.begin, 0, "no undo block"); eq(#rec.labels, 0, "no undo point")
+  eq(looked.a, nil); eq(looked.b, nil); eq(st.undo_open, false)
+  eq(st.session_takes["{a}"], nil); eq(st.session_takes["{b}"], nil)
 end) end)
 
 -- Tests appended by later tasks go above this line.
