@@ -750,10 +750,12 @@ local function request_confirm(req)
 end
 
 --- The consequence of the confirm `c` for its ticked rows, `only` and check: computed again only when one of them
---- changed since the last call (HI5), else the kept answer. nil when the request has no consequence.
+--- (or the project state) changed since the last call (HI5), else the kept answer. nil when the request has no consequence.
 K.confirm_consequence = function(c)
   if not c.consequence then return nil end
-  local key = tostring(c.only_on) .. "|" .. tostring(c.checked) .. "|" .. tostring(c.ticks_rev)
+  -- The project state counts too: an undo in the arrange view can change what the consequence reads
+  local key = tostring(c.only_on) .. "|" .. tostring(c.checked) .. "|" .. tostring(c.ticks_rev) .. "|"
+    .. tostring(state.cache.count)
   if c.cons_key ~= key then
     c.cons = c.consequence(c.only_on, c.checked, c.ticked) or { lines = {} }
     c.cons_key = key
@@ -10576,23 +10578,33 @@ local function draw_info_modal()
   end
 end
 
+--- The height of a confirm's body, the region above its footer. Pure: avail_h = the modal's content height,
+--- btn_h = the button row's, gap = the space above the footer, reason_h = the line that says why the confirm is
+--- off (0: none kept), spacing_y = ImGui's item spacing (after the body, the gap and the reason). At least 1, so
+--- a modal too short for its body still shows its buttons.
+K.confirm_body_h = function(avail_h, btn_h, gap, reason_h, spacing_y)
+  local footer = spacing_y + gap + spacing_y + btn_h
+  if reason_h > 0 then footer = footer + reason_h + spacing_y end
+  return math.max(1, avail_h - footer)
+end
+
 --- The one confirm modal (see request_confirm): consequence and count in the body, Cancel first,
 --- Esc = Cancel, danger-styled confirm button. Called inside the main window's `if visible` block.
 --- The list of a confirm dialog (request_confirm's `list`): one row per thing the action replaces, its name and,
---- dimmed at the right, where it is (`where`, e.g. track and position). The region takes the room the dialog has
---- left above its closing lines and buttons, three rows at least, and scrolls; only the rows in view are drawn. A
+--- dimmed at the right, where it is (`where`, e.g. track and position). The region takes the room the dialog's
+--- body has left above its closing lines, three rows at least, and scrolls; only the rows in view are drawn. A
 --- name that does not fit is shortened (its row's tooltip has it in full), and `where` gives way first.
 K.confirm_list = function(c)
   local P = Theme.get_palette()
   local L = Theme.layout
   local row_h = reaper.ImGui_GetTextLineHeightWithSpacing(ctx)
   local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-  -- What comes below the list, with the spacing ImGui puts after every item: the closing lines (a gap, then the
-  -- line wrapped to the dialog's width) and the button row with the gap above it. The gap drawn above the list and
-  -- the spacing after it count too, or the buttons are pushed out of a dialog that cannot grow
+  -- What comes below the list in the confirm's body, with the spacing ImGui puts after every item: the closing
+  -- lines (a gap, then the line wrapped to the dialog's width). The gap drawn above the list and the spacing after
+  -- it count too, or the body scrolls for nothing (the button row is outside the body, see K.confirm_body_h)
   local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
   spacing_y = spacing_y or 0
-  local below = (L.xs + spacing_y) + spacing_y + (L.lg + spacing_y) + reaper.ImGui_GetFrameHeight(ctx)
+  local below = (L.xs + spacing_y) + spacing_y
   for _, line in ipairs(c.after_lines) do
     local _, line_h = reaper.ImGui_CalcTextSize(ctx, line, nil, nil, false, avail_w)
     below = below + (L.sm + spacing_y) + (line_h or 0) + spacing_y
@@ -10648,7 +10660,7 @@ K.CHECKLIST_MAX_ROWS = 6
 --- The targets of a confirm dialog (request_confirm's `checklist`, `only` and `check`): the caption with "All" and
 --- "None" beside it, the rows in a region that scrolls past K.CHECKLIST_MAX_ROWS (only the rows in view are drawn),
 --- then the checkboxes. A row's name that does not fit is shortened (its tooltip has it in full); a row with a reason
---- is disabled, the reason beside it in dim text. While `only` is on, the list and the check are disabled and
+--- is disabled, the reason beside it in dim text (shortened too when the row is narrow, its tooltip in full). While `only` is on, the list and the check are disabled and
 --- only.reason says why. A click changes c.ticked / c.only_on / c.checked; the consequence follows on the next frame.
 K.confirm_targets = function(c, P, L)
   local list = c.checklist
@@ -10696,10 +10708,19 @@ K.confirm_targets = function(c, P, L)
         for index = first_row + 1, end_row do
           local row = rows[index]
           local name = row.name or "Item"
-          local reason_w = row.reason and (reaper.ImGui_CalcTextSize(ctx, row.reason)) + L.md or 0
-          local shown = fit_text(ctx, name, math.max(L.xxxl, inner_w - box_w - reason_w), "regular")
+          -- A row with a reason: the name keeps half of the row (or what it needs), the reason is shortened to the
+          -- rest, so a narrow docker never scrolls sideways
+          local row_w = inner_w - box_w
+          local name_room = row_w
+          if row.reason then
+            local reason_w = reaper.ImGui_CalcTextSize(ctx, row.reason)
+            name_room = math.max(math.min(reaper.ImGui_CalcTextSize(ctx, name), row_w * 0.5), row_w - reason_w - L.md)
+          end
+          local shown = fit_text(ctx, name, name_room, "regular")
+          -- The row's ID is its item's (RB17): a row keeps its state when the list above it changes
+          reaper.ImGui_PushID(ctx, tostring(row.id))
           if row.reason then reaper.ImGui_BeginDisabled(ctx) end
-          local changed, on = reaper.ImGui_Checkbox(ctx, shown .. "###confirm_row_" .. index,
+          local changed, on = reaper.ImGui_Checkbox(ctx, shown .. "###confirm_row",
             c.ticked[row.id] == true and not row.reason)
           if changed and not row.reason then K.confirm_tick(c, row.id, on == true) end
           if shown ~= name and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()
@@ -10709,8 +10730,15 @@ K.confirm_targets = function(c, P, L)
           if row.reason then
             reaper.ImGui_EndDisabled(ctx)
             reaper.ImGui_SameLine(ctx, 0, L.md)
-            reaper.ImGui_TextColored(ctx, P.text_dim, row.reason)
+            local reason_room = row_w - reaper.ImGui_CalcTextSize(ctx, shown) - L.md
+            local reason_shown = fit_text(ctx, row.reason, reason_room, "regular")
+            reaper.ImGui_TextColored(ctx, P.text_dim, reason_shown)
+            if reason_shown ~= row.reason
+                and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+              Theme.tooltip(ctx, row.reason)
+            end
           end
+          reaper.ImGui_PopID(ctx)
         end
       end
       if c.only_on then reaper.ImGui_EndDisabled(ctx) end
@@ -10761,37 +10789,51 @@ local function draw_confirm_modal()
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
-    for i, line in ipairs(c.body_lines) do
-      if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.sm) end
-      reaper.ImGui_TextWrapped(ctx, line)
-    end
-    if c.list and #c.list > 0 then K.confirm_list(c) end
-    for _, line in ipairs(c.after_lines) do
-      reaper.ImGui_Dummy(ctx, 0, L.sm)
-      reaper.ImGui_TextWrapped(ctx, line)
-    end
-    if c.checklist or c.check or c.only then K.confirm_targets(c, P, L) end
-    if cons then
-      for _, line in ipairs(cons.lines or {}) do
-        reaper.ImGui_Dummy(ctx, 0, L.sm)
-        reaper.ImGui_TextWrapped(ctx, line)
-      end
-    end
-
-    -- Button row pinned to the bottom of the modal, centred like the Close rows; a disabled confirm says why above it
+    -- The footer (the line that says why the confirm is off, then the button row) is pinned to the bottom of the
+    -- modal, outside the body: the body takes the room above it and scrolls, so the buttons are always in view. The
+    -- reason's line is kept even while there is no reason (a confirm with a consequence can get one), so nothing
+    -- moves when it comes and goes (EP5)
     local cancel_w = reaper.ImGui_CalcTextSize(ctx, "Cancel") + L.md * 2
     local confirm_w = reaper.ImGui_CalcTextSize(ctx, confirm_label) + L.md * 2
     local btn_h = reaper.ImGui_GetFrameHeight(ctx)
-    local _, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
-    if avail_h > btn_h + L.lg then
-      reaper.ImGui_SetCursorPosY(ctx, reaper.ImGui_GetCursorPosY(ctx) + avail_h - btn_h)
-    else
-      reaper.ImGui_Dummy(ctx, 0, L.lg)
+    local avail_w, avail_h = reaper.ImGui_GetContentRegionAvail(ctx)
+    local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+    local reason_h = 0
+    if blocked then
+      local _, wrapped_h = reaper.ImGui_CalcTextSize(ctx, blocked, nil, nil, false, avail_w)
+      reason_h = wrapped_h or 0
+    elseif c.consequence then
+      reason_h = reaper.ImGui_GetTextLineHeight(ctx)
     end
+    local body_h = K.confirm_body_h(avail_h, btn_h, L.lg, reason_h, spacing_y or 0)
+
+    if reaper.ImGui_BeginChild(ctx, "##confirm_body", 0, body_h, 0) then
+      for i, line in ipairs(c.body_lines) do
+        if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.sm) end
+        reaper.ImGui_TextWrapped(ctx, line)
+      end
+      if c.list and #c.list > 0 then K.confirm_list(c) end
+      for _, line in ipairs(c.after_lines) do
+        reaper.ImGui_Dummy(ctx, 0, L.sm)
+        reaper.ImGui_TextWrapped(ctx, line)
+      end
+      if c.checklist or c.check or c.only then K.confirm_targets(c, P, L) end
+      if cons then
+        for _, line in ipairs(cons.lines or {}) do
+          reaper.ImGui_Dummy(ctx, 0, L.sm)
+          reaper.ImGui_TextWrapped(ctx, line)
+        end
+      end
+      reaper.ImGui_EndChild(ctx)
+    end
+
+    reaper.ImGui_Dummy(ctx, 0, L.lg)
     if blocked then
       reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim)
       reaper.ImGui_TextWrapped(ctx, blocked)
       reaper.ImGui_PopStyleColor(ctx, 1)
+    elseif reason_h > 0 then
+      reaper.ImGui_Dummy(ctx, 0, reason_h)
     end
     Theme.hcenter(ctx, cancel_w + L.md + confirm_w)
 
@@ -11416,6 +11458,16 @@ K.apply_initial_ticks = function(rows, selected)
     end
   end
   return ticked
+end
+
+--- The ticks of `ticked` (guid -> true) carried over to `rows` (K.apply_rows's, read again). Pure: a row that is
+--- no longer in the list, or that cannot be written any more (a reason), drops out.
+K.apply_carry_ticks = function(rows, ticked)
+  local carried = {}
+  for _, row in ipairs(rows) do
+    if not row.reason and ticked[row.guid] then carried[row.id] = true end
+  end
+  return carried
 end
 
 --- The targets of the ticked rows, as K.apply_plan's entries. Pure: a row with a reason is never one.
@@ -12587,6 +12639,7 @@ do
     only = "New items only: change no item, just save the starting values",
     only_reason = "Untick \"New items only\" to pick items.",
     tick_some = "Tick at least one item",
+    none_tickable = "No item here can be changed",
     check = "Keep changes already made to items and notes",
     consequence = "%d items lose their own values, %d notes lose theirs, %d items change key, %d are split again (%d edited notes in them are lost).",
     keep = "%d items with edited notes are not split again.",
@@ -12650,9 +12703,15 @@ do
     for _, key in ipairs(keys) do if key == "separation" then gives_sep = true end end
     -- The item the values come from: it must still be the open item when the user confirms
     local open_guid = state.target_take_guid
+    -- Planned from the rows of now: an undo in the arrange view while the confirm is up reloads the pitched items
+    -- (state.session_takes) and may take one out of the project. The ticks carry over by guid. Also says whether
+    -- any row can be ticked at all
     local function plan_for(only_on, checked, ticks)
-      local entries = only_on and {} or K.apply_ticked_entries(rows, ticks or {})
-      return K.apply_plan(src, entries, keys, checked, old_start), #entries
+      local now_rows = K.apply_rows()
+      local tickable = false
+      for _, row in ipairs(now_rows) do if not row.reason then tickable = true end end
+      local entries = only_on and {} or K.apply_ticked_entries(now_rows, K.apply_carry_ticks(now_rows, ticks or {}))
+      return K.apply_plan(src, entries, keys, checked, old_start), #entries, tickable
     end
     request_confirm({
       id = "apply",
@@ -12665,7 +12724,7 @@ do
       size = Theme.layout.modal_md,
       confirm_label = APPLY_COPY.confirm_new,
       consequence = function(only_on, checked, ticks)
-        local plan, n_ticked = plan_for(only_on, checked, ticks)
+        local plan, n_ticked, tickable = plan_for(only_on, checked, ticks)
         local c = plan.counts
         local lines = {}
         if not only_on and n_ticked > 0 then
@@ -12676,7 +12735,7 @@ do
         local out = { lines = lines }
         if not only_on and n_ticked == 0 then
           out.confirm_label = string.format(APPLY_COPY.confirm, 0)
-          out.reason = APPLY_COPY.tick_some
+          out.reason = tickable and APPLY_COPY.tick_some or APPLY_COPY.none_tickable
         elseif only_on or plan.changed == 0 then
           out.confirm_label = APPLY_COPY.confirm_new
           if not start_changes then out.reason = APPLY_COPY.nothing end

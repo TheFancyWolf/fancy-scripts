@@ -4086,6 +4086,74 @@ test("batch_carries_on_when_a_write_raises", function() with_point_stubs(functio
   eq(tostring(said):find("disk full", 1, true) ~= nil, true, "the console says why")
 end) end)
 
+-- The confirm's layout: the button row (and the line that says why Apply is off) is outside the scrolling body
+test("confirm_body_h_leaves_room_for_the_reason_and_the_buttons", function()
+  local K = S.K
+  -- avail 400, buttons 20, gap 12, a reason line 14, item spacing 4
+  local body = K.confirm_body_h(400, 20, 12, 14, 4)
+  eq(body, 400 - (4 + 12 + 4 + 14 + 4 + 20), "the body leaves the gap, the reason line and the button row")
+  eq(K.confirm_body_h(400, 20, 12, 0, 4), 400 - (4 + 12 + 4 + 20), "no reason slot: only the gap and the buttons")
+  eq(K.confirm_body_h(30, 20, 12, 14, 4), 1, "too little room: the body is one pixel, the buttons stay in view")
+end)
+
+test("apply_carry_ticks_by_guid", function()
+  local rows = { apply_row("a"), apply_row("m", "Not an audio item"), apply_row("b") }
+  local carried = S.K.apply_carry_ticks(rows, { ["{a}"] = true, ["{m}"] = true, ["{x}"] = true })
+  eq(carried["{a}"], true, "a ticked row carried over")
+  eq(carried["{m}"], nil, "a row that cannot be written any more drops out")
+  eq(carried["{x}"], nil, "a row that is no longer in the list drops out")
+  eq(carried["{b}"], nil, "an unticked row stays unticked")
+end)
+
+test("apply_confirm_plans_with_the_rows_of_now", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm, K.apply_run }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.ticked["{a}"] and c.ticked["{b}"], true, "every row ticked")
+    -- Cmd+Z in the arrange view while the confirm is up: a is gone, b's model is reloaded with another value
+    reaper.GetMediaItemTakeByGUID = function(_, guid) if guid == "{a}" then return nil end return (guid:gsub("[{}]", "")) end
+    K.drop_project_cache()
+    local b2 = apply_target("b", fr, 0.5, K.apply_source({ "tolerance" }).tolerance)
+    st.session_takes["{b}"] = b2.data
+    local ran = nil
+    K.apply_run = function(plan) ran = plan end
+    c.on_confirm(c.only_on, c.checked, c.ticked)
+    eq(ran ~= nil, true, "Apply runs")
+    eq(#ran.items, 1, "only b"); eq(ran.items[1].guid, "{b}")
+    eq(ran.items[1].set.tolerance, nil, "planned from b's reloaded model (it already holds the value given)")
+  end)
+  st.target_take_guid, st.confirm, K.apply_run = table.unpack(saved, 1, 3)
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_confirm_says_when_no_row_can_be_ticked", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm, reaper.TakeIsMIDI }
+  local ok, err = pcall(function()
+    local a = apply_target("a", fr, 0.5, 12)
+    st.session_takes["{a}"] = a.data
+    st.session_order[#st.session_order + 1] = "{a}"
+    reaper.TakeIsMIDI = function() return true end
+    st.target_take_guid, st.confirm = "{open}", nil
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    st.confirm = nil
+    eq(c.only_on, true, "nothing can be ticked: New items only starts on")
+    eq(c.consequence(false, false, {}).reason, "No item here can be changed", "New items only off, nothing tickable")
+  end)
+  st.target_take_guid, st.confirm, reaper.TakeIsMIDI = table.unpack(saved, 1, 3)
+  if not ok then error(err, 0) end
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
