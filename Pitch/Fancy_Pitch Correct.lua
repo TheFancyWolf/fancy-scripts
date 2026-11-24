@@ -3754,17 +3754,7 @@ K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item)
   item = item or (take and K.take_item(take)) or nil
   if not take or not item then return false end
 
-  -- Set pitch shift mode (Elastique Soloist Monophonic by default), unless the user keeps each item's own
-  if not keep_pitch_mode and not state.keep_pitch_mode and state.pitchmode_value ~= -1 then
-    reaper.SetMediaItemTakeInfo_Value(take, "I_PITCHMODE", state.pitchmode_value)
-  end
-
-  local env = ensure_take_pitch_envelope(take, item)
-  if not env then return false end
-
   local item_len = math.max(0.1, reaper.GetMediaItemInfo_Value(item, "D_LENGTH"))
-  -- Clear existing points across the entire item
-  reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
 
   -- Does the correction reach any note? (the item's values reach unedited notes too.) A take whose notes are all
   -- bypassed, or that has none, gets a clean envelope
@@ -3777,15 +3767,32 @@ K.write_take_envelope = function(guid, data, keep_pitch_mode, take, item)
     end
   end
 
+  -- 1-2. The trajectory (frame shifts, scoop, ramps, glides): the same one the canvas draws. Built before anything
+  -- is written, so a build that fails leaves the take's envelope and pitch mode as they were
+  local build
   if any_reached then
-    local SHAPE = 5   -- Bezier
-    local TENSION = 0 -- Neutral tension
-    -- 1-2. The trajectory (frame shifts, scoop, ramps, glides): the same one the canvas draws
     local saved = state.target_take_guid
     state.target_take_guid = guid
-    local ok, build = pcall(K.correction_build, notes, item_len)
+    local ok, res = pcall(K.correction_build, notes, item_len)
     state.target_take_guid = saved
-    if not ok then error(build, 0) end
+    if not ok then error(res, 0) end
+    build = res
+  end
+
+  -- Set pitch shift mode (Elastique Soloist Monophonic by default), unless the user keeps each item's own
+  if not keep_pitch_mode and not state.keep_pitch_mode and state.pitchmode_value ~= -1 then
+    reaper.SetMediaItemTakeInfo_Value(take, "I_PITCHMODE", state.pitchmode_value)
+  end
+
+  local env = ensure_take_pitch_envelope(take, item)
+  if not env then return false end
+
+  -- Clear existing points across the entire item
+  reaper.DeleteEnvelopePointRange(env, 0, item_len + 1.0)
+
+  if build then
+    local SHAPE = 5   -- Bezier
+    local TENSION = 0 -- Neutral tension
     -- 3. Adaptive decimation with sub-cent tolerance (0.01 st / 1 cent)
     for _, pt in ipairs(rdp_simplify(build.points, 0.01)) do
       local t = math.max(0.0, math.min(item_len, pt.time))
@@ -12524,6 +12531,9 @@ do
       if src[key] ~= nil and K.value_changed(old_start[key], src[key]) then start_changes = true end
     end
     local footnote = string.format(APPLY_COPY.footnote, K.MOD_LABEL)
+    -- Only a Separation given splits items again: the keep line is about that alone
+    local gives_sep = false
+    for _, key in ipairs(keys) do if key == "separation" then gives_sep = true end end
     local plan = nil
     -- The item the values come from: it must still be the open item when the user confirms
     local open_guid = state.target_take_guid
@@ -12548,7 +12558,7 @@ do
         local lines = {}
         if choice ~= "new" then
           lines[1] = string.format(APPLY_COPY.consequence, c.items_lose, c.notes_lose, c.key_change, c.resplit, c.lost)
-          if checked then lines[#lines + 1] = string.format(APPLY_COPY.keep, c.not_resplit) end
+          if checked and gives_sep then lines[#lines + 1] = string.format(APPLY_COPY.keep, c.not_resplit) end
         end
         lines[#lines + 1] = footnote
         local out = { lines = lines }

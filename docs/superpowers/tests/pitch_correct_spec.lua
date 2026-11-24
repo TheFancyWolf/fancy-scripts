@@ -3571,6 +3571,20 @@ test("reset_item_all_asks_in_reset_words", function() with_write_stubs({}, funct
   if not ok then error(err, 0) end
 end) end)
 
+test("write_take_envelope_keeps_the_old_envelope_when_the_build_fails", function() with_write_stubs({}, function(rec)
+  local K = S.K
+  local saved_build = K.correction_build
+  local pitchmode_set = false
+  reaper.SetMediaItemTakeInfo_Value = function() pitchmode_set = true end
+  K.correction_build = function() error("bad note") end
+  local data = { notes = { { start_time = 0, end_time = 1, avg_note = 60, controls = { center_pitch = 60 } } } }
+  local ok, err = pcall(K.write_take_envelope, "{a}", data, false)
+  K.correction_build, reaper.SetMediaItemTakeInfo_Value = saved_build, nil
+  eq(ok, false, "the error is passed on"); eq(tostring(err):find("bad note", 1, true) ~= nil, true)
+  eq(#rec.cleared, 0, "the old points are still there")
+  eq(pitchmode_set, false, "the pitch mode is not changed either")
+end) end)
+
 -- Apply to other items (K.apply_plan, the confirm's choices)
 -- A target of K.apply_plan: a model with notes split from `fr` at `sep`, each note with its controls
 local function apply_target(id, fr, sep, tol)
@@ -3694,6 +3708,32 @@ test("apply_run_one_undo_and_cancel", function() with_write_stubs({}, function(r
   st.target_take_guid, G.tolerance, reaper.time_precise, st.is_analyzing = table.unpack(saved, 1, 4)
   K.batch = nil
   st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
+test("apply_keep_line_only_when_separation_is_given", function() with_write_stubs({}, function()
+  local st, K = S.state, S.K
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, st.confirm }
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    local function keep_shown(keys)
+      st.target_take_guid, st.confirm = "{open}", nil
+      K.apply_open(keys)
+      local c = st.confirm
+      st.confirm = nil
+      for _, line in ipairs(c.consequence("all", true).lines) do
+        if line:find("not split again", 1, true) then return true end
+      end
+      return false
+    end
+    eq(keep_shown({ "tolerance" }), false, "Tolerance never splits again: no keep line")
+    eq(keep_shown({ "separation" }), true, "Separation: the keep line")
+    eq(keep_shown(nil), true, "every value: the keep line")
+  end)
+  st.target_take_guid, st.confirm = table.unpack(saved, 1, 2)
   if not ok then error(err, 0) end
 end) end)
 
