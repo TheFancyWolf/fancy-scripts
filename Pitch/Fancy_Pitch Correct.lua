@@ -11379,7 +11379,8 @@ K.apply_run = function(plan, keys, src, label)
   K.save_settings("cascade")
   local queue = {}
   for _, row in ipairs(plan.items) do
-    if row.changes then queue[#queue + 1] = { guid = row.guid, name = row.name, row = row, len = 1 } end
+    -- Never the open item: its canvas holds its model (K.apply_open's on_confirm already refuses a changed item)
+    if row.changes and row.guid ~= state.target_take_guid then queue[#queue + 1] = { guid = row.guid, name = row.name, row = row, len = 1 } end
   end
   if #queue == 0 then
     set_status(K.APPLY_START_ONLY)
@@ -12430,6 +12431,7 @@ do
     confirm = "Apply (%d)",
     confirm_new = "Save starting values",
     nothing = "Nothing would change",
+    changed = "The item changed meanwhile. Nothing was applied.",
   }
   -- The name of each value in the confirm's title, its readout and its undo label
   local APPLY_LABEL = { correct_mode = "Mode", key_idx = "Key", scale_idx = "Key" }
@@ -12480,6 +12482,8 @@ do
     end
     local footnote = string.format(APPLY_COPY.footnote, K.MOD_LABEL)
     local plan = nil
+    -- The item the values come from: it must still be the open item when the user confirms
+    local open_guid = state.target_take_guid
     request_confirm({
       id = "apply",
       title = label and string.format(APPLY_COPY.title_one, label) or APPLY_COPY.title_all,
@@ -12514,6 +12518,12 @@ do
         return out
       end,
       on_confirm = function(choice, checked)
+        -- The open item changed while the confirm was up (the selection follower): the values and the targets were
+        -- read for another item, and the new open item may be one of the targets
+        if state.target_take_guid ~= open_guid then
+          set_status(APPLY_COPY.changed)
+          return
+        end
         if not plan then plan = K.apply_plan(src, targets[choice] or {}, keys, checked, old_start) end
         K.apply_run(plan, keys, src, label)
       end,

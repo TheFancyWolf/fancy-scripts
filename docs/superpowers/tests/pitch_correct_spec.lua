@@ -3576,6 +3576,40 @@ test("apply_run_one_undo_and_cancel", function() with_write_stubs({}, function(r
   if not ok then error(err, 0) end
 end) end)
 
+test("apply_refuses_when_the_open_item_changed", function() with_write_stubs({}, function(rec)
+  local st, K, G = S.state, S.K, S.global_defaults
+  local fr = frames(REARTIC_SEGS, HOP)
+  local saved = { st.target_take_guid, G.tolerance, reaper.time_precise, st.is_analyzing, st.confirm }
+  reaper.time_precise = function() return 0 end
+  local ok, err = pcall(function()
+    local a, b = apply_target("a", fr, 0.5, 12), apply_target("b", fr, 0.5, 20)
+    st.session_takes["{a}"], st.session_takes["{b}"] = a.data, b.data
+    st.session_order[#st.session_order + 1] = "{a}"; st.session_order[#st.session_order + 1] = "{b}"
+    st.target_take_guid, st.confirm = "{open}", nil
+    local start_tol = G.tolerance
+    K.apply_open({ "tolerance" })
+    local c = st.confirm
+    eq(c ~= nil and c.id, "apply", "the confirm is open")
+    eq(c.choice, "all", "nothing selected: all pitched items")
+    st.target_take_guid = "{a}"   -- the user clicked a target in the arrange view
+    c.on_confirm(c.choice, c.checked)
+    eq(#rec.labels, 0, "no undo point"); eq(K.batch, nil, "no run")
+    eq(st.session_takes["{a}"], a.data, "a untouched"); eq(G.tolerance, start_tol, "starting values untouched")
+    eq(st.status.text, "The item changed meanwhile. Nothing was applied.")
+    -- Defence in depth: a row for the open item is never run
+    local plan = K.apply_plan({ tolerance = 40 }, { a, b }, { "tolerance" }, false, apply_start(0.5, 8))
+    K.apply_run(plan, { "tolerance" }, { tolerance = 40 }, "Tolerance")
+    for _ = 1, 10 do if K.batch then K.analysis_tick() end end
+    eq(rec.labels[1], "Apply Tolerance to 1 items", "only b")
+    eq(st.session_takes["{a}"], a.data, "the open item is not written")
+    eq(st.session_takes["{b}"].overrides.tolerance, 40, "b written")
+  end)
+  st.target_take_guid, G.tolerance, reaper.time_precise, st.is_analyzing, st.confirm = table.unpack(saved, 1, 5)
+  K.batch = nil
+  st.status.text, st.status.hold = "", nil
+  if not ok then error(err, 0) end
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
