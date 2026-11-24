@@ -2327,8 +2327,9 @@ end
 
 --- Save the active Key/Scale as the open item's own (one named undo point, so Cmd+Z reverts it together with the
 --- Key/Scale selection). It is not a starting value: new items start from those (K.start_values). An item not
---- analysed yet keeps it in state.key_idx / state.scale_idx, and its first analysis stores it.
-local function save_current_scale_settings()
+--- analysed yet keeps it in state.key_idx / state.scale_idx, and its first analysis stores it. `undo_label`: "Set Key"
+--- or "Set Scale" (K.scale_changed).
+local function save_current_scale_settings(undo_label)
   if state.target_take_guid and state.session_takes[state.target_take_guid] then
     local data = state.session_takes[state.target_take_guid]
     data.key_idx = state.key_idx
@@ -2337,7 +2338,7 @@ local function save_current_scale_settings()
     if take then
       reaper.Undo_BeginBlock()
       save_take_data(take, data)
-      reaper.Undo_EndBlock("Change Key/Scale", -1)
+      reaper.Undo_EndBlock(undo_label or "Set Key", -1)
       note_own_write()
     end
   end
@@ -3716,18 +3717,20 @@ end
 
 --- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). With no
 --- Classic or Hard note in the open item this is the plain save; otherwise the item's notes follow the new scale:
---- its take data takes the new Key and Scale and the envelope is rewritten, all in the "Change Key/Scale" undo point.
-K.scale_changed = function()
+--- its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. `what` = "key" or
+--- "scale": what changed, which names the undo point ("Set Key" / "Set Scale").
+K.scale_changed = function(what)
+  local undo_label = (what == "scale") and "Set Scale" or "Set Key"
   update_scale_pitch_classes()
   local data = state.target_take_guid and state.session_takes[state.target_take_guid]
   local count = data and K.mode_note_count(state.notes or {}) or 0
   if count == 0 then
-    save_current_scale_settings()
+    save_current_scale_settings(undo_label)
     return
   end
   data.key_idx = state.key_idx
   data.scale_idx = state.scale_idx
-  if apply_envelope_to_take("Change Key/Scale") then
+  if apply_envelope_to_take(undo_label) then
     local key_name = SCALE_KEYS[state.key_idx].display
     local scale_name = SCALE_DEFINITIONS[state.scale_idx].name
     if count == 1 then
@@ -8493,7 +8496,7 @@ local function draw_graph(draw_ctx, w, h)
           end
           if differs then
             for _, o in ipairs(targets) do o.controls.correct_mode = choice - 1 end
-            apply_envelope_to_take("Change Mode")
+            apply_envelope_to_take("Set Mode")
           end
         end
       end
@@ -11177,7 +11180,7 @@ do
         local is_sel = (state.key_idx == i)
         if Theme.selectable(ctx, k_info.name .. "##key_" .. i, is_sel, nil, s.key_list_w) and not is_sel then
           state.key_idx = i
-          K.scale_changed()
+          K.scale_changed("key")
         end
         if is_sel then reaper.ImGui_SetItemDefaultFocus(ctx) end
       end
@@ -11196,7 +11199,7 @@ do
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
-      K.scale_changed()
+      K.scale_changed("scale")
     end
   end
 
@@ -11542,6 +11545,8 @@ do
   local bar_sel = {}
   -- The press now held on a value control: what it was aimed at when it began (see draw_value)
   local bar_gesture = { id = nil, target = nil, notes = nil, dead = false }
+  -- This item's value of each control (by id) when its press began: a drag that ends there writes nothing (UC1)
+  local bar_press = {}
   -- Separation while its control is held or typed into: the value from before the press (see draw_separation)
   local bar_sep_before = nil
   local function bar_sel_notes()
@@ -11568,6 +11573,13 @@ do
   --- Give `note` its own value of `spec` (display units, clamped to the range).
   local function bar_note_write(note, spec, v)
     note.controls[spec.key] = math.max(spec.lo, math.min(spec.hi, v)) / spec.scale
+  end
+
+  --- Whether a committed value `after` differs from `before` (stored units; nil = no value): an edit that ends
+  --- where it began makes no undo point.
+  K.value_changed = function(before, after)
+    if type(before) ~= "number" or type(after) ~= "number" then return before ~= after end
+    return math.abs(after - before) > 1e-9
   end
 
   --- The bar's write path: give the `sel_n` notes of `sel_notes` their own value `v` of `key` (stored units; 0 is a
@@ -11897,7 +11909,10 @@ do
       -- the selection went away, another item became the target), the rest of the gesture does nothing: it must
       -- never turn a drag on notes into a change of the item.
       local gest = bar_gesture
-      if pressed then gest.id, gest.target, gest.notes, gest.dead = spec.id, view.target, state.notes, false end
+      if pressed then
+        gest.id, gest.target, gest.notes, gest.dead = spec.id, view.target, state.notes, false
+        bar_press[spec.id] = K.item_value(take_data, key)
+      end
       local dead = false
       if gest.id == spec.id then
         if view.disabled or gest.target ~= view.target or gest.notes ~= state.notes then gest.dead = true end
@@ -11951,8 +11966,14 @@ do
         elseif reset then
           K.reset_target(key, sel_notes, 0)
         else
+          local before = K.item_value(take_data, key)
           if changed then K.bar_write(key, v / spec.scale, sel_notes, 0) end
-          if committed and take_data then apply_envelope_to_take("Adjust " .. name) end
+          if committed and take_data then
+            -- A typed value is compared with the value it replaced, a drag with the value at its press
+            local from = typed and before or bar_press[spec.id]
+            bar_press[spec.id] = nil
+            if K.value_changed(from, K.item_value(take_data, key)) then apply_envelope_to_take("Adjust " .. name) end
+          end
         end
         return
       end
@@ -11975,10 +11996,16 @@ do
       elseif reset then
         K.reset_target(key, sel_notes, sel_n)
       elseif changed and typed then
-        -- A typed value sets every selected note to it
+        -- A typed value sets every selected note to it; nothing is written when every note shows it already
         state.bar_edit = nil
-        for i = 1, sel_n do bar_note_write(sel_notes[i], spec, v) end
-        apply_envelope_to_take("Adjust " .. name)
+        local target, moved = math.max(spec.lo, math.min(spec.hi, v)), false
+        for i = 1, sel_n do
+          if K.value_changed(bar_note_value(sel_notes[i], spec), target) then moved = true break end
+        end
+        if moved then
+          for i = 1, sel_n do bar_note_write(sel_notes[i], spec, v) end
+          apply_envelope_to_take("Adjust " .. name)
+        end
       elseif held and reaper.ImGui_IsMouseDragging(bctx, 0) then
         if not edit then
           edit = { id = spec.id, notes = state.notes, acc = 0, raws = {}, starts = {} }
@@ -12119,7 +12146,7 @@ do
       end
       if not changed or choice == idx or not take_data then return end
       K.bar_write("correct_mode", choice - 1, sel_notes, sel_n)
-      if apply_envelope_to_take("Change Mode") and sel_n == 0 then
+      if apply_envelope_to_take("Set Mode") and sel_n == 0 then
         set_status(K.mode_item_status(choice - 1, K.mode_own_count(state.notes)))
       end
     end

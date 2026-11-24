@@ -3207,12 +3207,41 @@ test("scale_change_keeps_start_key", function()
   local saved = { st.target_take_guid, st.key_idx, S.global_defaults.key_idx }
   st.target_take_guid = nil
   st.key_idx = (S.global_defaults.key_idx or 1) % 12 + 1
-  local ok, err = pcall(K.scale_changed)
+  local ok, err = pcall(K.scale_changed, "key")
   reaper.SetExtState = set_ext
   st.target_take_guid, st.key_idx = saved[1], saved[2]
   if not ok then error(err, 0) end
   eq(ext, 0, "SetExtState calls")
   eq(S.global_defaults.key_idx, saved[3], "the starting key")
+end)
+
+test("value_changed_no_op", function()
+  local vc = S.K.value_changed
+  eq(vc(8, 8), false, "same value")
+  eq(vc(8, 8 + 1e-12), false, "float noise")
+  eq(vc(8, 20), true, "moved")
+  eq(vc(0, 0), false, "zero to zero")
+  eq(vc(nil, 0), true, "no value to 0")
+  eq(vc(nil, nil), false, "nothing to nothing")
+end)
+
+test("key_scale_undo_labels", function()
+  local st, K = S.state, S.K
+  local labels = {}
+  local saved = { st.target_take_guid, st.session_takes["{KL}"], st.key_idx, st.scale_idx,
+    reaper.GetMediaItemTakeByGUID, reaper.Undo_EndBlock }
+  reaper.GetMediaItemTakeByGUID = function() return "TAKE" end
+  reaper.Undo_EndBlock = function(label) labels[#labels + 1] = label end
+  st.target_take_guid, st.session_takes["{KL}"] = "{KL}", { notes = {}, results = {} }
+  local ok, err = pcall(function()
+    K.scale_changed("key")
+    K.scale_changed("scale")
+  end)
+  st.target_take_guid, st.session_takes["{KL}"], st.key_idx, st.scale_idx,
+    reaper.GetMediaItemTakeByGUID, reaper.Undo_EndBlock = table.unpack(saved, 1, 6)
+  if not ok then error(err, 0) end
+  eq(labels[1], "Set Key", "key")
+  eq(labels[2], "Set Scale", "scale")
 end)
 
 -- Tests appended by later tasks go above this line.
