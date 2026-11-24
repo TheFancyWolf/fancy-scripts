@@ -3384,6 +3384,72 @@ test("resplit_stretch_unchanged_no_undo", function() with_write_stubs({}, functi
   eq(status, "Nothing to re-split.", "status")
 end) end)
 
+-- The Values group in three named groups, and the pill menu's reset (task 5) ------------------------------------
+test("hdr_plan_widths_ordered", function()
+  local saved = { reaper.ImGui_CalcTextSize, reaper.ImGui_GetFrameHeight }
+  reaper.ImGui_CalcTextSize = function(_, text) return #text * 7, 13 end
+  reaper.ImGui_GetFrameHeight = function() return 20 end
+  local ok, err = pcall(function()
+    local s = S.measure_header_static()
+    local plans = S.K.HDR_PLANS
+    eq(#plans, 5, "plans")
+    for i = 1, #plans - 1 do
+      local a, b = S.hdr_min_content_w(s, false, i), S.hdr_min_content_w(s, false, i + 1)
+      if a <= b then error(string.format("plan %d (%g) is not wider than plan %d (%g)", i, a, i + 1, b), 0) end
+    end
+    eq(plans[1].captions and plans[3].captions and not plans[2].captions and not plans[4].captions
+      and not plans[5].captions, true, "captions in plans 1 and 3 only")
+  end)
+  reaper.ImGui_CalcTextSize, reaper.ImGui_GetFrameHeight = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("reset_item_all_counts", function()
+  local K = S.K
+  local data = {}
+  K.item_seed(data)
+  eq(K.item_differs(data), 0, "seeded")
+  data.overrides.tolerance = data.overrides.tolerance + 5
+  eq(K.item_differs(data), 1, "tolerance changed")
+  K.item_reset_values(data)
+  eq(K.item_differs(data), 0, "reset")
+  eq(data.overrides.tolerance, K.start_values().tolerance, "starting value back")
+end)
+
+test("reset_item_all_one_undo", function() with_write_stubs({}, function(rec)
+  local st, K = S.state, S.K
+  local fr = stretch_frames(slide_segs(62))
+  local start = K.start_values()
+  local other_sep = (start.separation > 0.5) and 0.2 or 0.9
+  local old, old_splits = K.segment(fr, other_sep)
+  local data = { guid = "{a}", name = "{a}", notes = old, results = fr, item_len = 2, sample_rate = 44100 }
+  K.item_seed(data)
+  data.separation = other_sep
+  data.overrides.tolerance = start.tolerance + 5
+  data.key_idx = (start.key_idx % 12) + 1
+  local saved = { st.target_take_guid, st.results, st.notes, st.split_points, st.separation, st.key_idx,
+    st.scale_idx, reaper.time_precise, st.status.text }
+  reaper.time_precise = function() return 0 end
+  st.target_take_guid, st.session_takes["{a}"] = "{a}", data
+  st.results, st.notes, st.split_points, st.separation = fr, old, old_splits, other_sep
+  st.key_idx = data.key_idx
+  local ok, err = pcall(function()
+    K.reset_item_all()
+    eq(#rec.labels, 1, "one undo point")
+    eq(rec.labels[1], "Reset item to starting values", "undo label")
+    eq(st.status.text, "Item reset to the starting values.", "status")
+    eq(K.item_differs(data), 0, "every value back")
+    eq(st.separation, start.separation, "bar Separation follows")
+    eq(st.key_idx, start.key_idx, "bar Key follows")
+    eq(st.notes ~= old, true, "re-split")
+    K.reset_item_all()
+    eq(#rec.labels, 1, "nothing differs: no undo point")
+  end)
+  st.target_take_guid, st.results, st.notes, st.split_points, st.separation, st.key_idx,
+    st.scale_idx, reaper.time_precise, st.status.text = table.unpack(saved, 1, 9)
+  if not ok then error(err, 0) end
+end) end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
