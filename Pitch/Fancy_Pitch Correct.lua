@@ -1,9 +1,10 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.23.1
+-- @version 2.24.0
 -- @changelog
---   Note rows use two greys: every in-key row (every row in Chromatic) one grey, out-of-key rows dark
---   Black-key rows no longer get their own shade; the accent tint on in-key rows is gone
+--   Rename a Pitched Items row in place (double-click its name, or Rename… in its right-click menu): the take is
+--   renamed in REAPER as one undo step, with no re-analysis
+--   A take renamed in REAPER's arrange view shows its new name in Pitched Items right away
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -2450,6 +2451,14 @@ end
 --- Stored data that cannot be used (it does not decode, or holds no analysis) is not dropped silently: the take is
 --- recorded in state.unreadable_takes (the Pitched Items banner reports it); nothing stored, or data that loads,
 --- clears the record. Returns the model, or nil.
+--- The take's name as REAPER has it now (the arrange window's item label). The name saved with an analysis is only
+--- the fallback, for a take REAPER gives no name.
+K.live_take_name = function(take, fallback)
+  local name = take and reaper.GetTakeName(take) or nil
+  if name and name ~= "" then return name end
+  return fallback or "Item"
+end
+
 local function load_take_data(take, raw)
   if not take then return nil end
   local guid = get_take_guid(take)
@@ -2480,6 +2489,7 @@ local function load_take_data(take, raw)
   if guid then state.unreadable_takes[guid] = (not readable) or nil end
   if readable then
     K.item_seed(data)
+    data.name = K.live_take_name(take, data.name)   -- the name is REAPER's, not the one saved with the analysis
     return data
   end
   return nil
@@ -3088,6 +3098,10 @@ local function sync_with_project()
       i = i + 1
     else
       state.missing_takes[guid] = nil
+      -- A rename in REAPER (or its undo) shows in the list without a re-analysis
+      local listed = state.session_takes[guid]
+      if listed then listed.name = K.live_take_name(take, listed.name) end
+      if guid == state.target_take_guid then state.target_take_name = K.live_take_name(take, state.target_take_name) end
       local raw = read_take_raw(take)
       if raw == (state.raw_cache[guid] or "") then
         i = i + 1
@@ -9448,8 +9462,10 @@ local BODY = {
   menu_remove_sel_fmt = "Remove Selected Items (%d)…",
   menu_no_selection = "no rows selected",
   menu_wipe_fmt = "Wipe All Items (%d)…",
-  row_click_tip = string.format("Click to make this the active item · %s-click to add or remove · Shift-click for a range",
-    K.MOD_LABEL),
+  menu_rename = "Rename…",
+  menu_rename_missing = "item not in project",
+  row_click_tip = string.format("Click to make this the active item · %s-click to add or remove · Shift-click for a range"
+    .. "\nDouble-click to rename (the take in REAPER is renamed too)", K.MOD_LABEL),
 }
 
 --- `text` shortened with a trailing ellipsis to at most max_w wide in the font pushed now (font_tag names
@@ -9501,7 +9517,8 @@ K.INFO_SECTIONS = {
     { "Click a Pitched Items row", "Switch the active item, select only that row" },
     { K.MOD_LABEL .. " + Click a row", "Add / remove the row from the selection" },
     { "Shift + Click a row", "Select a range of rows" },
-    { "Right-click a row", "Remove this, the selected or all items" },
+    { "Double-click a row's name", "Rename the item (Enter renames, Esc keeps the name)" },
+    { "Right-click a row", "Rename, or remove this, the selected or all items" },
     { "Select an audio item in REAPER", "Becomes the active item" },
     { "Drag the divider", "Resize Pitched Items" },
     { "H", "Show / hide the Shortcuts list", panel = { "General", 5, "Hide this list" } },
@@ -9782,7 +9799,10 @@ K.draw_items_body = function(sidebar_ctx)
         reaper.ImGui_PushStyleVar(sidebar_ctx, reaper.ImGui_StyleVar_SelectableTextAlign(), 0, 0.5)
         reaper.ImGui_SetCursorPosY(sidebar_ctx, line_y)
         if rows_locked then reaper.ImGui_BeginDisabled(sidebar_ctx) end
-        if reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h)
+        local renaming = K.rename ~= nil and K.rename.guid == guid and not rows_locked and not is_missing
+        if renaming then
+          K.draw_rename_field(sidebar_ctx, guid, name_w, card_h, line_y)
+        elseif reaper.ImGui_Selectable(sidebar_ctx, sel_text .. "###sel", false, reaper.ImGui_SelectableFlags_None(), name_w, card_h)
            and not rows_locked then
           -- Cmd/Ctrl-click toggles the row, Shift-click selects the range from the anchor (both leave the active item
           -- alone); a plain click makes the row active and the only one selected
@@ -9795,8 +9815,17 @@ K.draw_items_body = function(sidebar_ctx)
             row_action = { kind = "click", guid = guid, take = take_obj }
           end
         end
-        if not rows_locked and reaper.ImGui_BeginPopupContextItem(sidebar_ctx, "##row_menu") then
+        -- Double-click on the name renames the item in place (the first click of it made the row active)
+        if not renaming and not rows_locked and not is_missing
+           and reaper.ImGui_IsItemHovered(sidebar_ctx) and reaper.ImGui_IsMouseDoubleClicked(sidebar_ctx, 0) then
+          row_action = { kind = "rename", guid = guid }
+        end
+        if not renaming and not rows_locked and reaper.ImGui_BeginPopupContextItem(sidebar_ctx, "##row_menu") then
           if reaper.ImGui_Shortcut(sidebar_ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(sidebar_ctx) end
+          local rename_reason = is_missing and BODY.menu_rename_missing or nil
+          if reaper.ImGui_MenuItem(sidebar_ctx, BODY.menu_rename, rename_reason, false, rename_reason == nil) then
+            row_action = { kind = "rename", guid = guid }
+          end
           if reaper.ImGui_MenuItem(sidebar_ctx, BODY.menu_remove_one) then
             row_action = { kind = "remove_one", guid = guid }
           end
@@ -9822,7 +9851,7 @@ K.draw_items_body = function(sidebar_ctx)
           if reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
             Theme.tooltip(sidebar_ctx, string.format("Item: %s\n%s", full_name, K.REASON_ANALYZING))
           end
-        elseif reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        elseif not renaming and reaper.ImGui_IsItemHovered(sidebar_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           local lines = { string.format("Item: %s", full_name) }
           if is_missing then
             lines[#lines + 1] = state_tip
@@ -9917,7 +9946,51 @@ K.run_row_action = function(a)
     K.request_remove_selected_confirm()
   elseif a.kind == "wipe" then
     request_wipe_confirm()
+  elseif a.kind == "rename" then
+    local data = state.session_takes[a.guid]
+    if data then K.rename = { guid = a.guid, text = data.name or "", focus = true } end
   end
+end
+
+--- The in-place rename field of a Pitched Items row (K.rename = { guid, text, focus }), drawn where the name is.
+--- Enter renames the take in REAPER; Esc or a click elsewhere leaves the name as it was (as the typed value entry).
+K.draw_rename_field = function(rctx, guid, w, card_h, line_y)
+  local r = K.rename
+  local frame_h = reaper.ImGui_GetFrameHeight(rctx) or card_h
+  reaper.ImGui_SetCursorPosY(rctx, line_y + math.max(0, (card_h - frame_h) * 0.5))
+  reaper.ImGui_SetNextItemWidth(rctx, w)
+  if r.focus then
+    reaper.ImGui_SetKeyboardFocusHere(rctx)
+    r.focus = false
+    r.shown = false
+  end
+  local entered, text = reaper.ImGui_InputText(rctx, "##rename", r.text,
+    reaper.ImGui_InputTextFlags_EnterReturnsTrue() | reaper.ImGui_InputTextFlags_AutoSelectAll())
+  if type(text) == "string" then r.text = text end
+  local active = reaper.ImGui_IsItemActive(rctx)
+  if entered then
+    K.rename = nil
+    K.rename_take(guid, r.text)
+  elseif r.shown and not active then
+    K.rename = nil
+    K.drag_hot.esc_used = true   -- an Esc that ended the entry is spent (HC5): it does not also clear a selection
+  end
+  if active then r.shown = true end
+end
+
+--- Rename the take of a Pitched Items row in REAPER (one undo point). The list reads the name back from the take.
+K.rename_take = function(guid, text)
+  local name = tostring(text or ""):match("^%s*(.-)%s*$")
+  local data = state.session_takes[guid]
+  local take = resolve_take_by_guid(guid)
+  if not data or not take or name == "" or name == reaper.GetTakeName(take) then return end
+  reaper.Undo_BeginBlock()
+  reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", name, true)
+  reaper.Undo_EndBlock("Rename Take", -1)
+  reaper.UpdateArrange()
+  data.name = name
+  if guid == state.target_take_guid then state.target_take_name = name end
+  set_status(string.format("Renamed to \"%s\". %s+Z to undo.", name, K.MOD_LABEL))
 end
 
 -- The panel's Shortcuts groups, in the order they are drawn

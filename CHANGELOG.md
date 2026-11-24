@@ -4,6 +4,9 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.24.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Rename items without analysing again:
+  - **Rename in Pitched Items**: double-click a row's name, or right-click the row and choose Rename…, type the new name and press Enter. The take is renamed in REAPER too, as one undo step "Rename Take". Esc or a click elsewhere keeps the old name.
+  - **Names follow REAPER**: a take renamed in the arrange view (or a rename undone) shows its new name in Pitched Items right away. The analysis is not touched.
 - **Fancy Pitch Correct v2.23.1 (`Pitch/Fancy_Pitch Correct.lua`)** — Calmer note rows:
   - **Two greys for the note rows**: every in-key row is now the same grey, with a thin line between rows; rows outside the key stay dark. In Chromatic every row is the in-key grey, so the two look alike. Black-key rows no longer get their own shade, and the faint accent tint on in-key rows is gone.
 - **Fancy Pitch Correct v2.23.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Remove several Pitched Items at once:
