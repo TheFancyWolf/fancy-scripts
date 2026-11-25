@@ -4739,6 +4739,46 @@ test("form_binding_shape", function()
   eq(form.values.threshold, S.state.threshold)
 end)
 
+test("form_layout_picks_by_space", function()
+  local K = S.K
+  local need = { row_w = 400, stacked_w = 200, full_h = 120, stacked_h = 200, button_h = 40 }
+  eq(K.form_layout(600, 300, need), "full")
+  eq(K.form_layout(250, 300, need), "stacked")
+  eq(K.form_layout(1200, 110, need), "summary")
+end)
+
+test("batch_start_snapshots_given_values", function()
+  local real_begin = S.K.analysis_begin
+  with_batch(function()
+    local K, st = S.K, S.state
+    local names = { "GetTakeName", "GetMediaItemInfo_Value", "new_array", "GetSetMediaItemTakeInfo_String" }
+    local old, saved_acc, saved_min = {}, K.open_accessor, st.min_freq
+    for _, n in ipairs(names) do old[n] = reaper[n] end
+    K.analysis_begin = real_begin
+    K.open_accessor = function() return "acc" end
+    reaper.GetTakeName = function() return "t" end
+    reaper.GetMediaItemInfo_Value = function() return 2 end
+    reaper.new_array = function() return {} end
+    reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{a}" end return true, "" end
+    local ok, err = pcall(function()
+      local values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+      K.batch_start(entries3(), values)
+      values.min_freq = 80   -- the form changes after the click: the batch keeps what it was started with
+      eq(K.batch.values.min_freq, 250, "the batch keeps the values it was started with")
+      eq(st.analysis_params.min_freq, 250); eq(st.analysis_params.block_size, 2048); eq(st.analysis_params.hop_size, 256)
+      eq(st.min_freq, saved_min, "state.min_freq unchanged")
+      K.batch = nil; st.is_analyzing = false
+      K.batch_start(entries3())
+      eq(K.batch.values.min_freq, st.min_freq, "no values: the defaults")
+      eq(st.analysis_params.min_freq, st.min_freq)
+    end)
+    K.open_accessor = saved_acc
+    for _, n in ipairs(names) do reaper[n] = old[n] end
+    st.analysis_params, st.accessor, st.buffer = nil, nil, nil
+    if not ok then error(err, 0) end
+  end)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
