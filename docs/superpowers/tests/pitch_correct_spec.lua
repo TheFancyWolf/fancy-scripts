@@ -4572,6 +4572,99 @@ test("confirm_fit_hidden_until_measured", function()
     "never measured: shown anyway after a few frames")
 end)
 
+local SOPRANO_ANALYSIS = { min_freq = 250, max_freq = 1200, threshold = 0.08, block_size = 1024, hop_size = 512 }
+test("form_seeds_from_item_not_defaults", function()
+  local f = S.K.form_new("{a}", { notes = { {} }, analysis = SOPRANO_ANALYSIS })
+  eq(f.source, "item"); eq(f.values.min_freq, 250); eq(f.values.max_freq, 1200)
+  eq(f.seed, SOPRANO_ANALYSIS, "the seed is the stored table")
+  eq(S.K.form_header(f), "ANALYZE WITH · as analyzed before")
+end)
+test("form_unrecorded_item_uses_defaults", function()
+  local f = S.K.form_new("{a}", { notes = { {} } })
+  eq(f.source, "unrecorded"); eq(f.values.min_freq, S.state.min_freq)
+  eq(S.K.form_header(f), "ANALYZE WITH · not recorded, your defaults")
+  local u = S.K.form_new("{b}", nil)
+  eq(u.source, "defaults"); eq(S.K.form_header(u), "ANALYZE WITH · your defaults")
+  eq(S.K.form_new("batch", nil).guid, "batch")
+end)
+test("form_reseeds_when_stored_analysis_changes", function()
+  local st = S.state
+  local saved = st.analysis_form
+  local a1 = { min_freq = 250, max_freq = 1200, threshold = 0.08, block_size = 1024, hop_size = 512 }
+  local a2 = { min_freq = 80, max_freq = 350, threshold = 0.15, block_size = 2048, hop_size = 256 }
+  local d1 = { notes = { {} }, analysis = a1 }
+  local d2 = { notes = { {} }, analysis = a2 }
+  st.analysis_form = nil
+  S.K.form_sync("{a}", d1)
+  local form = st.analysis_form
+  S.K.form_set(form, "threshold", 0.25)
+  S.K.form_sync("{a}", d1)
+  eq(st.analysis_form, form, "same guid and same stored analysis: kept")
+  eq(st.analysis_form.values.threshold, 0.25)
+  S.K.form_sync("{a}", d2)
+  eq(st.analysis_form.values.min_freq, 80, "an undo replaced the stored analysis: reseeded from it")
+  eq(st.analysis_form.values.threshold, 0.15)
+  eq(next(st.analysis_form.edited), nil, "edited is empty")
+  st.analysis_form = saved
+end)
+test("form_follows_defaults_for_untouched_rows", function()
+  local st = S.state
+  local saved, saved_min, saved_max = st.analysis_form, st.min_freq, st.max_freq
+  st.analysis_form = nil
+  S.K.form_sync("{b}", nil)
+  local form = st.analysis_form
+  S.K.form_set(form, "threshold", 0.25)
+  st.min_freq, st.max_freq = 80, 350   -- Bass
+  S.K.form_sync("{b}", nil)
+  eq(form.values.min_freq, 80); eq(form.values.max_freq, 350)
+  eq(form.values.threshold, 0.25, "the edited row keeps its value")
+  st.min_freq, st.max_freq, st.analysis_form = saved_min, saved_max, saved
+end)
+test("form_set_and_reset_row", function()
+  local f = S.K.form_new("{c}", nil)
+  S.K.form_set(f, "range", { min = 250, max = 1200 })
+  eq(f.values.min_freq, 250); eq(f.values.max_freq, 1200)
+  eq(f.edited.min_freq, true); eq(f.edited.max_freq, true)
+  S.K.form_reset_row(f, "range")
+  eq(f.values.min_freq, S.state.min_freq); eq(f.values.max_freq, S.state.max_freq)
+  eq(next(f.edited), nil)
+  S.K.form_set(f, "block_size", 2048); S.K.form_reset_row(f, "block")
+  eq(f.values.block_size, S.state.block_size); eq(f.edited.block_size, nil)
+end)
+test("form_changed_rows_counts_rows_not_keys", function()
+  local v = S.K.analysis_defaults(); v.min_freq, v.max_freq = 250, 1200
+  eq(S.K.form_changed_rows(v), 1)
+  v.threshold = 0.25; eq(S.K.form_changed_rows(v), 2)
+  local f = { source = "defaults", values = v }
+  eq(S.K.form_header(f), "ANALYZE WITH · 2 changed from defaults")
+  v.threshold = S.state.threshold
+  eq(S.K.form_header(f), "ANALYZE WITH · 1 changed from defaults")
+end)
+test("form_summary_names_presets_and_custom", function()
+  local v = S.K.analysis_defaults()
+  eq(S.K.form_summary(v), "Generic Vocal · Clean / Strict · Standard (Realtime)")
+  v.max_freq = 999; eq(S.K.form_summary(v):match("^Custom") ~= nil, true)
+  eq(S.K.analyzed_with_tip({ analysis = SOPRANO_ANALYSIS }), "Analyzed with Soprano · Clean / Strict · Standard (Realtime)")
+  eq(S.K.analyzed_with_tip({}), nil)
+end)
+test("form_defaults_request_names_changes", function()
+  local K, st = S.K, S.state
+  local v = K.analysis_defaults(); v.min_freq, v.max_freq = 250, 1200
+  local req = K.form_defaults_request(v)
+  eq(req.title, "Make these your defaults?")
+  eq(req.body_lines[1], "New analyses will start with: Soprano (was Generic Vocal).")
+  eq(req.body_lines[2], "Items already analyzed keep their own settings.")
+  eq(req.confirm_label, "Save as Default")
+  local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time }
+  local group
+  K.save_settings = function(g) group = g end
+  reaper.time_precise = function() return 0 end
+  req.on_confirm()
+  eq(st.min_freq, 250); eq(st.max_freq, 1200); eq(group, "engine"); eq(st.status.text, "Defaults saved.")
+  K.save_settings, st.min_freq, st.max_freq, reaper.time_precise = saved[1], saved[2], saved[3], saved[4]
+  st.status.text, st.status.until_time = saved[5], saved[6]
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

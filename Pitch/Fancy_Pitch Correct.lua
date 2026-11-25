@@ -435,6 +435,7 @@ local state = {
   -- Target item binding (persistent GUID lock)
   target_take_guid = nil,
   target_take_name = nil,
+  analysis_form = nil,   -- { guid, values, edited, source, seed }: the values the next analysis of the target item would use (K.form_new)
 
   -- Undo / model sync with REAPER
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
@@ -1714,6 +1715,140 @@ K.analysis_values = function(t)
   if not listed(BLOCK_SIZES, values.block_size) or not listed(HOP_SIZES, values.hop_size) then return nil end
   if values.hop_size > values.block_size then return nil end
   return values
+end
+
+--- Which of the three rows (Vocal Range, Detection Mode, Quality) of `values` match a preset: the names of the
+--- presets, K.CUSTOM_PRESET for a row that matches none.
+K.form_part_names = function(values)
+  local r = K.match_preset(VOCAL_RANGES, function(e) return e.min == values.min_freq and e.max == values.max_freq end)
+  local m = K.match_preset(DETECTION_MODES, function(e) return e.threshold == values.threshold end)
+  local q = K.match_preset(QUALITY_MODES, function(e) return e.block == values.block_size and e.hop == values.hop_size end)
+  return VOCAL_RANGES[r] and VOCAL_RANGES[r].name or K.CUSTOM_PRESET,
+    DETECTION_MODES[m] and DETECTION_MODES[m].name or K.CUSTOM_PRESET,
+    QUALITY_MODES[q] and QUALITY_MODES[q].name or K.CUSTOM_PRESET
+end
+
+--- "Soprano · Clean / Strict · Standard (Realtime)": the three rows of `values` by preset name.
+K.form_summary = function(values)
+  local r, m, q = K.form_part_names(values)
+  return r .. " · " .. m .. " · " .. q
+end
+
+--- "Analyzed with Soprano · ...": what an analysed item's tooltip says, nil when it has no stored analysis.
+K.analyzed_with_tip = function(data)
+  if not data or not data.analysis then return nil end
+  return "Analyzed with " .. K.form_summary(data.analysis)
+end
+
+--- Where a form for `data` starts from: "item" (it has a stored analysis), "unrecorded" (notes, no stored
+--- analysis) or "defaults" (not analysed, or a batch).
+K.form_source = function(data)
+  if data and K.analysis_values(data.analysis) then return "item" end
+  if data and data.notes and #data.notes > 0 then return "unrecorded" end
+  return "defaults"
+end
+
+--- A fresh form for `guid` (or "batch", with `data` nil): the item's stored analysis when it has one, else the
+--- Settings' values. `seed` is the stored table it came from (identity compare in K.form_sync).
+K.form_new = function(guid, data)
+  local source = K.form_source(data)
+  local form = { guid = guid, edited = {}, source = source }
+  if source == "item" then
+    form.values = K.analysis_values(data.analysis)
+    form.seed = data.analysis
+  else
+    form.values = K.analysis_defaults()
+  end
+  return form
+end
+
+--- Keep state.analysis_form on `guid`: a new form when the item changed or its stored analysis is not the one the
+--- form was seeded from (an undo or a re-analysis replaced it); otherwise the rows the user has not touched follow
+--- the Settings' defaults (not for an item's own values).
+K.form_sync = function(guid, data)
+  local form = state.analysis_form
+  if not form or form.guid ~= guid or form.seed ~= (data and data.analysis or nil) or form.source ~= K.form_source(data) then
+    state.analysis_form = K.form_new(guid, data)
+    return
+  end
+  if form.source ~= "item" then
+    local defaults = K.analysis_defaults()
+    for _, key in ipairs(K.ANALYSIS_KEYS) do
+      if not form.edited[key] then form.values[key] = defaults[key] end
+    end
+  end
+end
+
+--- Set one value of the form and mark it edited. key "range" takes a VOCAL_RANGES entry (both Hz) and "quality" a
+--- QUALITY_MODES entry (block and hop).
+K.form_set = function(form, key, value)
+  local pairs_of = {
+    range = function() return { min_freq = value.min, max_freq = value.max } end,
+    quality = function() return { block_size = value.block, hop_size = value.hop } end,
+  }
+  local set = pairs_of[key] and pairs_of[key]() or { [key] = value }
+  for k, v in pairs(set) do
+    form.values[k] = v
+    form.edited[k] = true
+  end
+end
+
+--- Put a row back to the Settings' default: row_id "range", "mode", "quality", "block", "hop", "threshold",
+--- "min_freq" or "max_freq".
+K.form_reset_row = function(form, row_id)
+  local keys_of = {
+    range = { "min_freq", "max_freq" }, mode = { "threshold" }, quality = { "block_size", "hop_size" },
+    block = { "block_size" }, hop = { "hop_size" }, threshold = { "threshold" },
+    min_freq = { "min_freq" }, max_freq = { "max_freq" },
+  }
+  local defaults = K.analysis_defaults()
+  for _, key in ipairs(keys_of[row_id] or {}) do
+    form.values[key] = defaults[key]
+    form.edited[key] = nil
+  end
+end
+
+--- How many of the three rows (Vocal Range, Detection Mode, Quality) of `values` differ from the Settings' defaults.
+K.form_changed_rows = function(values)
+  local d = K.analysis_defaults()
+  local n = 0
+  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq then n = n + 1 end
+  if values.threshold ~= d.threshold then n = n + 1 end
+  if values.block_size ~= d.block_size or values.hop_size ~= d.hop_size then n = n + 1 end
+  return n
+end
+
+--- The form's header line.
+K.form_header = function(form)
+  if form.source == "item" then return "ANALYZE WITH · as analyzed before" end
+  if form.source == "unrecorded" then return "ANALYZE WITH · not recorded, your defaults" end
+  local n = K.form_changed_rows(form.values)
+  if n == 0 then return "ANALYZE WITH · your defaults" end
+  return string.format("ANALYZE WITH · %d changed from defaults", n)
+end
+
+--- The Save as Default confirm (a request_confirm request) for `values`.
+K.form_defaults_request = function(values)
+  local copy = {}
+  for _, key in ipairs(K.ANALYSIS_KEYS) do copy[key] = values[key] end
+  local nr, nm, nq = K.form_part_names(copy)
+  local or_, om, oq = K.form_part_names(K.analysis_defaults())
+  local parts = {}
+  if nr ~= or_ then parts[#parts + 1] = string.format("%s (was %s)", nr, or_) end
+  if nm ~= om then parts[#parts + 1] = string.format("%s (was %s)", nm, om) end
+  if nq ~= oq then parts[#parts + 1] = string.format("%s (was %s)", nq, oq) end
+  local first = #parts > 0 and ("New analyses will start with: " .. table.concat(parts, ", ") .. ".")
+    or "New analyses will start with these values."
+  return {
+    title = "Make these your defaults?",
+    body_lines = { first, "Items already analyzed keep their own settings." },
+    confirm_label = "Save as Default",
+    on_confirm = function()
+      for _, key in ipairs(K.ANALYSIS_KEYS) do state[key] = copy[key] end
+      K.save_settings("engine")
+      set_status("Defaults saved.")
+    end,
+  }
 end
 
 --- Start analysing `take` (in `item`): it becomes the target and its audio is read slice by slice from the next
@@ -3165,9 +3300,11 @@ local function switch_active_target(guid, take_obj)
 
   if data then
     adopt_take_data(guid, data)
+    K.form_sync(guid, data)
     return true
   end
   K.adopt_new_item_values()   -- not analysed yet: it shows, and its first analysis uses, a new item's values
+  K.form_sync(guid, nil)
   return false
 end
 
@@ -3324,6 +3461,7 @@ local function sync_with_project()
     end
   end
   if analyses_changed then K.status_release() end
+  if state.target_take_guid then K.form_sync(state.target_take_guid, state.session_takes[state.target_take_guid]) end
 end
 
 --- Persist the target's note model to its take (P_EXT) so it lands inside the caller's open undo block.
@@ -13881,6 +14019,10 @@ local function loop_body()
 
   -- Follow REAPER's undo / redo / project changes (one cheap count check per frame)
   sync_with_project()
+  local form_guid = state.target_take_guid
+  if form_guid and (not state.analysis_form or state.analysis_form.guid ~= form_guid) then   -- HI5: only on a target change
+    K.form_sync(form_guid, state.session_takes[form_guid])
+  end
   K.analysis_tick()
   K.stale_check_step(ctx)
 
