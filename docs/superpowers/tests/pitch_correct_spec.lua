@@ -4791,7 +4791,7 @@ test("form_set_and_reset_row", function()
   eq(f.values.block_size, S.state.block_size); eq(f.edited.block_size, nil)
 end)
 test("form_changed_rows_counts_rows_not_keys", function()
-  local v = S.K.analysis_defaults(); v.min_freq, v.max_freq = 250, 1200
+  local v = S.K.analysis_defaults(); v.auto_range, v.min_freq, v.max_freq = false, 250, 1200
   eq(S.K.form_changed_rows(v), 1)
   v.threshold = 0.25; eq(S.K.form_changed_rows(v), 2)
   local f = { source = "defaults", values = v }
@@ -4864,6 +4864,7 @@ test("rows_edit_the_bound_table", function()
   local b = S.K.form_binding(form)
   local range = settings_row("detection", "range")
   local before = { st.min_freq, st.max_freq }
+  form.values.auto_range = false -- the Hz are only the user's to set when not Auto
   b.set("min_freq", 250); b.set("max_freq", 1200)
   eq(range.is_default(b), false)
   eq(st.min_freq, before[1], "state untouched"); eq(st.max_freq, before[2], "state untouched")
@@ -5936,6 +5937,38 @@ test("form_changed_rows_auto_nil_is_false", function()
   local n = K.form_changed_rows(v)
   st.auto_range = saved
   eq(n, 0, "nil and false are the same")
+end)
+
+test("range_row_auto_found_from_track_is_default", function()
+  local K, st = S.K, S.state
+  local row
+  for _, section in ipairs(K.SETTINGS_SECTIONS) do
+    for _, r in ipairs(section.rows) do if r.id == "range" then row = r end end
+  end
+  local auto_base = { auto_range = true, min_freq = 65, max_freq = 1000 }
+  local fixed_base = { auto_range = false, min_freq = 130, max_freq = 500 }
+  local function is_def(v, base) return row.is_default({ v = v, base = base }) end
+  eq(is_def({ auto_range = true, min_freq = 104, max_freq = 554 }, auto_base), true, "Auto found from the track is the default")
+  eq(is_def({ auto_range = true, min_freq = 104, max_freq = 554 }, fixed_base), false, "Auto against a fixed default")
+  eq(is_def({ auto_range = false, min_freq = 130, max_freq = 500 }, auto_base), false, "fixed against Auto")
+  eq(is_def({ auto_range = false, min_freq = 65, max_freq = 1000 }, auto_base), false, "Generic Vocal is not Auto")
+  eq(is_def({ auto_range = false, min_freq = 130, max_freq = 500 }, fixed_base), true, "fixed equal to fixed")
+  local saved = { st.auto_range, st.min_freq, st.max_freq }
+  local ok, err = pcall(function()
+    local function changed(v, d)
+      st.auto_range, st.min_freq, st.max_freq = d.auto_range, d.min_freq, d.max_freq
+      local x = K.analysis_defaults()
+      v.threshold, v.block_size, v.hop_size = x.threshold, x.block_size, x.hop_size
+      return K.form_changed_rows(v)
+    end
+    eq(changed({ auto_range = true, min_freq = 104, max_freq = 554 }, auto_base), 0, "Auto found from the track: no changed row")
+    eq(changed({ auto_range = true, min_freq = 104, max_freq = 554 }, fixed_base), 1)
+    eq(changed({ auto_range = false, min_freq = 130, max_freq = 500 }, auto_base), 1)
+    eq(changed({ auto_range = false, min_freq = 65, max_freq = 1000 }, auto_base), 1)
+    eq(changed({ auto_range = false, min_freq = 130, max_freq = 500 }, fixed_base), 0)
+  end)
+  st.auto_range, st.min_freq, st.max_freq = table.unpack(saved, 1, 3)
+  if not ok then error(err, 0) end
 end)
 
 test("auto_hz_rows_disabled_with_reason", function()

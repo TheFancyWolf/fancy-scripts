@@ -2555,11 +2555,19 @@ K.hz_reset_follows = function(v, base)
   return true
 end
 
+--- Whether two values tables have the same Vocal Range: both Auto (whatever Hz the analysis ran with, found from the
+--- track), or neither Auto and the same Hz.
+K.range_same = function(a, b)
+  local a_auto, b_auto = a.auto_range == true, b.auto_range == true
+  if a_auto or b_auto then return a_auto and b_auto end
+  return a.min_freq == b.min_freq and a.max_freq == b.max_freq
+end
+
 --- How many of the three rows (Vocal Range, Detection Mode, Quality) of `values` differ from the Settings' defaults.
 K.form_changed_rows = function(values)
   local d = K.analysis_defaults()
   local n = 0
-  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq or (values.auto_range == true) ~= (d.auto_range == true) then
+  if not K.range_same(values, d) then
     n = n + 1
   end
   if values.threshold ~= d.threshold then n = n + 1 end
@@ -12183,8 +12191,7 @@ K.SETTINGS_SECTIONS = {
   { id = "detection", title = "Analysis Defaults", rows = {
     { id = "range", label = "Vocal Range", labels = COMBO_LABELS.ranges,
       is_default = function(b)
-        return b.v.min_freq == b.base.min_freq and b.v.max_freq == b.base.max_freq
-          and (b.v.auto_range == true) == (b.base.auto_range == true)
+        return K.range_same(b.v, b.base)
       end,
       reset = function(b) b.reset("range") end,
       draw = function(w, b)
