@@ -283,6 +283,9 @@ local K = {
     separation = { 0, 1 },
   },
 
+  -- The five detection values an analysis is run with, and the item stores (take data field `analysis`)
+  ANALYSIS_KEYS = { "min_freq", "max_freq", "threshold", "block_size", "hop_size" },
+
   -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
   -- (see K.tone_tick). The P_* entries are its 0-based parameter indices; MON is added to an FX index to address the
   -- Monitoring FX chain, which lives on the master track
@@ -1677,10 +1680,47 @@ K.open_accessor = function(take)
   return nil
 end
 
+--- The detection values the Settings hold now: a fresh table of the K.ANALYSIS_KEYS copied from state.
+K.analysis_defaults = function()
+  local values = {}
+  for _, key in ipairs(K.ANALYSIS_KEYS) do values[key] = state[key] end
+  return values
+end
+
+--- A validated copy of the K.ANALYSIS_KEYS of `t`, or nil when `t` is not a table or any of them is missing or
+--- invalid: a finite number (not a string): Hz within the widest Settings span with min below max, threshold inside K.LIMITS, a block size and a hop size from the lists,
+--- with the hop no longer than the block.
+K.analysis_values = function(t)
+  if type(t) ~= "table" then return nil end
+  local function listed(list, v)
+    for _, x in ipairs(list) do if x == v then return true end end
+    return false
+  end
+  local values = {}
+  for _, key in ipairs(K.ANALYSIS_KEYS) do
+    local v = t[key]
+    if type(v) ~= "number" or v ~= v then return nil end
+    values[key] = v
+  end
+  -- A vocal range's low end (Soprano: 250 Hz) lies above the Settings drag's min range, so both Hz values are held to
+  -- the widest span the Settings allow, and the low end must be below the high end
+  local hz_lo, hz_hi = K.LIMITS.min_freq[1], K.LIMITS.max_freq[2]
+  for _, key in ipairs({ "min_freq", "max_freq" }) do
+    if values[key] < hz_lo or values[key] > hz_hi then return nil end
+  end
+  if values.min_freq >= values.max_freq then return nil end
+  local lim = K.LIMITS.threshold
+  if values.threshold < lim[1] or values.threshold > lim[2] then return nil end
+  if not listed(BLOCK_SIZES, values.block_size) or not listed(HOP_SIZES, values.hop_size) then return nil end
+  if values.hop_size > values.block_size then return nil end
+  return values
+end
+
 --- Start analysing `take` (in `item`): it becomes the target and its audio is read slice by slice from the next
 --- frame on (process_analysis_step). opts (optional):
 ---   sample_rate     the rate to read at, when the caller already knows it (a batch records it when it starts:
 ---                   REAPER can report 0 for every source while it is in the background, see K.batch_selection)
+---   values          the detection values to analyse with (K.analysis_defaults() shape); omitted: the Settings' now
 ---   defer_envelope  do not create or show the take's Pitch envelope now (a batch does it in its one undo block)
 --- Returns true, or false and why: "offline" (the source has no sample rate: its media is offline) or "accessor"
 --- (REAPER gave no audio accessor). Nothing is changed when it returns false.
@@ -1714,16 +1754,17 @@ K.analysis_begin = function(take, item, opts)
 
   -- A bad engine value must never crash (negative array size) or hang (a hop of 0 never advances the
   -- analysis time) an analysis: clamp to 64 <= block, 1 <= hop <= block before anything is allocated
-  local block = math.floor(tonumber(state.block_size) or DEFAULTS.block_size)
-  state.block_size = math.max(K.BLOCK_SIZE_MIN, math.min(K.BLOCK_SIZE_MAX, block))
-  local hop = math.floor(tonumber(state.hop_size) or DEFAULTS.hop_size)
-  state.hop_size = math.max(1, math.min(state.block_size, hop))
+  local values = opts.values or K.analysis_defaults()
+  local block = math.floor(tonumber(values.block_size) or DEFAULTS.block_size)
+  block = math.max(K.BLOCK_SIZE_MIN, math.min(K.BLOCK_SIZE_MAX, block))
+  local hop = math.floor(tonumber(values.hop_size) or DEFAULTS.hop_size)
+  hop = math.max(1, math.min(block, hop))
 
   -- The running analysis reads this snapshot, never the live settings: the Settings controls are locked meanwhile,
   -- and a value changed some other way cannot overrun the sample buffer or mix two parameter sets
   state.analysis_params = {
-    block_size = state.block_size, hop_size = state.hop_size, threshold = state.threshold,
-    min_freq = state.min_freq, max_freq = state.max_freq,
+    block_size = block, hop_size = hop, threshold = values.threshold,
+    min_freq = values.min_freq, max_freq = values.max_freq,
   }
 
   state.accessor = accessor
@@ -1748,7 +1789,7 @@ K.analysis_begin = function(take, item, opts)
 end
 
 --- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected).
-local function start_analysis()
+local function start_analysis(values)
   -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
   -- get_target_take() falls back to the selected audio item only when there is no usable target.
   local take, item = get_target_take()
@@ -1757,7 +1798,7 @@ local function start_analysis()
     set_status("Select an audio item first")
     return
   end
-  if not K.analysis_begin(take, item) then
+  if not K.analysis_begin(take, item, { values = values }) then
     set_status("Couldn't read this item's audio. Check that its media is online, then try again.")
   end
 end
@@ -2476,7 +2517,8 @@ K.take_json = function(data)
     key_idx = data.key_idx or state.key_idx,
     scale_idx = data.scale_idx or state.scale_idx,
     separation = data.separation,   -- the Separation the notes were split at (see K.follow_resplit_undo)
-    overrides = data.overrides or nil
+    overrides = data.overrides or nil,
+    analysis = data.analysis,   -- the values the analysis ran with (K.analysis_values)
   }
   if data.notes then
     for _, note in ipairs(data.notes) do
@@ -2569,6 +2611,7 @@ local function load_take_data(take, raw)
   if guid then state.unreadable_takes[guid] = (not readable) or nil end
   if readable then
     K.item_seed(data)
+    data.analysis = K.analysis_values(data.analysis)   -- a malformed record counts as not recorded
     data.name = K.live_take_name(take, data.name)   -- the name is REAPER's, not the one saved with the analysis
     return data
   end
@@ -5345,6 +5388,7 @@ local function process_analysis_step()
         key_idx = state.key_idx,
         scale_idx = state.scale_idx,
         separation = state.separation,
+        analysis = params,   -- the frozen snapshot: the five values this analysis ran with
       }
       -- Every new analysis starts at the defaults (K.item_seed); its Separation, Key and Scale are the state mirrors
       -- above (K.analysis_begin or, in a batch, K.batch_next put the default Separation; the Key and Scale are the

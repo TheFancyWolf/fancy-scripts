@@ -2486,7 +2486,7 @@ test("batch_copy", function()
   eq(b, "3 already have notes. You will be asked before they are replaced.")
   a, b = K.batch_lines({ n = 2, skipped = 1, with_notes = 1, target_in = true })
   eq(a, "2 audio items selected (1 other item is skipped)."); eq(b, "1 already has notes. You will be asked before it is replaced.")
-  eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another. One undo step for all of them.")
+  eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another.\n\nOne undo step for all of them.")
   eq(K.batch_undo_label(12), "Analyze Pitch (12 items)"); eq(K.batch_undo_label(1), "Analyze Pitch (1 item)")
 end)
 
@@ -2745,6 +2745,103 @@ test("take_json_is_what_save_writes", function() with_write_stubs({}, function(r
   if not ok then error(err, 0) end
   eq(rec.stored.a, json)
 end) end)
+
+test("analysis_defaults_copies_state", function()
+  local d = S.K.analysis_defaults()
+  eq(d.min_freq, S.state.min_freq); eq(d.hop_size, S.state.hop_size)
+  d.min_freq = 1; eq(S.state.min_freq ~= 1, true, "a copy, not state")
+end)
+test("analysis_values_accepts_good", function()
+  local v = S.K.analysis_values({ min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 })
+  eq(v.max_freq, 1200); eq(v.block_size, 2048)
+end)
+test("analysis_values_rejects_bad", function()
+  local K = S.K
+  eq(K.analysis_values(nil), nil)
+  eq(K.analysis_values({ min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 512, hop_size = 1024 }), nil, "hop > block")
+  eq(K.analysis_values({ min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 1000, hop_size = 256 }), nil, "block not listed")
+  eq(K.analysis_values({ min_freq = "250", max_freq = 1200, threshold = 0.25, block_size = 1024, hop_size = 256 }), nil, "string")
+  eq(K.analysis_values({ min_freq = 5, max_freq = 1200, threshold = 0.25, block_size = 1024, hop_size = 256 }), nil, "Hz below limit")
+  eq(K.analysis_values({ min_freq = 1200, max_freq = 1200, threshold = 0.25, block_size = 1024, hop_size = 256 }), nil, "min >= max")
+end)
+test("take_json_round_trips_analysis", function()
+  local v = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+  local json = S.K.take_json({ guid = "{a}", results = {}, notes = {}, analysis = v })
+  eq(json:find('"analysis"') ~= nil, true)
+  for _, part in ipairs({ '"min_freq":250', '"max_freq":1200', '"threshold":0.25', '"block_size":2048', '"hop_size":256' }) do
+    eq(json:find(part, 1, true) ~= nil, true, "stored text holds " .. part)
+  end
+end)
+test("analysis_begin_snapshots_opts_values", function()
+  local K, st = S.K, S.state
+  local saved = { K.open_accessor, st.block_size, st.hop_size, st.min_freq, st.target_take_guid, st.target_take_name,
+    st.session_takes, st.separation }
+  local names = { "GetTakeName", "GetMediaItemInfo_Value", "new_array", "GetSetMediaItemTakeInfo_String" }
+  local old = {}
+  for _, n in ipairs(names) do old[n] = reaper[n] end
+  K.open_accessor = function() return "acc" end
+  reaper.GetTakeName = function() return "t" end
+  reaper.GetMediaItemInfo_Value = function() return 2 end
+  reaper.new_array = function() return {} end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{z}" end return true, "" end
+  local before = { st.block_size, st.hop_size, st.min_freq }
+  local ok, err = pcall(function()
+    local began = K.analysis_begin("take", "item", { sample_rate = 48000, defer_envelope = true,
+      values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 } })
+    eq(began, true)
+    eq(st.analysis_params.min_freq, 250); eq(st.analysis_params.block_size, 2048)
+    eq(st.analysis_params.hop_size, 256); eq(st.analysis_params.max_freq, 1200); eq(st.analysis_params.threshold, 0.25)
+    eq(st.min_freq, before[3], "state.min_freq unchanged"); eq(st.block_size, before[1]); eq(st.hop_size, before[2])
+    -- no values: the defaults, copied from state
+    K.analysis_begin("take", "item", { sample_rate = 48000, defer_envelope = true })
+    eq(st.analysis_params.min_freq, st.min_freq)
+  end)
+  K.open_accessor = saved[1]
+  for _, n in ipairs(names) do reaper[n] = old[n] end
+  st.is_analyzing, st.analysis_params, st.accessor, st.buffer = false, nil, nil, nil
+  st.target_take_guid, st.target_take_name, st.separation = saved[5], saved[6], saved[8]
+  if not ok then error(err, 0) end
+end)
+test("load_take_data_drops_bad_analysis", function()
+  local K, st = S.K, S.state
+  local good = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+  local bad = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 512, hop_size = 1024 }
+  local raw, changes = "", 1
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.last_change_count, #st.session_order }
+  st.target_take_guid = "{other}"
+  local function load(a)
+    st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"] = nil, nil, nil
+    while #st.session_order > saved[3] do table.remove(st.session_order) end
+    raw = K.take_json({ guid = "{a}", name = "A", results = {}, notes = {}, item_len = 1, sample_rate = 48000, analysis = a })
+    st.undone_takes["{a}"] = 1
+    changes = changes + 1
+    st.last_change_count = changes - 1
+    K.drop_project_cache()
+    S.sync_with_project()
+    return st.session_takes["{a}"]
+  end
+  local ok, err = pcall(function()
+    local d = load(good)
+    eq(type(d), "table", "loaded"); eq(d.analysis.block_size, 2048); eq(d.analysis.min_freq, 250)
+    eq(d.analysis.hop_size, 256); eq(d.analysis.threshold, 0.25); eq(d.analysis.max_freq, 1200)
+    d = load(bad)
+    eq(type(d), "table", "loaded"); eq(d.analysis, nil, "hop > block is not recorded")
+    d = load(nil)
+    eq(type(d), "table", "loaded"); eq(d.analysis, nil)
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"], st.undone_takes["{a}"] = nil, nil, nil, nil
+  while #st.session_order > saved[3] do table.remove(st.session_order) end
+  st.target_take_guid, st.last_change_count = saved[1], saved[2]
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
 
 test("batch_write_leaves_an_item_whose_envelope_cannot_be_made", function() with_write_stubs({}, function(rec)
   local written = S.K.batch_write(done2())
