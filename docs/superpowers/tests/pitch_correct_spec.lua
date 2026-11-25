@@ -4946,7 +4946,8 @@ test("batch_start_snapshots_given_values", function()
     reaper.new_array = function() return {} end
     reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{a}" end return true, "" end
     local ok, err = pcall(function()
-      local values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+      local values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256,
+        auto_range = false }   -- a range picked by hand (Soprano): Auto would find its own Hz
       K.batch_start(entries3(), values)
       values.min_freq = 80   -- the form changes after the click: the batch keeps what it was started with
       eq(K.batch.values.min_freq, 250, "the batch keeps the values it was started with")
@@ -6188,6 +6189,519 @@ test("key_tooltip_names_the_track_and_runner_up", function()
   end)
   reaper.GetTrackName = get_name
   if not ok then error(err, 0) end
+end)
+
+-- Analyze runs the pre-analysis first (auto range and key, Task 6) --------------------------------------------------
+
+-- A small project: opts.tracks = { [track] = { items = { "it_x", ... }, freq = Hz, name = "V _ Main" } }; item "it_x"
+-- holds take "tk_x" (GUID "{x}"), opts.len seconds of a sine at its track's freq, read at opts.rate (8000) by the
+-- analysis and at K.PRE.RATE by the pre-analysis. opts.step: seconds reaper.time_precise advances per call (0).
+-- opts.offline: { [take] = true } has no sample rate; opts.ext: { [track] = text } what the track's record holds.
+-- w.log records, in order, "begin", "end:<label>", "track:<track>" (a track write) and "take:<guid>" (a take
+-- write); w.reads every accessor read { acc, rate }. Every stub, state value and K value it changes is put back.
+local function auto_world(opts, fn)
+  local K, st = S.K, S.state
+  local w = { log = {}, reads = {}, destroyed = 0, now = 0, count = 1, dead = {}, ext = {} }
+  local rate, len = opts.rate or 8000, opts.len or 6
+  local take_of, item_of, track_of, freq_of, guid_of, by_guid = {}, {}, {}, {}, {}, {}
+  for track, t in pairs(opts.tracks) do
+    w.ext[track] = { [K.TRACK_SCAN_KEY] = opts.ext and opts.ext[track] or "" }
+    for _, item in ipairs(t.items) do
+      local id = item:sub(4)
+      local take = "tk_" .. id
+      take_of[item], item_of[take], track_of[take], track_of[item] = take, item, track, track
+      freq_of["acc_" .. take], guid_of[take], by_guid["{" .. id .. "}"] = t.freq, "{" .. id .. "}", take
+    end
+  end
+  local function log(s) w.log[#w.log + 1] = s end
+  local stubs = {
+    ValidatePtr2 = function(_, ptr) return ptr ~= nil and not w.dead[ptr] end,
+    CountTrackMediaItems = function(track) return opts.tracks[track] and #opts.tracks[track].items or 0 end,
+    GetTrackMediaItem = function(track, i) return opts.tracks[track] and opts.tracks[track].items[i + 1] end,
+    GetActiveTake = function(item) return take_of[item] end,
+    TakeIsMIDI = function() return false end,
+    GetMediaItemInfo_Value = function(_, key) if key == "D_LENGTH" then return len end return 0 end,
+    GetSetMediaItemTakeInfo_String = function(take, key, _, set)
+      if key == "GUID" then return guid_of[take] ~= nil, guid_of[take] or "" end
+      if set then log("take:" .. tostring(guid_of[take])) end
+      return true, ""
+    end,
+    GetSetMediaTrackInfo_String = function(track, key, value, set)
+      w.ext[track] = w.ext[track] or {}
+      if set then
+        w.ext[track][key] = value
+        log("track:" .. tostring(track))
+        return true, value
+      end
+      return true, w.ext[track][key] or ""
+    end,
+    GetMediaItemTakeByGUID = function(_, guid) local t = by_guid[guid]; if t and not w.dead[t] then return t end end,
+    GetMediaItemTake_Item = function(take) return item_of[take] end,
+    GetMediaItemTake_Track = function(take) return track_of[take] end,
+    GetMediaItemTrack = function(item) return track_of[item] end,
+    GetMediaItemTake_Source = function(take) return "src_" .. take end,
+    GetMediaSourceSampleRate = function(src)
+      if opts.offline and opts.offline[src:sub(5)] then return 0 end
+      return rate
+    end,
+    GetTakeName = function(take) return take end,
+    GetTrackName = function(track) return true, opts.tracks[track] and opts.tracks[track].name or "V _ Main" end,
+    GetTakeEnvelopeByName = function(take) return "env_" .. take end,
+    GetEnvelopeStateChunk = function() return true, "<PITCHENV\nACT 1 -1\nVIS 1 1 1\n>" end,
+    Undo_BeginBlock = function() log("begin") end,
+    Undo_EndBlock = function(label) log("end:" .. tostring(label)) end,
+    new_array = function() return {} end,
+    GetAudioAccessorSamples = function(acc, r, _, t, n, buf)
+      w.reads[#w.reads + 1] = { acc = acc, rate = r }
+      local f = freq_of[acc] or 220
+      for i = 1, n do buf[i] = 0.5 * math.sin(2 * math.pi * f * (t + (i - 1) / r)) end
+      return 1
+    end,
+    DestroyAudioAccessor = function() w.destroyed = w.destroyed + 1 end,
+    time_precise = function() w.now = w.now + (opts.step or 0); return w.now end,
+    GetProjectStateChangeCount = function() return w.count end,
+    CountSelectedMediaItems = function() return 0 end,
+    NamedCommandLookup = function() return 0 end,
+  }
+  local old = {}
+  for name, f in pairs(stubs) do old[name] = rawget(reaper, name); rawset(reaper, name, f) end
+  local old_k = { open_accessor = K.open_accessor, write_take_envelope = K.write_take_envelope,
+    take_correction = K.take_correction, pre_begin = K.pre_begin }
+  K.open_accessor = function(take)
+    if opts.unreadable and opts.unreadable[take] then return nil end
+    return "acc_" .. take
+  end
+  K.write_take_envelope = function(guid) log("take:" .. tostring(guid)); return true end
+  K.take_correction = function() return {} end
+  w.pre_calls = 0
+  K.pre_begin = function(...) w.pre_calls = w.pre_calls + 1; return old_k.pre_begin(...) end
+  local keys = { "target_take_guid", "target_take_name", "key_idx", "scale_idx", "separation", "results", "notes",
+    "split_points", "analysis_empty", "progress", "is_analyzing", "accessor", "buffer", "analysis_params",
+    "sample_rate", "item_len", "start_time", "end_time", "current_time", "analysis_form", "last_change_count",
+    "last_seen_sel_guid", "scale_pc_set", "pre" }
+  local saved = {}
+  for _, k in ipairs(keys) do saved[k] = st[k] end
+  local saved_status = { st.status.text, st.status.until_time, st.status.hold }
+  local NK = K.new_key
+  local saved_nk = { NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx }
+  local saved_order = #st.session_order
+  local saved_reanalyze = K.reanalyze_status_guid
+  st.is_analyzing, st.accessor, st.pre, st.analysis_params = false, nil, nil, nil
+  st.status.text, st.status.until_time, st.status.hold = "", 0, nil
+  K.track_records_pending = {}
+  K.drop_project_cache()
+  local ok, err = pcall(fn, w)
+  pcall(K.pre_cancel)
+  for name in pairs(stubs) do rawset(reaper, name, old[name]) end
+  for name, f in pairs(old_k) do K[name] = f end
+  for _, k in ipairs(keys) do st[k] = saved[k] end
+  st.status.text, st.status.until_time, st.status.hold = table.unpack(saved_status, 1, 3)
+  NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved_nk, 1, 4)
+  for g in pairs(by_guid) do
+    st.session_takes[g], st.raw_cache[g], st.stale_takes[g], st.missing_takes[g] = nil, nil, nil, nil
+    st.undone_takes[g], st.stale_env[g], st.unreadable_takes[g] = nil, nil, nil
+  end
+  while #st.session_order > saved_order do table.remove(st.session_order) end
+  K.batch, K.auto_run, K.reanalyze_status_guid = nil, nil, saved_reanalyze
+  K.track_records_pending = {}
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+
+-- Ticks the window's analysis until nothing runs (bounded)
+local function auto_run_out()
+  for _ = 1, 100000 do
+    if not S.state.is_analyzing and not S.state.pre and not S.K.batch then return end
+    S.K.analysis_tick()
+  end
+  error("the analysis never ended")
+end
+
+local function auto_values(auto)
+  local v = S.K.analysis_defaults()
+  v.auto_range = auto
+  if not auto then v.min_freq, v.max_freq = 130, 500 end
+  return v
+end
+
+local function index_of(list, value)
+  for i, v in ipairs(list) do if v == value then return i end end
+  return nil
+end
+
+local ONE_TRACK = { tr = { items = { "it_a", "it_b" }, freq = 220 } }
+
+test("auto_needed_cases", function()
+  local K, st = S.K, S.state
+  local saved = { st.key_idx, st.session_takes["{an}"] }
+  local ok, err = pcall(function()
+    st.key_idx = 5
+    eq(K.auto_needed(auto_values(true), "{new}"), true, "Vocal Range Auto")
+    eq(K.auto_needed(auto_values(false), "{new}"), false, "fixed range, key 5")
+    st.key_idx = 0
+    eq(K.auto_needed(auto_values(false), "{new}"), true, "fixed range, not analysed, Key Auto")
+    st.session_takes["{an}"] = { guid = "{an}", notes = {}, results = {}, key_idx = 4, scale_idx = 1 }
+    eq(K.auto_needed(auto_values(false), "{an}"), false, "fixed range, analysed item")
+    eq(K.auto_needed(auto_values(true), "{an}"), true, "Auto range, analysed item")
+  end)
+  st.key_idx, st.session_takes["{an}"] = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("auto_values_from_record", function()
+  local K = S.K
+  local v, none = K.auto_values(auto_values(true), { st = {}, takes = {}, lo_st = 40, hi_st = 69 })
+  local lo, hi = K.pre_range_hz(40, 69)
+  eq(v.min_freq, lo); eq(v.max_freq, hi); eq(v.auto_lo_st, 40); eq(v.auto_hi_st, 69); eq(v.auto_range, true)
+  eq(none, false); eq(v.auto_none == true, false)
+  v, none = K.auto_values(auto_values(true), { st = {}, takes = {} })
+  eq(v.min_freq, 65); eq(v.max_freq, 1000); eq(v.auto_none, true); eq(none, true); eq(v.auto_lo_st, nil)
+  v, none = K.auto_values(auto_values(true), nil)
+  eq(v.min_freq, 65); eq(v.auto_none, true, "no record: like a record without a range"); eq(none, true)
+  local fixed = auto_values(false)
+  v = K.auto_values(fixed, { st = {}, takes = {}, lo_st = 40, hi_st = 69 })
+  eq(v.min_freq, 130, "a fixed range is left as it is"); eq(v.max_freq, 500); eq(v.auto_lo_st, nil)
+  eq(K.analysis_values(K.auto_values(auto_values(true), { st = {}, takes = {}, lo_st = 40, hi_st = 69 })).auto_lo_st,
+    40, "the found notes are kept by what is stored")
+end)
+
+test("auto_status_strings", function()
+  local K = S.K
+  local base = { track = "V _ Main", range_text = "E2\xE2\x80\x93A4", key_text = "E Major", want_range = true,
+    want_key = true, fresh = true }
+  local function with(t)
+    local out = {}
+    for k, v in pairs(base) do out[k] = v end
+    for k, v in pairs(t) do out[k] = v end
+    return out
+  end
+  eq(K.auto_status(with({})), "Found E2\xE2\x80\x93A4, E Major. " .. MOD .. "+Z to undo.")
+  eq(K.auto_status(with({ alt_text = "C# Minor" })),
+    "Found E2\xE2\x80\x93A4, E Major (C# Minor also fits). " .. MOD .. "+Z to undo.")
+  eq(K.auto_status(with({ want_key = false, alt_text = "C# Minor" })), "Found E2\xE2\x80\x93A4. " .. MOD .. "+Z to undo.")
+  eq(K.auto_status(with({ want_range = false })), "Found E Major. " .. MOD .. "+Z to undo.")
+  eq(K.auto_status(with({ fresh = false })), "Used V _ Main's range and key: E2\xE2\x80\x93A4, E Major.")
+  eq(K.auto_status(with({ fresh = false, want_key = false })), "Used V _ Main's range: E2\xE2\x80\x93A4.")
+  eq(K.auto_status(with({ fresh = false, want_range = false })), "Used V _ Main's key: E Major.")
+  eq(K.auto_status(with({ none = true, range_text = false })), "Couldn't find a range on V _ Main: used Generic Vocal.")
+  eq(K.auto_status(with({ no_key = true, key_text = false, kept_key_text = "E Major" })),
+    "Not enough singing to tell the key: kept E Major.")
+  eq(K.auto_status(with({ skipped = 2, total = 12 })),
+    "Couldn't read 2 of 12 items on V _ Main (media offline). Used the rest.")
+  -- one message only, by priority: no range > no key > unreadable media > found / used
+  eq(K.auto_status(with({ none = true, no_key = true, kept_key_text = "E Major", skipped = 2, total = 12 })),
+    "Couldn't find a range on V _ Main: used Generic Vocal.")
+  eq(K.auto_status(with({ no_key = true, kept_key_text = "E Major", skipped = 2, total = 12 })),
+    "Not enough singing to tell the key: kept E Major.")
+  eq(K.auto_status(with({ none = true, want_range = false })), "Found E Major. " .. MOD .. "+Z to undo.",
+    "no range found matters only when the range was wanted")
+  eq(K.auto_status(with({ fresh = false, skipped = 2, total = 12 })),
+    "Used V _ Main's range and key: E2\xE2\x80\x93A4, E Major.", "a reused record's old skips are not news")
+  eq(select(2, K.auto_status(with({ fresh = false }))), "used")
+  eq(select(2, K.auto_status(with({}))), "found")
+end)
+
+test("track_record_sees_pending", function()
+  local K = S.K
+  local reads = 0
+  local old = rawget(reaper, "GetSetMediaTrackInfo_String")
+  rawset(reaper, "GetSetMediaTrackInfo_String", function() reads = reads + 1; return true, "" end)
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    eq(K.track_record("trP"), nil, "nothing stored")
+    local rec = K.track_record_build(K.pre_tally_new(), { ["{p}"] = true }, nil)
+    K.track_records_pending["trP"] = rec
+    eq(K.track_record("trP"), rec, "a record found but not written yet is the track's record")
+    K.track_records_pending = {}
+    eq(K.track_record("trP"), nil, "dropped: the stored one (none) again")
+  end)
+  rawset(reaper, "GetSetMediaTrackInfo_String", old)
+  K.track_records_pending = {}
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
+test("analyze_auto_then_stores", function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0   -- not analysed, Key Auto
+    S.start_analysis(auto_values(true))
+    eq(st.pre ~= nil, true, "stage 1 runs first")
+    eq(st.is_analyzing, true)
+    eq(K.locked_reason(), "Finding range and key\xE2\x80\xA6 0%", "one track: no name")
+    eq(K.analysis_progress(), 0)
+    auto_run_out()
+    local data = st.session_takes["{a}"]
+    eq(type(data), "table", "analysed")
+    local rec = K.track_record_valid(JSON.decode(w.ext.tr[K.TRACK_SCAN_KEY]))
+    eq(type(rec), "table", "the track holds its record")
+    eq(rec.lo_st, 57); eq(rec.hi_st, 57); eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], true)
+    local lo, hi = K.pre_range_hz(57, 57)
+    eq(data.analysis.auto_range, true); eq(data.analysis.min_freq, lo); eq(data.analysis.max_freq, hi)
+    eq(data.analysis.auto_lo_st, 57); eq(data.analysis.auto_hi_st, 57)
+    eq(K.range_name(K.analysis_values(data.analysis)), "Auto: " .. K.pre_range_text(57, 57))
+    -- written once, inside the analysis's own undo block
+    local writes = 0
+    for _, s in ipairs(w.log) do if s == "track:tr" then writes = writes + 1 end end
+    eq(writes, 1, "one track write")
+    local at, b, e = index_of(w.log, "track:tr"), index_of(w.log, "begin"), index_of(w.log, "end:Analyze Pitch")
+    eq(b ~= nil and e ~= nil, true, "the analysis's undo block")
+    eq(at > b and at < e, true, "between its Undo_BeginBlock and Undo_EndBlock")
+    eq(#w.log, 4, "begin, the take, the track, end: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil)
+    -- the key came from the track, the bar shows it, the status line says what was found
+    eq(type(rec.key_idx), "number", "a key was found")
+    eq(data.key_idx, rec.key_idx); eq(data.scale_idx, rec.scale_idx); eq(data.key_from_track, true)
+    eq(st.key_idx, rec.key_idx, "the bar shows the found key")
+    local key = K.key_text(rec.key_idx, rec.scale_idx)
+    local alt = rec.alt_key_idx and (" (" .. K.key_text(rec.alt_key_idx, rec.alt_scale_idx) .. " also fits)") or ""
+    eq(st.status.text, "Found " .. K.pre_range_text(57, 57) .. ", " .. key .. alt .. ". " .. MOD .. "+Z to undo.")
+    eq(st.is_analyzing, false); eq(st.pre, nil); eq(K.auto_run, nil)
+  end)
+end)
+
+test("undo_drops_record_cache", function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 3
+    S.start_analysis(auto_values(true))
+    auto_run_out()
+    K.refresh_project_cache()
+    eq(K.track_record("tr") ~= nil, true, "the stored record")
+    w.ext.tr[K.TRACK_SCAN_KEY] = ""   -- Cmd+Z took the record away
+    w.count = w.count + 1
+    K.refresh_project_cache()
+    eq(K.track_record("tr"), nil, "read again after the undo")
+  end)
+end)
+
+test("analyze_auto_reuses_record", function()
+  local K = S.K
+  local tally = K.pre_tally_new()
+  for _ = 1, 300 do K.pre_tally_add(tally, 329.63) end   -- E4
+  for _ = 1, 300 do K.pre_tally_add(tally, 164.81) end   -- E3
+  for _ = 1, 200 do K.pre_tally_add(tally, 246.94) end   -- B3
+  for _ = 1, 100 do K.pre_tally_add(tally, 207.65) end   -- G#3
+  local rec = K.track_record_build(tally, { ["{a}"] = true, ["{b}"] = true }, nil)
+  rec.alt_key_idx, rec.alt_scale_idx = nil, nil
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(rec) } }, function(w)
+    local st = S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    eq(st.pre, nil, "no stage 1: the record covers every take")
+    eq(K.analysis_progress(), 0, "plain analysis progress")
+    auto_run_out()
+    for _, r in ipairs(w.reads) do eq(r.rate ~= K.PRE.RATE, true, "nothing read at the pre-analysis rate") end
+    eq(index_of(w.log, "track:tr"), nil, "no track write")
+    local data = st.session_takes["{a}"]
+    local lo, hi = K.pre_range_hz(rec.lo_st, rec.hi_st)
+    eq(data.analysis.min_freq, lo); eq(data.analysis.max_freq, hi)
+    eq(data.key_idx, rec.key_idx)
+    eq(st.status.text, string.format("Used V _ Main's range and key: %s, %s.", K.pre_range_text(rec.lo_st, rec.hi_st),
+      K.key_text(rec.key_idx, rec.scale_idx)))
+  end)
+end)
+
+test("analyze_fixed_range_fixed_key_no_pre", function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx, st.scale_idx = "{a}", 5, 1
+    local seen_pre = false
+    S.start_analysis(auto_values(false))
+    for _ = 1, 100000 do
+      if st.pre then seen_pre = true end
+      if not st.is_analyzing then break end
+      K.analysis_tick()
+    end
+    eq(seen_pre, false, "state.pre never set"); eq(w.pre_calls, 0)
+    eq(st.session_takes["{a}"].analysis.min_freq, 130); eq(st.session_takes["{a}"].analysis.auto_range, false)
+    eq(index_of(w.log, "track:tr"), nil)
+    eq(st.status.text, "", "no Auto message")
+  end)
+end)
+
+test("cancel_in_stage_one_writes_nothing", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    K.analysis_tick(); K.analysis_tick()
+    eq(st.pre ~= nil, true, "still in stage 1")
+    local p = K.analysis_progress()
+    eq(p > 0 and p <= K.PRE.SHARE, true, "stage 1 is the first share of the whole, got " .. p)
+    eq(K.locked_reason(), string.format("Finding range and key\xE2\x80\xA6 %d%%", math.floor(p * 100)))
+    eq(K.cancel_analysis(), true)
+    eq(index_of(w.log, "begin"), nil, "no undo block"); eq(#w.log, 0, "no take or track write")
+    eq(st.is_analyzing, false); eq(st.pre, nil); eq(next(K.track_records_pending), nil)
+    eq(st.status.text, K.CANCELLED_TEXT)
+    eq(st.session_takes["{a}"], nil)
+  end)
+end)
+
+test("auto_progress_spans_both_stages", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    while st.pre do K.analysis_tick() end
+    eq(st.is_analyzing, true, "stage 2 started by itself")
+    eq(K.locked_reason(), K.LOCKED_REASON, "stage 2: the usual locked line")
+    st.progress = 0.5
+    near(K.analysis_progress(), K.PRE.SHARE + (1 - K.PRE.SHARE) * 0.5, 1e-12)
+    eq(K.status_line(false), string.format("Analyzing tk_a… %d%%", math.floor(K.analysis_progress() * 100)))
+  end)
+end)
+
+test("auto_stage_two_cancel_drops_pending", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    while st.pre do K.analysis_tick() end
+    eq(K.track_records_pending.tr ~= nil, true, "the found record waits for the analysis's block")
+    K.analysis_tick()
+    eq(st.is_analyzing, true, "the analysis is part way")
+    -- the window's error handling and Cancel both end here
+    eq(K.cancel_analysis(), true)
+    eq(next(K.track_records_pending), nil, "the record is dropped with the analysis")
+    eq(K.auto_run, nil)
+    eq(#w.log, 0, "nothing written")
+    eq(st.is_analyzing, false)
+    -- a later, unrelated undo block writes no stale record
+    K.track_records_flush()
+    eq(index_of(w.log, "track:tr"), nil)
+  end)
+end)
+
+test("auto_begin_failure_drops_pending", function()
+  auto_world({ tracks = ONE_TRACK, offline = { tk_a = true } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    eq(st.pre ~= nil, true, "stage 1 runs: the pre-analysis needs no sample rate")
+    auto_run_out()
+    eq(#w.reads > 0 and w.reads[1].rate == K.PRE.RATE, true, "the track was heard")
+    eq(st.status.text, "Couldn't read this item's audio. Check that its media is online, then try again.")
+    eq(next(K.track_records_pending), nil, "the record of the stage 1 run is dropped")
+    eq(K.auto_run, nil)
+    eq(#w.log, 0, "nothing written"); eq(st.is_analyzing, false); eq(st.pre, nil)
+  end)
+end)
+
+test("auto_release_during_stage_one_ends_cleanly", function()
+  -- reset_analysis_model (the open item removed, the session wiped) releases the analysis: on_done never comes
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    K.analysis_tick()
+    K.release_analysis()
+    eq(st.pre, nil); eq(st.is_analyzing, false); eq(next(K.track_records_pending), nil); eq(K.auto_run, nil)
+    for _ = 1, 5 do K.analysis_tick() end
+    eq(st.is_analyzing, false, "nothing waits on it"); eq(#w.log, 0)
+    -- and Analyze works again
+    S.start_analysis(auto_values(true))
+    eq(st.pre ~= nil, true, "a new run starts")
+  end)
+end)
+
+test("auto_never_starts_twice", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    local pre = st.pre
+    S.start_analysis(auto_values(true))
+    eq(w.pre_calls, 1, "refused while stage 1 runs"); eq(st.pre, pre)
+    K.batch_start({ { guid = "{b}", take = "tk_b", item = "it_b", name = "B", len = 6, sample_rate = 8000 } },
+      auto_values(true))
+    eq(K.batch, nil, "no batch while it runs"); eq(w.pre_calls, 1)
+  end)
+end)
+
+local TWO_TRACKS = { tr1 = { items = { "it_a" }, freq = 110, name = "Low" },
+  tr2 = { items = { "it_b" }, freq = 440, name = "High" } }
+local function two_entries()
+  return { { guid = "{a}", take = "tk_a", item = "it_a", name = "A", len = 6, sample_rate = 8000, has_notes = false },
+    { guid = "{b}", take = "tk_b", item = "it_b", name = "B", len = 6, sample_rate = 8000, has_notes = false } }
+end
+
+test("batch_two_tracks_each_own_range", function()
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.new_key.key_idx = 3   -- a key chosen by hand: only the range is found
+    K.batch_start(two_entries(), auto_values(true))
+    eq(st.pre ~= nil, true, "stage 1 before the first item"); eq(st.pre.n_tracks, 2)
+    K.analysis_tick()
+    eq(K.locked_reason():find("^Finding range and key: Low\xE2\x80\xA6 %d+%%$") ~= nil, true,
+      "two tracks: the one being heard is named, got " .. K.locked_reason())
+    eq(K.status_line(false), K.locked_reason())
+    eq(K.analysis_progress() <= K.PRE.SHARE, true)
+    auto_run_out()
+    local recs = {}
+    for _, tr in ipairs({ "tr1", "tr2" }) do
+      recs[tr] = K.track_record_valid(JSON.decode(w.ext[tr][K.TRACK_SCAN_KEY]))
+      eq(type(recs[tr]), "table", tr .. " holds its record")
+    end
+    eq(recs.tr1.lo_st, 45); eq(recs.tr2.lo_st, 69)
+    local a, b = st.session_takes["{a}"], st.session_takes["{b}"]
+    eq(a.analysis.min_freq, (K.pre_range_hz(recs.tr1.lo_st, recs.tr1.hi_st)), "a: its own track's range")
+    eq(b.analysis.min_freq, (K.pre_range_hz(recs.tr2.lo_st, recs.tr2.hi_st)), "b: its own track's range")
+    eq(a.analysis.min_freq ~= b.analysis.min_freq, true)
+    eq(a.key_idx, 3, "the hand key")
+    local begins, ends, at1, at2 = 0, nil, index_of(w.log, "track:tr1"), index_of(w.log, "track:tr2")
+    for i, s in ipairs(w.log) do
+      if s == "begin" then begins = begins + 1 end
+      if s:find("^end:") then ends = i end
+    end
+    eq(begins, 1, "one undo block: " .. table.concat(w.log, ","))
+    eq(w.log[ends], "end:Analyze Pitch (2 items)")
+    eq(at1 ~= nil and at1 < ends, true, "tr1 written inside it"); eq(at2 ~= nil and at2 < ends, true, "tr2 too")
+    eq(st.status.text, "Analyzed 2 items. " .. MOD .. "+Z to undo.", "the batch's own summary, nothing added")
+    eq(next(K.track_records_pending), nil)
+  end)
+end)
+
+test("batch_cancel_after_stage_one_writes_no_record", function()
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.new_key.key_idx = 3
+    K.batch_start(two_entries(), auto_values(true))
+    while st.pre do K.analysis_tick() end
+    eq(K.track_records_pending.tr1 ~= nil, true, "found, waiting for the batch's block")
+    eq(K.batch.pre_ran, true)
+    near(K.analysis_progress(), K.PRE.SHARE + (1 - K.PRE.SHARE) * K.batch_progress(K.batch, st.progress), 1e-12)
+    K.cancel_analysis()
+    eq(K.batch, nil); eq(st.is_analyzing, false)
+    eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil, "the batch wrote nothing: its records are dropped")
+    eq(st.status.text, "Batch cancelled. Nothing was changed.")
+  end)
+end)
+
+test("batch_cancel_in_stage_one", function()
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.batch_start(two_entries(), auto_values(true))
+    K.analysis_tick()
+    K.cancel_analysis()
+    eq(K.batch, nil); eq(st.pre, nil); eq(st.is_analyzing, false); eq(#w.log, 0)
+    eq(next(K.track_records_pending), nil)
+    eq(st.status.text, "Batch cancelled. Nothing was changed.")
+  end)
+end)
+
+test("batch_stage_one_released_ends_the_batch", function()
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.batch_start(two_entries(), auto_values(true))
+    K.analysis_tick()
+    K.release_analysis()   -- reset_analysis_model while stage 1 runs: on_done never comes
+    eq(st.pre, nil); eq(st.is_analyzing, false); eq(next(K.track_records_pending), nil)
+    K.analysis_tick()
+    eq(K.batch, nil, "the batch does not wait forever"); eq(st.is_analyzing, false); eq(#w.log, 0)
+    eq(st.status.text, "Batch cancelled. Nothing was changed.")
+  end)
 end)
 
 -- Tests appended by later tasks go above this line.

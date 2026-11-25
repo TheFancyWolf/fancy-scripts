@@ -1224,9 +1224,12 @@ K.track_record_valid = function(t)
   return t
 end
 
---- The pre-analysis record of `track` (nil: none or not valid), cached per project state.
+--- The pre-analysis record of `track` (nil: none or not valid), cached per project state. A record found but not
+--- written yet (K.track_records_pending: it waits for the analysis's undo block) is the track's record already.
 K.track_record = function(track)
   if not track then return nil end
+  local pending = K.track_records_pending and K.track_records_pending[track]
+  if pending then return pending end
   local cache = state.cache.trackscan
   local rec = cache[track]
   if rec ~= nil then return rec or nil end
@@ -1827,9 +1830,17 @@ K.release_analysis = function()
   state.is_analyzing = false
   state.analysis_params = nil
   if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
-  -- A running pre-analysis stops too. Records a finished one left pending stay for the caller's undo block (an
-  -- analysis or batch started from its on_done releases the analysis before it writes)
+  -- A running pre-analysis stops too. Records a finished one left pending stay for a running batch's undo block (it
+  -- releases the analysis between its items); a single analysis that is released never writes, so its records go
   if state.pre then K.pre_cancel() end
+  if not K.batch then K.auto_drop() end
+end
+
+--- Forget what an Auto analysis carries to its end (K.auto_run) and every record waiting for its undo block: the
+--- analysis ended without writing (cancelled, could not begin, released, the item went).
+K.auto_drop = function()
+  K.auto_run = nil
+  K.track_records_pending = {}
 end
 
 --- Auto range and key, the pre-analysis: a coarse, time-sliced listen through every audio item on some tracks. Each
@@ -2568,6 +2579,11 @@ K.analysis_begin = function(take, item, opts)
     block_size = block, hop_size = hop, threshold = values.threshold,
     min_freq = values.min_freq, max_freq = values.max_freq, auto_range = values.auto_range == true,
   }
+  -- An Auto range keeps what it was found from (K.auto_values), so the item shows "Auto: E2–A4" afterwards
+  if values.auto_range == true then
+    state.analysis_params.auto_lo_st, state.analysis_params.auto_hi_st = values.auto_lo_st, values.auto_hi_st
+    state.analysis_params.auto_none = values.auto_none == true or nil
+  end
 
   state.accessor = accessor
   state.buffer = reaper.new_array(state.analysis_params.block_size)
@@ -2590,8 +2606,140 @@ K.analysis_begin = function(take, item, opts)
   return true
 end
 
---- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected).
+-- Auto range and key, wired into Analyze (docs/design/pitch-correct-auto-range-key.md): when Vocal Range or Key is
+-- on Auto, the item's track is heard first (stage 1, K.pre_begin), then the item is analysed with the range found
+-- (stage 2). The record found waits in K.track_records_pending and is written inside the analysis's own undo block;
+-- every way an analysis ends without one drops it (K.auto_drop). K.auto_run carries a single analysis's stage-1
+-- outcome to its end: { guid, track, rec, fresh, pre_ran, want_range, want_key, skipped, total }.
+K.auto_run = nil
+K.AUTO_UNREADABLE_TEXT = "Couldn't read this item's audio. Check that its media is online, then try again."
+
+--- True when analysing the item `guid` with `values` needs its track's range or key: Vocal Range is Auto, or the
+--- item is not analysed yet and the bar's Key is Auto (0).
+K.auto_needed = function(values, guid)
+  if values and values.auto_range == true then return true end
+  return not (guid and state.session_takes[guid]) and state.key_idx == 0
+end
+
+--- A copy of `values` to analyse with. With Vocal Range Auto: the Hz of the range in `record` (K.pre_range_hz, its
+--- notes kept as auto_lo_st / auto_hi_st), or, when the record (nil counts) has no range, Generic Vocal's Hz with
+--- auto_none. A fixed range is left as it is. Returns the copy and whether nothing was found (none).
+K.auto_values = function(values, record)
+  local out = {}
+  for k, v in pairs(values or K.analysis_defaults()) do out[k] = v end
+  if out.auto_range ~= true then return out, false end
+  out.auto_lo_st, out.auto_hi_st, out.auto_none = nil, nil, nil
+  if record and record.lo_st and record.hi_st then
+    out.min_freq, out.max_freq = K.pre_range_hz(record.lo_st, record.hi_st)
+    out.auto_lo_st, out.auto_hi_st = record.lo_st, record.hi_st
+    return out, false
+  end
+  for _, r in ipairs(VOCAL_RANGES) do
+    if r.name == "Generic Vocal" and not r.auto then out.min_freq, out.max_freq = r.min, r.max end
+  end
+  out.auto_none = true
+  return out, true
+end
+
+--- The status message after an Auto analysis, and its kind ("none", "no_key", "skipped", "found", "used"), or nil.
+--- info = { fresh (stage 1 heard the track), range_text, key_text, alt_text, track (its name), none (no range found),
+--- no_key (no key found), kept_key_text, skipped, total (items on the track this run), want_range, want_key }. One
+--- message, by priority: no range > no key > unreadable media > found / used. Only what was on Auto is named.
+K.auto_status = function(info)
+  local track = info.track or ""
+  if info.want_range and info.none then
+    return string.format("Couldn't find a range on %s: used Generic Vocal.", track), "none"
+  end
+  if info.want_key and info.no_key then
+    return string.format("Not enough singing to tell the key: kept %s.", info.kept_key_text or ""), "no_key"
+  end
+  if info.fresh and (info.skipped or 0) > 0 then
+    return string.format("Couldn't read %d of %d items on %s (media offline). Used the rest.", info.skipped,
+      math.max(info.total or 0, info.skipped), track), "skipped"
+  end
+  local parts = {}
+  if info.want_range and info.range_text then parts[#parts + 1] = info.range_text end
+  if info.want_key and info.key_text then parts[#parts + 1] = info.key_text end
+  if #parts == 0 then return nil end
+  if info.fresh then
+    local alt = (info.want_key and info.alt_text) and string.format(" (%s also fits)", info.alt_text) or ""
+    return string.format("Found %s%s. %s+Z to undo.", table.concat(parts, ", "), alt, K.MOD_LABEL), "found"
+  end
+  local what = (info.want_range and info.want_key) and "range and key" or (info.want_range and "range" or "key")
+  return string.format("Used %s's %s: %s.", track, what, table.concat(parts, ", ")), "used"
+end
+
+--- The status message for the Auto analysis K.auto_run of `data` (the item's new model), and its kind, or nil.
+K.auto_run_status = function(run, data)
+  local rec = run.rec
+  local _, name = reaper.GetTrackName(run.track)
+  local info = {
+    fresh = run.fresh, track = type(name) == "string" and name or "", want_range = run.want_range,
+    want_key = run.want_key, skipped = rec and rec.skipped or 0, total = run.total,
+    none = not (rec and rec.lo_st), no_key = not (rec and rec.key_idx),
+    kept_key_text = K.key_text(data.key_idx or 0, data.scale_idx or 0),
+  }
+  if rec and rec.lo_st then info.range_text = K.pre_range_text(rec.lo_st, rec.hi_st) end
+  if rec and rec.key_idx then info.key_text = K.key_text(rec.key_idx, rec.scale_idx) end
+  if rec and rec.alt_key_idx then info.alt_text = K.key_text(rec.alt_key_idx, rec.alt_scale_idx) end
+  return K.auto_status(info)
+end
+
+--- Why the analysis controls are disabled while something runs: during stage 1 how far it is ("Finding range and
+--- key… 42%", with the track's name when this run hears two or more), else K.LOCKED_REASON.
+K.locked_reason = function()
+  local pre = state.pre
+  if not pre then return K.LOCKED_REASON end
+  local pct = math.floor(K.analysis_progress() * 100)
+  if (pre.n_tracks or 1) > 1 then
+    return string.format("Finding range and key: %s… %d%%", pre.track_name or "", pct)
+  end
+  return string.format("Finding range and key… %d%%", pct)
+end
+
+--- Analyse `take` (in `item`) with Vocal Range or Key on Auto: its track is heard first, unless its record covers
+--- every take already (then at once), and the analysis starts with the range found (K.auto_values).
+K.auto_begin = function(take, item, values, guid)
+  local track = reaper.GetMediaItemTake_Track(take)
+  if track and not reaper.ValidatePtr2(0, track, "MediaTrack*") then track = nil end
+  local run = { guid = guid, track = track, want_range = values.auto_range == true, want_key = K.auto_needed(nil, guid) }
+  if track then
+    local list, skipped = K.pre_takes(track, K.track_record(track))
+    run.total = #list + skipped
+  end
+  local sync = true
+  local function on_done(results)
+    local pre_ran = not sync
+    local rec = track and results[track] or nil
+    run.rec, run.pre_ran = rec, pre_ran
+    run.fresh = track ~= nil and K.track_records_pending[track] ~= nil
+    -- The item can go while its track is heard: nothing is analysed then, and nothing is written
+    if pre_ran and not (reaper.ValidatePtr2(0, take, "MediaItem_Take*") and reaper.ValidatePtr2(0, item, "MediaItem*")) then
+      K.auto_drop()
+      set_status(K.AUTO_UNREADABLE_TEXT)
+      return
+    end
+    local reanalyze = K.reanalyze_status_guid   -- K.request_analyze set it while stage 1 ran
+    if not K.analysis_begin(take, item, { values = (K.auto_values(values, rec)) }) then
+      K.auto_drop()
+      set_status(K.AUTO_UNREADABLE_TEXT)
+      return
+    end
+    if pre_ran then K.reanalyze_status_guid = reanalyze end
+    K.auto_run = run
+  end
+  if track then
+    K.pre_begin({ track }, { on_done = on_done })
+  else
+    on_done({})
+  end
+  sync = false
+end
+
+--- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected). Never while an
+--- analysis, a batch or a pre-analysis runs.
 local function start_analysis(values)
+  if state.is_analyzing or K.batch or state.pre then return end
   -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
   -- get_target_take() falls back to the selected audio item only when there is no usable target.
   local take, item = get_target_take()
@@ -2600,8 +2748,14 @@ local function start_analysis(values)
     set_status("Select an audio item first")
     return
   end
+  K.auto_drop()
+  local guid = get_take_guid(take)
+  if K.auto_needed(values or K.analysis_defaults(), guid) then
+    K.auto_begin(take, item, values or K.analysis_defaults(), guid)
+    return
+  end
   if not K.analysis_begin(take, item, { values = values }) then
-    set_status("Couldn't read this item's audio. Check that its media is online, then try again.")
+    set_status(K.AUTO_UNREADABLE_TEXT)
   end
 end
 
@@ -3834,6 +3988,8 @@ K.batch_write = function(done)
     end
   end
   reaper.UpdateArrange()
+  -- The track records an Auto batch found ride in the same step, once something of the batch was written
+  if #written > 0 then K.track_records_flush() end
   -- No item could get its envelope: no "Analyze Pitch (0 items)" step is named for it
   reaper.Undo_EndBlock(#written > 0 and K.batch_undo_label(#written) or "Analyze Pitch", -1)
   state.undo_open = false
@@ -3853,11 +4009,12 @@ K.batch_finish = function(cancelled)
     K.apply_finish(cancelled)
     return
   end
+  K.release_analysis()   -- while K.batch is still set: the records found for the batch stay for its write
   K.batch = nil
-  K.release_analysis()
   state.progress = 0
 
   local written = K.batch_write(batch.done)
+  K.auto_drop()   -- written inside the batch's block, or nothing was written: they never wait for another block
   local empty = 0
   for _, entry in ipairs(written) do
     if entry.empty then empty = empty + 1 end
@@ -3921,8 +4078,11 @@ K.batch_next = function()
       state.key_idx = before and before.key_idx or start.key_idx
       state.scale_idx = before and before.scale_idx or start.scale_idx
       update_scale_pitch_classes()
+      -- Vocal Range Auto: the range found on the item's own track (K.auto_values; a fixed range as it is)
+      local track = reaper.GetMediaItemTake_Track(take)
+      local values = K.auto_values(batch.values, track and K.track_record(track) or nil)
       if K.analysis_begin(take, item, { sample_rate = entry.sample_rate, defer_envelope = true,
-          values = batch.values }) then return end
+          values = values }) then return end
     end
     batch.failed = batch.failed + 1
     batch.done_len = batch.done_len + (entry.len or 0)
@@ -3970,7 +4130,7 @@ end
 --- Start a batch over `entries` (K.batch_selection's takes, read when the user asked for it), every item analysed
 --- with `values` (K.analysis_defaults() shape; omitted: the Settings' values now, kept for the whole batch).
 K.batch_start = function(entries, values)
-  if K.batch or state.is_analyzing or #entries == 0 then return end
+  if K.batch or state.is_analyzing or state.pre or #entries == 0 then return end
   if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge belongs to the item being left
   K.batch = K.batch_new(entries, state.target_take_guid)
   -- A copy: the form the values came from may change (or be reseeded) while the batch runs
@@ -3980,13 +4140,48 @@ K.batch_start = function(entries, values)
   end
   K.batch.values = copy
   K.batch.prev_name = state.target_take_name
-  K.batch_next()
+  -- Auto: the distinct tracks of the items that need their range or key are heard first, in one stage 1
+  local batch = K.batch
+  local tracks = K.batch_auto_tracks(entries, copy)
+  if #tracks == 0 then
+    K.batch_next()
+    return
+  end
+  batch.pre_ran = K.pre_begin(tracks, { on_done = function()
+    if K.batch == batch then K.batch_next() end
+  end })
+end
+
+--- The distinct tracks of `entries` (a batch's) whose items need the range or key found first: every item's when
+--- Vocal Range is Auto in `values`, else an item not analysed yet while the Key for new items is Auto.
+K.batch_auto_tracks = function(entries, values)
+  local seen, out = {}, {}
+  for _, entry in ipairs(entries) do
+    local need = values.auto_range == true
+      or (K.new_key.key_idx == 0 and not state.session_takes[entry.guid] and not entry.has_notes)
+    if need and entry.take and reaper.ValidatePtr2(0, entry.take, "MediaItem_Take*") then
+      local track = reaper.GetMediaItemTake_Track(entry.take)
+      if track and not seen[track] then
+        seen[track] = true
+        out[#out + 1] = track
+      end
+    end
+  end
+  return out
 end
 
 --- How far the running analysis is, 0 .. 1: the whole batch when one runs, else the item.
 K.analysis_progress = function()
-  if K.batch then return K.batch_progress(K.batch, state.progress) end
-  return state.progress or 0
+  -- Stage 1 of an Auto analysis is the first K.PRE.SHARE of the whole; the analysis after it the rest
+  if state.pre then return K.PRE.SHARE * K.pre_progress() end
+  local p, pre_ran
+  if K.batch then
+    p, pre_ran = K.batch_progress(K.batch, state.progress), K.batch.pre_ran
+  else
+    p, pre_ran = state.progress or 0, K.auto_run and K.auto_run.pre_ran
+  end
+  if pre_ran then return K.PRE.SHARE + (1 - K.PRE.SHARE) * p end
+  return p
 end
 
 --- The open item has no stored data: Separation is its default (K.item_default), Key and Scale the ones last chosen.
@@ -4188,9 +4383,11 @@ local function persist_take_model(take)
 end
 
 --- Close the undo block opened by apply_envelope_to_take: model (P_EXT) first, so Cmd+Z reverts
---- the envelope points and the note model together; then record the change count.
-local function end_apply(take, undo_desc)
+--- the envelope points and the note model together; then record the change count. flush_records: an Auto
+--- analysis's track records go into the same block (K.track_records_flush).
+local function end_apply(take, undo_desc, flush_records)
   persist_take_model(take)
+  if flush_records then K.track_records_flush() end
   reaper.Undo_EndBlock(undo_desc or "Apply Pitch Correction", -1)
   state.undo_open = false
   note_own_write()
@@ -4847,8 +5044,9 @@ end
 --- keep_pitch_mode leaves the item's I_PITCHMODE untouched (used by re-analysis, which applies no correction); so does
 --- the Settings option "Keep each item's own pitch algorithm" (state.keep_pitch_mode).
 --- Returns true when the envelope and the model were written (one undo point); false when they were not, after
---- saying why in the status line (so a caller must not then claim an undo point).
-local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
+--- saying why in the status line (so a caller must not then claim an undo point). flush_records (an Auto analysis):
+--- the track records it found are written inside the same block (K.track_records_flush).
+local function apply_envelope_to_take(undo_desc, keep_pitch_mode, flush_records)
   -- A pending arrow-key nudge is committed as its own undo point first
   if state.nudge_burst then flush_nudge_burst() end
 
@@ -4869,11 +5067,12 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode)
   -- An open item without a session model still gets its envelope (nothing is stored: see K.write_take_envelope)
   if not K.write_take_envelope(guid, data or { notes = state.notes }, keep_pitch_mode, take, item) then
     set_status("Couldn't show the pitch envelope on this item. Check that the item is an audio item on an unlocked track, then try again.")
-    end_apply(take, "Apply Pitch Correction")
+    end_apply(take, "Apply Pitch Correction", flush_records)
     return false
   end
 
   reaper.UpdateArrange()
+  if flush_records then K.track_records_flush() end
   reaper.Undo_EndBlock(undo_desc or "Apply Pitch Correction", -1)
   state.undo_open = false
   note_own_write()
@@ -6287,16 +6486,28 @@ local function process_analysis_step()
       -- Re-apply the envelope from the fresh (untouched) notes: this clears every stale point left by
       -- a previous analysis and writes the new model to the take inside the same "Analyze Pitch" block.
       -- The take's pitch mode is left alone, as for any analysis.
+      -- An Auto analysis's track record is written inside the same block (K.track_records_flush); one that is not
+      -- written with it is dropped below
+      local run = K.auto_run
+      if run and run.guid ~= state.target_take_guid then run = nil end
       if resolve_take_by_guid(state.target_take_guid, true) then
-        if apply_envelope_to_take("Analyze Pitch", true)
-            and K.reanalyze_status_guid == state.target_take_guid then
-          set_status(string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL))
+        if apply_envelope_to_take("Analyze Pitch", true, run ~= nil) then
+          local reanalyzed = K.reanalyze_status_guid == state.target_take_guid
+          local msg, kind = nil, nil
+          if run and run.track then msg, kind = K.auto_run_status(run, take_data) end
+          -- One message: the Auto one carries news, unless it only says the track's record was used again
+          if msg and not (reanalyzed and kind == "used") then
+            set_status(msg)
+          elseif reanalyzed then
+            set_status(string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL))
+          end
         end
       else
         state.missing_takes[state.target_take_guid] = true
       end
       K.reanalyze_status_guid = nil
     end
+    if not K.batch then K.auto_drop() end   -- written above, or never: nothing waits for a later undo block
     if external_change then state.last_change_count = nil end
   elseif state.item_len > 0 then
     state.progress = state.current_time / state.item_len
@@ -6323,6 +6534,12 @@ K.analysis_tick = function()
   -- A batch always has an item in progress. If something dropped the running analysis, that item counts as failed
   -- and the batch goes on: it must never sit there with nothing to do
   if not state.is_analyzing then
+    -- Its stage 1 was dropped before any item started (the analysis was released): the batch ends, nothing written,
+    -- rather than analysing its items without the ranges it was to find
+    if K.batch.index == 0 then
+      K.batch_finish(true)
+      return
+    end
     K.batch_item_failed(nil)
     return
   end
@@ -7801,7 +8018,7 @@ local function draw_graph(draw_ctx, w, h)
       if text_w < L.xxxl then text_w = 0 end   -- no room for a readable part of it: Change… still says where it is
       local row_w = (text_w > 0 and text_w + L.md or 0) + m.change_w + L.md + btn_w
       local x0 = cx - row_w * 0.5
-      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.LOCKED_REASON or reason,
+      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.locked_reason() or reason,
         is_batch)
       btn_cx = x0 + used + L.md + btn_w * 0.5
     else
@@ -11777,7 +11994,7 @@ K.form_rows_draw = function(section, b, opts)
     if reason then reaper.ImGui_PopStyleColor(ctx, 1) end
     reaper.ImGui_EndDisabled(ctx)
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-      Theme.tooltip(ctx, locked and K.LOCKED_REASON or reason or hint)
+      Theme.tooltip(ctx, locked and K.locked_reason() or reason or hint)
     end
     return clicked and not locked
   end
@@ -12072,7 +12289,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   local P = Theme.get_palette()
   local m = K.form_canvas_metrics()
   local locked = state.is_analyzing == true
-  local why = locked and K.LOCKED_REASON or reason
+  local why = locked and K.locked_reason() or reason
   local disabled = why ~= nil
   local stacked = layout == "stacked"
   local h = 0
@@ -12193,7 +12410,7 @@ K.canvas_form = function(has_target, is_batch)
       for _, key in ipairs(K.ANALYSIS_KEYS) do running.values[key] = params[key] end
       K.canvas_running_form = running
     end
-    return running, K.LOCKED_REASON
+    return running, K.locked_reason()
   end
   K.canvas_running_form = nil
   local form = state.analysis_form
@@ -12375,7 +12592,7 @@ local function draw_settings_modal()
     Theme.section_divider(ctx, engine.title, { color = P.yellow })
     if locked then
       Theme.align(ctx)
-      reaper.ImGui_TextColored(ctx, P.text_dim, K.LOCKED_REASON)
+      reaper.ImGui_TextColored(ctx, P.text_dim, K.locked_reason())
     end
     draw_form(engine)
 
@@ -15238,6 +15455,7 @@ do
     if state.status.text ~= "" and reaper.time_precise() < state.status.until_time then
       return state.status.text
     end
+    if state.pre then return K.locked_reason() end   -- stage 1 of an Auto analysis
     local batch = K.batch
     if batch and batch.kind == "apply" then
       return string.format("Applying values to %d of %d items\xE2\x80\xA6 %d%%", math.min(batch.index, #batch.queue),
@@ -15249,7 +15467,7 @@ do
         entry and entry.name or "item", math.floor(K.analysis_progress() * 100))
     end
     if state.is_analyzing then
-      return string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor((state.progress or 0) * 100))
+      return string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor(K.analysis_progress() * 100))
     end
     if not (state.frame.take and state.target_take_name) then
       return state.selection_issue or ""
@@ -16141,6 +16359,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            request_confirm = request_confirm, draw_confirm_modal = draw_confirm_modal, sync_with_project = sync_with_project,
            get_effective = get_effective, get_override_level = get_override_level,
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
-           clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session }
+           clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session,
+           start_analysis = start_analysis }
 end
 main()
