@@ -11074,6 +11074,8 @@ K.form_canvas_metrics = function()
   local pad_x = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding())
   local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
   local cell_x, cell_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding())
+  -- The form's border (ChildFlags_Borders) turns on the window padding inside it: counted on every side
+  local win_x, win_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
   local frame_h = reaper.ImGui_GetFrameHeight(ctx)
   local fhs = reaper.ImGui_GetFrameHeightWithSpacing(ctx)
   local line_h = reaper.ImGui_GetTextLineHeight(ctx) + spacing_y
@@ -11088,11 +11090,11 @@ K.form_canvas_metrics = function()
     save_w = save_w, change_w = text_w(K.FORM_COPY.change) + pad_x * 2,
     slot_w = math.max(save_w, text_w(K.FORM_COPY.matches)),
     -- Three table columns, each with its L.md gap and the cells' padding on both sides
-    row_w = label_w + control_w + reset_w + L.md * 3 + cell_x * 6,
-    stacked_w = math.max(label_w, Theme.calc_combo_width(ctx, { K.CUSTOM_PRESET }) + L.sm + reset_w),
-    h_full = head_h + n_det * table_row_h + spacing_y + fhs,
+    row_w = label_w + control_w + reset_w + L.md * 3 + cell_x * 6 + win_x * 2,
+    stacked_w = math.max(label_w, Theme.calc_combo_width(ctx, { K.CUSTOM_PRESET }) + L.sm + reset_w) + win_x * 2,
+    h_full = head_h + n_det * table_row_h + spacing_y + fhs + win_y * 2,
     adv_full = n_dsp * table_row_h + spacing_y,
-    h_stacked = head_h + n_det * (line_h + fhs) + fhs + fhs,
+    h_stacked = head_h + n_det * (line_h + fhs) + fhs + fhs + win_y * 2,
     adv_stacked = n_dsp * (line_h + fhs),
   }
   K.form_metrics_cache = m
@@ -11169,11 +11171,17 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   end
 
   reaper.ImGui_SetCursorScreenPos(ctx, x, y)
+  -- The form's surface: the canvas bg inside a P.border outline (spec Theme mapping)
   reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(), P.border)
   local win_flags = reaper.ImGui_WindowFlags_NoScrollbar() | reaper.ImGui_WindowFlags_NoScrollWithMouse()
-  local child_flags = reaper.ImGui_ChildFlags_AutoResizeY()
-  if max_h then win_flags, child_flags = 0, 0 end   -- held to max_h: it scrolls
-  if reaper.ImGui_BeginChild(ctx, "##canvas_form", w, max_h or 0, child_flags, win_flags) then
+  local child_flags = reaper.ImGui_ChildFlags_AutoResizeY() | reaper.ImGui_ChildFlags_Borders()
+  if max_h then win_flags, child_flags = 0, reaper.ImGui_ChildFlags_Borders() end   -- held to max_h: it scrolls
+  local child_open = reaper.ImGui_BeginChild(ctx, "##canvas_form", w, max_h or 0, child_flags, win_flags)
+  -- The border is drawn by BeginChild: P.border is popped at once, so the combos and buttons inside keep the
+  -- theme's own outline
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  if child_open then
     local content_w = reaper.ImGui_GetContentRegionAvail(ctx)   -- less the scrollbar when it scrolls
     local header = K.form_header(form)
     local head, tail = header:match("^(.-) · (.+)$")
@@ -11212,7 +11220,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
     local _, child_h = reaper.ImGui_GetItemRectSize(ctx)
     h = child_h or 0
   end
-  reaper.ImGui_PopStyleColor(ctx, 1)
+  reaper.ImGui_PopStyleColor(ctx, 1)   -- ChildBg
   return h
 end
 
