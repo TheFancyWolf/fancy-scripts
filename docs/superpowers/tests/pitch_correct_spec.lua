@@ -4665,6 +4665,26 @@ test("form_defaults_request_names_changes", function()
   st.status.text, st.status.until_time = saved[5], saved[6]
 end)
 
+test("form_defaults_saved_from_the_modal_reach_the_canvas_form", function()
+  local K, st = S.K, S.state
+  local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time,
+    st.target_take_guid, st.analysis_form }
+  local ok, err = pcall(function()
+    K.save_settings = function() end
+    reaper.time_precise = function() return 0 end
+    st.target_take_guid = "{c}"
+    st.analysis_form = K.form_new("{c}", nil)          -- the canvas form, untouched
+    local modal = K.form_copy(st.analysis_form)        -- the modal's own copy
+    K.form_set(modal, "range", { name = "Tenor", min = 130, max = 500 })
+    K.form_defaults_request(modal.values).on_confirm()
+    eq(st.analysis_form.values.min_freq, 130, "the untouched canvas form follows the new defaults")
+    eq(st.analysis_form.values.max_freq, 500)
+  end)
+  K.save_settings, st.min_freq, st.max_freq, reaper.time_precise = saved[1], saved[2], saved[3], saved[4]
+  st.status.text, st.status.until_time, st.target_take_guid, st.analysis_form = saved[5], saved[6], saved[7], saved[8]
+  if not ok then error(err, 0) end
+end)
+
 local function settings_row(section_id, row_id)
   for _, section in ipairs(S.K.SETTINGS_SECTIONS) do
     if section.id == section_id then

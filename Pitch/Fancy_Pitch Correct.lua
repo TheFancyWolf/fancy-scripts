@@ -1868,6 +1868,10 @@ K.form_defaults_request = function(values)
     on_confirm = function()
       for _, key in ipairs(K.ANALYSIS_KEYS) do state[key] = copy[key] end
       K.save_settings("engine")
+      -- The canvas form's untouched rows follow the new defaults (Save as Default in the analysis modal never
+      -- touches the canvas form itself), as after a Settings change
+      local guid = state.target_take_guid
+      if guid then K.form_sync(guid, state.session_takes[guid]) end
       set_status("Defaults saved.")
     end,
   }
@@ -11224,11 +11228,14 @@ K.confirm_form_draw = function(c)
     Theme.right_align(ctx, m.slot_w)
     save_draw()
   end
-  -- The consequence lines under a separator, when there are any
+  -- The consequence lines under a separator, when there are any. Either way an item ends the form: the fold's
+  -- right-hand action leaves the cursor moved with no item after it, and ImGui asks for one before the body ends
   if #c.body_lines > 0 or (c.list and #c.list > 0) or #c.after_lines > 0 then
     reaper.ImGui_Dummy(ctx, 0, L.sm)
     reaper.ImGui_Separator(ctx)
     reaper.ImGui_Dummy(ctx, 0, L.sm)
+  else
+    reaper.ImGui_Dummy(ctx, 0, 0)
   end
 end
 
