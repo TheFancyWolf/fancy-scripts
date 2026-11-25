@@ -5478,12 +5478,15 @@ end)
 
 -- One track "tr" with two 20 s audio items (takes "tk_a" / "tk_b", GUIDs "{a}" / "{b}") whose audio is a 220 Hz sine
 -- read at the asked rate. opts: prev (the record the track holds), unreadable (a take K.open_accessor gives nil
--- for), step (seconds reaper.time_precise advances per call, 0 by default). fn(w) runs with the stubs in place;
+-- for), step (seconds reaper.time_precise advances per call, 0 by default), offline (a take whose source has no
+-- sample rate), no_source (a take with no source), silent (a take whose every read gives 0), len ({ [item] = s }:
+-- an item's length, 20 s otherwise), stubs (more reaper stubs, put in over these). w.opened lists the takes
+-- K.open_accessor was asked for. fn(w) runs with the stubs in place;
 -- they are all put back afterwards, and the pre-analysis is cancelled. w records the reads, destroys, track writes
 -- and undo blocks; a pointer put in w.dead is no longer valid (reaper.ValidatePtr2).
 local function pre_world(opts, fn)
   local K, st = S.K, S.state
-  local w = { reads = {}, destroyed = 0, writes = 0, undo = 0, now = 0, dead = {} }
+  local w = { reads = {}, destroyed = 0, writes = 0, undo = 0, now = 0, dead = {}, opened = {} }
   local takes = { it_a = "tk_a", it_b = "tk_b" }
   local guids = { tk_a = "{a}", tk_b = "{b}" }
   local stubs = {
@@ -5492,7 +5495,15 @@ local function pre_world(opts, fn)
     GetTrackMediaItem = function(_, i) return ({ [0] = "it_a", [1] = "it_b" })[i] end,
     GetActiveTake = function(item) return takes[item] end,
     TakeIsMIDI = function() return false end,
-    GetMediaItemInfo_Value = function(_, key) if key == "D_LENGTH" then return 20 end return 0 end,
+    GetMediaItemInfo_Value = function(item, key)
+      if key == "D_LENGTH" then return opts.len and opts.len[item] or 20 end
+      return 0
+    end,
+    GetMediaItemTake_Source = function(take)
+      if opts.no_source == take then return nil end
+      return "src_" .. take
+    end,
+    GetMediaSourceSampleRate = function(src) if opts.offline == src:sub(5) then return 0 end return 44100 end,
     GetSetMediaItemTakeInfo_String = function(take, key)
       if key == "GUID" and guids[take] then return true, guids[take] end
       return false, ""
@@ -5505,6 +5516,7 @@ local function pre_world(opts, fn)
     new_array = function() return {} end,
     GetAudioAccessorSamples = function(acc, rate, _, t, n, buf)
       w.reads[#w.reads + 1] = { acc = acc, rate = rate, t = t, n = n }
+      if opts.silent and acc == "acc_" .. opts.silent then return 0 end
       for i = 1, n do buf[i] = 0.5 * math.sin(2 * math.pi * 220 * (t + (i - 1) / rate)) end
       return 1
     end,
@@ -5514,6 +5526,7 @@ local function pre_world(opts, fn)
       return w.now
     end,
   }
+  for name, f in pairs(opts.stubs or {}) do stubs[name] = f end
   local old = {}
   for name, f in pairs(stubs) do
     old[name] = rawget(reaper, name)
@@ -5524,6 +5537,7 @@ local function pre_world(opts, fn)
   local old_analyzing, old_accessor = st.is_analyzing, st.accessor
   st.is_analyzing, st.accessor = false, nil
   K.open_accessor = function(take)
+    w.opened[#w.opened + 1] = take
     if take == opts.unreadable then return nil end
     return "acc_" .. take
   end
@@ -6198,6 +6212,8 @@ end)
 -- holds take "tk_x" (GUID "{x}"), opts.len seconds of a sine at its track's freq, read at opts.rate (8000) by the
 -- analysis and at K.PRE.RATE by the pre-analysis. opts.step: seconds reaper.time_precise advances per call (0).
 -- opts.offline: { [take] = true } has no sample rate; opts.ext: { [track] = text } what the track's record holds.
+-- opts.real_open: the script's own K.open_accessor runs (REAPER's accessor stubbed), on a Pitch envelope with points
+-- (it bypasses and restores the envelope, then counts that as the script's own write).
 -- w.log records, in order, "begin", "end:<label>", "track:<track>" (a track write) and "take:<guid>" (a take
 -- write); w.reads every accessor read { acc, rate }. Every stub, state value and K value it changes is put back.
 local function auto_world(opts, fn)
@@ -6248,7 +6264,12 @@ local function auto_world(opts, fn)
     GetTakeName = function(take) return take end,
     GetTrackName = function(track) return true, opts.tracks[track] and opts.tracks[track].name or "V _ Main" end,
     GetTakeEnvelopeByName = function(take) return "env_" .. take end,
-    GetEnvelopeStateChunk = function() return true, "<PITCHENV\nACT 1 -1\nVIS 1 1 1\n>" end,
+    GetEnvelopeStateChunk = function()
+      if opts.real_open then return true, "<PITCHENV\nACT 1 -1\nVIS 1 1 1\nPT 0 0 0\n>" end
+      return true, "<PITCHENV\nACT 1 -1\nVIS 1 1 1\n>"
+    end,
+    SetEnvelopeStateChunk = function() return true end,
+    CreateTakeAudioAccessor = function(take) return "acc_" .. take end,
     Undo_BeginBlock = function() log("begin") end,
     Undo_EndBlock = function(label) log("end:" .. tostring(label)) end,
     new_array = function() return {} end,
@@ -6269,9 +6290,11 @@ local function auto_world(opts, fn)
   local old_k = { open_accessor = K.open_accessor, write_take_envelope = K.write_take_envelope,
     take_correction = K.take_correction, pre_begin = K.pre_begin, batch_write = K.batch_write }
   local saved_last_progress = K.pre_last_progress
-  K.open_accessor = function(take)
-    if opts.unreadable and opts.unreadable[take] then return nil end
-    return "acc_" .. take
+  if not opts.real_open then
+    K.open_accessor = function(take)
+      if opts.unreadable and opts.unreadable[take] then return nil end
+      return "acc_" .. take
+    end
   end
   K.write_take_envelope = function(guid) log("take:" .. tostring(guid)); return true end
   K.take_correction = function() return {} end
@@ -7223,7 +7246,8 @@ test("find_again_track_deleted_mid_run_says_so", function()
     t7_open(3, 1, false)
     K.find_again_request()
     K.analysis_tick()
-    w.dead["tr"] = true   -- the user deleted the track while it was heard
+    w.dead["tr"], w.dead["tk_a"], w.dead["it_a"] = true, true, true   -- the user deleted the track (and its items)
+    K.drop_project_cache()
     auto_run_out()
     eq(#w.log, 0); eq(next(K.track_records_pending), nil); eq(st.is_analyzing, false)
     eq(st.status.text, "This item is no longer in the project")
@@ -7330,6 +7354,264 @@ test("info_explains_auto_and_find_again", function()
       end
     end
   end
+end)
+
+-- Final review fixes (Auto Vocal Range and Key) -------------------------------------------------------------------
+
+-- F1: a Vocal Range saved before Auto existed is kept (load rule, no migration)
+test("auto_range_load_keeps_a_saved_range", function()
+  local T = load_script({ pitch_min_freq = "130", pitch_max_freq = "500" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, false, "a saved Tenor, no Auto flag: kept")
+  eq(T.state.min_freq, 130); eq(T.state.max_freq, 500)
+  T = load_script({ pitch_max_freq = "500" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, false, "only a Max stored, not Auto's: kept")
+  T = load_script({})
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, true, "fresh install: factory Auto")
+  T = load_script({ pitch_min_freq = "65", pitch_max_freq = "1000" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, true, "stored Hz are Auto's own: Auto")
+  T = load_script({ pitch_auto_range = "1", pitch_min_freq = "130", pitch_max_freq = "500" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, true, "an explicit flag wins")
+  T = load_script({ pitch_auto_range = "0", pitch_min_freq = "65", pitch_max_freq = "1000" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, false, "an explicit flag wins (off)")
+end)
+
+-- F2: an external change while stage 1 runs is not taken for the script's own write (the real K.open_accessor)
+local REAL_OPEN = { tracks = ONE_TRACK, step = 0.003, real_open = true }
+
+-- Ticks until stage 1 has opened take b (the second take), bounded
+local function until_second_take()
+  for _ = 1, 100000 do
+    local pre = S.state.pre
+    if not pre or (pre.ti == 2 and pre.accessor) then return end
+    S.K.analysis_tick()
+  end
+  error("stage 1 never reached the second take")
+end
+
+test("pre_external_change_survives_the_analysis", function()
+  for _, bump in ipairs({ true, false }) do
+    auto_world(REAL_OPEN, function(w)
+      local st = S.state
+      st.target_take_guid, st.key_idx = "{a}", 0
+      st.last_change_count = w.count
+      S.start_analysis(auto_values(true))
+      S.K.analysis_tick()
+      eq(st.pre ~= nil and st.pre.ti == 1, true, "stage 1 is on the first take")
+      if bump then w.count = w.count + 1 end   -- an undo made in REAPER while stage 1 runs
+      until_second_take()
+      auto_run_out()
+      eq(type(st.session_takes["{a}"]), "table", "analysed")
+      if bump then
+        eq(st.last_change_count, nil, "the next frame reads the project again")
+      else
+        eq(st.last_change_count, w.count, "no external change: nothing to read again")
+      end
+    end)
+  end
+end)
+
+test("pre_external_change_survives_find_again", function()
+  for _, bump in ipairs({ true, false }) do
+    auto_world(REAL_OPEN, function(w)
+      local st = S.state
+      t7_open(3, 1, false)
+      st.last_change_count = w.count
+      S.K.find_again_request()
+      S.K.analysis_tick()
+      if bump then w.count = w.count + 1 end
+      until_second_take()
+      auto_run_out()
+      eq(table.concat(w.log, ","), "begin,track:tr,end:Find Range and Key: V _ Main")
+      if bump then eq(st.last_change_count, nil) else eq(st.last_change_count, w.count) end
+    end)
+  end
+end)
+
+test("pre_external_change_survives_find_key", function()
+  for _, bump in ipairs({ true, false }) do
+    auto_world(REAL_OPEN, function(w)
+      local st = S.state
+      t7_open(3, 1, false)
+      st.last_change_count = w.count
+      st.key_idx = 0
+      S.K.scale_changed("key")
+      S.K.analysis_tick()
+      if bump then w.count = w.count + 1 end
+      until_second_take()
+      auto_run_out()
+      if bump then eq(st.last_change_count, nil) else eq(st.last_change_count, w.count) end
+    end)
+  end
+end)
+
+test("pre_external_change_survives_cancel", function()
+  for _, bump in ipairs({ true, false }) do
+    auto_world(REAL_OPEN, function(w)
+      local K, st = S.K, S.state
+      t7_open(3, 1, false)
+      st.last_change_count = w.count
+      K.find_again_request()
+      K.analysis_tick()
+      if bump then w.count = w.count + 1 end
+      until_second_take()
+      eq(st.pre ~= nil, true)
+      eq(K.cancel_analysis(), true)
+      auto_run_out()
+      eq(#w.log, 0)
+      if bump then eq(st.last_change_count, nil) else eq(st.last_change_count, w.count) end
+    end)
+  end
+end)
+
+-- F3: offline media and takes that give no audio are skipped, not heard
+test("pre_offline_source_is_skipped", function()
+  for _, opts in ipairs({ { offline = "tk_b" }, { no_source = "tk_b" } }) do
+    pre_world(opts, function(w)
+      local K = S.K
+      eq(K.pre_begin({ "tr" }, {}), true)
+      pre_run_out()
+      for _, take in ipairs(w.opened) do eq(take ~= "tk_b", true, "no accessor for the offline take") end
+      for _, r in ipairs(w.reads) do eq(r.acc, "acc_tk_a") end
+      local rec = K.track_records_pending["tr"]
+      eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], nil, "not heard: tried again next time")
+      eq(rec.skipped, 1, "counted")
+      eq(w.destroyed, 1)
+    end)
+  end
+end)
+
+test("pre_take_with_no_audio_is_skipped", function()
+  pre_world({ silent = "tk_b" }, function(w)
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    local rec = K.track_records_pending["tr"]
+    eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], nil, "every read gave nothing: not heard")
+    eq(rec.skipped, 1)
+    eq(w.destroyed, 2, "its accessor is destroyed")
+  end)
+end)
+
+test("pre_short_take_stays_heard", function()
+  pre_world({ len = { it_b = 0.01 } }, function(w)
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    for _, r in ipairs(w.reads) do eq(r.acc, "acc_tk_a", "shorter than one block: nothing read") end
+    local rec = K.track_records_pending["tr"]
+    eq(rec.takes["{b}"], true, "no read attempted: heard as before"); eq(rec.skipped, 0)
+  end)
+end)
+
+-- F4: malformed track records are no record
+test("track_record_rejects_malformed", function()
+  local K = S.K
+  local function rec(t)
+    local r = { st = { ["57"] = 500 }, takes = {} }
+    for k, v in pairs(t) do r[k] = v end
+    return r
+  end
+  for _, key in ipairs({ "-5", "128", "1e3", "5.5" }) do
+    eq(K.track_record_valid(rec({ st = { [key] = 500 } })), nil, "st key " .. key)
+  end
+  local inf = JSON.decode('{"st":{"57":1e999},"takes":{}}')
+  eq(inf.st["57"], math.huge, "the decoder gives inf")
+  eq(K.track_record_valid(inf), nil, "st value inf")
+  eq(K.track_record_valid(rec({ st = { ["57"] = -1 } })), nil, "st value negative")
+  eq(K.track_record_valid(rec({ st = { ["57"] = 0 / 0 } })), nil, "st value NaN")
+  eq(K.track_record_valid(rec({ skipped = 1.5 })), nil, "skipped fractional")
+  eq(K.track_record_valid(rec({ skipped = math.huge })), nil, "skipped inf")
+  eq(K.track_record_valid(rec({ lo_st = -1, hi_st = 60 })), nil, "lo_st -1")
+  eq(K.track_record_valid(rec({ lo_st = 60, hi_st = 128 })), nil, "hi_st 128")
+  eq(type(K.track_record_valid(rec({ st = { ["0"] = 1, ["127"] = 2.5 }, skipped = 3 }))), "table", "edges valid")
+end)
+
+test("track_record_round_trips_what_it_builds", function()
+  local K = S.K
+  local tally = K.pre_tally_new()
+  for i = 1, 400 do K.pre_tally_add(tally, 110 * 2 ^ ((i % 24) / 12)) end
+  local built = K.track_record_build(tally, { ["{a}"] = true }, nil)
+  built.skipped = 2
+  local back = K.track_record_valid(JSON.decode(JSON.encode(built)))
+  eq(type(back), "table", "a record from a real tally")
+  eq(back.lo_st, built.lo_st); eq(back.key_idx, built.key_idx); eq(back.skipped, 2)
+  local empty = K.track_record_build(K.pre_tally_new(), {}, nil)
+  eq(type(K.track_record_valid(JSON.decode(JSON.encode(empty)))), "table", "an empty record")
+  local merged = K.track_record_build(tally, { ["{b}"] = true }, back)
+  eq(type(K.track_record_valid(JSON.decode(JSON.encode(merged)))), "table", "a merged record")
+end)
+
+-- F5: Auto on an item that has its track's key already says so, and writes nothing
+test("find_key_no_op_says_the_tracks_key", function() t7_ext(function(ext)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(5, 1, true)
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(#w.log, 0, "no undo point"); eq(next(ext), nil, "no ExtState")
+    eq(st.status.text, "Used V _ Main's key: " .. K.key_text(5, 1) .. ".")
+    eq(next(K.track_records_pending), nil)
+  end)
+end) end)
+
+-- F6: an item whose track's record holds another key changes alone
+test("key_fix_track_holds_another_key_changes_the_item_only", function() t7_ext(function(ext, ext_sync)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx = 0
+    ext_sync()
+    local data = t7_open(7, 1, true)   -- found on its track once; the track's record holds E now
+    eq(K.key_found_text(data), nil, "no 'Found from' line")
+    st.key_idx = 3
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "no track write")
+    eq(t7_stored(w).key_idx, 5, "the track keeps its key")
+    eq(data.key_idx, 3)
+    eq(NK.key_idx, 3, "the Key for new items follows"); eq(ext.pitch_key_idx, "3")
+    eq(next(K.track_records_pending), nil)
+  end)
+end) end)
+
+-- F7: the track goes during Find Again; the item says so only when it went too
+test("find_again_track_deleted_item_moved_says_nothing", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    K.analysis_tick()
+    w.dead["tr"] = true   -- the track is deleted; the item was moved to another track first
+    auto_run_out()
+    eq(#w.log, 0); eq(next(K.track_records_pending), nil); eq(st.is_analyzing, false)
+    eq(st.status.text, "", "no status")
+  end)
+end)
+
+-- F8: MIDI items and items with no active take are neither opened nor counted
+test("pre_ignores_midi_and_empty_items", function()
+  local items = { [0] = "it_a", [1] = "it_m", [2] = "it_e" }
+  pre_world({ stubs = {
+    CountTrackMediaItems = function(track) return track == "tr" and 3 or 0 end,
+    GetTrackMediaItem = function(_, i) return items[i] end,
+    GetActiveTake = function(item) return ({ it_a = "tk_a", it_m = "tk_m" })[item] end,
+    TakeIsMIDI = function(take) return take == "tk_m" end,
+  } }, function(w)
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    eq(table.concat(w.opened, ","), "tk_a", "only the audio take is opened")
+    local rec = K.track_records_pending["tr"]
+    eq(rec.takes["{a}"], true)
+    local n = 0
+    for _ in pairs(rec.takes) do n = n + 1 end
+    eq(n, 1, "only the audio take is listed")
+    eq(rec.skipped, 0, "MIDI and empty items are not media offline")
+  end)
 end)
 
 -- Tests appended by later tasks go above this line.

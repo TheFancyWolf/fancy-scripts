@@ -570,16 +570,24 @@ K.track_label = function(track)
   return (type(name) == "string" and name ~= "") and name or "this track"
 end
 
+--- The track of an analysed item `data` (its take `guid`) and the track's record, when the item's key was found on
+--- the track (data.key_from_track) and the record still holds that key and scale; nil otherwise (no record, the item
+--- moved to another track, the track's key changed since).
+K.key_track_record = function(data, guid)
+  if not (data and data.key_from_track) then return nil end
+  local track = K.take_track(guid)
+  local rec = track and K.track_record(track)
+  if not (rec and rec.key_idx == data.key_idx and rec.scale_idx == data.scale_idx) then return nil end
+  return track, rec
+end
+
 --- The Key combo's line for an analysed item `data` whose key was found on its track (and the track's record still
 --- holds it): "Found from V _ Main. C# Minor also fits." (with the runner-up), or "Found from V _ Main."; nil for a
 --- key chosen by hand.
 K.key_found_text = function(data)
-  if not (data and data.key_from_track) then return nil end
-  local track = K.take_track(data.guid)
+  local track, rec = K.key_track_record(data, data and data.guid)
   if not track then return nil end
   local name = K.track_label(track)
-  local rec = K.track_record(track)
-  if not (rec and rec.key_idx == data.key_idx and rec.scale_idx == data.scale_idx) then return nil end
   if rec.alt_key_idx then
     return string.format("Found from %s. %s also fits.", name, K.key_text(rec.alt_key_idx, rec.alt_scale_idx))
   end
@@ -976,9 +984,22 @@ end)()
 
 --- Adopt every stored setting (validated by its entry) and remember what is stored.
 K.load_settings = function()
+  local found = {}
   for _, e in ipairs(K.PERSIST) do
     local raw = reaper.GetExtState("FancyScripts", e.ext)
-    if raw and raw ~= "" then e.apply(raw) end
+    if raw and raw ~= "" then
+      e.apply(raw)
+      found[e.ext] = true
+    end
+  end
+  -- A Vocal Range saved before Auto existed (no Auto flag stored) is kept: Auto only when the stored Hz are Auto's own
+  if not found.pitch_auto_range then
+    for _, r in ipairs(VOCAL_RANGES) do
+      if r.auto and ((found.pitch_min_freq and math.abs(state.min_freq - r.min) > 1e-9)
+          or (found.pitch_max_freq and math.abs(state.max_freq - r.max) > 1e-9)) then
+        state.auto_range = false
+      end
+    end
   end
   -- The hop never exceeds the block (either may come from a stored value)
   if state.hop_size > state.block_size then state.hop_size = state.block_size end
@@ -1208,11 +1229,14 @@ end
 --- `t` when it is a valid track record, else nil. Shape: { st = { ["52"] = frames }, takes = { [take_guid] = true },
 --- lo_st, hi_st (both or neither: nil = nothing sung found), key_idx + scale_idx (both or neither: nil = key not
 --- told; a found scale is Major or Natural Minor, a key corrected in the bar may be any scale), alt_key_idx +
---- alt_scale_idx (both or neither, only with a key; Major or Natural Minor), skipped (optional, a number >= 0) }.
+--- alt_scale_idx (both or neither, only with a key; Major or Natural Minor), skipped (optional, a whole number >= 0) }.
+--- Every number is finite: anything else is no record.
 K.track_record_valid = function(t)
   if type(t) ~= "table" or type(t.st) ~= "table" or type(t.takes) ~= "table" then return nil end
+  -- st: a whole MIDI note 0..127 written in digits (as K.track_record_build writes it) -> a finite count >= 0
   for k, v in pairs(t.st) do
-    if type(k) ~= "string" or not tonumber(k) or type(v) ~= "number" or v < 0 then return nil end
+    if type(k) ~= "string" or not k:match("^%d+$") or not whole_in(tonumber(k), 0, 127) then return nil end
+    if type(v) ~= "number" or not (v >= 0 and v < math.huge) then return nil end
   end
   for k, v in pairs(t.takes) do
     if type(k) ~= "string" or v ~= true then return nil end
@@ -1230,7 +1254,7 @@ K.track_record_valid = function(t)
   if t.alt_key_idx ~= nil then
     if t.key_idx == nil or not whole_in(t.alt_key_idx, 1, 12) or not whole_in(t.alt_scale_idx, 1, 2) then return nil end
   end
-  if t.skipped ~= nil and (type(t.skipped) ~= "number" or t.skipped < 0) then return nil end
+  if t.skipped ~= nil and not (whole_in(t.skipped, 0, math.huge) and t.skipped < math.huge) then return nil end
   return t
 end
 
@@ -1873,8 +1897,11 @@ end
 --- Forget what an Auto analysis carries to its end (K.auto_run) and every record waiting for its undo block: the
 --- analysis ended without writing (cancelled, could not begin, released, the item went).
 K.auto_drop = function()
+  local run = K.auto_run
   K.auto_run = nil
   K.track_records_pending = {}
+  -- Its stage 1 saw an external change (K.pre_note_external): read the project again after this analysis's writes
+  if run and run.external then state.last_change_count = nil end
 end
 
 --- Auto range and key, the pre-analysis: a coarse, time-sliced listen through every audio item on some tracks. Each
@@ -1979,14 +2006,25 @@ K.pre_close_accessor = function(pre)
   if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
 end
 
---- Go on to the next queued track. After the last one state.pre is cleared, then on_done runs; when it started no
---- analysis, state.is_analyzing goes back to false. Returns true when the pre-analysis ended.
+--- The resync is paused while the pre-analysis runs, and K.open_accessor counts the project's change count as this
+--- script's own after it bypasses a Pitch envelope: before each open (and when the run ends) pre.external remembers
+--- whether the project changed meanwhile (an undo, an edit in REAPER). Whoever ends a run that saw one (on_done's
+--- second argument; K.pre_cancel) sets state.last_change_count to nil after its own writes: the next frame reads the
+--- project again.
+K.pre_note_external = function(pre)
+  if state.last_change_count ~= reaper.GetProjectStateChangeCount(0) then pre.external = true end
+end
+
+--- Go on to the next queued track. After the last one state.pre is cleared, then on_done(results, external) runs
+--- (external: K.pre_note_external); when it started no analysis, state.is_analyzing goes back to false. Returns true
+--- when the pre-analysis ended.
 K.pre_next_track = function(pre)
   pre.qi, pre.ti, pre.t = pre.qi + 1, 1, 0
   if pre.qi > #pre.queue then
     state.pre = nil
     K.pre_last_progress = 1
-    if pre.on_done then pre.on_done(pre.results) end
+    K.pre_note_external(pre)
+    if pre.on_done then pre.on_done(pre.results, pre.external) end
     if not state.accessor and not state.pre then state.is_analyzing = false end
     return true
   end
@@ -2031,9 +2069,16 @@ K.pre_step = function()
       pre.done_s = pre.done_s + entry.len
       pre.ti, pre.t = pre.ti + 1, 0
     elseif not pre.accessor then
-      pre.accessor = K.open_accessor(entry.take)
-      pre.t = 0
-      if not pre.accessor then   -- no audio to read: counted, and not listed as heard (tried again next time)
+      -- Media offline (its source has no sample rate, as K.analysis_begin tests it) or no accessor: nothing to read.
+      -- Counted, and not listed as heard (tried again next time)
+      local source = reaper.GetMediaItemTake_Source(entry.take)
+      local rate = source and reaper.GetMediaSourceSampleRate(source)
+      if rate and rate > 0 then
+        K.pre_note_external(pre)
+        pre.accessor = K.open_accessor(entry.take)
+      end
+      pre.t, pre.reads, pre.got = 0, 0, 0
+      if not pre.accessor then
         tr.skipped = tr.skipped + 1
         pre.done_s = pre.done_s + entry.len
         pre.ti = pre.ti + 1
@@ -2041,15 +2086,22 @@ K.pre_step = function()
     elseif pre.t + block_s <= entry.len then
       local got = reaper.GetAudioAccessorSamples(pre.accessor, K.PRE.RATE, state.num_channels, pre.t, K.PRE.BLOCK,
         pre.buffer)
+      pre.reads = pre.reads + 1
       if got and got > 0 then
+        pre.got = pre.got + 1
         local _, freq = yin_process_block(pre.buffer, K.PRE.RATE, params)
         if freq then K.pre_tally_add(tr.tally, freq) end
       end
       pre.t = pre.t + K.PRE.STEP_S
     else
-      -- The take is heard to its end
+      -- The take is heard to its end. One whose every read gave no audio was not heard (its media went away): it is
+      -- counted as skipped, not listed. A take shorter than one block (nothing to read) is heard
       K.pre_close_accessor(pre)
-      tr.takes[entry.guid] = true
+      if pre.reads > 0 and pre.got == 0 then
+        tr.skipped = tr.skipped + 1
+      else
+        tr.takes[entry.guid] = true
+      end
       pre.done_s = pre.done_s + entry.len
       pre.ti, pre.t = pre.ti + 1, 0
     end
@@ -2064,6 +2116,7 @@ K.pre_cancel = function()
   K.track_records_pending = {}
   K.pre_last_progress = 0
   if pre and pre.accessor then pcall(reaper.DestroyAudioAccessor, pre.accessor) end
+  if pre and pre.external then state.last_change_count = nil end   -- K.pre_note_external
 end
 
 --- Developer switch (no interface): ExtState FancyScripts / pitch_dev_dump holds a folder, empty by default. While it
@@ -2745,20 +2798,22 @@ K.auto_begin = function(take, item, values, guid)
     run.total = #list + skipped
   end
   local sync = true
-  local function on_done(results)
+  local function on_done(results, external)
     local pre_ran = not sync
     local rec = track and results[track] or nil
-    run.rec, run.pre_ran = rec, pre_ran
+    run.rec, run.pre_ran, run.external = rec, pre_ran, external
     run.fresh = track ~= nil and K.track_records_pending[track] ~= nil
     -- The item can go while its track is heard: nothing is analysed then, and nothing is written
     if pre_ran and not (reaper.ValidatePtr2(0, take, "MediaItem_Take*") and reaper.ValidatePtr2(0, item, "MediaItem*")) then
       K.auto_drop()
+      if external then state.last_change_count = nil end
       set_status("This item is no longer in the project")
       return
     end
     local reanalyze = K.reanalyze_status_guid   -- K.request_analyze set it while stage 1 ran
     if not K.analysis_begin(take, item, { values = (K.auto_values(values, rec)) }) then
       K.auto_drop()
+      if external then state.last_change_count = nil end   -- after K.analysis_begin's own accessor
       set_status(K.AUTO_UNREADABLE_TEXT)
       return
     end
@@ -5155,14 +5210,10 @@ K.key_changed_status = function(count)
   end
 end
 
---- The track an analysed item `data` follows for its key, and the track's record: its key was found on the track
---- (data.key_from_track) and the track holds a record. nil otherwise.
+--- The track an analysed item `data` follows for its key, and the track's record (K.key_track_record: its key, as it
+--- was before the change, was found on the track and the record still holds it). nil otherwise.
 K.key_follow_track = function(data)
-  if not (data and data.key_from_track) then return nil end
-  local track = K.take_track(data.guid or state.target_take_guid)
-  local rec = track and K.track_record(track)
-  if not rec then return nil end
-  return track, rec
+  return K.key_track_record(data, data and (data.guid or state.target_take_guid))
 end
 
 --- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). With no
@@ -5233,7 +5284,10 @@ K.find_key_request = function()
     K.find_key_finish(guid, track, rec)
     return
   end
-  if K.pre_begin({ track }, { on_done = function(results) K.find_key_finish(guid, track, results[track]) end }) then
+  if K.pre_begin({ track }, { on_done = function(results, external)
+    K.find_key_finish(guid, track, results[track])
+    if external then state.last_change_count = nil end   -- K.pre_note_external: after its own write
+  end }) then
     state.pre.alone = true
   end
 end
@@ -5254,7 +5308,10 @@ K.find_key_finish = function(guid, track, rec)
     return
   end
   if data.key_idx == rec.key_idx and data.scale_idx == rec.scale_idx and data.key_from_track then
+    -- The item has its track's key already: nothing is written, the status says whose key it is
     K.track_records_pending[track] = nil
+    set_status((K.auto_status({ fresh = false, want_key = true, track = K.track_label(track),
+      key_text = K.key_text(rec.key_idx, rec.scale_idx) })))
     return
   end
   data.key_idx, data.scale_idx, data.key_from_track = rec.key_idx, rec.scale_idx, true
@@ -5293,20 +5350,24 @@ K.find_again_request = function()
   local prev = K.track_record(track)
   local list, skipped = K.pre_takes(track, nil)
   local total = #list + skipped
-  if K.pre_begin({ track }, { fresh = true,
-      on_done = function(results) K.find_again_finish(track, prev, results[track], total) end }) then
+  local guid = get_take_guid(take)
+  if K.pre_begin({ track }, { fresh = true, on_done = function(results, external)
+    K.find_again_finish(track, prev, results[track], total, guid)
+    if external then state.last_change_count = nil end   -- K.pre_note_external: after its own write
+  end }) then
     state.pre.alone = true
   end
 end
 
 --- The fresh record `rec` of `track` is heard (nil: the track went). Nothing found (no range, no key): the record
 --- `prev` stays as it is. Otherwise `rec` replaces it, with prev's key when none was found, in one undo point
---- "Find Range and Key: <track>" that holds only the record. `total`: the audio items on the track. Status by the
---- Auto analysis's priority: unreadable media > what was found. Nothing stays pending.
-K.find_again_finish = function(track, prev, rec, total)
+--- "Find Range and Key: <track>" that holds only the record. `total`: the audio items on the track; `guid`: the take
+--- it was asked from. Status by the Auto analysis's priority: unreadable media > what was found. Nothing stays pending.
+K.find_again_finish = function(track, prev, rec, total, guid)
   K.track_records_pending[track] = nil
   if not (rec and reaper.ValidatePtr2(0, track, "MediaTrack*")) then
-    set_status("This item is no longer in the project")   -- the track went while it was heard
+    -- The track went while it was heard: said only when the item `guid` went with it (one moved off it: no status)
+    if not (guid and resolve_take_by_guid(guid, true)) then set_status("This item is no longer in the project") end
     return
   end
   if not rec.lo_st and not rec.key_idx then
