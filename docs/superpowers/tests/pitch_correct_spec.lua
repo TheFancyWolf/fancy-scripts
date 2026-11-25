@@ -5828,11 +5828,16 @@ test("form_pick_range_clears_auto", function()
   K.form_reset_row(f, "range")
   eq(f.values.auto_range, S.state.auto_range, "Reset: back to the default, Auto included")
   eq(f.edited.auto_range, nil)
+  K.form_set(f, "range", vocal_range("Tenor"))
   K.form_set(f, "min_freq", 80)
-  eq(f.values.auto_range, false, "a Min Freq edit is not Auto")
-  K.form_set(f, "range", vocal_range("Auto"))
+  eq(f.values.auto_range, false, "a Min Freq edit never changes auto_range")
+  eq(f.values.min_freq, 80)
+  K.form_reset_row(f, "min_freq")
+  eq(f.values.min_freq, S.state.min_freq); eq(f.values.auto_range, false, "one Hz back alone: still not Auto")
   K.form_reset_row(f, "max_freq")
-  eq(f.values.auto_range, false, "a Max Freq reset is not Auto")
+  eq(f.values.max_freq, S.state.max_freq)
+  eq(f.values.auto_range, S.state.auto_range, "both Hz back at the defaults: the default range whole")
+  eq(f.edited.auto_range, nil)
 end)
 
 test("existing_presets_shift", function()
@@ -5863,6 +5868,62 @@ test("range_tip_names_found_hz", function()
   eq(K.range_tip({ auto_range = false, auto_lo_st = 40, auto_hi_st = 69 }), K.ROW_TIPS.range)
 end)
 
+test("dsp_section_reset_ends_at_auto", function()
+  local K, st = S.K, S.state
+  local saved = { st.auto_range, st.min_freq, st.max_freq, st.confirm, K.save_settings, reaper.time_precise,
+    st.status.text, st.status.until_time, st.target_take_guid }
+  local ok, err = pcall(function()
+    K.save_settings = function() end
+    reaper.time_precise = function() return 0 end
+    st.target_take_guid = nil
+    K.settings_binding().set("range", vocal_range("Tenor"))
+    eq(st.auto_range, false)
+    local dsp
+    for _, section in ipairs(K.SETTINGS_SECTIONS) do if section.id == "dsp" then dsp = section end end
+    K.request_settings_reset(dsp)
+    eq(st.auto_range, false, "the confirm alone changes nothing")
+    st.confirm.on_confirm()
+    local d = K.analysis_defaults()
+    eq(d.auto_range, true); eq(d.min_freq, S.DEFAULTS.min_freq); eq(d.max_freq, S.DEFAULTS.max_freq)
+    eq(K.range_name(d), "Auto")
+  end)
+  st.auto_range, st.min_freq, st.max_freq, st.confirm, K.save_settings, reaper.time_precise = table.unpack(saved, 1, 6)
+  st.status.text, st.status.until_time, st.target_take_guid = saved[7], saved[8], saved[9]
+  if not ok then error(err, 0) end
+end)
+
+test("hz_rows_at_default_while_auto", function()
+  local K = S.K
+  local dsp
+  for _, section in ipairs(K.SETTINGS_SECTIONS) do if section.id == "dsp" then dsp = section end end
+  local rows = {}
+  for _, row in ipairs(dsp.rows) do rows[row.id] = row end
+  local f = K.form_new("{hz}", { notes = { {} }, analysis = { auto_range = true, min_freq = 82, max_freq = 440,
+    threshold = 0.08, block_size = 1024, hop_size = 512 } })
+  local b = K.form_binding(f)
+  for _, id in ipairs({ "min_freq", "max_freq" }) do
+    eq(rows[id].is_default(b), true, id .. ": not the user's to set while Auto")
+    eq(rows[id].reason(b.v), "Found from the track", id .. ": Reset disabled with the reason")
+  end
+  -- Reset is disabled; were it called anyway, it would not switch Auto off
+  K.form_reset_row(f, "min_freq")
+  eq(f.values.auto_range, true, "auto_range untouched")
+  eq(f.values.max_freq, 440, "the other Hz untouched")
+  f.values.auto_range = false
+  eq(rows.max_freq.is_default(b), false, "not Auto: the Hz count again")
+  eq(rows.max_freq.reason(b.v), nil)
+end)
+
+test("form_changed_rows_auto_nil_is_false", function()
+  local K, st = S.K, S.state
+  local saved = st.auto_range
+  st.auto_range = false
+  local v = K.analysis_defaults(); v.auto_range = nil
+  local n = K.form_changed_rows(v)
+  st.auto_range = saved
+  eq(n, 0, "nil and false are the same")
+end)
+
 test("auto_hz_rows_disabled_with_reason", function()
   local K = S.K
   eq(K.auto_hz_reason({ auto_range = true }), "Found from the track")
@@ -5880,7 +5941,13 @@ test("settings_binding_auto_range", function()
     b.reset("range")
     eq(st.auto_range, S.DEFAULTS.auto_range); eq(st.min_freq, S.DEFAULTS.min_freq)
     b.reset("min_freq")
-    eq(st.auto_range, false, "a Min Freq reset is not Auto")
+    eq(st.auto_range, S.DEFAULTS.auto_range, "a Min Freq reset never switches Auto off")
+    b.set("range", vocal_range("Tenor")); b.set("min_freq", 80)
+    eq(st.auto_range, false, "a Min Freq edit never switches Auto on or off")
+    b.reset("min_freq")
+    eq(st.auto_range, false, "Max Freq still Tenor's: not the factory range")
+    b.reset("max_freq")
+    eq(st.auto_range, S.DEFAULTS.auto_range, "both Hz at the factory ones: the factory range, Auto included")
   end)
   st.auto_range, st.min_freq, st.max_freq = saved[1], saved[2], saved[3]
   if not ok then error(err, 0) end
@@ -5930,9 +5997,10 @@ test("analysis_begin_freezes_auto_range", function()
     GetMediaItemTake_Source = function() return "src" end, GetMediaSourceSampleRate = function() return 44100 end,
     GetMediaItemInfo_Value = function() return 1 end, new_array = function() return {} end,
   }
-  local saved_open, saved_state = K.open_accessor, {}
-  for _, key in ipairs({ "is_analyzing", "results", "target_take_guid", "accessor", "buffer", "sample_rate",
-      "item_len", "end_time", "current_time", "start_time", "progress", "separation", "analysis_empty" }) do
+  local saved_open, saved_state, saved_reanalyze = K.open_accessor, {}, K.reanalyze_status_guid
+  for _, key in ipairs({ "is_analyzing", "results", "target_take_guid", "target_take_name", "accessor", "buffer",
+      "sample_rate", "item_len", "end_time", "current_time", "start_time", "progress", "separation",
+      "analysis_empty", "nudge_burst" }) do
     saved_state[key] = st[key]
   end
   for k, f in pairs(stubs) do reaper[k] = f end
@@ -5947,8 +6015,12 @@ test("analysis_begin_freezes_auto_range", function()
     eq(st.analysis_params.auto_range, false)
   end)
   for k in pairs(stubs) do reaper[k] = nil end
-  K.open_accessor = saved_open
-  for key, v in pairs(saved_state) do st[key] = v end
+  K.open_accessor, K.reanalyze_status_guid = saved_open, saved_reanalyze
+  for _, key in ipairs({ "is_analyzing", "results", "target_take_guid", "target_take_name", "accessor", "buffer",
+      "sample_rate", "item_len", "end_time", "current_time", "start_time", "progress", "separation",
+      "analysis_empty", "nudge_burst" }) do
+    st[key] = saved_state[key]   -- nil values too (pairs skips them)
+  end
   st.is_analyzing = saved_state.is_analyzing
   st.analysis_params = saved_params
   if not ok then error(err, 0) end

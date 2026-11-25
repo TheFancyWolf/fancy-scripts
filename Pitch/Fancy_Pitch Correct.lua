@@ -2349,12 +2349,10 @@ K.form_sync = function(guid, data)
   end
 end
 
---- The values a row writes for `key`: "range" takes a VOCAL_RANGES entry (both Hz, and whether it is Auto) and
---- "quality" a QUALITY_MODES entry (block and hop); Min Freq or Max Freq set by hand is no longer Auto; any other key
---- is one value of its own.
+--- The values a row writes for `key`: "range" takes a VOCAL_RANGES entry (both Hz, and whether it is Auto: only this
+--- row changes auto_range) and "quality" a QUALITY_MODES entry (block and hop); any other key is one value of its own.
 K.value_pairs = function(key, value)
   if key == "range" then return { min_freq = value.min, max_freq = value.max, auto_range = value.auto == true } end
-  if key == "min_freq" or key == "max_freq" then return { [key] = value, auto_range = false } end
   if key == "quality" then return { block_size = value.block, hop_size = value.hop } end
   return { [key] = value }
 end
@@ -2369,7 +2367,7 @@ K.form_set = function(form, key, value)
 end
 
 --- Put a row back to the Settings' default: row_id "range", "mode", "quality", "block", "hop", "threshold",
---- "min_freq" or "max_freq" (either Hz reset by itself is no longer Auto).
+--- "min_freq" or "max_freq" (K.hz_reset_follows: both Hz back at the default ones bring the default range back).
 K.form_reset_row = function(form, row_id)
   local keys_of = {
     range = { "min_freq", "max_freq", "auto_range" }, mode = { "threshold" }, quality = { "block_size", "hop_size" },
@@ -2381,14 +2379,27 @@ K.form_reset_row = function(form, row_id)
     form.values[key] = defaults[key]
     form.edited[key] = nil
   end
-  if row_id == "min_freq" or row_id == "max_freq" then K.form_set(form, "auto_range", false) end
+  if (row_id == "min_freq" or row_id == "max_freq") and K.hz_reset_follows(form.values, defaults) then
+    form.edited.auto_range = nil
+  end
+end
+
+--- After a Min Freq or Max Freq reset of `v` to the defaults `base`: when both Hz now are the default range's, the
+--- default range is back whole, its auto_range included (the Hz rows never set auto_range otherwise, so a section
+--- reset of them ends at the defaults). Returns true when it restored auto_range.
+K.hz_reset_follows = function(v, base)
+  if v.min_freq ~= base.min_freq or v.max_freq ~= base.max_freq then return false end
+  v.auto_range = base.auto_range == true
+  return true
 end
 
 --- How many of the three rows (Vocal Range, Detection Mode, Quality) of `values` differ from the Settings' defaults.
 K.form_changed_rows = function(values)
   local d = K.analysis_defaults()
   local n = 0
-  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq or values.auto_range ~= d.auto_range then n = n + 1 end
+  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq or (values.auto_range == true) ~= (d.auto_range == true) then
+    n = n + 1
+  end
   if values.threshold ~= d.threshold then n = n + 1 end
   if values.block_size ~= d.block_size or values.hop_size ~= d.hop_size then n = n + 1 end
   return n
@@ -11480,9 +11491,9 @@ K.settings_binding = function()
         state.block_size = DEFAULTS.block_size
         if state.hop_size > state.block_size then state.hop_size = state.block_size end
       elseif row_id == "hop" then state.hop_size = math.min(DEFAULTS.hop_size, state.block_size)
-      else   -- threshold, min_freq, max_freq (either Hz reset by itself is no longer Auto)
+      else   -- threshold, min_freq, max_freq (both Hz back at the factory ones: the factory range, Auto included)
         restore({ row_id })
-        if row_id == "min_freq" or row_id == "max_freq" then state.auto_range = false end
+        if row_id == "min_freq" or row_id == "max_freq" then K.hz_reset_follows(state, DEFAULTS) end
       end
     end,
     commit = function()
@@ -11650,13 +11661,14 @@ K.SETTINGS_SECTIONS = {
           Theme.tooltip(ctx, "Detection Threshold\n\nThe confidence threshold for pitch detection. Lower is stricter.")
         end
       end },
-    -- Disabled while Vocal Range is Auto (K.auto_hz_reason): the reason inline after Min Freq and as both tooltips
-    { id = "min_freq", label = "Min Freq (Hz)",
-      is_default = function(b) return b.v.min_freq == b.base.min_freq end,
+    -- Disabled while Vocal Range is Auto (K.auto_hz_reason), Reset too: the reason inline after Min Freq and as the
+    -- tooltips. Their Hz are then not the user's to set, so they count as at their default
+    { id = "min_freq", label = "Min Freq (Hz)", reason = K.auto_hz_reason,
+      is_default = function(b) return K.auto_hz_reason(b.v) ~= nil or b.v.min_freq == b.base.min_freq end,
       reset = function(b) b.reset("min_freq") end,
       draw = function(w, b) K.hz_row_draw("dsp_min_freq", "min_freq", w, b, true) end },
-    { id = "max_freq", label = "Max Freq (Hz)",
-      is_default = function(b) return b.v.max_freq == b.base.max_freq end,
+    { id = "max_freq", label = "Max Freq (Hz)", reason = K.auto_hz_reason,
+      is_default = function(b) return K.auto_hz_reason(b.v) ~= nil or b.v.max_freq == b.base.max_freq end,
       reset = function(b) b.reset("max_freq") end,
       draw = function(w, b) K.hz_row_draw("dsp_max_freq", "max_freq", w, b, false) end },
   } },
@@ -11691,7 +11703,9 @@ K.form_rows_draw = function(section, b, opts)
 
   local function row_reset(row)
     local at_default = row.is_default(b)
-    if reset_button("Reset", "reset_" .. row.id, opts.reset_w, at_default and opts.default_reason or nil, opts.reset_hint) then
+    -- row.reason (optional): why the whole row is disabled now, Reset included
+    local why = row.reason and row.reason(b.v) or (at_default and opts.default_reason or nil)
+    if reset_button("Reset", "reset_" .. row.id, opts.reset_w, why, opts.reset_hint) then
       row.reset(b)
       b.commit()
     end
