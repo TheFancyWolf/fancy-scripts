@@ -564,6 +564,12 @@ K.key_text = function(key_idx, scale_idx)
   return key.display .. " " .. (scale_idx == 2 and "Minor" or scale.name)
 end
 
+--- The name of `track` for the Key combo, the status line and undo labels ("this track" when REAPER gives none).
+K.track_label = function(track)
+  local _, name = reaper.GetTrackName(track)
+  return (type(name) == "string" and name ~= "") and name or "this track"
+end
+
 --- The Key combo's line for an analysed item `data` whose key was found on its track (and the track's record still
 --- holds it): "Found from V _ Main. C# Minor also fits." (with the runner-up), or "Found from V _ Main."; nil for a
 --- key chosen by hand.
@@ -571,8 +577,7 @@ K.key_found_text = function(data)
   if not (data and data.key_from_track) then return nil end
   local track = K.take_track(data.guid)
   if not track then return nil end
-  local _, name = reaper.GetTrackName(track)
-  name = (name and name ~= "") and name or "this track"
+  local name = K.track_label(track)
   local rec = K.track_record(track)
   if not (rec and rec.key_idx == data.key_idx and rec.scale_idx == data.scale_idx) then return nil end
   if rec.alt_key_idx then
@@ -2642,6 +2647,9 @@ end
 -- outcome to its end: { guid, track, rec, fresh, pre_ran, want_range, want_key, skipped, total }.
 K.auto_run = nil
 K.AUTO_UNREADABLE_TEXT = "Couldn't read this item's audio. Check that its media is online, then try again."
+-- Shared by the Auto analysis, Find Key and Find Range and Key Again: the key kept, and items skipped of a track
+K.NO_KEY_FMT = "Not enough singing to tell the key: kept %s."
+K.SKIPPED_FMT = "Couldn't read %d of %d items on %s (media offline). Used the rest."
 
 --- True when analysing the item `guid` with `values` needs its track's range or key: Vocal Range is Auto, or the
 --- item is not analysed yet and the bar's Key is Auto (0).
@@ -2680,10 +2688,10 @@ K.auto_status = function(info)
     return string.format("Couldn't find a range on %s: used Generic Vocal.", track), "none"
   end
   if info.want_key and info.no_key then
-    return string.format("Not enough singing to tell the key: kept %s.", info.kept_key_text or ""), "no_key"
+    return string.format(K.NO_KEY_FMT, info.kept_key_text or ""), "no_key"
   end
   if info.fresh and (info.skipped or 0) > 0 then
-    return string.format("Couldn't read %d of %d items on %s (media offline). Used the rest.", info.skipped,
+    return string.format(K.SKIPPED_FMT, info.skipped,
       math.max(info.total or 0, info.skipped), track), "skipped"
   end
   local parts = {}
@@ -5147,12 +5155,6 @@ K.key_changed_status = function(count)
   end
 end
 
---- The name of `track` for the status line and undo labels ("this track" when REAPER gives none).
-K.track_label = function(track)
-  local _, name = reaper.GetTrackName(track)
-  return (type(name) == "string" and name ~= "") and name or "this track"
-end
-
 --- The track an analysed item `data` follows for its key, and the track's record: its key was found on the track
 --- (data.key_from_track) and the track holds a record. nil otherwise.
 K.key_follow_track = function(data)
@@ -5181,9 +5183,12 @@ K.scale_changed = function(what)
     return
   end
   update_scale_pitch_classes()
-  -- A real key or a scale chosen is the key last chosen by hand (what Auto falls back to)
+  -- A real key or a scale chosen is the key last chosen by hand (what Auto falls back to). On the from-track path
+  -- below it changes in memory only: it is saved with the next "key" settings save
   if state.key_idx ~= 0 then K.new_key.hand_key_idx, K.new_key.hand_scale_idx = state.key_idx, state.scale_idx end
-  local follow, rec = K.key_follow_track(data)
+  -- While an analysis, a batch or a pre-analysis runs its pending records are its own: the key changes as on any item
+  local follow, rec = nil, nil
+  if not (state.is_analyzing or K.batch or state.pre) then follow, rec = K.key_follow_track(data) end
   if follow then
     -- The track's record takes the key (its runner-up no longer applies); written inside the item's undo block
     local new = {}
@@ -5245,7 +5250,7 @@ K.find_key_finish = function(guid, track, rec)
   end
   if not (rec and rec.key_idx) then
     K.track_records_pending[track] = nil
-    set_status(string.format("Not enough singing to tell the key: kept %s.", K.key_text(data.key_idx, data.scale_idx)))
+    set_status(string.format(K.NO_KEY_FMT, K.key_text(data.key_idx, data.scale_idx)))
     return
   end
   if data.key_idx == rec.key_idx and data.scale_idx == rec.scale_idx and data.key_from_track then
@@ -5256,13 +5261,19 @@ K.find_key_finish = function(guid, track, rec)
   state.key_idx, state.scale_idx = rec.key_idx, rec.scale_idx
   update_scale_pitch_classes()
   local label = "Find Key: " .. (data.name or state.target_take_name or "this item")
-  local count = K.mode_note_count(state.notes or {})
-  if count == 0 then
-    save_current_scale_settings(label, track)
-  elseif apply_envelope_to_take(label, nil, track) then
-    K.key_changed_status(count)
+  local wrote
+  if K.mode_note_count(state.notes or {}) == 0 then
+    wrote = save_current_scale_settings(label, track)
+  else
+    wrote = apply_envelope_to_take(label, nil, track)
   end
   K.track_records_pending[track] = nil   -- written inside the block above, or never
+  if wrote then
+    -- What was found, as an Auto analysis says it with only the key on Auto: "Found E Major. Cmd+Z to undo."
+    set_status((K.auto_status({ fresh = true, want_key = true, track = K.track_label(track),
+      key_text = K.key_text(rec.key_idx, rec.scale_idx),
+      alt_text = rec.alt_key_idx and K.key_text(rec.alt_key_idx, rec.alt_scale_idx) or nil })))
+  end
 end
 
 --- Why "..." > Find Range and Key Again is disabled, or nil: no item to take the track from, or something runs.
@@ -5294,10 +5305,23 @@ end
 --- Auto analysis's priority: unreadable media > what was found. Nothing stays pending.
 K.find_again_finish = function(track, prev, rec, total)
   K.track_records_pending[track] = nil
-  if not (rec and reaper.ValidatePtr2(0, track, "MediaTrack*")) then return end
+  if not (rec and reaper.ValidatePtr2(0, track, "MediaTrack*")) then
+    set_status("This item is no longer in the project")   -- the track went while it was heard
+    return
+  end
   if not rec.lo_st and not rec.key_idx then
-    local k, sc = K.key_resolve(state.key_idx, state.scale_idx, state.target_take_guid)
-    set_status(string.format("Not enough singing to tell the key: kept %s.", K.key_text(k, sc)))
+    -- Nothing heard at all, every take unreadable: say so; else the key kept (the track's, else the bar's)
+    if (rec.skipped or 0) > 0 and next(rec.takes) == nil then
+      set_status(K.AUTO_UNREADABLE_TEXT)
+      return
+    end
+    local k, sc
+    if prev and prev.key_idx then
+      k, sc = prev.key_idx, prev.scale_idx
+    else
+      k, sc = K.key_resolve(state.key_idx, state.scale_idx, state.target_take_guid)
+    end
+    set_status(string.format(K.NO_KEY_FMT, K.key_text(k, sc)))
     return
   end
   local found_key = rec.key_idx ~= nil
@@ -5314,7 +5338,7 @@ K.find_again_finish = function(track, prev, rec, total)
   state.undo_open = false
   note_own_write()
   if (rec.skipped or 0) > 0 then
-    set_status(string.format("Couldn't read %d of %d items on %s (media offline). Used the rest.", rec.skipped,
+    set_status(string.format(K.SKIPPED_FMT, rec.skipped,
       math.max(total or 0, rec.skipped), name))
     return
   end
@@ -11124,10 +11148,8 @@ K.INFO_SECTIONS = {
     { "Shift / " .. K.MOD_LABEL .. " / Alt + Space", "Your REAPER actions for those chords" },
   } },
   { title = "Icons", rows = {
-    { "… (top right)", "More: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help" },
+    { "… (top right)", "More: Analyze, Analyze Selected Items, Find Range and Key Again, Reset, Layers, Note Tone, Settings, Help" },
     { "Analysis modal", "Re-Analyze… opens the analysis settings; Enter analyzes, Esc cancels" },
-    { "Vocal Range / Key: Auto", "Listens through the whole track once, before its first analysis, for the singer's range and the song's key" },
-    { "… > Find Range and Key Again", "Listens to the track afresh; items already analyzed keep theirs" },
     { "× (top right)", "Close the window (Esc when floating)" },
     { "> / <", "Hide / show the Pitched Items panel" },
     { "▾ / ▸ (section header)", "Collapse / expand the section" },
@@ -11137,6 +11159,11 @@ K.INFO_SECTIONS = {
   } },
 }
 K.INFO_TERMS = "Reset reverts note edits · Clear discards analysis · Remove drops an item · Wipe removes all"
+-- How the analysis finds the range and key: { label, sentence }, drawn under the Terms line in its style
+K.INFO_NOTES = {
+  { "Auto", "Vocal Range and Key on Auto hear the whole track once, before its first analysis, for the singer's range and the song's key." },
+  { "Find Range and Key Again", "In the … menu, it hears the track afresh; items already analyzed keep theirs." },
+}
 
 --- The body of the Pitched Items section: the unreadable-data banner, then the item rows (or the empty text).
 K.draw_items_body = function(sidebar_ctx)
@@ -12973,6 +13000,10 @@ local function draw_info_modal()
     desc_w = desc_w + L.md
     local terms_key = "Terms"
     local terms_w = ((reaper.ImGui_CalcTextSize(ctx, terms_key)) or 0) + L.md + ((reaper.ImGui_CalcTextSize(ctx, K.INFO_TERMS)) or 0) + L.md
+    for _, note in ipairs(K.INFO_NOTES) do
+      terms_w = math.max(terms_w, ((reaper.ImGui_CalcTextSize(ctx, note[1])) or 0) + L.md
+        + ((reaper.ImGui_CalcTextSize(ctx, note[2])) or 0) + L.md)
+    end
     local table_flags = reaper.ImGui_TableFlags_SizingFixedFit() | reaper.ImGui_TableFlags_NoHostExtendX()
     local fixed = reaper.ImGui_TableColumnFlags_WidthFixed()
 
@@ -13006,6 +13037,14 @@ local function draw_info_modal()
       reaper.ImGui_TextColored(ctx, P.accent, terms_key)
       reaper.ImGui_SameLine(ctx, 0, L.md)
       reaper.ImGui_Text(ctx, K.INFO_TERMS)
+      -- The analysis notes, one line each in the same style
+      for _, note in ipairs(K.INFO_NOTES) do
+        reaper.ImGui_TableNextRow(ctx)
+        reaper.ImGui_TableSetColumnIndex(ctx, 0)
+        reaper.ImGui_TextColored(ctx, P.accent, note[1])
+        reaper.ImGui_SameLine(ctx, 0, L.md)
+        reaper.ImGui_Text(ctx, note[2])
+      end
       reaper.ImGui_EndTable(ctx)
     end
 
@@ -14531,7 +14570,8 @@ do
   -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = K.REASON_NO_TARGET
   local HDR_REASON_NO_NOTES = "Analyze an item first"
-  local HDR_MORE_TIP = "Menu\n\nAnalyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings and Help."
+  local HDR_MORE_TIP = "Menu\n\nAnalyze, Analyze Selected Items, Find Range and Key Again, Reset, Layers, Note Tone,"
+    .. " Settings and Help."
   -- The right-click menu of Key and Scale (hdr_key_menu)
   local HDR_APPLY_KEY = "Apply Key to other items\xE2\x80\xA6"
 

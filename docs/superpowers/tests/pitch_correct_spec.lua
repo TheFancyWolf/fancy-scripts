@@ -6997,19 +6997,21 @@ test("find_key_uses_record", function() t7_ext(function(ext, ext_sync)
     eq(st.key_idx, 10, "the bar shows the real key"); eq(st.scale_idx, 2)
     eq(NK.key_idx, 0); eq(NK.hand_key_idx, 6); eq(next(ext), nil)
     eq(w.pre_calls, 0, "the record is there: nothing is heard")
+    eq(st.status.text, "Found A Minor. " .. MOD .. "+Z to undo.", "the plain save says what it found")
   end)
 end) end)
 
-test("find_key_envelope_path_says_key_changed", function()
+test("find_key_envelope_path_says_what_it_found", function()
   local mode_count = S.K.mode_note_count
   S.K.mode_note_count = function() return 2 end
-  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2, { 1, 1 })) } },
+    function(w)
     local K, st = S.K, S.state
     t7_open(3, 1, false)
     st.key_idx = 0
     K.scale_changed("key")
     eq(table.concat(w.log, ","), "begin,take:{a},end:Find Key: Lead Vox")
-    eq(st.status.text, "Key changed: 2 Classic / Hard notes follow A Natural Minor")
+    eq(st.status.text, "Found A Minor (C Major also fits). " .. MOD .. "+Z to undo.", "not the Key changed text")
   end)
   S.K.mode_note_count = mode_count
   if not ok then error(err, 0) end
@@ -7042,15 +7044,19 @@ test("find_key_refused_while_analysing", function()
   auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
     local K, st = S.K, S.state
     local data = t7_open(3, 1, false)
+    local was = st.is_analyzing
     st.is_analyzing = true
-    st.key_idx = 0
-    K.find_key_request()
-    eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 0, "find_key_request itself touches nothing")
-    st.key_idx = 0
-    K.scale_changed("key")
-    eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 3, "the bar shows the item's key again")
-    eq(w.pre_calls, 0)
-    st.is_analyzing = false
+    local ok, err = pcall(function()
+      st.key_idx = 0
+      K.find_key_request()
+      eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 0, "find_key_request itself touches nothing")
+      st.key_idx = 0
+      K.scale_changed("key")
+      eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 3, "the bar shows the item's key again")
+      eq(w.pre_calls, 0)
+    end)
+    st.is_analyzing = was
+    if not ok then error(err, 0) end
   end)
 end)
 
@@ -7077,6 +7083,8 @@ test("find_key_hears_the_track_first", function() t7_ext(function(ext, ext_sync)
     eq(st.key_idx, rec.key_idx)
     eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(st.is_analyzing, false)
     eq(NK.key_idx, 0); eq(next(ext), nil)
+    local alt = rec.alt_key_idx and (" (" .. K.key_text(rec.alt_key_idx, rec.alt_scale_idx) .. " also fits)") or ""
+    eq(st.status.text, "Found " .. K.key_text(rec.key_idx, rec.scale_idx) .. alt .. ". " .. MOD .. "+Z to undo.")
   end)
 end) end)
 
@@ -7158,16 +7166,23 @@ test("find_again_refused_while_analysing", function()
   auto_world({ tracks = ONE_TRACK }, function(w)
     local K, st = S.K, S.state
     t7_open(3, 1, false)
+    local was = st.is_analyzing
     st.is_analyzing = true
-    K.find_again_request()
-    eq(w.pre_calls, 0); eq(#w.log, 0)
-    st.is_analyzing = false
+    local ok, err = pcall(function()
+      K.find_again_request()
+      eq(w.pre_calls, 0); eq(#w.log, 0)
+    end)
+    st.is_analyzing = was
+    if not ok then error(err, 0) end
   end)
 end)
 
+-- A track whose items are heard but hold no singing (silence)
+local SILENT_TRACK = { tr = { items = { "it_a", "it_b" }, freq = 0 } }
+
 test("find_again_nothing_found_keeps_the_record", function()
   local old = JSON.encode(t7_record(7, 1))
-  auto_world({ tracks = ONE_TRACK, unreadable = { tk_a = true, tk_b = true }, ext = { tr = old } }, function(w)
+  auto_world({ tracks = SILENT_TRACK, ext = { tr = old } }, function(w)
     local K, st = S.K, S.state
     t7_open(3, 1, false)
     K.find_again_request()
@@ -7175,9 +7190,70 @@ test("find_again_nothing_found_keeps_the_record", function()
     eq(#w.log, 0, "no undo point: " .. table.concat(w.log, ","))
     eq(w.ext.tr[K.TRACK_SCAN_KEY], old, "the record is kept untouched")
     eq(next(K.track_records_pending), nil)
-    eq(st.status.text, "Not enough singing to tell the key: kept D Major.", "the bar's key")
+    eq(st.status.text, "Not enough singing to tell the key: kept F# Major.", "the track's kept key, not the bar's")
   end)
 end)
+
+test("find_again_nothing_found_without_a_key_names_the_bar_key", function()
+  auto_world({ tracks = SILENT_TRACK }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    auto_run_out()
+    eq(#w.log, 0); eq(w.ext.tr[K.TRACK_SCAN_KEY], ""); eq(next(K.track_records_pending), nil)
+    eq(st.status.text, "Not enough singing to tell the key: kept D Major.", "no key kept on the track: the bar's")
+  end)
+end)
+
+test("find_again_all_media_unreadable_says_so", function()
+  local old = JSON.encode(t7_record(7, 1))
+  auto_world({ tracks = ONE_TRACK, unreadable = { tk_a = true, tk_b = true }, ext = { tr = old } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    auto_run_out()
+    eq(#w.log, 0); eq(w.ext.tr[K.TRACK_SCAN_KEY], old); eq(next(K.track_records_pending), nil)
+    eq(st.status.text, K.AUTO_UNREADABLE_TEXT)
+  end)
+end)
+
+test("find_again_track_deleted_mid_run_says_so", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    K.analysis_tick()
+    w.dead["tr"] = true   -- the user deleted the track while it was heard
+    auto_run_out()
+    eq(#w.log, 0); eq(next(K.track_records_pending), nil); eq(st.is_analyzing, false)
+    eq(st.status.text, "This item is no longer in the project")
+  end)
+end)
+
+test("key_fix_leaves_a_running_analysis_alone", function() t7_ext(function(_, ext_sync)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx = 0
+    ext_sync()
+    t7_open(5, 1, true)
+    -- an Auto analysis (or a batch) runs and its record waits for its own undo block
+    local pending = t7_record(5, 1, { 2, 2 })
+    K.track_records_pending.tr = pending
+    local was = st.is_analyzing
+    st.is_analyzing = true
+    local ok, err = pcall(function()
+      st.key_idx = 3
+      K.scale_changed("key")
+      eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "no track write in the Set Key block")
+      eq(rawequal(K.track_records_pending.tr, pending), true, "the run's record is still pending, the same object")
+      eq(pending.key_idx, 5); eq(pending.alt_key_idx, 2, "and unchanged")
+      eq(NK.key_idx, 3, "an ordinary key change meanwhile")
+    end)
+    st.is_analyzing = was
+    K.track_records_pending = {}
+    if not ok then error(err, 0) end
+  end)
+end) end)
 
 test("find_again_range_only_keeps_the_key", function()
   local min_frames = S.K.PRE.KEY_MIN_FRAMES
@@ -7236,15 +7312,24 @@ test("track_record_holds_a_corrected_scale", function()
 end)
 
 test("info_explains_auto_and_find_again", function()
-  local auto, again = false, false
-  for _, section in ipairs(S.K.INFO_SECTIONS) do
+  local K = S.K
+  -- prose beside the Terms line, not rows of the shortcut tables
+  eq(#K.INFO_NOTES, 2, "two sentences")
+  local text = {}
+  for _, note in ipairs(K.INFO_NOTES) do text[#text + 1] = note[1] .. " " .. note[2] end
+  eq(text[1]:find("Auto", 1, true) ~= nil and text[1]:find("whole track", 1, true) ~= nil, true, "Auto")
+  eq(text[2]:find("Find Range and Key Again", 1, true) ~= nil and text[2]:find("keep theirs", 1, true) ~= nil, true,
+    "Find Range and Key Again")
+  for _, section in ipairs(K.INFO_SECTIONS) do
     for _, row in ipairs(section.rows) do
-      local text = row[1] .. " " .. row[2]
-      if text:find("Auto", 1, true) and text:find("whole track", 1, true) then auto = true end
-      if text:find("Find Range and Key Again", 1, true) and text:find("keep theirs", 1, true) then again = true end
+      eq(row[1]:find("Auto", 1, true), nil, "no row for Auto: " .. row[1])
+      if row[1]:find("Find Range and Key Again", 1, true) then error("a row for Find Range and Key Again") end
+      if row[1] == "… (top right)" then
+        eq(row[2], "More: Analyze, Analyze Selected Items, Find Range and Key Again, Reset, Layers, Note Tone, "
+          .. "Settings, Help", "the menu in order")
+      end
     end
   end
-  eq(auto, true, "a sentence on Auto"); eq(again, true, "a sentence on Find Range and Key Again")
 end)
 
 -- Tests appended by later tasks go above this line.
