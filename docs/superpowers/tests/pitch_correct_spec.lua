@@ -4946,9 +4946,10 @@ test("batch_start_snapshots_given_values", function()
     reaper.new_array = function() return {} end
     reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{a}" end return true, "" end
     local ok, err = pcall(function()
-      local values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256,
-        auto_range = false }   -- a range picked by hand (Soprano): Auto would find its own Hz
+      local values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
       K.batch_start(entries3(), values)
+      eq(K.batch.values.auto_range, false, "given values without the Auto flag are a fixed range")
+      eq(K.batch.values.min_freq, 250, "the given Hz are kept"); eq(K.batch.values.max_freq, 1200)
       values.min_freq = 80   -- the form changes after the click: the batch keeps what it was started with
       eq(K.batch.values.min_freq, 250, "the batch keeps the values it was started with")
       eq(st.analysis_params.min_freq, 250); eq(st.analysis_params.block_size, 2048); eq(st.analysis_params.hop_size, 256)
@@ -6266,7 +6267,8 @@ local function auto_world(opts, fn)
   local old = {}
   for name, f in pairs(stubs) do old[name] = rawget(reaper, name); rawset(reaper, name, f) end
   local old_k = { open_accessor = K.open_accessor, write_take_envelope = K.write_take_envelope,
-    take_correction = K.take_correction, pre_begin = K.pre_begin }
+    take_correction = K.take_correction, pre_begin = K.pre_begin, batch_write = K.batch_write }
+  local saved_last_progress = K.pre_last_progress
   K.open_accessor = function(take)
     if opts.unreadable and opts.unreadable[take] then return nil end
     return "acc_" .. take
@@ -6294,6 +6296,7 @@ local function auto_world(opts, fn)
   pcall(K.pre_cancel)
   for name in pairs(stubs) do rawset(reaper, name, old[name]) end
   for name, f in pairs(old_k) do K[name] = f end
+  K.pre_last_progress = saved_last_progress
   for _, k in ipairs(keys) do st[k] = saved[k] end
   st.status.text, st.status.until_time, st.status.hold = table.unpack(saved_status, 1, 3)
   NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved_nk, 1, 4)
@@ -6649,14 +6652,15 @@ test("batch_two_tracks_each_own_range", function()
     eq(b.analysis.min_freq, (K.pre_range_hz(recs.tr2.lo_st, recs.tr2.hi_st)), "b: its own track's range")
     eq(a.analysis.min_freq ~= b.analysis.min_freq, true)
     eq(a.key_idx, 3, "the hand key")
-    local begins, ends, at1, at2 = 0, nil, index_of(w.log, "track:tr1"), index_of(w.log, "track:tr2")
+    local begins, starts, ends, at1, at2 = 0, nil, nil, index_of(w.log, "track:tr1"), index_of(w.log, "track:tr2")
     for i, s in ipairs(w.log) do
-      if s == "begin" then begins = begins + 1 end
+      if s == "begin" then begins = begins + 1; starts = i end
       if s:find("^end:") then ends = i end
     end
     eq(begins, 1, "one undo block: " .. table.concat(w.log, ","))
     eq(w.log[ends], "end:Analyze Pitch (2 items)")
-    eq(at1 ~= nil and at1 < ends, true, "tr1 written inside it"); eq(at2 ~= nil and at2 < ends, true, "tr2 too")
+    eq(at1 ~= nil and at1 > starts and at1 < ends, true, "tr1 written inside it")
+    eq(at2 ~= nil and at2 > starts and at2 < ends, true, "tr2 too")
     eq(st.status.text, "Analyzed 2 items. " .. MOD .. "+Z to undo.", "the batch's own summary, nothing added")
     eq(next(K.track_records_pending), nil)
   end)
@@ -6701,6 +6705,123 @@ test("batch_stage_one_released_ends_the_batch", function()
     K.analysis_tick()
     eq(K.batch, nil, "the batch does not wait forever"); eq(st.is_analyzing, false); eq(#w.log, 0)
     eq(st.status.text, "Batch cancelled. Nothing was changed.")
+  end)
+end)
+
+-- Fix round 1: after any failed or cancelled analysis or batch, nothing is pending and K.auto_run is nil
+local THREE = { tr = { items = { "it_a", "it_b" }, freq = 220 }, tr2 = { items = { "it_c" }, freq = 440, name = "Other" } }
+local function entry_c()
+  return { guid = "{c}", take = "tk_c", item = "it_c", name = "C", len = 6, sample_rate = 8000, has_notes = false }
+end
+
+-- What the window's error handler does after a failed frame (loop): close an open block, then cancel
+local function after_frame_error()
+  local st = S.state
+  if st.undo_open then st.undo_open = false; reaper.Undo_EndBlock("Apply Pitch Correction (interrupted)", -1) end
+  S.K.drop_project_cache()
+  pcall(S.K.cancel_analysis)
+  if st.undo_open then st.undo_open = false; reaper.Undo_EndBlock("Analyze Pitch (interrupted)", -1) end
+end
+
+local function tick_until_error()
+  for _ = 1, 100000 do
+    local ok, err = pcall(S.K.analysis_tick)
+    if not ok then return err end
+    if not S.state.is_analyzing and not S.state.pre and not S.K.batch then return nil end
+  end
+  error("never ended")
+end
+
+test("frame_error_in_finishing_frame_drops_pending", function()
+  auto_world({ tracks = THREE }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 3
+    local write = K.write_take_envelope
+    K.write_take_envelope = function() error("write failed") end
+    S.start_analysis(auto_values(true))
+    local err = tick_until_error()
+    eq(tostring(err):find("write failed", 1, true) ~= nil, true, "the finishing frame failed")
+    after_frame_error()
+    eq(next(K.track_records_pending), nil, "nothing pending after the error"); eq(K.auto_run, nil)
+    K.write_take_envelope = write
+    -- a later batch on another track never writes the first track's record
+    K.batch_start({ entry_c() }, auto_values(true))
+    auto_run_out()
+    eq(index_of(w.log, "track:tr"), nil, "no write for the first track: " .. table.concat(w.log, ","))
+    eq(index_of(w.log, "track:tr2") ~= nil, true, "the batch's own track is written")
+  end)
+end)
+
+test("failed_batch_write_drops_pending", function()
+  auto_world({ tracks = THREE }, function(w)
+    local K, st = S.K, S.state
+    K.new_key.key_idx = 3
+    local real_write = K.batch_write
+    K.batch_write = function() error("disk full") end
+    K.batch_start({ entry_c() }, auto_values(true))
+    local err = tick_until_error()
+    eq(tostring(err):find("disk full", 1, true) ~= nil, true, "the batch's write failed")
+    after_frame_error()
+    eq(next(K.track_records_pending), nil, "nothing pending after the error"); eq(K.auto_run, nil)
+    K.batch_write = real_write
+    st.target_take_guid, st.key_idx = "{a}", 3
+    S.start_analysis(auto_values(true))
+    auto_run_out()
+    eq(index_of(w.log, "track:tr2"), nil, "the failed batch's record is never written: " .. table.concat(w.log, ","))
+  end)
+end)
+
+test("error_recovery_drops_pending", function()
+  local K = S.K
+  K.track_records_pending["trE"], K.auto_run = { st = {}, takes = {} }, { guid = "{e}" }
+  local ok, err = pcall(K.recover_after_error)
+  local left_pending, left_run = next(K.track_records_pending), K.auto_run
+  K.track_records_pending, K.auto_run = {}, nil
+  if not ok then error(err, 0) end
+  eq(left_pending, nil); eq(left_run, nil)
+end)
+
+test("batch_start_drops_stale_pending", function()
+  auto_world({ tracks = THREE }, function(w)
+    local K = S.K
+    K.new_key.key_idx = 3
+    K.track_records_pending["tr"] = K.track_record_build(K.pre_tally_new(), {}, nil)   -- left by something else
+    K.batch_start({ entry_c() }, auto_values(true))
+    auto_run_out()
+    eq(index_of(w.log, "track:tr"), nil, "a record the batch did not find is not written")
+  end)
+end)
+
+test("batch_writes_only_records_of_written_tracks", function()
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.new_key.key_idx = 3
+    K.batch_start(two_entries(), auto_values(true))
+    for _ = 1, 100000 do
+      if K.batch and K.batch.index == 2 and st.is_analyzing then break end
+      K.analysis_tick()
+    end
+    eq(#K.batch.done, 1, "the first item is finished"); eq(K.batch.index, 2, "the second is part way")
+    K.cancel_analysis()
+    local n = 0
+    for _, s in ipairs(w.log) do if s:find("^track:") then n = n + 1 end end
+    eq(n, 1, "one track write: " .. table.concat(w.log, ","))
+    eq(index_of(w.log, "track:tr1") ~= nil, true, "the first track's record, with its item")
+    eq(index_of(w.log, "track:tr2"), nil, "no item of the second track was written: neither is its record")
+    eq(next(K.track_records_pending), nil, "and it is not left pending")
+  end)
+end)
+
+test("item_gone_in_stage_one_says_so", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.key_idx = "{a}", 0
+    S.start_analysis(auto_values(true))
+    K.analysis_tick()
+    w.dead["tk_a"], w.dead["it_a"] = true, true   -- the user deleted the item while its track was heard
+    auto_run_out()
+    eq(st.status.text, "This item is no longer in the project")
+    eq(#w.log, 0); eq(next(K.track_records_pending), nil); eq(st.is_analyzing, false)
   end)
 end)
 

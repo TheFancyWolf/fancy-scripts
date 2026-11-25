@@ -1284,10 +1284,13 @@ end
 K.track_records_pending = {}
 
 --- Write every pending record to its track and forget them (and the cache, which may hold older ones). Opens NO
---- undo block: the caller's block is open, so the write is part of the user's one undo step.
-K.track_records_flush = function()
+--- undo block: the caller's block is open, so the write is part of the user's one undo step. keep (optional): a set
+--- { [track] = true }; only those tracks' records are written, the others are forgotten unwritten.
+K.track_records_flush = function(keep)
   for track, rec in pairs(K.track_records_pending) do
-    reaper.GetSetMediaTrackInfo_String(track, K.TRACK_SCAN_KEY, JSON.encode(rec), true)
+    if not keep or keep[track] then
+      reaper.GetSetMediaTrackInfo_String(track, K.TRACK_SCAN_KEY, JSON.encode(rec), true)
+    end
   end
   K.track_records_pending = {}
   state.cache.trackscan = {}
@@ -2716,7 +2719,7 @@ K.auto_begin = function(take, item, values, guid)
     -- The item can go while its track is heard: nothing is analysed then, and nothing is written
     if pre_ran and not (reaper.ValidatePtr2(0, take, "MediaItem_Take*") and reaper.ValidatePtr2(0, item, "MediaItem*")) then
       K.auto_drop()
-      set_status(K.AUTO_UNREADABLE_TEXT)
+      set_status("This item is no longer in the project")
       return
     end
     local reanalyze = K.reanalyze_status_guid   -- K.request_analyze set it while stage 1 ran
@@ -3691,7 +3694,11 @@ K.cancel_analysis = function()
     set_status(K.CANCELLED_TEXT)
     return true
   end
-  if not state.is_analyzing and not state.accessor then return false end
+  if not state.is_analyzing and not state.accessor then
+    -- Nothing runs, but an analysis that failed after it stopped reading may have left its records: never kept
+    K.auto_drop()
+    return false
+  end
   K.release_analysis()
   K.reanalyze_status_guid = nil
   state.progress = 0
@@ -3988,8 +3995,20 @@ K.batch_write = function(done)
     end
   end
   reaper.UpdateArrange()
-  -- The track records an Auto batch found ride in the same step, once something of the batch was written
-  if #written > 0 then K.track_records_flush() end
+  -- The track records an Auto batch found ride in the same step, each only with an item of its track that was
+  -- written (K.batch_finish drops the others)
+  if #written > 0 then
+    local keep = {}
+    for _, r in ipairs(buildable) do
+      for _, e in ipairs(written) do
+        if e == r.entry then
+          local track = reaper.GetMediaItemTake_Track(r.take)
+          if track then keep[track] = true end
+        end
+      end
+    end
+    K.track_records_flush(keep)
+  end
   -- No item could get its envelope: no "Analyze Pitch (0 items)" step is named for it
   reaper.Undo_EndBlock(#written > 0 and K.batch_undo_label(#written) or "Analyze Pitch", -1)
   state.undo_open = false
@@ -4132,12 +4151,15 @@ end
 K.batch_start = function(entries, values)
   if K.batch or state.is_analyzing or state.pre or #entries == 0 then return end
   if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge belongs to the item being left
+  K.auto_drop()   -- only the records this batch finds are written with it
   K.batch = K.batch_new(entries, state.target_take_guid)
-  -- A copy: the form the values came from may change (or be reseeded) while the batch runs
+  -- A copy: the form the values came from may change (or be reseeded) while the batch runs. In values given by the
+  -- caller a missing Auto flag is a fixed range (as for a single analysis), never the default's Auto
   local copy = K.analysis_defaults()
   for _, key in ipairs(K.ANALYSIS_KEYS) do
     if values and values[key] ~= nil then copy[key] = values[key] end
   end
+  if values then copy.auto_range = values.auto_range == true end
   K.batch.values = copy
   K.batch.prev_name = state.target_take_name
   -- Auto: the distinct tracks of the items that need their range or key are heard first, in one stage 1
@@ -16240,6 +16262,24 @@ K.draw_fatal = function()
   return keep_open and open
 end
 
+--- After a frame failed: close an undo block it left open, cancel the running analysis (a batch writes its finished
+--- items here, in an undo block of its own), and keep no track record an analysis or batch found (K.auto_drop):
+--- after any failed analysis or batch nothing is pending.
+K.recover_after_error = function()
+  if state.undo_open then   -- the frame failed inside an undo block (a note edit, a batch's write): close it
+    state.undo_open = false
+    pcall(reaper.Undo_EndBlock, "Apply Pitch Correction (interrupted)", -1)
+  end
+  K.drop_project_cache()    -- what the failed frame asked REAPER is not trusted any more
+  pcall(K.cancel_analysis)
+  pcall(K.tone_kill)
+  if state.undo_open then   -- that write failed as well
+    state.undo_open = false
+    pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
+  end
+  K.auto_drop()
+end
+
 --- One frame of the window, every cycle. A frame that fails does not end the script: the failure is logged to the
 --- console (for support), the running analysis is cancelled (its audio accessor must never outlive a failed
 --- frame) and the window switches to K.draw_fatal's message. If that message cannot be drawn either, the
@@ -16260,17 +16300,7 @@ local function loop()
       state.error_streak = 0
     else
       reaper.ShowConsoleMsg("Fancy Pitch Correct Error: " .. tostring(open) .. "\n")
-      if state.undo_open then   -- the frame failed inside an undo block (a note edit, a batch's write): close it
-        state.undo_open = false
-        pcall(reaper.Undo_EndBlock, "Apply Pitch Correction (interrupted)", -1)
-      end
-      K.drop_project_cache()    -- what the failed frame asked REAPER is not trusted any more
-      pcall(K.cancel_analysis)  -- a batch writes its finished items here, in an undo block of its own
-      pcall(K.tone_kill)
-      if state.undo_open then   -- that write failed as well
-        state.undo_open = false
-        pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
-      end
+      K.recover_after_error()
       state.clipper = nil       -- nor is a list clipper it may have left begun (a new one is made when needed)
       K.confirm_clipper = nil
       state.error_streak = state.error_streak + 1
