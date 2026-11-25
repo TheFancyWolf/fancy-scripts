@@ -2491,8 +2491,11 @@ test("batch_copy", function()
   -- Fitted to the width (one unit per character here)
   local len = function(text) return #text end
   local names = { "Verse 1", "Verse 2", "Chorus", "Bridge" }
-  eq(K.batch_names_fit(names, 100, len), "4 items selected: Verse 1, Verse 2, Chorus, Bridge")
-  eq(K.batch_names_fit(names, 36, len), "4 items selected: Verse 1, +3 more")
+  eq(K.batch_names_fit({ "Verse 1", "Verse 2" }, 100, len), "2 items selected: Verse 1, Verse 2")
+  eq(K.batch_names_fit({ "Verse 1", "Verse 2", "Chorus" }, 100, len), "3 items selected: Verse 1, Verse 2, …",
+    "3 or more: two names and an ellipsis")
+  eq(K.batch_names_fit(names, 100, len), "4 items selected: Verse 1, Verse 2, …")
+  eq(K.batch_names_fit(names, 30, len), "4 items selected: Verse 1, …", "narrow: fewer names")
   eq(K.batch_names_fit(names, 20, len), "4 items selected")
   eq(K.batch_names_tip({ "A", "B" }), "2 selected items\n\nA\nB")
   eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another.\n\nOne undo step for all of them.")

@@ -3112,7 +3112,7 @@ end
 
 --- The lines above the canvas form for what K.batch_peek returned: the first, and the second or nil. The first
 --- names what Analyze will analyse: the open item (target_name, nil when there is none) unless two or more audio
---- items are selected, then "N items selected: a, b, …" (the canvas fits it to its width, K.batch_names_fit). With nothing to
+--- items are selected, then "N items selected: a, b, …" (the full list here; the canvas fits it to its width, K.batch_names_fit). With nothing to
 --- analyse it is the instruction. Both read "N item(s) selected: …".
 K.batch_lines = function(peek, target_name)
   if peek.n < 2 then
@@ -3135,16 +3135,18 @@ K.batch_lines = function(peek, target_name)
   return first, (#parts > 0 and table.concat(parts, " ") or nil)
 end
 
--- At most this many names are tried on the batch line, and listed in its tooltip
+-- At most this many names are listed in the batch line's tooltip
 K.BATCH_NAMES_MAX = 20
+-- The batch line names this many items at most: with more selected it ends in "…" (the count leads the line)
+K.BATCH_NAMES_SHOWN = 2
 
---- "N items selected: a, b, +3 more": as many of `names` as fit max_w by measure(text) -> width, the rest counted. When not
---- even the first name fits: "N items selected".
+--- "N items selected: a, b, …": the first K.BATCH_NAMES_SHOWN of `names` (fewer when they do not fit max_w by
+--- measure(text) -> width), "…" when some are left out. When not even the first name fits: "N items selected".
 K.batch_names_fit = function(names, max_w, measure)
   local n = #names
-  for k = math.min(n, K.BATCH_NAMES_MAX), 1, -1 do
+  for k = math.min(n, K.BATCH_NAMES_SHOWN), 1, -1 do
     local text = string.format("%d items selected: %s", n, table.concat(names, ", ", 1, k))
-    if k < n then text = text .. string.format(", +%d more", n - k) end
+    if k < n then text = text .. ", …" end
     if measure(text) <= max_w then return text end
   end
   return string.format("%d items selected", n)
