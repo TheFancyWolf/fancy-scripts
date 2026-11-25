@@ -1552,6 +1552,99 @@ K.analysis_frame = function(start_s, params, sample_rate, rms, freq, lvl, cands)
     lvl = lvl, cands = cands }
 end
 
+--- Auto range and key: a tally of the pitches heard (frames per MIDI note) gives a vocal range and a key.
+--- STEP_S and BLOCK are provisional until the quick pre-pass is timed.
+K.PRE = { RATE = 11025, BLOCK = 512, STEP_S = 0.1, MIN_HZ = 65, MAX_HZ = 1000, THRESHOLD = 0.15, MIN_FRAMES = 30,
+  KEY_MIN_FRAMES = 100, TRIM = 0.02, MARGIN_LO_ST = 3, MARGIN_HI_ST = 4, KEY_CLOSE = 0.05, SHARE = 0.25 }
+-- Krumhansl-Kessler key profiles (index 1 = the tonic)
+K.PRE.MAJOR = { 6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88 }
+K.PRE.MINOR = { 6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17 }
+
+--- An empty tally: st[midi_int] = frames heard, n = their total.
+K.pre_tally_new = function() return { st = {}, n = 0 } end
+
+--- Count one frame at `freq_hz` (nil and non-positive are ignored) under its nearest MIDI note.
+K.pre_tally_add = function(tally, freq_hz)
+  if type(freq_hz) ~= "number" or freq_hz <= 0 then return end
+  local midi = math.floor(69 + 12 * math.log(freq_hz / 440.0, 2) + 0.5)
+  tally.st[midi] = (tally.st[midi] or 0) + 1
+  tally.n = tally.n + 1
+end
+
+--- Add the frames of tally `from` into tally `into`.
+K.pre_tally_merge = function(into, from)
+  for midi, c in pairs(from.st) do into.st[midi] = (into.st[midi] or 0) + c end
+  into.n = into.n + from.n
+end
+
+--- The range heard: the notes at the TRIM and 1 - TRIM quantiles by frame count, or nil under MIN_FRAMES.
+K.pre_range = function(tally)
+  if tally.n < K.PRE.MIN_FRAMES then return nil end
+  local notes = {}
+  for midi in pairs(tally.st) do notes[#notes + 1] = midi end
+  table.sort(notes)
+  local lo_at, hi_at = K.PRE.TRIM * tally.n, (1 - K.PRE.TRIM) * tally.n
+  local lo, hi, cum = nil, nil, 0
+  for _, midi in ipairs(notes) do
+    cum = cum + tally.st[midi]
+    if not lo and cum >= lo_at then lo = midi end
+    if not hi and cum >= hi_at then hi = midi end
+  end
+  return lo, hi
+end
+
+--- The detector's min / max frequency (whole Hz) for a range in semitones, with a margin each side, within K.LIMITS.
+K.pre_range_hz = function(lo_st, hi_st)
+  local function hz(st) return 440 * 2 ^ ((st - 69) / 12) end
+  local min_lim, max_lim = K.LIMITS.min_freq, K.LIMITS.max_freq
+  local lo = math.floor(hz(lo_st - K.PRE.MARGIN_LO_ST) + 0.5)
+  local hi = math.floor(hz(hi_st + K.PRE.MARGIN_HI_ST) + 0.5)
+  lo = math.max(min_lim[1], math.min(lo, min_lim[2]))
+  hi = math.max(max_lim[1], math.min(hi, max_lim[2]))
+  if lo >= hi then lo = math.max(min_lim[1], hi - 1) end
+  if lo >= hi then hi = lo + 1 end
+  return lo, hi
+end
+
+--- The key heard: Pearson correlation of the 12 pitch classes with the Krumhansl-Kessler profiles at every root.
+--- Returns key_idx, scale_idx (1 = Major, 2 = Natural Minor) and, when the runner-up is within KEY_CLOSE of the best,
+--- its alt_key_idx, alt_scale_idx. nil under KEY_MIN_FRAMES.
+K.pre_key = function(tally)
+  if tally.n < K.PRE.KEY_MIN_FRAMES then return nil end
+  local pc = {}
+  for i = 1, 12 do pc[i] = 0 end
+  for midi, c in pairs(tally.st) do pc[(midi % 12) + 1] = pc[(midi % 12) + 1] + c end
+  local function pearson(profile, root)
+    local mx, my = 0, 0
+    for i = 1, 12 do mx = mx + pc[i]; my = my + profile[i] end
+    mx, my = mx / 12, my / 12
+    local sxy, sxx, syy = 0, 0, 0
+    for i = 1, 12 do
+      local x = pc[i] - mx
+      local y = profile[((i - 1 - root) % 12) + 1] - my
+      sxy = sxy + x * y; sxx = sxx + x * x; syy = syy + y * y
+    end
+    if sxx <= 0 or syy <= 0 then return -1 end
+    return sxy / math.sqrt(sxx * syy)
+  end
+  local cands = {}
+  for root = 0, 11 do
+    cands[#cands + 1] = { key = root + 1, scale = 1, score = pearson(K.PRE.MAJOR, root) }
+    cands[#cands + 1] = { key = root + 1, scale = 2, score = pearson(K.PRE.MINOR, root) }
+  end
+  table.sort(cands, function(a, b) return a.score > b.score end)
+  local best, second = cands[1], cands[2]
+  if best.score - second.score <= K.PRE.KEY_CLOSE then
+    return best.key, best.scale, second.key, second.scale
+  end
+  return best.key, best.scale
+end
+
+--- A range as text: "E2\xE2\x80\x93A4" (the script's own note names, an en dash).
+K.pre_range_text = function(lo_st, hi_st)
+  return midi_to_name(lo_st) .. "\xE2\x80\x93" .. midi_to_name(hi_st)
+end
+
 -------------------------------------------------------------------------------
 -- 3. ANALYSIS ROUTINE (DEFERRED)
 -------------------------------------------------------------------------------

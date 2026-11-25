@@ -5335,6 +5335,54 @@ test("form_defaults_request_is_safe_and_fit", function()
   eq(req.fit, true, "sized to its two lines")
 end)
 
+local function tally_of(notes)   -- { [midi] = frames }
+  local t = S.K.pre_tally_new()
+  for midi, n in pairs(notes) do
+    for _ = 1, n do S.K.pre_tally_add(t, 440 * 2 ^ ((midi - 69) / 12)) end
+  end
+  return t
+end
+
+test("pre_range_trims_outliers", function()
+  local t = tally_of({ [40] = 200, [52] = 400, [69] = 200, [88] = 2, [28] = 2 })
+  local lo, hi = S.K.pre_range(t)
+  eq(lo, 40); eq(hi, 69)
+end)
+
+test("pre_range_needs_frames", function()
+  eq(S.K.pre_range(tally_of({ [60] = 29 })), nil)
+end)
+
+test("pre_range_hz_margin_and_limits", function()
+  local lo, hi = S.K.pre_range_hz(40, 69)          -- E2 .. A4
+  near(lo, 440 * 2 ^ ((37 - 69) / 12), 1)           -- 3 st below
+  near(hi, 440 * 2 ^ ((73 - 69) / 12), 1)           -- 4 st above
+  local lo2, hi2 = S.K.pre_range_hz(0, 127)
+  eq(lo2, S.K.LIMITS.min_freq[1]); eq(hi2, S.K.LIMITS.max_freq[2])
+end)
+
+test("pre_key_major", function()   -- E major scale, tonic and fifth weighted
+  local k, s = S.K.pre_key(tally_of({ [52]=300, [54]=100, [56]=180, [57]=120, [59]=250, [61]=100, [63]=60 }))
+  eq(k, 5); eq(s, 1)               -- SCALE_KEYS[5] = E, SCALE_DEFINITIONS[1] = Major
+end)
+
+test("pre_key_minor", function()   -- A natural minor
+  local k, s = S.K.pre_key(tally_of({ [57]=300, [59]=100, [60]=180, [62]=120, [64]=250, [65]=100, [67]=100 }))
+  eq(k, 10); eq(s, 2)
+end)
+
+test("pre_key_close_call_names_runner_up", function()   -- flat use of the seven notes of C major / A minor
+  local k, s, ak, as = S.K.pre_key(tally_of({ [60]=100, [62]=100, [64]=100, [65]=100, [67]=100, [69]=100, [71]=100 }))
+  eq(type(ak), "number"); eq(type(as), "number")
+  eq((k == 1 and s == 1 and ak == 10 and as == 2) or (k == 10 and s == 2 and ak == 1 and as == 1), true)
+end)
+
+test("pre_key_needs_frames", function()
+  eq(S.K.pre_key(tally_of({ [60] = 99 })), nil)
+end)
+
+test("pre_range_text", function() eq(S.K.pre_range_text(40, 69), "E2\xE2\x80\x93A4") end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
