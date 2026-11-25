@@ -11743,6 +11743,11 @@ local function draw_settings_modal()
     reaper.ImGui_TextColored(ctx, P.text_dim, K.ANALYSIS_DEFAULTS_NOTE)
     draw_form(detection)
 
+    reaper.ImGui_Dummy(ctx, 0, L.sm)
+    if Theme.collapsing_header(ctx, dsp.title) then
+      draw_form(dsp)
+    end
+
     -- The System Default of the item values (saved from the "This item" menu), and its way back to the factory ones
     Theme.section_divider(ctx, "Item Value Defaults", { color = P.yellow })
     local sys = {}
@@ -11770,11 +11775,6 @@ local function draw_settings_modal()
       -- The confirm is the only modal: close Settings first
       reaper.ImGui_CloseCurrentPopup(ctx)
       K.request_factory_defaults()
-    end
-
-    reaper.ImGui_Dummy(ctx, 0, L.sm)
-    if Theme.collapsing_header(ctx, dsp.title) then
-      draw_form(dsp)
     end
 
     -- The confirm is the only modal: close Settings first
