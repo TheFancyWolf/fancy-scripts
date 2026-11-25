@@ -4779,6 +4779,217 @@ test("batch_start_snapshots_given_values", function()
   end)
 end)
 
+local TENOR = { name = "Tenor", min = 130, max = 500 }
+
+test("reanalyze_request_carries_form_copy", function()
+  local f = S.K.form_new("{a}", { notes = { {} }, analysis = SOPRANO_ANALYSIS })
+  local req = S.K.reanalyze_request(4, "Lead Vox", f)
+  eq(req.title, "Re-analyze Lead Vox?"); eq(req.confirm_label, "Re-Analyze")
+  eq(req.fit, true)
+  eq(req.form ~= f, true, "a copy"); eq(req.form.values ~= f.values, true, "its own values")
+  eq(req.form.values.min_freq, 250); eq(req.form.source, "item")
+  eq(S.K.form_header(req.form), "ANALYZE WITH · as analyzed before")
+  eq(#req.body_lines, 3)
+  eq(req.body_lines[1], "This replaces the detected notes and discards your edits to 4 notes.")
+  eq(req.body_lines[2], S.K.REANALYZE_VALUES_LINE)
+  S.K.form_set(req.form, "range", TENOR)
+  eq(f.values.min_freq, 250, "edits in the modal never touch the canvas form")
+  eq(f.edited.min_freq, nil)
+  local r0 = S.K.reanalyze_request(0, "Lead Vox", f)
+  eq(#r0.body_lines, 1); eq(r0.body_lines[1], S.K.REANALYZE_VALUES_LINE)
+end)
+
+test("batch_modal_request_titles_and_seeds_defaults", function()
+  local K, st = S.K, S.state
+  local entries = { { guid = "{a}", name = "A", has_notes = false }, { guid = "{b}", name = "B", has_notes = false } }
+  local saved_min = st.min_freq
+  st.min_freq = 130   -- the Settings say Tenor's low end
+  local ok, err = pcall(function()
+    local req = K.batch_modal_request(entries)
+    eq(req.title, "Analyze 2 items"); eq(req.confirm_label, "Analyze 2 Items")
+    eq(req.form.source, "defaults"); eq(req.form.guid, "batch"); eq(req.form.values.min_freq, 130)
+    eq(#req.body_lines, 0, "no item holds notes: nothing to warn about"); eq(req.list, nil)
+    eq(req.fit, true)
+    eq(st.analysis_form == req.form, false, "never the canvas form")
+    entries[2].has_notes = true
+    local warn = K.batch_modal_request(entries)
+    eq(warn.title, "Analyze 2 items", "the modal's title, not the old confirm's question")
+    eq(warn.body_lines[1], "1 of them already has notes. Analyzing replaces its notes and any edits:")
+    eq(#warn.list, 1); eq(warn.list[1].name, "B")
+    eq(#warn.after_lines, 2)
+    local started
+    local real = K.batch_start
+    K.batch_start = function(e, v) started = { e = e, v = v } end
+    local ok2, err2 = pcall(function() warn.on_confirm(warn.form.values) end)
+    K.batch_start = real
+    if not ok2 then error(err2, 0) end
+    eq(started.e, entries); eq(started.v, warn.form.values)
+  end)
+  st.min_freq = saved_min
+  if not ok then error(err, 0) end
+end)
+
+test("batch_uses_and_stores_modal_values", function()
+  local real_begin = S.K.analysis_begin
+  with_batch(function()
+    local K, st = S.K, S.state
+    local names = { "GetTakeName", "GetMediaItemInfo_Value", "new_array", "GetSetMediaItemTakeInfo_String" }
+    local old, saved_acc, saved_min, saved_form = {}, K.open_accessor, st.min_freq, st.analysis_form
+    for _, n in ipairs(names) do old[n] = reaper[n] end
+    K.analysis_begin = real_begin
+    K.open_accessor = function() return "acc" end
+    reaper.GetTakeName = function() return "t" end
+    reaper.GetMediaItemInfo_Value = function() return 2 end
+    reaper.new_array = function() return {} end
+    reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{a}" end return true, "" end
+    local ok, err = pcall(function()
+      st.min_freq = 80   -- the Settings hold Bass; the modal picks Soprano
+      local req = K.batch_modal_request(entries3())
+      K.form_set(req.form, "range", { name = "Soprano", min = 250, max = 1200 })
+      req.on_confirm(req.form.values)
+      eq(K.batch ~= nil, true, "the batch runs")
+      eq(K.batch.values.min_freq, 250, "the batch keeps the modal's values")
+      eq(st.analysis_params.min_freq, 250, "the first item is analysed with them")
+      eq(st.analysis_params.max_freq, 1200)
+      eq(st.min_freq, 80, "state.min_freq unchanged")
+      eq(st.analysis_form, saved_form, "the canvas form is not replaced")
+      K.cancel_analysis()
+      eq(K.batch, nil, "cancelled")
+    end)
+    K.open_accessor = saved_acc
+    for _, n in ipairs(names) do reaper[n] = old[n] end
+    st.analysis_params, st.accessor, st.buffer = nil, nil, nil
+    st.min_freq = saved_min
+    if not ok then error(err, 0) end
+  end)
+end)
+
+test("confirm_enter_runs_primary_only_with_form", function()
+  local K, st = S.K, S.state
+  eq(K.confirm_enter({}), false, "existing confirms: Enter is not theirs")
+  eq(K.confirm_enter({ form = { values = {} } }), true)
+  local saved = st.confirm
+  S.request_confirm({ title = "T", on_confirm = function() end })
+  eq(K.confirm_enter(st.confirm), false)
+  local f = K.form_new("batch", nil)
+  S.request_confirm({ title = "T", form = f, on_confirm = function() end })
+  eq(st.confirm.form, f); eq(K.confirm_enter(st.confirm), true)
+  st.confirm = saved
+end)
+
+-- Draws the confirm modal with Enter pressed (Shortcut true for Enter only) and returns what on_confirm received.
+local function confirm_with_enter(req, active)
+  local K, st = S.K, S.state
+  local got = { called = false }
+  req.on_confirm = function(...) got.called = true; got.args = { ... } end
+  local enter, kp_enter = 1001, 1002
+  local stubs = {
+    ImGui_Key_Enter = function() return enter end,
+    ImGui_Key_KeypadEnter = function() return kp_enter end,
+    ImGui_Shortcut = function(_, key) return key == enter end,
+    ImGui_IsAnyItemActive = function() return active == true end,
+    ImGui_IsPopupOpen = function(_, name) return name ~= "" end,   -- the modal is open, nothing over it
+    ImGui_BeginPopupModal = function() return true, true end,
+    ImGui_BeginChild = function() return true end,
+    ImGui_BeginTable = function() return false end,
+    ImGui_GetWindowSize = function() return 560, 480 end,
+    ImGui_GetWindowPos = function() return 100, 50 end,
+    ImGui_Viewport_GetPos = function() return 0, 0 end,
+    ImGui_Viewport_GetSize = function() return 800, 600 end,
+    ImGui_GetContentRegionAvail = function() return 520, 400 end,
+    ImGui_GetStyleVar = function() return 4, 4 end,
+    ImGui_GetFrameHeight = function() return 20 end,
+    ImGui_GetFrameHeightWithSpacing = function() return 24 end,
+    ImGui_GetTextLineHeight = function() return 14 end,
+    ImGui_GetFontSize = function() return 13 end,
+    ImGui_CalcTextSize = function() return 40, 14 end,
+    ImGui_GetCursorPosX = function() return 0 end,
+    ImGui_GetCursorPosY = function() return 0 end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local saved, real_form_draw = st.confirm, K.confirm_form_draw
+  -- The form's widgets are checked in real REAPER; here only what Enter does
+  K.confirm_form_draw = function() end
+  local ok, err = pcall(function()
+    S.request_confirm(req)
+    S.draw_confirm_modal()
+  end)
+  K.confirm_form_draw = real_form_draw
+  for k in pairs(stubs) do reaper[k] = nil end
+  st.confirm = saved
+  K.form_metrics_cache = nil
+  if not ok then error(err, 0) end
+  return got
+end
+
+test("confirm_enter_confirms_the_form_with_its_values", function()
+  local f = S.K.form_new("batch", nil)
+  local got = confirm_with_enter({ title = "Analyze 2 items", form = f, confirm_label = "Analyze 2 Items", fit = true })
+  eq(got.called, true, "Enter runs the primary")
+  eq(got.args[1], f.values, "on_confirm receives form.values")
+  eq(confirm_with_enter({ title = "Delete?", body_lines = { "x" } }).called, false, "no form: Enter does nothing")
+  eq(confirm_with_enter({ title = "T", form = S.K.form_new("batch", nil) }, true).called, false,
+    "not while an item (a field) is active")
+end)
+
+test("request_analyze_modal_only_on_analysed_items", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.notes, st.confirm, st.analysis_form }
+  local ok, err = pcall(function()
+    st.session_takes["{a}"] = { notes = { {} }, analysis = SOPRANO_ANALYSIS }
+    st.target_take_guid, st.target_take_name = "{a}", "Lead Vox"
+    st.notes = { { avg_note = 60 } }   -- analysed, nothing edited (no controls: not modified)
+    st.analysis_form = K.form_new("{a}", st.session_takes["{a}"])
+    st.confirm = nil
+    K.request_analyze()
+    local c = st.confirm
+    eq(c ~= nil, true, "an analysed item always gets the modal")
+    eq(c.title, "Re-analyze Lead Vox?"); eq(c.id, "reanalyze")
+    eq(#c.body_lines, 1); eq(c.body_lines[1], K.REANALYZE_VALUES_LINE)
+    eq(c.form.values.min_freq, 250, "seeded from the item")
+    eq(c.form ~= st.analysis_form, true)
+  end)
+  st.target_take_guid, st.target_take_name, st.notes, st.confirm, st.analysis_form = table.unpack(saved, 1, 5)
+  st.session_takes["{a}"] = nil
+  if not ok then error(err, 0) end
+end)
+
+test("analyze_change_request_copies_values_back", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.analysis_form, st.status.text }
+  local ok, err = pcall(function()
+    st.target_take_guid, st.target_take_name = "{z}", "Lead Vox"
+    st.analysis_form = K.form_new("{z}", nil)
+    local req = K.analyze_change_request(st.analysis_form)
+    eq(req.title, "Analyze Lead Vox"); eq(req.confirm_label, "Analyze"); eq(req.fit, true)
+    eq(req.form ~= st.analysis_form, true, "a copy")
+    K.form_set(req.form, "range", TENOR)
+    eq(st.analysis_form.values.min_freq, st.min_freq, "the canvas form is untouched")
+    reaper.CountMediaItems = function() return 0 end
+    reaper.CountSelectedMediaItems = function() return 0 end
+    reaper.time_precise = function() return 0 end
+    req.on_confirm(req.form.values)   -- no take in the stub: start_analysis says so
+    reaper.CountMediaItems, reaper.CountSelectedMediaItems, reaper.time_precise = nil, nil, nil
+    eq(st.status.text, "Select an audio item first", "start_analysis ran")
+    eq(st.analysis_form.values.min_freq, 130, "the values come back to the canvas form")
+    eq(st.analysis_form.values.max_freq, 500)
+    eq(st.analysis_form.edited.min_freq, true, "marked edited")
+    eq(st.analysis_form.edited.threshold, nil, "unchanged keys are not")
+  end)
+  st.target_take_guid, st.target_take_name, st.analysis_form, st.status.text = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
+end)
+
+test("info_lists_the_analysis_modal", function()
+  local found = false
+  for _, section in ipairs(S.K.INFO_SECTIONS) do
+    for _, row in ipairs(section.rows) do
+      if row[2] == "Re-Analyze… opens the analysis settings; Enter analyzes, Esc cancels" then found = true end
+    end
+  end
+  eq(found, true)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
