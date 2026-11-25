@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.25.0
+-- @version 2.26.0
 -- @changelog
---   Selecting rows in Pitched Items selects their items in the arrange view
+--   Analysis settings at the Analyze button: an "Analyze with" form on the empty canvas, each item remembers the settings it was analysed with, the Re-Analyze... menu item and Analyze Selected Items (N)... open them (the no-notes Re-Analyze button analyses at once), Save as Default, Settings section renamed "Analysis Defaults"
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -274,14 +274,19 @@ local K = {
   KEEP_PITCH_LABEL = "Keep each item's own pitch algorithm",
   DEFAULT_SAMPLE_RATE = 44100,                       -- the block / hop readouts assume this until an item has been analysed
 
-  -- Value ranges { lowest, highest } of the Settings drags; a stored value is clamped to them (see K.PERSIST)
+  -- Value ranges { lowest, highest } of the Settings drags; a stored value is clamped to them (see K.PERSIST). The
+  -- two Hz drags also stop 1 Hz short of each other (K.drag_bounds), so their outer ends are what counts: a vocal
+  -- range's low end (Soprano: 250 Hz) lies well above 200 Hz
   LIMITS = {
     threshold = { 0.05, 0.5 },
-    min_freq = { 20, 200 },
-    max_freq = { 200, 2000 },
+    min_freq = { 20, 1999 },
+    max_freq = { 21, 2000 },
     tolerance = { 0, 50 },   -- cents
     separation = { 0, 1 },
   },
+
+  -- The five detection values an analysis is run with, and the item stores (take data field `analysis`)
+  ANALYSIS_KEYS = { "min_freq", "max_freq", "threshold", "block_size", "hop_size" },
 
   -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
   -- (see K.tone_tick). The P_* entries are its 0-based parameter indices; MON is added to an FX index to address the
@@ -432,6 +437,7 @@ local state = {
   -- Target item binding (persistent GUID lock)
   target_take_guid = nil,
   target_take_name = nil,
+  analysis_form = nil,   -- { guid, values, edited, source, seed }: the values the next analysis of the target item would use (K.form_new)
 
   -- Undo / model sync with REAPER
   last_change_count = nil,  -- GetProjectStateChangeCount(0) after the last own write / resync (nil = resync next frame)
@@ -695,15 +701,20 @@ end
 --- on_confirm(checked, ticked) receives the state of the check and the ticked rows.
 --- size = a Theme.layout modal size (default L.modal_sm). fit = true: size.h is only where it opens; the modal then
 --- takes its content's height (up to the most the window it opens from allows) with the footer right under it.
-local function request_confirm(req)
-  if not req or not req.on_confirm then return end
+--- Optional analysis form (the analysis modal: Re-Analyze…, Analyze Selected Items (N)…, Change…):
+---   form = an analysis form (K.form_new), the modal's own copy: drawn above body_lines (K.confirm_form_draw: the
+---          header, the detection rows, the Advanced fold, Save as Default). Enter / KeypadEnter run the primary
+---          (K.confirm_enter) and on_confirm(values) receives form.values.
+---   safe = true: the primary is not danger-styled (nothing the user made is lost).
+--- K.confirm_new builds the modal's state from a request; request_confirm makes it the one confirm (state.confirm).
+K.confirm_new = function(req)
   local ticked = {}
   if req.checklist then
     for _, row in ipairs(req.checklist.rows) do
       if not row.reason and req.checklist.ticked and req.checklist.ticked[row.id] then ticked[row.id] = true end
     end
   end
-  state.confirm = {
+  return {
     id = req.id or "action",
     title = req.title or "Are you sure?",
     body_lines = req.body_lines or {},
@@ -722,9 +733,23 @@ local function request_confirm(req)
     cons_key = nil,
     size = req.size,
     fit = req.fit == true,  -- sized to its content (K.confirm_fit_h), else req.size throughout
+    form = req.form,
+    safe = req.safe == true,
+    nested = nil,         -- the Save as Default confirm opened from the form, drawn over this one
     open_pending = true,  -- OpenPopup once, on the next draw_confirm_modal() call
     opened = false,
   }
+end
+
+local function request_confirm(req)
+  if not req or not req.on_confirm then return end
+  state.confirm = K.confirm_new(req)
+end
+
+--- True when Enter / KeypadEnter run the primary of the confirm `c`: only the analysis modal (it has a form); every
+--- other confirm keeps Enter for ImGui's own keyboard use.
+K.confirm_enter = function(c)
+  return c ~= nil and c.form ~= nil
 end
 
 --- The consequence of the confirm `c` for its ticked rows and check: computed again only when one of them
@@ -1677,10 +1702,191 @@ K.open_accessor = function(take)
   return nil
 end
 
+--- The detection values the Settings hold now: a fresh table of the K.ANALYSIS_KEYS copied from state.
+K.analysis_defaults = function()
+  local values = {}
+  for _, key in ipairs(K.ANALYSIS_KEYS) do values[key] = state[key] end
+  return values
+end
+
+--- A validated copy of the K.ANALYSIS_KEYS of `t`, or nil when `t` is not a table or any of them is missing or
+--- invalid: a finite number (not a string): Hz within the widest Settings span with min below max, threshold inside K.LIMITS, a block size and a hop size from the lists,
+--- with the hop no longer than the block.
+K.analysis_values = function(t)
+  if type(t) ~= "table" then return nil end
+  local function listed(list, v)
+    for _, x in ipairs(list) do if x == v then return true end end
+    return false
+  end
+  local values = {}
+  for _, key in ipairs(K.ANALYSIS_KEYS) do
+    local v = t[key]
+    if type(v) ~= "number" or v ~= v then return nil end
+    values[key] = v
+  end
+  -- Both Hz values are held to the widest span the Settings allow (Min Freq's low end to Max Freq's high end), and
+  -- the low end must be below the high end
+  local hz_lo, hz_hi = K.LIMITS.min_freq[1], K.LIMITS.max_freq[2]
+  for _, key in ipairs({ "min_freq", "max_freq" }) do
+    if values[key] < hz_lo or values[key] > hz_hi then return nil end
+  end
+  if values.min_freq >= values.max_freq then return nil end
+  local lim = K.LIMITS.threshold
+  if values.threshold < lim[1] or values.threshold > lim[2] then return nil end
+  if not listed(BLOCK_SIZES, values.block_size) or not listed(HOP_SIZES, values.hop_size) then return nil end
+  if values.hop_size > values.block_size then return nil end
+  return values
+end
+
+--- Which of the three rows (Vocal Range, Detection Mode, Quality) of `values` match a preset: the names of the
+--- presets, K.CUSTOM_PRESET for a row that matches none.
+K.form_part_names = function(values)
+  local r = K.match_preset(VOCAL_RANGES, function(e) return e.min == values.min_freq and e.max == values.max_freq end)
+  local m = K.match_preset(DETECTION_MODES, function(e) return e.threshold == values.threshold end)
+  local q = K.match_preset(QUALITY_MODES, function(e) return e.block == values.block_size and e.hop == values.hop_size end)
+  return VOCAL_RANGES[r] and VOCAL_RANGES[r].name or K.CUSTOM_PRESET,
+    DETECTION_MODES[m] and DETECTION_MODES[m].name or K.CUSTOM_PRESET,
+    QUALITY_MODES[q] and QUALITY_MODES[q].name or K.CUSTOM_PRESET
+end
+
+--- "Soprano · Clean / Strict · Standard (Realtime)": the three rows of `values` by preset name.
+K.form_summary = function(values)
+  local r, m, q = K.form_part_names(values)
+  return r .. " · " .. m .. " · " .. q
+end
+
+--- "Analyzed with Soprano · ...": what an analysed item's tooltip says, nil when it has no stored analysis.
+K.analyzed_with_tip = function(data)
+  local values = data and K.analysis_values(data.analysis)
+  if not values then return nil end
+  return "Analyzed with " .. K.form_summary(values)
+end
+
+--- Where a form for `data` starts from: "item" (it has a stored analysis), "unrecorded" (notes, no stored
+--- analysis) or "defaults" (not analysed, or a batch).
+K.form_source = function(data)
+  if data and K.analysis_values(data.analysis) then return "item" end
+  if data and data.notes and #data.notes > 0 then return "unrecorded" end
+  return "defaults"
+end
+
+--- A fresh form for `guid` (or "batch", with `data` nil): the item's stored analysis when it has one, else the
+--- Settings' values. `seed` is the stored table it came from (identity compare in K.form_sync).
+K.form_new = function(guid, data)
+  local source = K.form_source(data)
+  local form = { guid = guid, edited = {}, source = source }
+  if source == "item" then
+    form.values = K.analysis_values(data.analysis)
+    form.seed = data.analysis
+  else
+    form.values = K.analysis_defaults()
+  end
+  return form
+end
+
+--- Keep state.analysis_form on `guid`: a new form when the item changed or its stored analysis is not the one the
+--- form was seeded from (an undo or a re-analysis replaced it); otherwise the rows the user has not touched follow
+--- the Settings' defaults (not for an item's own values).
+K.form_sync = function(guid, data)
+  local form = state.analysis_form
+  if not form or form.guid ~= guid or form.seed ~= (data and data.analysis or nil) or form.source ~= K.form_source(data) then
+    state.analysis_form = K.form_new(guid, data)
+    return
+  end
+  if form.source ~= "item" then
+    local defaults = K.analysis_defaults()
+    for _, key in ipairs(K.ANALYSIS_KEYS) do
+      if not form.edited[key] then form.values[key] = defaults[key] end
+    end
+  end
+end
+
+--- The values a row writes for `key`: "range" takes a VOCAL_RANGES entry (both Hz) and "quality" a QUALITY_MODES
+--- entry (block and hop); any other key is one value of its own.
+K.value_pairs = function(key, value)
+  if key == "range" then return { min_freq = value.min, max_freq = value.max } end
+  if key == "quality" then return { block_size = value.block, hop_size = value.hop } end
+  return { [key] = value }
+end
+
+--- Set one value of the form and mark it edited. key "range" takes a VOCAL_RANGES entry (both Hz) and "quality" a
+--- QUALITY_MODES entry (block and hop).
+K.form_set = function(form, key, value)
+  for k, v in pairs(K.value_pairs(key, value)) do
+    form.values[k] = v
+    form.edited[k] = true
+  end
+end
+
+--- Put a row back to the Settings' default: row_id "range", "mode", "quality", "block", "hop", "threshold",
+--- "min_freq" or "max_freq".
+K.form_reset_row = function(form, row_id)
+  local keys_of = {
+    range = { "min_freq", "max_freq" }, mode = { "threshold" }, quality = { "block_size", "hop_size" },
+    block = { "block_size" }, hop = { "hop_size" }, threshold = { "threshold" },
+    min_freq = { "min_freq" }, max_freq = { "max_freq" },
+  }
+  local defaults = K.analysis_defaults()
+  for _, key in ipairs(keys_of[row_id] or {}) do
+    form.values[key] = defaults[key]
+    form.edited[key] = nil
+  end
+end
+
+--- How many of the three rows (Vocal Range, Detection Mode, Quality) of `values` differ from the Settings' defaults.
+K.form_changed_rows = function(values)
+  local d = K.analysis_defaults()
+  local n = 0
+  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq then n = n + 1 end
+  if values.threshold ~= d.threshold then n = n + 1 end
+  if values.block_size ~= d.block_size or values.hop_size ~= d.hop_size then n = n + 1 end
+  return n
+end
+
+--- The form's header line.
+K.form_header = function(form)
+  if form.source == "item" then return "ANALYZE WITH · as analyzed before" end
+  if form.source == "unrecorded" then return "ANALYZE WITH · not recorded, your defaults" end
+  local n = K.form_changed_rows(form.values)
+  if n == 0 then return "ANALYZE WITH · your defaults" end
+  return string.format("ANALYZE WITH · %d changed from defaults", n)
+end
+
+--- The Save as Default confirm (a request_confirm request) for `values`.
+K.form_defaults_request = function(values)
+  local copy = {}
+  for _, key in ipairs(K.ANALYSIS_KEYS) do copy[key] = values[key] end
+  local nr, nm, nq = K.form_part_names(copy)
+  local or_, om, oq = K.form_part_names(K.analysis_defaults())
+  local parts = {}
+  if nr ~= or_ then parts[#parts + 1] = string.format("%s (was %s)", nr, or_) end
+  if nm ~= om then parts[#parts + 1] = string.format("%s (was %s)", nm, om) end
+  if nq ~= oq then parts[#parts + 1] = string.format("%s (was %s)", nq, oq) end
+  local first = #parts > 0 and ("New analyses will start with: " .. table.concat(parts, ", ") .. ".")
+    or "New analyses will start with these values."
+  return {
+    title = "Make these your defaults?",
+    body_lines = { first, "Items already analyzed keep their own settings." },
+    confirm_label = "Save as Default",
+    fit = true,    -- as tall as its two lines: no empty block above the buttons
+    safe = true,   -- nothing the user made is lost (items keep their own settings)
+    on_confirm = function()
+      for _, key in ipairs(K.ANALYSIS_KEYS) do state[key] = copy[key] end
+      K.save_settings("engine")
+      -- The canvas form's untouched rows follow the new defaults (Save as Default in the analysis modal never
+      -- touches the canvas form itself), as after a Settings change
+      local guid = state.target_take_guid
+      if guid then K.form_sync(guid, state.session_takes[guid]) end
+      set_status("Defaults saved.")
+    end,
+  }
+end
+
 --- Start analysing `take` (in `item`): it becomes the target and its audio is read slice by slice from the next
 --- frame on (process_analysis_step). opts (optional):
 ---   sample_rate     the rate to read at, when the caller already knows it (a batch records it when it starts:
 ---                   REAPER can report 0 for every source while it is in the background, see K.batch_selection)
+---   values          the detection values to analyse with (K.analysis_defaults() shape); omitted: the Settings' now
 ---   defer_envelope  do not create or show the take's Pitch envelope now (a batch does it in its one undo block)
 --- Returns true, or false and why: "offline" (the source has no sample rate: its media is offline) or "accessor"
 --- (REAPER gave no audio accessor). Nothing is changed when it returns false.
@@ -1714,16 +1920,24 @@ K.analysis_begin = function(take, item, opts)
 
   -- A bad engine value must never crash (negative array size) or hang (a hop of 0 never advances the
   -- analysis time) an analysis: clamp to 64 <= block, 1 <= hop <= block before anything is allocated
-  local block = math.floor(tonumber(state.block_size) or DEFAULTS.block_size)
-  state.block_size = math.max(K.BLOCK_SIZE_MIN, math.min(K.BLOCK_SIZE_MAX, block))
-  local hop = math.floor(tonumber(state.hop_size) or DEFAULTS.hop_size)
-  state.hop_size = math.max(1, math.min(state.block_size, hop))
+  local values = opts.values or K.analysis_defaults()
+  -- A zero-width or inverted Hz range finds nothing and is stored as "not recorded": analyse with the Settings'
+  -- values instead (and the factory Hz when those are inverted too)
+  local function hz_ok(t) return (tonumber(t.min_freq) or 0) < (tonumber(t.max_freq) or 0) end
+  if not hz_ok(values) then
+    values = K.analysis_defaults()
+    if not hz_ok(values) then values.min_freq, values.max_freq = DEFAULTS.min_freq, DEFAULTS.max_freq end
+  end
+  local block = math.floor(tonumber(values.block_size) or DEFAULTS.block_size)
+  block = math.max(K.BLOCK_SIZE_MIN, math.min(K.BLOCK_SIZE_MAX, block))
+  local hop = math.floor(tonumber(values.hop_size) or DEFAULTS.hop_size)
+  hop = math.max(1, math.min(block, hop))
 
   -- The running analysis reads this snapshot, never the live settings: the Settings controls are locked meanwhile,
   -- and a value changed some other way cannot overrun the sample buffer or mix two parameter sets
   state.analysis_params = {
-    block_size = state.block_size, hop_size = state.hop_size, threshold = state.threshold,
-    min_freq = state.min_freq, max_freq = state.max_freq,
+    block_size = block, hop_size = hop, threshold = values.threshold,
+    min_freq = values.min_freq, max_freq = values.max_freq,
   }
 
   state.accessor = accessor
@@ -1748,7 +1962,7 @@ K.analysis_begin = function(take, item, opts)
 end
 
 --- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected).
-local function start_analysis()
+local function start_analysis(values)
   -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
   -- get_target_take() falls back to the selected audio item only when there is no usable target.
   local take, item = get_target_take()
@@ -1757,7 +1971,7 @@ local function start_analysis()
     set_status("Select an audio item first")
     return
   end
-  if not K.analysis_begin(take, item) then
+  if not K.analysis_begin(take, item, { values = values }) then
     set_status("Couldn't read this item's audio. Check that its media is online, then try again.")
   end
 end
@@ -2476,7 +2690,8 @@ K.take_json = function(data)
     key_idx = data.key_idx or state.key_idx,
     scale_idx = data.scale_idx or state.scale_idx,
     separation = data.separation,   -- the Separation the notes were split at (see K.follow_resplit_undo)
-    overrides = data.overrides or nil
+    overrides = data.overrides or nil,
+    analysis = data.analysis,   -- the values the analysis ran with (K.analysis_values)
   }
   if data.notes then
     for _, note in ipairs(data.notes) do
@@ -2569,6 +2784,7 @@ local function load_take_data(take, raw)
   if guid then state.unreadable_takes[guid] = (not readable) or nil end
   if readable then
     K.item_seed(data)
+    data.analysis = K.analysis_values(data.analysis)   -- a malformed record counts as not recorded
     data.name = K.live_take_name(take, data.name)   -- the name is REAPER's, not the one saved with the analysis
     return data
   end
@@ -3037,7 +3253,8 @@ K.batch_next = function()
       state.key_idx = before and before.key_idx or start.key_idx
       state.scale_idx = before and before.scale_idx or start.scale_idx
       update_scale_pitch_classes()
-      if K.analysis_begin(take, item, { sample_rate = entry.sample_rate, defer_envelope = true }) then return end
+      if K.analysis_begin(take, item, { sample_rate = entry.sample_rate, defer_envelope = true,
+          values = batch.values }) then return end
     end
     batch.failed = batch.failed + 1
     batch.done_len = batch.done_len + (entry.len or 0)
@@ -3082,11 +3299,18 @@ K.batch_item_failed = function(err)
   K.batch_next()
 end
 
---- Start a batch over `entries` (K.batch_selection's takes, read when the user asked for it).
-K.batch_start = function(entries)
+--- Start a batch over `entries` (K.batch_selection's takes, read when the user asked for it), every item analysed
+--- with `values` (K.analysis_defaults() shape; omitted: the Settings' values now, kept for the whole batch).
+K.batch_start = function(entries, values)
   if K.batch or state.is_analyzing or #entries == 0 then return end
   if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge belongs to the item being left
   K.batch = K.batch_new(entries, state.target_take_guid)
+  -- A copy: the form the values came from may change (or be reseeded) while the batch runs
+  local copy = K.analysis_defaults()
+  for _, key in ipairs(K.ANALYSIS_KEYS) do
+    if values and values[key] ~= nil then copy[key] = values[key] end
+  end
+  K.batch.values = copy
   K.batch.prev_name = state.target_take_name
   K.batch_next()
 end
@@ -3122,9 +3346,11 @@ local function switch_active_target(guid, take_obj)
 
   if data then
     adopt_take_data(guid, data)
+    K.form_sync(guid, data)
     return true
   end
   K.adopt_new_item_values()   -- not analysed yet: it shows, and its first analysis uses, a new item's values
+  K.form_sync(guid, nil)
   return false
 end
 
@@ -3281,6 +3507,7 @@ local function sync_with_project()
     end
   end
   if analyses_changed then K.status_release() end
+  if state.target_take_guid then K.form_sync(state.target_take_guid, state.session_takes[state.target_take_guid]) end
 end
 
 --- Persist the target's note model to its take (P_EXT) so it lands inside the caller's open undo block.
@@ -5345,6 +5572,7 @@ local function process_analysis_step()
         key_idx = state.key_idx,
         scale_idx = state.scale_idx,
         separation = state.separation,
+        analysis = params,   -- the frozen snapshot: the five values this analysis ran with
       }
       -- Every new analysis starts at the defaults (K.item_seed); its Separation, Key and Scale are the state mirrors
       -- above (K.analysis_begin or, in a batch, K.batch_next put the default Separation; the Key and Scale are the
@@ -5363,6 +5591,9 @@ local function process_analysis_step()
       end
       state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       state.session_takes[state.target_take_guid] = take_data
+      -- The form follows: it now shows the values the item was analysed with ("as analyzed before"), so a later
+      -- undo, which takes them away again, reseeds it from what the item holds then
+      K.form_sync(state.target_take_guid, take_data)
 
       local found = false
       for _, g in ipairs(state.session_order) do
@@ -6771,71 +7002,113 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  -- Nothing to edit yet: not analysed (Analyze Item above a hint), or analysed without finding a pitched note
-  if #state.results == 0 or state.analysis_empty then
+  -- Nothing to edit yet: not analysed (the "Analyze with" form above Analyze Item, the hint lines under it), or
+  -- analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes one of three
+  -- layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary line beside
+  -- the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
+  -- analysis runs (its first slice already fills state.results) the form stays in place, locked, showing the values
+  -- it runs with (K.canvas_form), and the button is disabled.
+  local form_canvas, no_notes = K.empty_canvas()
+  if form_canvas then
     local cx = full_px + full_w * 0.5
     local cy = py + h * 0.5
     local gap = L.lg
+    local avail_w = full_w - L.sm * 2
+    local analyze_h = K.analyze_btn_h(draw_ctx)
+    local _, text_h = reaper.ImGui_CalcTextSize(draw_ctx, "Ag")
 
-    if #state.results == 0 then
-      -- With two or more audio items selected in REAPER the button analyses them all (a batch); the lines under it
-      -- say what it will take, or that several items can be analysed at once. Each line is wrapped to the canvas
-      -- and centred; in a canvas too short for the button and the lines, the lines go, the last one first.
-      local peek = K.batch_peek(reaper.time_precise())
-      local is_batch = peek.n >= 2
-      local _, text_h = reaper.ImGui_CalcTextSize(draw_ctx, "Ag")
-      local shown = {}
-      for _, line in ipairs({ K.batch_lines(peek) }) do
-        shown[#shown + 1] = K.wrap_lines(draw_ctx, line, full_w - L.sm * 2)
-      end
-      local analyze_h = K.analyze_btn_h(draw_ctx)
-      local function block_h()
-        local total = analyze_h
-        for i, rows in ipairs(shown) do
-          total = total + (i == 1 and gap or L.xs) + #rows * text_h
-        end
-        return total
-      end
-      while #shown > 0 and block_h() > h do shown[#shown] = nil end
-      local start_y = cy - block_h() * 0.5
-
-      local can_analyze = (is_batch or target_take ~= nil) and not state.is_analyzing
-      local tip = state.is_analyzing and "Analysis in progress"
-        or (is_batch and K.batch_tip(peek.n))
-        or (target_take ~= nil and "Detect the pitch of the selected audio item"
-          or "Select an audio item in REAPER to analyze it.")
-      if canvas_button(K.batch_label(peek.n, false), "cv_analyze", cx, start_y, can_analyze, tip,
-          K.batch_label(peek.n, true), K.ANALYZE_BTN) then
-        if is_batch then K.batch_request() else start_analysis() end
-      end
-
-      -- Centred text below the button
-      local y = start_y + analyze_h
-      for i, rows in ipairs(shown) do
-        y = y + (i == 1 and gap or L.xs)
-        for _, row in ipairs(rows) do
-          reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
-          y = y + text_h
-        end
-      end
+    -- Above the form: the no-notes title and hint. Under the button: the hint lines (with two or more audio items
+    -- selected in REAPER the button analyses them all, a batch, and the lines say what it will take)
+    local peek, is_batch = nil, false
+    local title, title_w, title_h, hint_rows, above_h = nil, 0, 0, {}, 0
+    local shown = {}
+    if no_notes then
+      title = "No pitched notes found"
+      local pushed_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)   -- measured in its font
+      title_w, title_h = reaper.ImGui_CalcTextSize(draw_ctx, title)
+      Theme.pop_font(draw_ctx, pushed_font)
+      hint_rows = K.wrap_lines(draw_ctx, "Try another Vocal Range or Detection Mode.", avail_w)
+      above_h = title_h + L.xs + #hint_rows * text_h + gap
     else
-      local title = "No pitched notes found"
-      local hint = "Try another Vocal Range or Detection Mode in Settings."
-      -- The title is measured and drawn in the same (bold) font
+      peek = K.batch_peek(reaper.time_precise())
+      is_batch = peek.n >= 2
+      for _, line in ipairs({ K.batch_lines(peek) }) do
+        shown[#shown + 1] = K.wrap_lines(draw_ctx, line, avail_w)
+      end
+    end
+
+    local form, reason = K.canvas_form(target_take ~= nil, is_batch)
+    local layout, form_w, form_h, form_max_h = K.form_canvas_plan(avail_w, h - above_h, analyze_h + gap)
+    if layout == "summary" and above_h + analyze_h > h then
+      title, hint_rows, above_h = nil, {}, 0   -- a strip too short for the title: the button row only
+    end
+    local function block_h()
+      local total = above_h + analyze_h + (layout == "summary" and 0 or form_h + gap)
+      for i, rows in ipairs(shown) do
+        total = total + (i == 1 and gap or L.xs) + #rows * text_h
+      end
+      return total
+    end
+    while #shown > 0 and block_h() > h do shown[#shown] = nil end
+    local y = cy - block_h() * 0.5
+
+    if title then
       local pushed_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)
-      local title_w, title_h = reaper.ImGui_CalcTextSize(draw_ctx, title)
+      reaper.ImGui_DrawList_AddText(draw_list, cx - title_w * 0.5, y, P.text, title)
       Theme.pop_font(draw_ctx, pushed_font)
-      local hint_w, hint_h = reaper.ImGui_CalcTextSize(draw_ctx, hint)
-      local start_y = cy - (title_h + L.xs + hint_h + gap + L.btn_lg.h) * 0.5
+      local hy = y + title_h + L.xs
+      for _, row in ipairs(hint_rows) do
+        reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, hy, P.text_dim, row.text)
+        hy = hy + text_h
+      end
+      y = y + above_h
+    end
 
-      pushed_font = Theme.push_font(draw_ctx, fonts.large_bold or fonts.medium_bold)
-      reaper.ImGui_DrawList_AddText(draw_list, cx - title_w * 0.5, start_y, P.text, title)
-      Theme.pop_font(draw_ctx, pushed_font)
-      reaper.ImGui_DrawList_AddText(draw_list, cx - hint_w * 0.5, start_y + title_h + L.xs, P.text_dim, hint)
+    local label, narrow_label, btn_id = "Re-Analyze", nil, "cv_reanalyze"
+    if not no_notes then
+      label, narrow_label, btn_id = K.batch_label(peek.n, false), K.batch_label(peek.n, true), "cv_analyze"
+    end
+    local can_analyze = (is_batch or target_take ~= nil) and not state.is_analyzing
+    local tip = state.is_analyzing and "Analysis in progress"
+      or (is_batch and K.batch_tip(peek.n))
+      or (target_take ~= nil and "Detect the pitch of the selected audio item"
+        or "Select an audio item in REAPER to analyze it.")
 
-      if canvas_button("Open Settings", "cv_open_settings", cx, start_y + title_h + L.xs + hint_h + gap, true,
-          "Open Settings to change the Vocal Range or Detection Mode") then
-        show_settings_modal = true
+    local btn_cx = cx
+    if layout == "summary" then
+      -- One row, centred: the summary line (shortened to the room left), Change…, the button
+      local m = K.form_canvas_metrics()
+      local btn_w = K.analyze_btn_w(draw_ctx, label)
+      if narrow_label and btn_w > avail_w then
+        label = narrow_label
+        btn_w = K.analyze_btn_w(draw_ctx, label)
+      end
+      narrow_label = nil
+      local sum_w = (reaper.ImGui_CalcTextSize(draw_ctx, K.FORM_COPY.summary .. K.form_summary(form.values))) or 0
+      local text_w = math.min(sum_w, avail_w - btn_w - m.change_w - L.md * 2)
+      if text_w < L.xxxl then text_w = 0 end   -- no room for a readable part of it: Change… still says where it is
+      local row_w = (text_w > 0 and text_w + L.md or 0) + m.change_w + L.md + btn_w
+      local x0 = cx - row_w * 0.5
+      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.LOCKED_REASON or reason,
+        is_batch)
+      btn_cx = x0 + used + L.md + btn_w * 0.5
+    else
+      local drawn_h = K.form_canvas_draw(form, cx - form_w * 0.5, y, form_w, layout, reason, form_max_h)
+      K.form_canvas_last = { layout = layout, adv = K.form_adv_open, h = drawn_h, scroll = form_max_h ~= nil }
+      y = y + form_h + gap
+    end
+
+    if canvas_button(label, btn_id, btn_cx, y, can_analyze, tip, narrow_label, K.ANALYZE_BTN) then
+      if is_batch then K.batch_request(form.values) else start_analysis(form.values) end
+    end
+
+    -- Centred text below the button
+    y = y + analyze_h
+    for i, rows in ipairs(shown) do
+      y = y + (i == 1 and gap or L.xs)
+      for _, row in ipairs(rows) do
+        reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
+        y = y + text_h
       end
     end
 
@@ -9721,6 +9994,7 @@ K.INFO_SECTIONS = {
   } },
   { title = "Icons", rows = {
     { "… (top right)", "More: Analyze, Analyze Selected Items, Reset, Layers, Note Tone, Settings, Help" },
+    { "Analysis modal", "Re-Analyze… opens the analysis settings; Enter analyzes, Esc cancels" },
     { "× (top right)", "Close the window (Esc when floating)" },
     { "> / <", "Hide / show the Pitched Items panel" },
     { "▾ / ▸ (section header)", "Collapse / expand the section" },
@@ -10485,22 +10759,37 @@ local function hop_choices(block_size)
   return hops
 end
 
---- Settings value control: a param_drag on state[key] within K.LIMITS[key], `width` wide and without a label (the form's
---- label column names it); double-click restores DEFAULTS[key] (engine settings are not project state: no undo point).
---- The value is saved once the edit is done (the drag released, a typed entry confirmed, a reset), not while it moves.
-local function settings_drag(id, key, fmt, width)
+--- The { lowest, highest } a detection row's drag allows for `key` of the values `v`: K.LIMITS[key], except that
+--- Min Freq stays 1 Hz below v.max_freq and Max Freq 1 Hz above v.min_freq (K.analysis_values needs min < max).
+K.drag_bounds = function(key, v)
+  local lim = K.LIMITS[key]
+  local lo, hi = lim[1], lim[2]
+  if key == "min_freq" then
+    hi = math.max(lo, math.min(hi, (tonumber(v.max_freq) or hi + 1) - 1))
+  elseif key == "max_freq" then
+    lo = math.min(hi, math.max(lo, (tonumber(v.min_freq) or lo - 1) + 1))
+  end
+  return lo, hi
+end
+
+--- Value control of the detection rows: a param_drag on b.v[key] within K.drag_bounds(key, b.v), `width` wide and without a
+--- label (the form's label column names it); double-click restores the row's default (b.reset(key); the key is the
+--- row id). `b` is the row binding (see K.settings_binding): the value is committed once the edit is done (the drag
+--- released, a typed entry confirmed, a reset), not while it moves.
+local function settings_drag(id, key, fmt, width, b)
   reaper.ImGui_SetNextItemWidth(ctx, width)
-  local raw = state[key]
-  local changed, v, committed, reset, cancelled = param_drag(ctx, id, nil, raw, K.LIMITS[key][1], K.LIMITS[key][2], fmt)
+  local raw = b.v[key]
+  local lo, hi = K.drag_bounds(key, b.v)
+  local changed, v, committed, reset, cancelled = param_drag(ctx, id, nil, raw, lo, hi, fmt)
   local back = K.drag_revert(id, raw, cancelled)
   if back ~= nil then
-    state[key] = back   -- Esc during the drag: the value from before it, nothing saved
+    b.set(key, back)   -- Esc during the drag: the value from before it, nothing committed
   elseif reset then
-    state[key] = DEFAULTS[key]
+    b.reset(key)
   elseif changed then
-    state[key] = v
+    b.set(key, v)
   end
-  if committed then K.save_settings("engine") end
+  if committed then b.commit() end
 end
 
 --- Index of the entry of `list` for which `same(entry)` holds, 0 when none does (its combo then reads "Custom").
@@ -10536,9 +10825,63 @@ K.size_combo = function(id, list, current, w, tip)
   return list[new_idx], changed
 end
 
--- The Settings forms: Pitch Shift Engine, Analysis & Detection, Advanced DSP. A row knows its label, whether its
--- value is the factory one (DEFAULTS), how to restore it, and how to draw its control `w` pixels wide; a preset combo
--- reads "Custom" when the values match none of its presets. draw_settings_modal lays the rows out as label | control |
+--- The row binding of the Settings: the rows edit `state`, a reset restores the factory DEFAULTS, and a commit saves
+--- the engine group and lets an open analysis form follow the new defaults.
+K.settings_binding = function()
+  local function restore(keys)
+    for _, key in ipairs(keys) do state[key] = DEFAULTS[key] end
+  end
+  return {
+    v = state, base = DEFAULTS,
+    set = function(key, value)
+      for k, v in pairs(K.value_pairs(key, value)) do state[k] = v end
+    end,
+    reset = function(row_id)
+      if row_id == "range" then restore({ "min_freq", "max_freq" })
+      elseif row_id == "mode" then restore({ "threshold" })
+      elseif row_id == "quality" then restore({ "block_size", "hop_size" })
+      elseif row_id == "block" then
+        state.block_size = DEFAULTS.block_size
+        if state.hop_size > state.block_size then state.hop_size = state.block_size end
+      elseif row_id == "hop" then state.hop_size = math.min(DEFAULTS.hop_size, state.block_size)
+      else restore({ row_id }) end   -- threshold, min_freq, max_freq
+    end,
+    commit = function()
+      K.save_settings("engine")
+      local guid = state.target_take_guid
+      if guid then K.form_sync(guid, state.session_takes[guid]) end
+    end,
+  }
+end
+
+--- The row binding of an analysis form (K.form_new): the rows edit form.values and mark what the user changed, a
+--- reset goes back to the Settings' values, and nothing is saved.
+K.form_binding = function(form)
+  return {
+    v = form.values, base = K.analysis_defaults(),
+    set = function(key, value) K.form_set(form, key, value) end,
+    reset = function(row_id)
+      K.form_reset_row(form, row_id)
+      if form.values.hop_size > form.values.block_size then form.values.hop_size = form.values.block_size end
+    end,
+    commit = function() end,
+  }
+end
+
+--- The line under the Analysis Defaults divider.
+K.ANALYSIS_DEFAULTS_NOTE = "New analyses start with these. Each item keeps the settings it was analyzed with."
+
+--- Tooltips of the three preset rows (shared by the Settings and the analysis form).
+K.ROW_TIPS = {
+  range = "Vocal Range\n\nThe pitch range searched for this analysis. Pick the singer's range to avoid octave errors.",
+  mode = "Detection Mode\n\nHow sure the detector must be before it calls a sound a note. Lenient finds breathy notes; Strict ignores noise.",
+  quality = "Quality / CPU\n\nFiner timing or finer pitch, and how long the analysis takes.",
+}
+
+-- The Settings forms: Pitch Shift Engine, Analysis Defaults, Advanced DSP. A row knows its label, whether its
+-- value is the factory one (DEFAULTS), how to restore it, and how to draw its control `w` pixels wide; the detection and dsp rows take the binding `b`
+-- of the table they edit (K.settings_binding, K.form_binding): is_default(b), reset(b), draw(w, b); a preset combo
+-- reads "Custom" when the values match none of its presets. K.form_rows_draw lays the rows out as label | control |
 -- Reset, and a section's "Reset section" walks the same rows. `labels` = every text the control can show and `fit` =
 -- the width it needs at least (they size the control column).
 K.SETTINGS_SECTIONS = {
@@ -10573,100 +10916,556 @@ K.SETTINGS_SECTIONS = {
         end
       end },
   } },
-  { id = "detection", title = "Analysis & Detection Presets", rows = {
+  { id = "detection", title = "Analysis Defaults", rows = {
     { id = "range", label = "Vocal Range", labels = COMBO_LABELS.ranges,
-      is_default = function() return state.min_freq == DEFAULTS.min_freq and state.max_freq == DEFAULTS.max_freq end,
-      reset = function() state.min_freq, state.max_freq = DEFAULTS.min_freq, DEFAULTS.max_freq end,
-      draw = function(w)
-        local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == state.min_freq and r.max == state.max_freq end)
+      is_default = function(b) return b.v.min_freq == b.base.min_freq and b.v.max_freq == b.base.max_freq end,
+      reset = function(b) b.reset("range") end,
+      draw = function(w, b)
+        local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == b.v.min_freq and r.max == b.v.max_freq end)
         local idx, changed = Theme.combo(ctx, "##settings_range", VOCAL_RANGES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Vocal Range\n\nLimits the frequency search to avoid octave jump errors.",
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.range,
         })
         if changed and VOCAL_RANGES[idx] then
-          state.min_freq, state.max_freq = VOCAL_RANGES[idx].min, VOCAL_RANGES[idx].max
-          K.save_settings("engine")
+          b.set("range", VOCAL_RANGES[idx])
+          b.commit()
         end
       end },
     { id = "mode", label = "Detection Mode", labels = COMBO_LABELS.detection,
-      is_default = function() return state.threshold == DEFAULTS.threshold end,
-      reset = function() state.threshold = DEFAULTS.threshold end,
-      draw = function(w)
-        local current = K.match_preset(DETECTION_MODES, function(m) return m.threshold == state.threshold end)
+      is_default = function(b) return b.v.threshold == b.base.threshold end,
+      reset = function(b) b.reset("mode") end,
+      draw = function(w, b)
+        local current = K.match_preset(DETECTION_MODES, function(m) return m.threshold == b.v.threshold end)
         local idx, changed = Theme.combo(ctx, "##settings_mode", DETECTION_MODES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Detection Mode\n\nThe confidence threshold for pitched note detection.",
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.mode,
         })
         if changed and DETECTION_MODES[idx] then
-          state.threshold = DETECTION_MODES[idx].threshold
-          K.save_settings("engine")
+          b.set("threshold", DETECTION_MODES[idx].threshold)
+          b.commit()
         end
       end },
     { id = "quality", label = "Quality / CPU", labels = COMBO_LABELS.quality,
-      is_default = function() return state.block_size == DEFAULTS.block_size and state.hop_size == DEFAULTS.hop_size end,
-      reset = function() state.block_size, state.hop_size = DEFAULTS.block_size, DEFAULTS.hop_size end,
-      draw = function(w)
-        local current = K.match_preset(QUALITY_MODES, function(q) return q.block == state.block_size and q.hop == state.hop_size end)
+      is_default = function(b) return b.v.block_size == b.base.block_size and b.v.hop_size == b.base.hop_size end,
+      reset = function(b) b.reset("quality") end,
+      draw = function(w, b)
+        local current = K.match_preset(QUALITY_MODES, function(q) return q.block == b.v.block_size and q.hop == b.v.hop_size end)
         local idx, changed = Theme.combo(ctx, "##settings_quality", QUALITY_MODES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Quality / CPU\n\nThe trade-off between time and frequency resolution.",
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.quality,
         })
         if changed and QUALITY_MODES[idx] then
-          state.block_size = QUALITY_MODES[idx].block
-          state.hop_size = QUALITY_MODES[idx].hop
-          K.save_settings("engine")
+          b.set("quality", QUALITY_MODES[idx])
+          b.commit()
         end
       end },
   } },
   { id = "dsp", title = "Advanced DSP Parameters", rows = {
     -- Discrete choices; a value outside the lists (older state) shows the nearest item. The hop never exceeds the block.
     { id = "block", label = "Block size (samples)", name = "Block size",
-      is_default = function() return state.block_size == DEFAULTS.block_size end,
-      reset = function()
-        state.block_size = DEFAULTS.block_size
-        if state.hop_size > state.block_size then state.hop_size = state.block_size end
-      end,
-      draw = function(w)
-        local size, changed = K.size_combo("##dsp_block", BLOCK_SIZES, state.block_size, w,
+      is_default = function(b) return b.v.block_size == b.base.block_size end,
+      reset = function(b) b.reset("block") end,
+      draw = function(w, b)
+        local size, changed = K.size_combo("##dsp_block", BLOCK_SIZES, b.v.block_size, w,
           "Samples analyzed per window (e.g. 512, 1024, 2048).")
         if changed then
-          state.block_size = size
+          b.set("block_size", size)
           -- The block shrank below the hop: clamp the hop down (every block up to 1024 is also a hop size)
-          if state.hop_size > state.block_size then state.hop_size = state.block_size end
-          K.save_settings("engine")
+          if b.v.hop_size > b.v.block_size then b.set("hop_size", b.v.block_size) end
+          b.commit()
         end
       end },
-    -- The factory hop never exceeds the block either: a smaller block limits what Reset can restore
+    -- The default hop never exceeds the block either: a smaller block limits what Reset can restore
     { id = "hop", label = "Hop size (samples)", name = "Hop size",
-      is_default = function() return state.hop_size == math.min(DEFAULTS.hop_size, state.block_size) end,
-      reset = function() state.hop_size = math.min(DEFAULTS.hop_size, state.block_size) end,
-      draw = function(w)
-        local size, changed = K.size_combo("##dsp_hop", hop_choices(state.block_size), state.hop_size, w,
+      is_default = function(b) return b.v.hop_size == math.min(b.base.hop_size, b.v.block_size) end,
+      reset = function(b) b.reset("hop") end,
+      draw = function(w, b)
+        local size, changed = K.size_combo("##dsp_hop", hop_choices(b.v.block_size), b.v.hop_size, w,
           "Samples to advance between analysis windows.")
         if changed then
-          state.hop_size = size
-          K.save_settings("engine")
+          b.set("hop_size", size)
+          b.commit()
         end
       end },
     { id = "threshold", label = "Detection Threshold",
-      is_default = function() return state.threshold == DEFAULTS.threshold end,
-      reset = function() state.threshold = DEFAULTS.threshold end,
-      draw = function(w)
-        settings_drag("dsp_threshold", "threshold", "%.2f", w)
+      is_default = function(b) return b.v.threshold == b.base.threshold end,
+      reset = function(b) b.reset("threshold") end,
+      draw = function(w, b)
+        settings_drag("dsp_threshold", "threshold", "%.2f", w, b)
         if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           Theme.tooltip(ctx, "Detection Threshold\n\nThe confidence threshold for pitch detection. Lower is stricter.")
         end
       end },
     { id = "min_freq", label = "Min Freq (Hz)",
-      is_default = function() return state.min_freq == DEFAULTS.min_freq end,
-      reset = function() state.min_freq = DEFAULTS.min_freq end,
-      draw = function(w) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w) end },
+      is_default = function(b) return b.v.min_freq == b.base.min_freq end,
+      reset = function(b) b.reset("min_freq") end,
+      draw = function(w, b) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w, b) end },
     { id = "max_freq", label = "Max Freq (Hz)",
-      is_default = function() return state.max_freq == DEFAULTS.max_freq end,
-      reset = function() state.max_freq = DEFAULTS.max_freq end,
-      draw = function(w) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w) end },
+      is_default = function(b) return b.v.max_freq == b.base.max_freq end,
+      reset = function(b) b.reset("max_freq") end,
+      draw = function(w, b) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w, b) end },
   } },
 }
+
+--- One section as a form: a row per setting (label | control | Reset), bound to `b` (K.settings_binding or
+--- K.form_binding). opts: locked (disable everything), stacked (label above the control, and the control takes the
+--- width left after Reset), label_w, control_w, reset_w (control_w is the whole width when stacked), reset_hint (the
+--- Reset tooltip), default_reason (the disabled Reset's tooltip), id (id suffix, default the section id), and, for a
+--- "Reset section" button, section_reset_w, section_hint and section_default_reason. Returns true when
+--- "Reset section" was clicked (the caller confirms and resets).
+K.form_rows_draw = function(section, b, opts)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local locked = opts.locked
+  local id = opts.id or section.id
+  local section_clicked = false
+
+  --- A text button that is disabled, dim and explained when `reason` is set (the tooltip waits like every tooltip and
+  --- also shows on the disabled button). Returns true when it was clicked.
+  local function reset_button(label, btn_id, w, reason, hint)
+    reaper.ImGui_BeginDisabled(ctx, reason ~= nil)
+    if reason then reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim) end
+    local clicked = reaper.ImGui_Button(ctx, label .. "###" .. btn_id, w, 0)
+    if reason then reaper.ImGui_PopStyleColor(ctx, 1) end
+    reaper.ImGui_EndDisabled(ctx)
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+      Theme.tooltip(ctx, locked and K.LOCKED_REASON or reason or hint)
+    end
+    return clicked and not locked
+  end
+
+  local function row_reset(row)
+    local at_default = row.is_default(b)
+    if reset_button("Reset", "reset_" .. row.id, opts.reset_w, at_default and opts.default_reason or nil, opts.reset_hint) then
+      row.reset(b)
+      b.commit()
+    end
+    return at_default
+  end
+
+  local differing = 0
+  if opts.stacked then
+    reaper.ImGui_BeginDisabled(ctx, locked)
+    for _, row in ipairs(section.rows) do
+      if row.label ~= "" then reaper.ImGui_Text(ctx, row.label) end
+      row.draw(math.max(opts.control_w - opts.reset_w - L.sm, 1), b)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
+      if not row_reset(row) then differing = differing + 1 end
+    end
+    reaper.ImGui_EndDisabled(ctx)
+    return false
+  end
+
+  local form_flags = reaper.ImGui_TableFlags_SizingFixedFit() | reaper.ImGui_TableFlags_NoHostExtendX()
+  local fixed = reaper.ImGui_TableColumnFlags_WidthFixed()
+  if not reaper.ImGui_BeginTable(ctx, "##settings_form_" .. id, 3, form_flags) then return false end
+  reaper.ImGui_TableSetupColumn(ctx, "##label", fixed, opts.label_w + L.md)
+  reaper.ImGui_TableSetupColumn(ctx, "##control", fixed, opts.control_w + L.md)
+  reaper.ImGui_TableSetupColumn(ctx, "##reset", fixed, opts.reset_w + L.md)
+  reaper.ImGui_BeginDisabled(ctx, locked)
+  for _, row in ipairs(section.rows) do
+    reaper.ImGui_TableNextRow(ctx)
+    reaper.ImGui_TableSetColumnIndex(ctx, 0)
+    if row.label ~= "" then
+      Theme.align(ctx)
+      reaper.ImGui_Text(ctx, row.label)
+    end
+    reaper.ImGui_TableSetColumnIndex(ctx, 1)
+    row.draw(opts.control_w, b)
+    reaper.ImGui_TableSetColumnIndex(ctx, 2)
+    if not row_reset(row) then differing = differing + 1 end
+  end
+  if opts.section_reset_w then
+    reaper.ImGui_TableNextRow(ctx)
+    reaper.ImGui_TableSetColumnIndex(ctx, 1)
+    if reset_button("Reset section", "reset_section_" .. section.id, opts.section_reset_w,
+        differing == 0 and opts.section_default_reason or nil, opts.section_hint) then
+      section_clicked = true
+    end
+  end
+  reaper.ImGui_EndDisabled(ctx)
+  reaper.ImGui_EndTable(ctx)
+  return section_clicked
+end
+
+-- The "Analyze with" form on the empty canvas (spec: Analysis Settings at the Analyze Button). Its copy:
+K.FORM_COPY = {
+  reset_hint = "Back to your default (from Settings)",
+  default_reason = "Already the default",
+  save = "Save as Default",
+  save_tip = "Use these values for every new analysis",
+  matches = "Matches your defaults",
+  change = "Change…",
+  change_tip = "Change the values this item is analyzed with",
+  summary = "Analyze with: ",
+  no_target = "Select an audio item in REAPER to analyze it.",
+}
+
+--- Which layout of the canvas form fits avail_w x avail_h: "full" (label | control | Reset rows), "stacked" (each
+--- label above its control) or "summary" (one line beside the button). need = { row_w, stacked_w, full_h, stacked_h,
+--- button_h }: the width of a full row, the heights of the two forms and the button's height with its gap.
+K.form_layout = function(avail_w, avail_h, need)
+  if avail_w >= need.row_w and avail_h >= need.full_h + need.button_h then return "full" end
+  if avail_h >= need.stacked_h + need.button_h then return "stacked" end
+  return "summary"
+end
+
+--- What the canvas form is measured with in the font pushed now (kept per font size, not measured every frame):
+--- the column widths, the Save as Default slot, and the estimated heights of the full and stacked forms with
+--- Advanced closed (h_full, h_stacked) and what Advanced adds when open (adv_full, adv_stacked).
+K.form_canvas_metrics = function()
+  local key = reaper.ImGui_GetFontSize(ctx)
+  local m = K.form_metrics_cache
+  if m and m.key == key then return m end
+  local L = Theme.layout
+  local function text_w(text) return (reaper.ImGui_CalcTextSize(ctx, text)) or 0 end
+  local detection, dsp = K.SETTINGS_SECTIONS[2], K.SETTINGS_SECTIONS[3]
+  local label_w, control_w = 0, Theme.calc_combo_width(ctx, { K.CUSTOM_PRESET })
+  for _, section in ipairs({ detection, dsp }) do
+    for _, row in ipairs(section.rows) do
+      label_w = math.max(label_w, text_w(row.label))
+      if row.labels then control_w = math.max(control_w, Theme.calc_combo_width(ctx, row.labels)) end
+    end
+  end
+  local pad_x = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_FramePadding())
+  local _, spacing_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
+  local cell_x, cell_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_CellPadding())
+  -- The form's border (ChildFlags_Borders) turns on the window padding inside it: counted on every side
+  local win_x, win_y = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+  local frame_h = reaper.ImGui_GetFrameHeight(ctx)
+  local fhs = reaper.ImGui_GetFrameHeightWithSpacing(ctx)
+  local line_h = reaper.ImGui_GetTextLineHeight(ctx) + spacing_y
+  local reset_w = text_w("Reset") + L.md * 2
+  local save_w = text_w(K.FORM_COPY.save) + pad_x * 2
+  local table_row_h = frame_h + cell_y * 2
+  -- The header: the divider (spacing, label, separator, spacing) and the count line under it, then the reason line
+  local head_h = spacing_y * 4 + frame_h + 1 + line_h + line_h
+  local n_det, n_dsp = #detection.rows, #dsp.rows
+  m = {
+    key = key, label_w = label_w, control_w = control_w, reset_w = reset_w, frame_h = frame_h,
+    save_w = save_w, change_w = text_w(K.FORM_COPY.change) + pad_x * 2,
+    slot_w = math.max(save_w, text_w(K.FORM_COPY.matches)),
+    -- Three table columns, each with its L.md gap and the cells' padding on both sides
+    row_w = label_w + control_w + reset_w + L.md * 3 + cell_x * 6 + win_x * 2,
+    stacked_w = math.max(label_w, Theme.calc_combo_width(ctx, { K.CUSTOM_PRESET }) + L.sm + reset_w) + win_x * 2,
+    h_full = head_h + n_det * table_row_h + spacing_y + fhs + win_y * 2,
+    adv_full = n_dsp * table_row_h + spacing_y,
+    h_stacked = head_h + n_det * (line_h + fhs) + fhs + fhs + win_y * 2,
+    adv_stacked = n_dsp * (line_h + fhs),
+  }
+  K.form_metrics_cache = m
+  return m
+end
+
+--- The layout of the canvas form for a canvas avail_w x avail_h whose button takes button_h (with its gap), the
+--- width the form takes in it, its height and, when it scrolls, the height it is held to (else nil). When only the
+--- open Advanced fold keeps the form from fitting, the form keeps the layout it has with the fold closed and
+--- scrolls inside the room there is (the fold stays open: the user opened it).
+K.form_canvas_plan = function(avail_w, avail_h, button_h)
+  local m = K.form_canvas_metrics()
+  local function need(open)
+    return { row_w = m.row_w, stacked_w = m.stacked_w, button_h = button_h,
+      full_h = m.h_full + (open and m.adv_full or 0), stacked_h = m.h_stacked + (open and m.adv_stacked or 0) }
+  end
+  local open = K.form_adv_open == true
+  local layout = K.form_layout(avail_w, avail_h, need(open))
+  local max_h = nil
+  if layout == "summary" and open then
+    local closed = K.form_layout(avail_w, avail_h, need(false))
+    if closed ~= "summary" then
+      layout = closed
+      max_h = math.max(avail_h - button_h - Theme.layout.lg, 1)   -- and a margin under the button
+    end
+  end
+  local form_w = layout == "full" and m.row_w or math.max(math.min(avail_w, m.row_w), 1)
+  -- Its height: what it took when last drawn the same way, else the estimate
+  local last = K.form_canvas_last
+  local form_h
+  if max_h then form_h = max_h
+  elseif layout == "full" then form_h = m.h_full + (open and m.adv_full or 0)
+  elseif layout == "stacked" then form_h = m.h_stacked + (open and m.adv_stacked or 0)
+  else form_h = 0 end
+  if not max_h and last and last.layout == layout and last.adv == open and not last.scroll and (last.h or 0) > 0
+      and layout ~= "summary" then
+    form_h = last.h
+  end
+  return layout, form_w, form_h, max_h
+end
+
+--- Whether a child window `key` is dimmed this frame for a modal over it (`open`: the modal is open now). Like
+--- Theme.modal_scrim, the first frame it is seen open is skipped (no dim while the modal may still be hidden), and the
+--- latch is released once it is closed. Pure but for its latch (K.child_dim_seen).
+K.child_dim_seen = {}
+K.child_dim_due = function(key, open)
+  if not open then
+    K.child_dim_seen[key] = nil
+    return false
+  end
+  if not K.child_dim_seen[key] then
+    K.child_dim_seen[key] = true
+    return false
+  end
+  return true
+end
+
+--- Dim the child window being drawn now (call right before its EndChild) while a modal is over it. A modal's scrim
+--- (Theme.modal_scrim) is drawn on its parent window's draw list, and ImGui renders a child window after its
+--- parent's list: without this the child stays bright above the scrim. Fills the child's own rect with the same
+--- palette key (dim_bg) on the child's own draw list.
+K.child_dim = function(key, open)
+  if not K.child_dim_due(key, open) then return end
+  local dl = reaper.ImGui_GetWindowDrawList(ctx)
+  local x, y = reaper.ImGui_GetWindowPos(ctx)
+  local w, h = reaper.ImGui_GetWindowSize(ctx)
+  if not (dl and x and y and w and h) then return end
+  reaper.ImGui_DrawList_PushClipRect(dl, x, y, x + w, y + h, false)
+  reaper.ImGui_DrawList_AddRectFilled(dl, x, y, x + w, y + h, Theme.get_palette().dim_bg)
+  reaper.ImGui_DrawList_PopClipRect(dl)
+end
+
+--- The popup name of the confirm `c` (stable ID after ###: the visible title may carry the item name).
+K.confirm_popup_name = function(c)
+  return c.title .. "###confirm_" .. c.id
+end
+
+--- True while a modal of the main window is open (Settings, Info or a confirm). Call in the main window's own ID
+--- scope: the popup names hash with the ID stack, and the canvas is drawn inside the body table's (its own) scope.
+--- The window asks once per frame before the body (K.window_modal_now) and the canvas form reads that.
+K.window_modal_open = function()
+  local c = state.confirm
+  return reaper.ImGui_IsPopupOpen(ctx, "Settings & Audio Engine##settings_modal")
+    or reaper.ImGui_IsPopupOpen(ctx, "Keyboard Shortcuts & Help##info_modal")
+    or (c ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c)))
+end
+
+--- Save as Default, or "Matches your defaults" in its place while `form` holds the defaults (EP2), right-aligned in
+--- a slot as wide as the wider of the two (K.form_canvas_metrics' slot_w). why (optional): why it is disabled.
+--- Returns true when it was clicked (the caller asks K.form_defaults_request's confirm).
+K.form_save_draw = function(form, id, why)
+  local P = Theme.get_palette()
+  local m = K.form_canvas_metrics()
+  local cur_x = reaper.ImGui_GetCursorPosX(ctx)
+  if K.form_changed_rows(form.values) == 0 then
+    reaper.ImGui_SetCursorPosX(ctx, cur_x + m.slot_w - ((reaper.ImGui_CalcTextSize(ctx, K.FORM_COPY.matches)) or 0))
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, P.text_dim, K.FORM_COPY.matches)
+    return false
+  end
+  reaper.ImGui_SetCursorPosX(ctx, cur_x + m.slot_w - m.save_w)
+  reaper.ImGui_BeginDisabled(ctx, why ~= nil)
+  local clicked = reaper.ImGui_Button(ctx, K.FORM_COPY.save .. "###" .. id, m.save_w, 0)
+  reaper.ImGui_EndDisabled(ctx)
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+    Theme.tooltip(ctx, why or K.FORM_COPY.save_tip)
+  end
+  return clicked and why == nil
+end
+
+--- The analysis modal's form (request_confirm's `form`), at the top of the confirm `c`'s body: the header, the
+--- detection rows, the Advanced fold with Save as Default at its right (under the form when stacked), the DSP rows
+--- when open, then a separator before the consequence lines. Stacked (label above control) when the modal is
+--- narrower than the full rows. Save as Default opens its confirm over this modal (c.nested).
+K.confirm_form_draw = function(c)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local form = c.form
+  local m = K.form_canvas_metrics()
+  local win_x = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_WindowPadding())
+  local content_w = reaper.ImGui_GetContentRegionAvail(ctx) or 0
+  local stacked = content_w < m.row_w - (win_x or 0) * 2
+  local header = K.form_header(form)
+  local head, tail = header:match("^(.-) · (.+)$")
+  Theme.section_divider(ctx, head or header, { color = P.yellow })
+  if tail then reaper.ImGui_TextColored(ctx, P.text_dim, tail) end
+
+  local function save_draw()
+    if K.form_save_draw(form, "modal_save", nil) then
+      c.nested = K.confirm_new(K.form_defaults_request(form.values))
+    end
+  end
+  local b = K.form_binding(form)
+  local opts = {
+    locked = false, stacked = stacked, label_w = m.label_w, control_w = stacked and content_w or m.control_w,
+    reset_w = m.reset_w, reset_hint = K.FORM_COPY.reset_hint, default_reason = K.FORM_COPY.default_reason,
+    id = "modal_detection",
+  }
+  K.form_rows_draw(K.SETTINGS_SECTIONS[2], b, opts)
+  local adv_open
+  if stacked then
+    adv_open = Theme.collapsing_header(ctx, "Advanced##modal_adv")
+  else
+    adv_open = Theme.collapsing_header(ctx, "Advanced##modal_adv",
+      { action_fn = save_draw, close_w = m.slot_w, close_h = m.frame_h, margin = L.sm })
+  end
+  c.form_adv_open = adv_open   -- the fit's key: opening the fold resizes the modal
+  if adv_open then
+    opts.id = "modal_dsp"
+    K.form_rows_draw(K.SETTINGS_SECTIONS[3], b, opts)
+  end
+  if stacked then
+    Theme.right_align(ctx, m.slot_w)
+    save_draw()
+  end
+  -- The consequence lines under a separator, when there are any. Either way an item ends the form: the fold's
+  -- right-hand action leaves the cursor moved with no item after it, and ImGui asks for one before the body ends
+  if #c.body_lines > 0 or (c.list and #c.list > 0) or #c.after_lines > 0 then
+    reaper.ImGui_Dummy(ctx, 0, L.sm)
+    reaper.ImGui_Separator(ctx)
+    reaper.ImGui_Dummy(ctx, 0, L.sm)
+  else
+    reaper.ImGui_Dummy(ctx, 0, 0)
+  end
+end
+
+--- The "Analyze with" form of the empty canvas: a child window at x, y (screen), w wide, over the canvas: the header
+--- (ANALYZE WITH and the changed count), the three rows, the Advanced fold, and Save as Default right-aligned.
+--- layout "full" or "stacked" (K.form_layout). reason (optional): why the form is disabled (no item). While an
+--- analysis runs everything is disabled with K.LOCKED_REASON under the header. max_h (optional): the height it is
+--- held to, scrolling inside (K.form_canvas_plan); else it takes its content's height. Returns the height it took.
+K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
+  local P = Theme.get_palette()
+  local m = K.form_canvas_metrics()
+  local locked = state.is_analyzing == true
+  local why = locked and K.LOCKED_REASON or reason
+  local disabled = why ~= nil
+  local stacked = layout == "stacked"
+  local h = 0
+
+  local function save_draw()
+    if K.form_save_draw(form, "canvas_save", why) then request_confirm(K.form_defaults_request(form.values)) end
+  end
+
+  reaper.ImGui_SetCursorScreenPos(ctx, x, y)
+  -- The form's surface: the canvas bg inside a P.border outline (spec Theme mapping)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ChildBg(), P.bg)
+  reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Border(), P.border)
+  local win_flags = reaper.ImGui_WindowFlags_NoScrollbar() | reaper.ImGui_WindowFlags_NoScrollWithMouse()
+  local child_flags = reaper.ImGui_ChildFlags_AutoResizeY() | reaper.ImGui_ChildFlags_Borders()
+  if max_h then win_flags, child_flags = 0, reaper.ImGui_ChildFlags_Borders() end   -- held to max_h: it scrolls
+  local under_modal = K.window_modal_now == true   -- asked in the main window's scope (K.window_modal_open)
+  local child_open = reaper.ImGui_BeginChild(ctx, "##canvas_form", w, max_h or 0, child_flags, win_flags)
+  -- The border is drawn by BeginChild: P.border is popped at once, so the combos and buttons inside keep the
+  -- theme's own outline
+  reaper.ImGui_PopStyleColor(ctx, 1)
+  if child_open then
+    local content_w = reaper.ImGui_GetContentRegionAvail(ctx)   -- less the scrollbar when it scrolls
+    local header = K.form_header(form)
+    local head, tail = header:match("^(.-) · (.+)$")
+    Theme.section_divider(ctx, head or header, { color = P.yellow })
+    if tail then reaper.ImGui_TextColored(ctx, P.text_dim, tail) end
+    if why then reaper.ImGui_TextColored(ctx, P.text_dim, why) end
+
+    local b = K.form_binding(form)
+    local opts = {
+      locked = disabled, stacked = stacked, label_w = m.label_w, control_w = stacked and content_w or m.control_w,
+      reset_w = m.reset_w, reset_hint = K.FORM_COPY.reset_hint, default_reason = K.FORM_COPY.default_reason,
+      id = "canvas_detection",
+    }
+    K.form_rows_draw(K.SETTINGS_SECTIONS[2], b, opts)
+
+    local adv_open
+    if stacked then
+      adv_open = Theme.collapsing_header(ctx, "Advanced##canvas_adv")
+    else
+      adv_open = Theme.collapsing_header(ctx, "Advanced##canvas_adv",
+        { action_fn = save_draw, close_w = m.slot_w, close_h = m.frame_h, margin = Theme.layout.sm })
+    end
+    K.form_adv_open = adv_open
+    if adv_open then
+      opts.id = "canvas_dsp"   -- the same columns as the rows above, so the controls line up
+      K.form_rows_draw(K.SETTINGS_SECTIONS[3], b, opts)
+    end
+    if stacked then
+      Theme.right_align(ctx, m.slot_w)
+      save_draw()
+    end
+    -- The fold's right-hand action leaves the cursor moved with no item after it: ImGui asks for an item before
+    -- the child ends
+    reaper.ImGui_Dummy(ctx, 0, 0)
+    K.child_dim("canvas_form", under_modal)
+    reaper.ImGui_EndChild(ctx)
+    local _, child_h = reaper.ImGui_GetItemRectSize(ctx)
+    h = child_h or 0
+  end
+  reaper.ImGui_PopStyleColor(ctx, 1)   -- ChildBg
+  return h
+end
+
+--- The summary line of a short canvas: dim "Analyze with: Soprano · ..." (shortened to text_w with the whole line
+--- in its tooltip) and Change… at x, centred on a row row_h tall at y. Returns the width it took. Change… opens the
+--- analysis modal (K.analyze_change_request), or the batch modal seeded with the form when the canvas button is a
+--- batch (is_batch). reason (optional): why Change… is disabled, its tooltip then.
+K.form_summary_draw = function(form, x, y, text_w, row_h, reason, is_batch)
+  local disabled = reason ~= nil
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local m = K.form_canvas_metrics()
+  local row_y = y + math.floor((row_h - m.frame_h) * 0.5)
+  local used = 0
+  if text_w > 0 then
+    local full = K.FORM_COPY.summary .. K.form_summary(form.values)
+    local shown = fit_text(ctx, full, text_w, "canvas_summary")
+    reaper.ImGui_SetCursorScreenPos(ctx, x, row_y)
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, P.text_dim, shown)
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then Theme.tooltip(ctx, full) end
+    used = ((reaper.ImGui_CalcTextSize(ctx, shown)) or 0) + L.md
+  end
+  reaper.ImGui_SetCursorScreenPos(ctx, x + used, row_y)
+  reaper.ImGui_BeginDisabled(ctx, disabled)
+  local clicked = reaper.ImGui_Button(ctx, K.FORM_COPY.change .. "###change", m.change_w, 0)
+  reaper.ImGui_EndDisabled(ctx)
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+    Theme.tooltip(ctx, reason or K.FORM_COPY.change_tip)
+  end
+  if clicked and not disabled then
+    if is_batch then K.batch_request(nil, form) else request_confirm(K.analyze_change_request(form)) end
+  end
+  return used + m.change_w
+end
+
+--- Whether the canvas shows the "Analyze with" form instead of notes (not analysed, no pitched note found, or an
+--- analysis running), and whether it is the no-notes canvas (title, hint and Re-Analyze; never while analysing).
+K.empty_canvas = function()
+  local running = state.is_analyzing == true
+  local shows = #state.results == 0 or state.analysis_empty == true or running
+  return shows, shows and #state.results > 0 and not running
+end
+
+--- The form the empty canvas shows: the open item's (state.analysis_form), or, with no item to analyse, a form of
+--- the defaults that is shown disabled with why. A batch without an open item gets a form of its own, kept here
+--- (never in state.analysis_form) until there is an open item again. While an analysis runs: a form of the values it
+--- runs with (state.analysis_params: a Re-Analyze from the modal or a batch may run with others than the open
+--- form's), locked with K.LOCKED_REASON. Returns the form and the reason (nil when it can be edited).
+K.canvas_form = function(has_target, is_batch)
+  local params = state.is_analyzing and state.analysis_params
+  if params then
+    local running = K.canvas_running_form
+    if not running or running.params ~= params then
+      running = { guid = "running", edited = {}, source = "running", params = params, values = {} }
+      for _, key in ipairs(K.ANALYSIS_KEYS) do running.values[key] = params[key] end
+      K.canvas_running_form = running
+    end
+    return running, K.LOCKED_REASON
+  end
+  K.canvas_running_form = nil
+  local form = state.analysis_form
+  if has_target and form and form.guid == state.target_take_guid then
+    K.canvas_batch_form = nil
+    return form, nil
+  end
+  if is_batch then
+    K.canvas_batch_form = K.canvas_batch_form or K.form_new("batch", nil)
+    return K.canvas_batch_form, nil
+  end
+  return K.form_new(nil, nil), K.FORM_COPY.no_target
+end
+
+--- The width of the Analyze button for `label`, measured in the context it is drawn in.
+K.analyze_btn_w = function(draw_ctx, label)
+  local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, K.ANALYZE_BTN)
+  local btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + K.ANALYZE_BTN.pad_x * 2
+  Theme.pop_button_preset(draw_ctx, var_count, pushed_font)
+  return btn_w
+end
+
 
 --- Ask before restoring every setting of a Settings section to its DEFAULTS value. These settings are outside the
 --- undo history (and are saved), so the confirm names how many change and which; the confirm is the only modal, so the
@@ -10676,11 +11475,12 @@ K.request_settings_reset = function(section)
   -- names and the count come from exactly the sequence on_confirm runs
   local names = {}
   local saved = {}
+  local b = K.settings_binding()
   for k, v in pairs(state) do saved[k] = v end
   for _, row in ipairs(section.rows) do
-    if not row.is_default() then
+    if not row.is_default(b) then
       names[#names + 1] = row.name or row.label
-      row.reset()
+      row.reset(b)
     end
   end
   for k, v in pairs(saved) do state[k] = v end
@@ -10698,12 +11498,12 @@ K.request_settings_reset = function(section)
     on_confirm = function()
       local done = 0
       for _, row in ipairs(section.rows) do
-        if not row.is_default() then
-          row.reset()
+        if not row.is_default(b) then
+          row.reset(b)
           done = done + 1
         end
       end
-      K.save_settings("engine")
+      b.commit()
       set_status(string.format("Reset %d %s to %s (not undoable)", done, plural(done, "setting", "settings"),
         plural(done, "its default", "their defaults")))
     end,
@@ -10736,10 +11536,11 @@ end
 --- Keep a dialog inside the window it opens from. A dialog larger than that window becomes an OS window of its
 --- own, centred on the (small) docked window, and can run off the screen with its end out of reach; capped to the
 --- window it stays inside and longer content scrolls. Call right before BeginPopupModal, in the host window's scope.
+--- host_w, host_h (optional): the size of that window, when it is not the one drawing now (a confirm over a confirm).
 --- Returns the largest width and height the dialog may take.
-function K.fit_modal(modal_ctx)
+function K.fit_modal(modal_ctx, host_w, host_h)
   local L = Theme.layout
-  local host_w, host_h = reaper.ImGui_GetWindowSize(modal_ctx)
+  if not (host_w and host_h) then host_w, host_h = reaper.ImGui_GetWindowSize(modal_ctx) end
   local max_w, max_h = math.max((host_w or 0) - L.xl * 2, L.xxxl), math.max((host_h or 0) - L.xl * 2, L.xxxl)
   reaper.ImGui_SetNextWindowSizeConstraints(modal_ctx, 0, 0, max_w, max_h)
   return max_w, max_h
@@ -10778,60 +11579,17 @@ local function draw_settings_modal()
         if row.fit then control_w = math.max(control_w, row.fit()) end
       end
     end
-    local reset_w = text_w("Reset") + L.md * 2
-    local section_reset_w = text_w("Reset section") + L.md * 2
-    local form_flags = reaper.ImGui_TableFlags_SizingFixedFit() | reaper.ImGui_TableFlags_NoHostExtendX()
-    local fixed = reaper.ImGui_TableColumnFlags_WidthFixed()
+    local opts = {
+      locked = locked, label_w = label_w, control_w = control_w, reset_w = text_w("Reset") + L.md * 2,
+      section_reset_w = text_w("Reset section") + L.md * 2,
+      reset_hint = "Restore the default value", default_reason = "Already at its default",
+      section_hint = "Restore every setting of this section to its default",
+      section_default_reason = "Already at its defaults",
+    }
+    local binding = K.settings_binding()
     local section_to_reset = nil
-
-    --- A text button that is disabled, dim and explained when `reason` is set (the tooltip waits like every tooltip and
-    --- also shows on the disabled button). Returns true when it was clicked.
-    local function reset_button(label, id, w, reason, hint)
-      reaper.ImGui_BeginDisabled(ctx, reason ~= nil)
-      if reason then reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim) end
-      local clicked = reaper.ImGui_Button(ctx, label .. "###" .. id, w, 0)
-      if reason then reaper.ImGui_PopStyleColor(ctx, 1) end
-      reaper.ImGui_EndDisabled(ctx)
-      if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-        Theme.tooltip(ctx, locked and K.LOCKED_REASON or reason or hint)
-      end
-      return clicked and not locked
-    end
-
-    --- One section as a form: a row per setting (label | control | Reset), then the section's own Reset.
     local function draw_form(section)
-      if not reaper.ImGui_BeginTable(ctx, "##settings_form_" .. section.id, 3, form_flags) then return end
-      reaper.ImGui_TableSetupColumn(ctx, "##label", fixed, label_w + L.md)
-      reaper.ImGui_TableSetupColumn(ctx, "##control", fixed, control_w + L.md)
-      reaper.ImGui_TableSetupColumn(ctx, "##reset", fixed, reset_w + L.md)
-      reaper.ImGui_BeginDisabled(ctx, locked)
-      local differing = 0
-      for _, row in ipairs(section.rows) do
-        reaper.ImGui_TableNextRow(ctx)
-        reaper.ImGui_TableSetColumnIndex(ctx, 0)
-        if row.label ~= "" then
-          Theme.align(ctx)
-          reaper.ImGui_Text(ctx, row.label)
-        end
-        reaper.ImGui_TableSetColumnIndex(ctx, 1)
-        row.draw(control_w)
-        reaper.ImGui_TableSetColumnIndex(ctx, 2)
-        local at_default = row.is_default()
-        if not at_default then differing = differing + 1 end
-        if reset_button("Reset", "reset_" .. row.id, reset_w, at_default and "Already at its default" or nil,
-            "Restore the default value") then
-          row.reset()
-          K.save_settings("engine")
-        end
-      end
-      reaper.ImGui_TableNextRow(ctx)
-      reaper.ImGui_TableSetColumnIndex(ctx, 1)
-      if reset_button("Reset section", "reset_section_" .. section.id, section_reset_w,
-          differing == 0 and "Already at its defaults" or nil, "Restore every setting of this section to its default") then
-        section_to_reset = section
-      end
-      reaper.ImGui_EndDisabled(ctx)
-      reaper.ImGui_EndTable(ctx)
+      if K.form_rows_draw(section, binding, opts) then section_to_reset = section end
     end
 
     local engine, detection, dsp = K.SETTINGS_SECTIONS[1], K.SETTINGS_SECTIONS[2], K.SETTINGS_SECTIONS[3]
@@ -10844,6 +11602,8 @@ local function draw_settings_modal()
     draw_form(engine)
 
     Theme.section_divider(ctx, detection.title, { color = P.yellow })
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, P.text_dim, K.ANALYSIS_DEFAULTS_NOTE)
     draw_form(detection)
 
     reaper.ImGui_Dummy(ctx, 0, L.sm)
@@ -11223,15 +11983,17 @@ K.confirm_targets = function(c, P, L)
   end
 end
 
-local function draw_confirm_modal()
-  local c = state.confirm
-  if not c then return end
+--- Draw the confirm `c` (K.confirm_new). host = { x, y, w, h } of the window it is kept inside (K.fit_modal) and
+--- centred on when it fits its content; nil: the window drawing now. gone() runs once the modal has closed (it
+--- drops `c`). A nested confirm (c.nested: Save as Default from the analysis form) is drawn inside this modal's
+--- scope, over it, kept inside the same host window.
+K.confirm_draw = function(c, host, gone)
   local cons = K.confirm_consequence(c)
   local P = Theme.get_palette()
   local L = Theme.layout
   local size = c.size or L.modal_sm
   -- Stable ID after ###: the visible title may carry the item name
-  local popup_name = c.title .. "###confirm_" .. c.id
+  local popup_name = K.confirm_popup_name(c)
 
   if c.open_pending then
     reaper.ImGui_OpenPopup(ctx, popup_name)
@@ -11241,10 +12003,18 @@ local function draw_confirm_modal()
 
   -- The window the confirm opens from: a confirm sized to its content is centred on it again at every resize (the
   -- place it first opens at is not reliable for a popup that is not on screen yet)
-  local host_x, host_y = reaper.ImGui_GetWindowPos(ctx)
-  local host_w, host_h = reaper.ImGui_GetWindowSize(ctx)
-  Theme.center_next_window(ctx, size.w, size.h, reaper.ImGui_Cond_Appearing())
-  local _, max_h = K.fit_modal(ctx)
+  local host_x, host_y, host_w, host_h
+  if host then
+    host_x, host_y, host_w, host_h = host.x, host.y, host.w, host.h
+  else
+    host_x, host_y = reaper.ImGui_GetWindowPos(ctx)
+    host_w, host_h = reaper.ImGui_GetWindowSize(ctx)
+  end
+  -- The analysis modal is at least as wide as its form's full rows (K.form_canvas_metrics), the fit permitting
+  local open_w = size.w
+  if c.form then open_w = math.max(open_w, K.form_canvas_metrics().row_w) end
+  Theme.center_next_window(ctx, open_w, size.h, reaper.ImGui_Cond_Appearing())
+  local _, max_h = K.fit_modal(ctx, host_w, host_h)
   if c.fit_size then   -- sized to its content (asked last frame): same width, centred on the window it opens from
     reaper.ImGui_SetNextWindowPos(ctx, c.fit_size.x, c.fit_size.y)
     reaper.ImGui_SetNextWindowSize(ctx, c.fit_size.w, c.fit_size.h)
@@ -11262,7 +12032,15 @@ local function draw_confirm_modal()
   local confirm_label = (cons and cons.confirm_label) or c.confirm_label
   local blocked = cons and cons.reason or nil
   if visible then
-    if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) or not open then
+    -- HC5, innermost first: an open combo or the Save as Default confirm over this modal takes Esc (and Enter)
+    -- before the modal does; a field being edited keeps Enter
+    local over = reaper.ImGui_IsPopupOpen(ctx, "", reaper.ImGui_PopupFlags_AnyPopupId())
+    if (not over and reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape())) or not open then
+      reaper.ImGui_CloseCurrentPopup(ctx)
+    end
+    if K.confirm_enter(c) and not over and not blocked and not reaper.ImGui_IsAnyItemActive(ctx)
+       and (reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Enter()) or reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_KeypadEnter())) then
+      confirmed = true
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
 
@@ -11285,8 +12063,11 @@ local function draw_confirm_modal()
     local body_h = K.confirm_body_h(avail_h, btn_h, L.lg, reason_h, spacing_y or 0)
 
     local content_h = nil
+    -- Save as Default's confirm open over this one: the body child (the form) is dimmed with it (K.child_dim)
+    local nested_open = c.nested ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c.nested))
     if reaper.ImGui_BeginChild(ctx, "##confirm_body", 0, body_h, 0) then
       local top_y = reaper.ImGui_GetCursorPosY(ctx) or 0
+      if c.form then K.confirm_form_draw(c) end
       for i, line in ipairs(c.body_lines) do
         if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.sm) end
         reaper.ImGui_TextWrapped(ctx, line)
@@ -11307,13 +12088,14 @@ local function draw_confirm_modal()
       -- body's padding below is the same as above it
       local end_y = reaper.ImGui_GetCursorPosY(ctx)
       if end_y then content_h = end_y - (spacing_y or 0) + top_y end
+      K.child_dim("confirm_body_" .. c.id, nested_open)
       reaper.ImGui_EndChild(ctx)
     end
     -- A confirm sized to its content: the body is as tall as what it draws (up to the most the window it opens from
     -- allows), the footer right under it; asked for next frame, before the modal begins
     if c.fit and content_h then
       local key = tostring(c.cons_key) .. "|" .. tostring(c.checklist and #c.checklist.rows or 0) .. "|"
-        .. tostring(math.floor((avail_w or 0) + 0.5))
+        .. tostring(math.floor((avail_w or 0) + 0.5)) .. "|" .. tostring(c.form_adv_open)
       if K.confirm_fit_due(c, key, body_h, content_h) then
         local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
         local win_x, win_y = reaper.ImGui_GetWindowPos(ctx)
@@ -11347,18 +12129,25 @@ local function draw_confirm_modal()
     reaper.ImGui_SameLine(ctx, 0, L.md)
 
     if blocked then reaper.ImGui_BeginDisabled(ctx) end
-    K.push_danger(P)
+    if not c.safe then K.push_danger(P) end
     if reaper.ImGui_Button(ctx, confirm_label .. "###confirm_ok", confirm_w, 0) and not blocked then
       confirmed = true
       reaper.ImGui_CloseCurrentPopup(ctx)
     end
-    K.pop_danger()
+    if not c.safe then K.pop_danger() end
     if blocked then
       reaper.ImGui_EndDisabled(ctx)
       if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()
           | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
         Theme.tooltip(ctx, blocked)
       end
+    end
+
+    -- Save as Default's confirm, over this modal: its scrim (Theme.modal_scrim, on this modal's draw list) dims this
+    -- modal's frame and footer; the body child, drawn above that list, is dimmed by K.child_dim. It stays inside the
+    -- window this modal is kept in
+    if c.nested then
+      K.confirm_draw(c.nested, { x = host_x, y = host_y, w = host_w, h = host_h }, function() c.nested = nil end)
     end
 
     reaper.ImGui_EndPopup(ctx)
@@ -11368,14 +12157,22 @@ local function draw_confirm_modal()
   -- The action runs once, after the modal was closed and its style / popup stacks are balanced
   if confirmed then
     c.confirmed = true
-    c.on_confirm(c.checked, c.ticked)
+    if c.form then c.on_confirm(c.form.values) else c.on_confirm(c.checked, c.ticked) end
   end
 
   if c.opened and not reaper.ImGui_IsPopupOpen(ctx, popup_name) then
     Theme.modal_scrim(ctx, popup_name) -- not open any more: releases the scrim's first-frame latch
-    state.confirm = nil
+    c.nested = nil
+    gone()
     if not c.confirmed and c.on_cancel then c.on_cancel() end
   end
+end
+
+local function draw_confirm_modal()
+  local c = state.confirm
+  if not c then return end
+  -- An on_confirm that asks for a new confirm replaces this one: only this one is dropped
+  K.confirm_draw(c, nil, function() if state.confirm == c then state.confirm = nil end end)
 end
 
 --- Number of notes the note-level commands (Reset, R / Delete) act on: the selection, if any.
@@ -11500,47 +12297,140 @@ K.note_action = function(id, note_idx)
   end
 end
 
---- Header Analyze / Re-Analyze: analyze right away, unless it would discard the user's edits.
+--- A copy of the analysis form `form` (K.form_new) for a modal: its edits never reach `form`.
+K.form_copy = function(form)
+  local copy = { guid = form.guid, source = form.source, seed = form.seed, values = {}, edited = {} }
+  for k, v in pairs(form.values) do copy.values[k] = v end
+  for k, v in pairs(form.edited) do copy.edited[k] = v end
+  return copy
+end
+
+--- The analysis form of the open item: state.analysis_form when it is the open item's, else nil.
+K.target_form = function()
+  local form = state.analysis_form
+  if form and form.guid == state.target_take_guid then return form end
+  return nil
+end
+
+--- The Re-Analyze… modal (a request_confirm request without on_confirm) for an item named `name` whose notes hold
+--- `edited` edits, seeded with a copy of `form`.
+K.reanalyze_request = function(edited, name, form)
+  local body
+  if edited > 0 then
+    body = {
+      string.format("This replaces the detected notes and discards your edits to %d %s.",
+        edited, plural(edited, "note", "notes")),
+      K.REANALYZE_VALUES_LINE,
+      string.format("%s+Z restores them once the analysis has finished.", K.MOD_LABEL),
+    }
+  else
+    body = { K.REANALYZE_VALUES_LINE }
+  end
+  return {
+    id = "reanalyze",
+    title = string.format("Re-analyze %s?", name),
+    form = K.form_copy(form),
+    body_lines = body,
+    confirm_label = "Re-Analyze",
+    fit = true,
+    safe = edited == 0,
+  }
+end
+
+--- "…" > Analyze / Re-Analyze…: an item without notes is analysed at once with the canvas form's values (they are
+--- on screen); an analysed item opens the Re-Analyze… modal, seeded from its own stored values (else the defaults).
 K.request_analyze = function()
-  local edited = count_modified_notes()
-  if edited == 0 then
-    start_analysis()
-    -- No confirm: an item whose values differ from the defaults is told so once the new analysis is written
+  local form = K.target_form()
+  if not (state.notes and #state.notes > 0) then
+    start_analysis(form and form.values or nil)
+    -- No modal: an item whose values differ from the defaults is told so once the new analysis is written
     if state.is_analyzing and K.item_off_defaults(state.session_takes[state.target_take_guid or ""]) > 0 then
       K.reanalyze_status_guid = state.target_take_guid
     end
     return
   end
+  local edited = count_modified_notes()
   local guid = state.target_take_guid
   local name = state.target_take_name or "this item"
-  request_confirm({
-    id = "reanalyze",
-    title = string.format("Re-analyze %s?", name),
-    body_lines = {
-      string.format("This replaces the detected notes and discards your edits to %d %s.",
-        edited, plural(edited, "note", "notes")),
-      K.REANALYZE_VALUES_LINE,
-      string.format("%s+Z restores them once the analysis has finished.", K.MOD_LABEL),
-    },
-    confirm_label = "Re-Analyze",
-    on_confirm = function()
-      -- The modal names one item: never analyze another one if the target changed meanwhile
+  local req = K.reanalyze_request(edited, name, form or K.form_new(guid, state.session_takes[guid or ""]))
+  req.on_confirm = function(values)
+    -- The modal names one item: never analyze another one if the target changed meanwhile
+    if state.target_take_guid ~= guid then
+      set_status("The active item changed. Nothing was re-analyzed.")
+      return
+    end
+    start_analysis(values)
+    if state.is_analyzing then
+      if edited > 0 then
+        set_status(string.format("Re-analyzing %s…", name))
+      elseif K.item_off_defaults(state.session_takes[guid or ""]) > 0 then
+        K.reanalyze_status_guid = guid   -- told once the new analysis is written
+      end
+    end
+  end
+  request_confirm(req)
+end
+
+--- Change… (the short canvas's summary line): the analysis modal for the open item, seeded with a copy of the
+--- canvas form `form`. Its on_confirm puts the values back into the canvas form (the changed keys marked edited, so
+--- they stay when the defaults change) and analyses the item with them. With several items selected the canvas
+--- button is a batch: Change… opens the batch modal instead (K.batch_request with that seed).
+K.analyze_change_request = function(form)
+  local guid = state.target_take_guid
+  local name = state.target_take_name or "this item"
+  return {
+    id = "analyze",
+    title = string.format("Analyze %s", name),
+    form = K.form_copy(form),
+    confirm_label = "Analyze",
+    fit = true,
+    safe = true,
+    on_confirm = function(values)
       if state.target_take_guid ~= guid then
-        set_status("The active item changed. Nothing was re-analyzed.")
+        set_status("The active item changed. Nothing was analyzed.")
         return
       end
-      start_analysis()
-      if state.is_analyzing then
-        set_status(string.format("Re-analyzing %s…", name))
+      local target = state.analysis_form
+      if target and target.guid == guid then
+        for _, key in ipairs(K.ANALYSIS_KEYS) do
+          if values[key] ~= target.values[key] then
+            target.values[key] = values[key]
+            target.edited[key] = true
+          end
+        end
       end
+      start_analysis(values)
     end,
-  })
+  }
+end
+
+--- The batch modal ("…" > Analyze Selected Items (N)…) for `entries` (K.batch_selection's takes), a request_confirm
+--- request: a form of its own (never state.analysis_form) seeded from the defaults, or a copy of `seed` (a form),
+--- and, when any item holds notes, K.batch_confirm's lines and list. on_confirm(values) starts the batch with them.
+K.batch_modal_request = function(entries, seed)
+  local n = #entries
+  local warn = K.batch_confirm(entries) or {}
+  local req = {
+    id = "batch",
+    title = string.format("Analyze %d items", n),
+    form = seed and K.form_copy(seed) or K.form_new("batch", nil),
+    body_lines = warn.body_lines or {},
+    list = warn.list,
+    after_lines = warn.after_lines,
+    confirm_label = string.format("Analyze %d Items", n),
+    fit = true,
+    safe = warn.list == nil,
+  }
+  req.on_confirm = function(values) K.batch_start(entries, values) end
+  return req
 end
 
 --- Analyze All Selected Items (the canvas button with two or more audio items selected, "…" > Analyze Selected
---- Items): the selection is read now and frozen; when any of its items holds notes the user is asked once, with
---- those items listed, before anything starts.
-K.batch_request = function()
+--- Items (N)…): the selection is read now and frozen. values (the canvas button: the canvas form's values): when any
+--- item holds notes the user is asked once, with those items listed, before anything starts. Without values ("…"):
+--- the batch modal (K.batch_modal_request) picks them, seeded from the defaults or a copy of the form `seed`
+--- (Change… on a short canvas), and names the items that hold notes.
+K.batch_request = function(values, seed)
   if state.is_analyzing or K.batch then return end
   local sel = K.batch_selection()
   if #sel.takes == 0 then
@@ -11554,18 +12444,23 @@ K.batch_request = function()
       entry.has_notes = true
     end
   end
-  local req = K.batch_confirm(sel.takes)
-  if not req then
-    K.batch_start(sel.takes)
-    return
+  local req
+  if values then
+    req = K.batch_confirm(sel.takes)
+    if not req then
+      K.batch_start(sel.takes, values)
+      return
+    end
+    req.on_confirm = function() K.batch_start(sel.takes, values) end
+  else
+    req = K.batch_modal_request(sel.takes, seed)
   end
-  for _, row in ipairs(req.list) do
+  for _, row in ipairs(req.list or {}) do
     -- Where the item is: its track and its start as REAPER's ruler shows it (items often share a name)
     local at = reaper.format_timestr_pos(row.pos or 0, "", -1) or ""
     row.where = (row.track ~= nil and row.track ~= "") and (row.track .. " · " .. at) or at
   end
   req.id = "batch"
-  req.on_confirm = function() K.batch_start(sel.takes) end
   request_confirm(req)
 end
 
@@ -12732,15 +13627,22 @@ do
         if batch and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           Theme.tooltip(ctx, K.CANCEL_BATCH_TIP)
         end
-      elseif reaper.ImGui_MenuItem(ctx, hs.analyze_label .. "###more_analyze",
-          (not hs.has_target) and HDR_REASON_NO_TARGET or nil, false, hs.has_target) then
-        K.request_analyze()
+      else
+        if reaper.ImGui_MenuItem(ctx, hs.analyze_label .. "###more_analyze",
+            (not hs.has_target) and HDR_REASON_NO_TARGET or nil, false, hs.has_target) then
+          K.request_analyze()
+        end
+        -- Re-Analyze…: what the item was analysed with (ST1)
+        local tip = hs.has_notes and K.analyzed_with_tip(state.session_takes[state.target_take_guid or ""]) or nil
+        if tip and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+          Theme.tooltip(ctx, tip)
+        end
       end
       -- Analyze Selected Items: always in the menu; with fewer than two audio items selected in REAPER, or while
       -- an analysis runs, it is disabled with the reason beside it
       local peek = K.batch_peek(reaper.time_precise())
       local batch_reason = analyzing and K.REASON_ANALYZING or (peek.n < 2 and K.REASON_BATCH_FEW or nil)
-      local batch_label = batch_reason and "Analyze Selected Items" or string.format("Analyze Selected Items (%d)", peek.n)
+      local batch_label = batch_reason and "Analyze Selected Items" or string.format("Analyze Selected Items (%d)…", peek.n)
       if reaper.ImGui_MenuItem(ctx, batch_label .. "###more_batch", batch_reason, false, batch_reason == nil) then
         K.batch_request()
       end
@@ -12834,7 +13736,7 @@ do
     local hs = {
       P = P, s = s, docked = docked, badge_w = badge_w, margin = right_margin,
       has_target = has_target, has_notes = has_notes, target_take = target_take, target_item = target_item,
-      analyze_label = has_notes and "Re-Analyze" or "Analyze",
+      analyze_label = has_notes and "Re-Analyze…" or "Analyze",
       reset_label = reset_label, reset_sel_n = reset_sel_n, reset_note_n = reset_note_n,
     }
     -- The Values units draw themselves (see TOP BAR CONTROLS)
@@ -13837,6 +14739,10 @@ local function loop_body()
 
   -- Follow REAPER's undo / redo / project changes (one cheap count check per frame)
   sync_with_project()
+  local form_guid = state.target_take_guid
+  if form_guid and (not state.analysis_form or state.analysis_form.guid ~= form_guid) then   -- HI5: only on a target change
+    K.form_sync(form_guid, state.session_takes[form_guid])
+  end
   K.analysis_tick()
   K.stale_check_step(ctx)
 
@@ -13975,6 +14881,8 @@ local function loop_body()
       K.toggle_shortcuts()
     end
 
+    -- Asked here, in the window's own ID scope, for the canvas form (drawn inside the body table, see K.child_dim)
+    K.window_modal_now = K.window_modal_open()
     local split_drawn = false
     if total_h > 80 then
       if state.sidebar_open and sidebar_fits then

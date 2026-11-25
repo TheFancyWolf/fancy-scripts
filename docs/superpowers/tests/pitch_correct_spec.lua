@@ -2486,7 +2486,7 @@ test("batch_copy", function()
   eq(b, "3 already have notes. You will be asked before they are replaced.")
   a, b = K.batch_lines({ n = 2, skipped = 1, with_notes = 1, target_in = true })
   eq(a, "2 audio items selected (1 other item is skipped)."); eq(b, "1 already has notes. You will be asked before it is replaced.")
-  eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another. One undo step for all of them.")
+  eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another.\n\nOne undo step for all of them.")
   eq(K.batch_undo_label(12), "Analyze Pitch (12 items)"); eq(K.batch_undo_label(1), "Analyze Pitch (1 item)")
 end)
 
@@ -2745,6 +2745,103 @@ test("take_json_is_what_save_writes", function() with_write_stubs({}, function(r
   if not ok then error(err, 0) end
   eq(rec.stored.a, json)
 end) end)
+
+test("analysis_defaults_copies_state", function()
+  local d = S.K.analysis_defaults()
+  eq(d.min_freq, S.state.min_freq); eq(d.hop_size, S.state.hop_size)
+  d.min_freq = 1; eq(S.state.min_freq ~= 1, true, "a copy, not state")
+end)
+test("analysis_values_accepts_good", function()
+  local v = S.K.analysis_values({ min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 })
+  eq(v.max_freq, 1200); eq(v.block_size, 2048)
+end)
+test("analysis_values_rejects_bad", function()
+  local K = S.K
+  eq(K.analysis_values(nil), nil)
+  eq(K.analysis_values({ min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 512, hop_size = 1024 }), nil, "hop > block")
+  eq(K.analysis_values({ min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 1000, hop_size = 256 }), nil, "block not listed")
+  eq(K.analysis_values({ min_freq = "250", max_freq = 1200, threshold = 0.25, block_size = 1024, hop_size = 256 }), nil, "string")
+  eq(K.analysis_values({ min_freq = 5, max_freq = 1200, threshold = 0.25, block_size = 1024, hop_size = 256 }), nil, "Hz below limit")
+  eq(K.analysis_values({ min_freq = 1200, max_freq = 1200, threshold = 0.25, block_size = 1024, hop_size = 256 }), nil, "min >= max")
+end)
+test("take_json_round_trips_analysis", function()
+  local v = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+  local json = S.K.take_json({ guid = "{a}", results = {}, notes = {}, analysis = v })
+  eq(json:find('"analysis"') ~= nil, true)
+  for _, part in ipairs({ '"min_freq":250', '"max_freq":1200', '"threshold":0.25', '"block_size":2048', '"hop_size":256' }) do
+    eq(json:find(part, 1, true) ~= nil, true, "stored text holds " .. part)
+  end
+end)
+test("analysis_begin_snapshots_opts_values", function()
+  local K, st = S.K, S.state
+  local saved = { K.open_accessor, st.block_size, st.hop_size, st.min_freq, st.target_take_guid, st.target_take_name,
+    st.session_takes, st.separation }
+  local names = { "GetTakeName", "GetMediaItemInfo_Value", "new_array", "GetSetMediaItemTakeInfo_String" }
+  local old = {}
+  for _, n in ipairs(names) do old[n] = reaper[n] end
+  K.open_accessor = function() return "acc" end
+  reaper.GetTakeName = function() return "t" end
+  reaper.GetMediaItemInfo_Value = function() return 2 end
+  reaper.new_array = function() return {} end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{z}" end return true, "" end
+  local before = { st.block_size, st.hop_size, st.min_freq }
+  local ok, err = pcall(function()
+    local began = K.analysis_begin("take", "item", { sample_rate = 48000, defer_envelope = true,
+      values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 } })
+    eq(began, true)
+    eq(st.analysis_params.min_freq, 250); eq(st.analysis_params.block_size, 2048)
+    eq(st.analysis_params.hop_size, 256); eq(st.analysis_params.max_freq, 1200); eq(st.analysis_params.threshold, 0.25)
+    eq(st.min_freq, before[3], "state.min_freq unchanged"); eq(st.block_size, before[1]); eq(st.hop_size, before[2])
+    -- no values: the defaults, copied from state
+    K.analysis_begin("take", "item", { sample_rate = 48000, defer_envelope = true })
+    eq(st.analysis_params.min_freq, st.min_freq)
+  end)
+  K.open_accessor = saved[1]
+  for _, n in ipairs(names) do reaper[n] = old[n] end
+  st.is_analyzing, st.analysis_params, st.accessor, st.buffer = false, nil, nil, nil
+  st.target_take_guid, st.target_take_name, st.separation = saved[5], saved[6], saved[8]
+  if not ok then error(err, 0) end
+end)
+test("load_take_data_drops_bad_analysis", function()
+  local K, st = S.K, S.state
+  local good = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+  local bad = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 512, hop_size = 1024 }
+  local raw, changes = "", 1
+  reaper.GetProjectStateChangeCount = function() return changes end
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
+  reaper.GetSetMediaItemTakeInfo_String = function(_, key)
+    if key == "GUID" then return true, "{a}" end
+    return true, raw
+  end
+  local saved = { st.target_take_guid, st.last_change_count, #st.session_order }
+  st.target_take_guid = "{other}"
+  local function load(a)
+    st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"] = nil, nil, nil
+    while #st.session_order > saved[3] do table.remove(st.session_order) end
+    raw = K.take_json({ guid = "{a}", name = "A", results = {}, notes = {}, item_len = 1, sample_rate = 48000, analysis = a })
+    st.undone_takes["{a}"] = 1
+    changes = changes + 1
+    st.last_change_count = changes - 1
+    K.drop_project_cache()
+    S.sync_with_project()
+    return st.session_takes["{a}"]
+  end
+  local ok, err = pcall(function()
+    local d = load(good)
+    eq(type(d), "table", "loaded"); eq(d.analysis.block_size, 2048); eq(d.analysis.min_freq, 250)
+    eq(d.analysis.hop_size, 256); eq(d.analysis.threshold, 0.25); eq(d.analysis.max_freq, 1200)
+    d = load(bad)
+    eq(type(d), "table", "loaded"); eq(d.analysis, nil, "hop > block is not recorded")
+    d = load(nil)
+    eq(type(d), "table", "loaded"); eq(d.analysis, nil)
+  end)
+  reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
+  st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"], st.undone_takes["{a}"] = nil, nil, nil, nil
+  while #st.session_order > saved[3] do table.remove(st.session_order) end
+  st.target_take_guid, st.last_change_count = saved[1], saved[2]
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
 
 test("batch_write_leaves_an_item_whose_envelope_cannot_be_made", function() with_write_stubs({}, function(rec)
   local written = S.K.batch_write(done2())
@@ -4473,6 +4570,605 @@ test("confirm_fit_hidden_until_measured", function()
   eq(K.confirm_fit_hidden({ fit = true, fit_shown = true }), false, "measured with no resize asked: drawn")
   eq(K.confirm_fit_hidden({ fit = true, fit_hidden_frames = K.CONFIRM_FIT_HIDDEN_MAX }), false,
     "never measured: shown anyway after a few frames")
+end)
+
+local SOPRANO_ANALYSIS = { min_freq = 250, max_freq = 1200, threshold = 0.08, block_size = 1024, hop_size = 512 }
+test("form_seeds_from_item_not_defaults", function()
+  local f = S.K.form_new("{a}", { notes = { {} }, analysis = SOPRANO_ANALYSIS })
+  eq(f.source, "item"); eq(f.values.min_freq, 250); eq(f.values.max_freq, 1200)
+  eq(f.seed, SOPRANO_ANALYSIS, "the seed is the stored table")
+  eq(S.K.form_header(f), "ANALYZE WITH · as analyzed before")
+end)
+test("form_unrecorded_item_uses_defaults", function()
+  local f = S.K.form_new("{a}", { notes = { {} } })
+  eq(f.source, "unrecorded"); eq(f.values.min_freq, S.state.min_freq)
+  eq(S.K.form_header(f), "ANALYZE WITH · not recorded, your defaults")
+  local u = S.K.form_new("{b}", nil)
+  eq(u.source, "defaults"); eq(S.K.form_header(u), "ANALYZE WITH · your defaults")
+  eq(S.K.form_new("batch", nil).guid, "batch")
+end)
+test("form_reseeds_when_stored_analysis_changes", function()
+  local st = S.state
+  local saved = st.analysis_form
+  local a1 = { min_freq = 250, max_freq = 1200, threshold = 0.08, block_size = 1024, hop_size = 512 }
+  local a2 = { min_freq = 80, max_freq = 350, threshold = 0.15, block_size = 2048, hop_size = 256 }
+  local d1 = { notes = { {} }, analysis = a1 }
+  local d2 = { notes = { {} }, analysis = a2 }
+  st.analysis_form = nil
+  S.K.form_sync("{a}", d1)
+  local form = st.analysis_form
+  S.K.form_set(form, "threshold", 0.25)
+  S.K.form_sync("{a}", d1)
+  eq(st.analysis_form, form, "same guid and same stored analysis: kept")
+  eq(st.analysis_form.values.threshold, 0.25)
+  S.K.form_sync("{a}", d2)
+  eq(st.analysis_form.values.min_freq, 80, "an undo replaced the stored analysis: reseeded from it")
+  eq(st.analysis_form.values.threshold, 0.15)
+  eq(next(st.analysis_form.edited), nil, "edited is empty")
+  st.analysis_form = saved
+end)
+test("form_follows_defaults_for_untouched_rows", function()
+  local st = S.state
+  local saved, saved_min, saved_max = st.analysis_form, st.min_freq, st.max_freq
+  st.analysis_form = nil
+  S.K.form_sync("{b}", nil)
+  local form = st.analysis_form
+  S.K.form_set(form, "threshold", 0.25)
+  st.min_freq, st.max_freq = 80, 350   -- Bass
+  S.K.form_sync("{b}", nil)
+  eq(form.values.min_freq, 80); eq(form.values.max_freq, 350)
+  eq(form.values.threshold, 0.25, "the edited row keeps its value")
+  st.min_freq, st.max_freq, st.analysis_form = saved_min, saved_max, saved
+end)
+test("form_set_and_reset_row", function()
+  local f = S.K.form_new("{c}", nil)
+  S.K.form_set(f, "range", { min = 250, max = 1200 })
+  eq(f.values.min_freq, 250); eq(f.values.max_freq, 1200)
+  eq(f.edited.min_freq, true); eq(f.edited.max_freq, true)
+  S.K.form_reset_row(f, "range")
+  eq(f.values.min_freq, S.state.min_freq); eq(f.values.max_freq, S.state.max_freq)
+  eq(next(f.edited), nil)
+  S.K.form_set(f, "block_size", 2048); S.K.form_reset_row(f, "block")
+  eq(f.values.block_size, S.state.block_size); eq(f.edited.block_size, nil)
+end)
+test("form_changed_rows_counts_rows_not_keys", function()
+  local v = S.K.analysis_defaults(); v.min_freq, v.max_freq = 250, 1200
+  eq(S.K.form_changed_rows(v), 1)
+  v.threshold = 0.25; eq(S.K.form_changed_rows(v), 2)
+  local f = { source = "defaults", values = v }
+  eq(S.K.form_header(f), "ANALYZE WITH · 2 changed from defaults")
+  v.threshold = S.state.threshold
+  eq(S.K.form_header(f), "ANALYZE WITH · 1 changed from defaults")
+end)
+test("form_summary_names_presets_and_custom", function()
+  local v = S.K.analysis_defaults()
+  eq(S.K.form_summary(v), "Generic Vocal · Clean / Strict · Standard (Realtime)")
+  v.max_freq = 999; eq(S.K.form_summary(v):match("^Custom") ~= nil, true)
+  eq(S.K.analyzed_with_tip({ analysis = SOPRANO_ANALYSIS }), "Analyzed with Soprano · Clean / Strict · Standard (Realtime)")
+  eq(S.K.analyzed_with_tip({}), nil)
+end)
+test("form_defaults_request_names_changes", function()
+  local K, st = S.K, S.state
+  local v = K.analysis_defaults(); v.min_freq, v.max_freq = 250, 1200
+  local req = K.form_defaults_request(v)
+  eq(req.title, "Make these your defaults?")
+  eq(req.body_lines[1], "New analyses will start with: Soprano (was Generic Vocal).")
+  eq(req.body_lines[2], "Items already analyzed keep their own settings.")
+  eq(req.confirm_label, "Save as Default")
+  local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time }
+  local group
+  K.save_settings = function(g) group = g end
+  reaper.time_precise = function() return 0 end
+  req.on_confirm()
+  eq(st.min_freq, 250); eq(st.max_freq, 1200); eq(group, "engine"); eq(st.status.text, "Defaults saved.")
+  K.save_settings, st.min_freq, st.max_freq, reaper.time_precise = saved[1], saved[2], saved[3], saved[4]
+  st.status.text, st.status.until_time = saved[5], saved[6]
+end)
+
+test("form_defaults_saved_from_the_modal_reach_the_canvas_form", function()
+  local K, st = S.K, S.state
+  local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time,
+    st.target_take_guid, st.analysis_form }
+  local ok, err = pcall(function()
+    K.save_settings = function() end
+    reaper.time_precise = function() return 0 end
+    st.target_take_guid = "{c}"
+    st.analysis_form = K.form_new("{c}", nil)          -- the canvas form, untouched
+    local modal = K.form_copy(st.analysis_form)        -- the modal's own copy
+    K.form_set(modal, "range", { name = "Tenor", min = 130, max = 500 })
+    K.form_defaults_request(modal.values).on_confirm()
+    eq(st.analysis_form.values.min_freq, 130, "the untouched canvas form follows the new defaults")
+    eq(st.analysis_form.values.max_freq, 500)
+  end)
+  K.save_settings, st.min_freq, st.max_freq, reaper.time_precise = saved[1], saved[2], saved[3], saved[4]
+  st.status.text, st.status.until_time, st.target_take_guid, st.analysis_form = saved[5], saved[6], saved[7], saved[8]
+  if not ok then error(err, 0) end
+end)
+
+local function settings_row(section_id, row_id)
+  for _, section in ipairs(S.K.SETTINGS_SECTIONS) do
+    if section.id == section_id then
+      for _, row in ipairs(section.rows) do if row.id == row_id then return row end end
+    end
+  end
+end
+
+test("rows_edit_the_bound_table", function()
+  local st = S.state
+  local form = S.K.form_new("batch", nil)
+  local b = S.K.form_binding(form)
+  local range = settings_row("detection", "range")
+  local before = { st.min_freq, st.max_freq }
+  b.set("min_freq", 250); b.set("max_freq", 1200)
+  eq(range.is_default(b), false)
+  eq(st.min_freq, before[1], "state untouched"); eq(st.max_freq, before[2], "state untouched")
+  range.reset(b)
+  eq(range.is_default(b), true)
+  eq(form.edited.min_freq, nil)
+  eq(form.values.min_freq, st.min_freq)
+end)
+
+test("settings_binding_resets_to_factory", function()
+  local K, st = S.K, S.state
+  local saved = { st.threshold, K.save_settings }
+  local b = K.settings_binding()
+  st.threshold = 0.25
+  local row = settings_row("dsp", "threshold")
+  eq(row.is_default(b), false)
+  row.reset(b)
+  eq(st.threshold, S.DEFAULTS.threshold)
+  eq(row.is_default(b), true)
+  local group
+  K.save_settings = function(g) group = g end
+  b.commit()
+  eq(group, "engine")
+  st.threshold, K.save_settings = saved[1], saved[2]
+end)
+
+test("settings_binding_commit_syncs_the_form", function()
+  local K, st = S.K, S.state
+  local saved = { K.save_settings, st.target_take_guid, st.session_takes["{c3}"], st.analysis_form, st.min_freq, st.max_freq }
+  K.save_settings = function() end
+  st.target_take_guid = "{c3}"
+  st.session_takes["{c3}"] = {}
+  st.analysis_form = nil
+  K.form_sync("{c3}", st.session_takes["{c3}"])
+  st.min_freq, st.max_freq = 250, 1200
+  K.settings_binding().commit()
+  eq(st.analysis_form.values.min_freq, 250, "untouched rows follow the new defaults")
+  st.target_take_guid = nil
+  K.settings_binding().commit()   -- no target: no error
+  K.save_settings, st.target_take_guid, st.session_takes["{c3}"], st.analysis_form, st.min_freq, st.max_freq = table.unpack(saved, 1, 6)
+end)
+
+test("settings_section_renamed", function()
+  eq(S.K.SETTINGS_SECTIONS[2].title, "Analysis Defaults")
+  eq(S.K.ANALYSIS_DEFAULTS_NOTE, "New analyses start with these. Each item keeps the settings it was analyzed with.")
+end)
+
+test("form_binding_shape", function()
+  local K = S.K
+  local form = K.form_new("batch", nil)
+  local b = K.form_binding(form)
+  eq(b.v, form.values)
+  eq(b.base.min_freq, S.state.min_freq)
+  b.commit()   -- a no-op
+  b.set("threshold", 0.3)
+  eq(form.values.threshold, 0.3)
+  b.reset("mode")
+  eq(form.values.threshold, S.state.threshold)
+end)
+
+test("form_layout_picks_by_space", function()
+  local K = S.K
+  local need = { row_w = 400, stacked_w = 200, full_h = 120, stacked_h = 200, button_h = 40 }
+  eq(K.form_layout(600, 300, need), "full")
+  eq(K.form_layout(250, 300, need), "stacked")
+  eq(K.form_layout(1200, 110, need), "summary")
+end)
+
+test("batch_start_snapshots_given_values", function()
+  local real_begin = S.K.analysis_begin
+  with_batch(function()
+    local K, st = S.K, S.state
+    local names = { "GetTakeName", "GetMediaItemInfo_Value", "new_array", "GetSetMediaItemTakeInfo_String" }
+    local old, saved_acc, saved_min = {}, K.open_accessor, st.min_freq
+    for _, n in ipairs(names) do old[n] = reaper[n] end
+    K.analysis_begin = real_begin
+    K.open_accessor = function() return "acc" end
+    reaper.GetTakeName = function() return "t" end
+    reaper.GetMediaItemInfo_Value = function() return 2 end
+    reaper.new_array = function() return {} end
+    reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{a}" end return true, "" end
+    local ok, err = pcall(function()
+      local values = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 256 }
+      K.batch_start(entries3(), values)
+      values.min_freq = 80   -- the form changes after the click: the batch keeps what it was started with
+      eq(K.batch.values.min_freq, 250, "the batch keeps the values it was started with")
+      eq(st.analysis_params.min_freq, 250); eq(st.analysis_params.block_size, 2048); eq(st.analysis_params.hop_size, 256)
+      eq(st.min_freq, saved_min, "state.min_freq unchanged")
+      K.batch = nil; st.is_analyzing = false
+      K.batch_start(entries3())
+      eq(K.batch.values.min_freq, st.min_freq, "no values: the defaults")
+      eq(st.analysis_params.min_freq, st.min_freq)
+    end)
+    K.open_accessor = saved_acc
+    for _, n in ipairs(names) do reaper[n] = old[n] end
+    st.analysis_params, st.accessor, st.buffer = nil, nil, nil
+    if not ok then error(err, 0) end
+  end)
+end)
+
+local TENOR = { name = "Tenor", min = 130, max = 500 }
+
+test("reanalyze_request_carries_form_copy", function()
+  local f = S.K.form_new("{a}", { notes = { {} }, analysis = SOPRANO_ANALYSIS })
+  local req = S.K.reanalyze_request(4, "Lead Vox", f)
+  eq(req.title, "Re-analyze Lead Vox?"); eq(req.confirm_label, "Re-Analyze")
+  eq(req.fit, true)
+  eq(req.form ~= f, true, "a copy"); eq(req.form.values ~= f.values, true, "its own values")
+  eq(req.form.values.min_freq, 250); eq(req.form.source, "item")
+  eq(S.K.form_header(req.form), "ANALYZE WITH · as analyzed before")
+  eq(#req.body_lines, 3)
+  eq(req.body_lines[1], "This replaces the detected notes and discards your edits to 4 notes.")
+  eq(req.body_lines[2], S.K.REANALYZE_VALUES_LINE)
+  S.K.form_set(req.form, "range", TENOR)
+  eq(f.values.min_freq, 250, "edits in the modal never touch the canvas form")
+  eq(f.edited.min_freq, nil)
+  local r0 = S.K.reanalyze_request(0, "Lead Vox", f)
+  eq(#r0.body_lines, 1); eq(r0.body_lines[1], S.K.REANALYZE_VALUES_LINE)
+end)
+
+test("batch_modal_request_titles_and_seeds_defaults", function()
+  local K, st = S.K, S.state
+  local entries = { { guid = "{a}", name = "A", has_notes = false }, { guid = "{b}", name = "B", has_notes = false } }
+  local saved_min = st.min_freq
+  st.min_freq = 130   -- the Settings say Tenor's low end
+  local ok, err = pcall(function()
+    local req = K.batch_modal_request(entries)
+    eq(req.title, "Analyze 2 items"); eq(req.confirm_label, "Analyze 2 Items")
+    eq(req.form.source, "defaults"); eq(req.form.guid, "batch"); eq(req.form.values.min_freq, 130)
+    eq(#req.body_lines, 0, "no item holds notes: nothing to warn about"); eq(req.list, nil)
+    eq(req.fit, true)
+    eq(st.analysis_form == req.form, false, "never the canvas form")
+    entries[2].has_notes = true
+    local warn = K.batch_modal_request(entries)
+    eq(warn.title, "Analyze 2 items", "the modal's title, not the old confirm's question")
+    eq(warn.body_lines[1], "1 of them already has notes. Analyzing replaces its notes and any edits:")
+    eq(#warn.list, 1); eq(warn.list[1].name, "B")
+    eq(#warn.after_lines, 2)
+    local started
+    local real = K.batch_start
+    K.batch_start = function(e, v) started = { e = e, v = v } end
+    local ok2, err2 = pcall(function() warn.on_confirm(warn.form.values) end)
+    K.batch_start = real
+    if not ok2 then error(err2, 0) end
+    eq(started.e, entries); eq(started.v, warn.form.values)
+  end)
+  st.min_freq = saved_min
+  if not ok then error(err, 0) end
+end)
+
+test("batch_uses_and_stores_modal_values", function()
+  local real_begin = S.K.analysis_begin
+  with_batch(function()
+    local K, st = S.K, S.state
+    local names = { "GetTakeName", "GetMediaItemInfo_Value", "new_array", "GetSetMediaItemTakeInfo_String" }
+    local old, saved_acc, saved_min, saved_form = {}, K.open_accessor, st.min_freq, st.analysis_form
+    for _, n in ipairs(names) do old[n] = reaper[n] end
+    K.analysis_begin = real_begin
+    K.open_accessor = function() return "acc" end
+    reaper.GetTakeName = function() return "t" end
+    reaper.GetMediaItemInfo_Value = function() return 2 end
+    reaper.new_array = function() return {} end
+    reaper.GetSetMediaItemTakeInfo_String = function(_, key) if key == "GUID" then return true, "{a}" end return true, "" end
+    local ok, err = pcall(function()
+      st.min_freq = 80   -- the Settings hold Bass; the modal picks Soprano
+      local req = K.batch_modal_request(entries3())
+      K.form_set(req.form, "range", { name = "Soprano", min = 250, max = 1200 })
+      req.on_confirm(req.form.values)
+      eq(K.batch ~= nil, true, "the batch runs")
+      eq(K.batch.values.min_freq, 250, "the batch keeps the modal's values")
+      eq(st.analysis_params.min_freq, 250, "the first item is analysed with them")
+      eq(st.analysis_params.max_freq, 1200)
+      eq(st.min_freq, 80, "state.min_freq unchanged")
+      eq(st.analysis_form, saved_form, "the canvas form is not replaced")
+      K.cancel_analysis()
+      eq(K.batch, nil, "cancelled")
+    end)
+    K.open_accessor = saved_acc
+    for _, n in ipairs(names) do reaper[n] = old[n] end
+    st.analysis_params, st.accessor, st.buffer = nil, nil, nil
+    st.min_freq = saved_min
+    if not ok then error(err, 0) end
+  end)
+end)
+
+test("confirm_enter_runs_primary_only_with_form", function()
+  local K, st = S.K, S.state
+  eq(K.confirm_enter({}), false, "existing confirms: Enter is not theirs")
+  eq(K.confirm_enter({ form = { values = {} } }), true)
+  local saved = st.confirm
+  S.request_confirm({ title = "T", on_confirm = function() end })
+  eq(K.confirm_enter(st.confirm), false)
+  local f = K.form_new("batch", nil)
+  S.request_confirm({ title = "T", form = f, on_confirm = function() end })
+  eq(st.confirm.form, f); eq(K.confirm_enter(st.confirm), true)
+  st.confirm = saved
+end)
+
+-- Draws the confirm modal with Enter pressed (Shortcut true for Enter only) and returns what on_confirm received.
+local function confirm_with_enter(req, active)
+  local K, st = S.K, S.state
+  local got = { called = false }
+  req.on_confirm = function(...) got.called = true; got.args = { ... } end
+  local enter, kp_enter = 1001, 1002
+  local stubs = {
+    ImGui_Key_Enter = function() return enter end,
+    ImGui_Key_KeypadEnter = function() return kp_enter end,
+    ImGui_Shortcut = function(_, key) return key == enter end,
+    ImGui_IsAnyItemActive = function() return active == true end,
+    ImGui_IsPopupOpen = function(_, name) return name ~= "" end,   -- the modal is open, nothing over it
+    ImGui_BeginPopupModal = function() return true, true end,
+    ImGui_BeginChild = function() return true end,
+    ImGui_BeginTable = function() return false end,
+    ImGui_GetWindowSize = function() return 560, 480 end,
+    ImGui_GetWindowPos = function() return 100, 50 end,
+    ImGui_Viewport_GetPos = function() return 0, 0 end,
+    ImGui_Viewport_GetSize = function() return 800, 600 end,
+    ImGui_GetContentRegionAvail = function() return 520, 400 end,
+    ImGui_GetStyleVar = function() return 4, 4 end,
+    ImGui_GetFrameHeight = function() return 20 end,
+    ImGui_GetFrameHeightWithSpacing = function() return 24 end,
+    ImGui_GetTextLineHeight = function() return 14 end,
+    ImGui_GetFontSize = function() return 13 end,
+    ImGui_CalcTextSize = function() return 40, 14 end,
+    ImGui_GetCursorPosX = function() return 0 end,
+    ImGui_GetCursorPosY = function() return 0 end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local saved, real_form_draw = st.confirm, K.confirm_form_draw
+  -- The form's widgets are checked in real REAPER; here only what Enter does
+  K.confirm_form_draw = function() end
+  local ok, err = pcall(function()
+    S.request_confirm(req)
+    S.draw_confirm_modal()
+  end)
+  K.confirm_form_draw = real_form_draw
+  for k in pairs(stubs) do reaper[k] = nil end
+  st.confirm = saved
+  K.form_metrics_cache = nil
+  if not ok then error(err, 0) end
+  return got
+end
+
+test("confirm_enter_confirms_the_form_with_its_values", function()
+  local f = S.K.form_new("batch", nil)
+  local got = confirm_with_enter({ title = "Analyze 2 items", form = f, confirm_label = "Analyze 2 Items", fit = true })
+  eq(got.called, true, "Enter runs the primary")
+  eq(got.args[1], f.values, "on_confirm receives form.values")
+  eq(confirm_with_enter({ title = "Delete?", body_lines = { "x" } }).called, false, "no form: Enter does nothing")
+  eq(confirm_with_enter({ title = "T", form = S.K.form_new("batch", nil) }, true).called, false,
+    "not while an item (a field) is active")
+end)
+
+test("request_analyze_modal_only_on_analysed_items", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.notes, st.confirm, st.analysis_form }
+  local ok, err = pcall(function()
+    st.session_takes["{a}"] = { notes = { {} }, analysis = SOPRANO_ANALYSIS }
+    st.target_take_guid, st.target_take_name = "{a}", "Lead Vox"
+    st.notes = { { avg_note = 60 } }   -- analysed, nothing edited (no controls: not modified)
+    st.analysis_form = K.form_new("{a}", st.session_takes["{a}"])
+    st.confirm = nil
+    K.request_analyze()
+    local c = st.confirm
+    eq(c ~= nil, true, "an analysed item always gets the modal")
+    eq(c.title, "Re-analyze Lead Vox?"); eq(c.id, "reanalyze")
+    eq(#c.body_lines, 1); eq(c.body_lines[1], K.REANALYZE_VALUES_LINE)
+    eq(c.form.values.min_freq, 250, "seeded from the item")
+    eq(c.form ~= st.analysis_form, true)
+  end)
+  st.target_take_guid, st.target_take_name, st.notes, st.confirm, st.analysis_form = table.unpack(saved, 1, 5)
+  st.session_takes["{a}"] = nil
+  if not ok then error(err, 0) end
+end)
+
+test("analyze_change_request_copies_values_back", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.target_take_name, st.analysis_form, st.status.text }
+  local ok, err = pcall(function()
+    st.target_take_guid, st.target_take_name = "{z}", "Lead Vox"
+    st.analysis_form = K.form_new("{z}", nil)
+    local req = K.analyze_change_request(st.analysis_form)
+    eq(req.title, "Analyze Lead Vox"); eq(req.confirm_label, "Analyze"); eq(req.fit, true)
+    eq(req.form ~= st.analysis_form, true, "a copy")
+    K.form_set(req.form, "range", TENOR)
+    eq(st.analysis_form.values.min_freq, st.min_freq, "the canvas form is untouched")
+    reaper.CountMediaItems = function() return 0 end
+    reaper.CountSelectedMediaItems = function() return 0 end
+    reaper.time_precise = function() return 0 end
+    req.on_confirm(req.form.values)   -- no take in the stub: start_analysis says so
+    reaper.CountMediaItems, reaper.CountSelectedMediaItems, reaper.time_precise = nil, nil, nil
+    eq(st.status.text, "Select an audio item first", "start_analysis ran")
+    eq(st.analysis_form.values.min_freq, 130, "the values come back to the canvas form")
+    eq(st.analysis_form.values.max_freq, 500)
+    eq(st.analysis_form.edited.min_freq, true, "marked edited")
+    eq(st.analysis_form.edited.threshold, nil, "unchanged keys are not")
+  end)
+  st.target_take_guid, st.target_take_name, st.analysis_form, st.status.text = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
+end)
+
+test("info_lists_the_analysis_modal", function()
+  local found = false
+  for _, section in ipairs(S.K.INFO_SECTIONS) do
+    for _, row in ipairs(section.rows) do
+      if row[2] == "Re-Analyze… opens the analysis settings; Enter analyzes, Esc cancels" then found = true end
+    end
+  end
+  eq(found, true)
+end)
+
+test("child_dim_skips_the_first_open_frame_and_releases_on_close", function()
+  local K = S.K
+  K.child_dim_seen = {}
+  eq(K.child_dim_due("t", false), false, "no modal: never dimmed")
+  eq(K.child_dim_due("t", true), false, "first frame open: skipped, as Theme.modal_scrim does")
+  eq(K.child_dim_due("t", true), true, "from the next frame on: dimmed")
+  eq(K.child_dim_due("t", true), true)
+  eq(K.child_dim_due("u", true), false, "each child has its own latch")
+  eq(K.child_dim_due("t", false), false, "closed: not dimmed")
+  eq(K.child_dim_due("t", true), false, "opened again: the first frame is skipped again")
+  K.child_dim_seen = {}
+end)
+
+test("child_dim_fills_the_child_rect_with_dim_bg", function()
+  local K = S.K
+  local fills, clips = {}, 0
+  local stubs = {
+    ImGui_GetWindowDrawList = function() return "dl" end,
+    ImGui_GetWindowPos = function() return 10, 20 end,
+    ImGui_GetWindowSize = function() return 300, 100 end,
+    ImGui_DrawList_PushClipRect = function() clips = clips + 1 end,
+    ImGui_DrawList_PopClipRect = function() clips = clips - 1 end,
+    ImGui_DrawList_AddRectFilled = function(dl, x1, y1, x2, y2, col)
+      fills[#fills + 1] = { dl = dl, x1 = x1, y1 = y1, x2 = x2, y2 = y2, col = col }
+    end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local ok, err = pcall(function()
+    K.child_dim_seen = {}
+    K.child_dim("c", true)
+    eq(#fills, 0, "first open frame: nothing drawn")
+    K.child_dim("c", true)
+    eq(#fills, 1, "then one fill")
+    local f = fills[1]
+    eq(f.dl, "dl"); eq(f.x1, 10); eq(f.y1, 20); eq(f.x2, 310); eq(f.y2, 120)
+    eq(f.col, package.loaded["theme"].get_palette().dim_bg, "the scrim's own colour")
+    eq(clips, 0, "clip push / pop balanced")
+    K.child_dim("c", false)
+    eq(#fills, 1, "closed: nothing drawn")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  K.child_dim_seen = {}
+  if not ok then error(err, 0) end
+end)
+
+test("canvas_form_while_analyzing_shows_the_running_values_locked", function()
+  local K, st = S.K, S.state
+  local saved = { st.is_analyzing, st.analysis_params, st.analysis_form, st.target_take_guid, st.results,
+    st.analysis_empty, K.canvas_batch_form, K.canvas_running_form }
+  local ok, err = pcall(function()
+    st.target_take_guid = "{run}"
+    st.analysis_form = K.form_new("{run}", nil)        -- the open item's form: the Settings' values
+    st.results, st.analysis_empty, st.is_analyzing = {}, false, false
+    local shows, no_notes = K.empty_canvas()
+    eq(shows, true, "not analysed: the form"); eq(no_notes, false)
+    local form, reason = K.canvas_form(true, false)
+    eq(form, st.analysis_form, "idle: the open item's form"); eq(reason, nil)
+
+    -- A Re-Analyze from the modal with Soprano: the first slice fills state.results
+    st.is_analyzing = true
+    st.analysis_params = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 512 }
+    st.results = { { time = 0 } }
+    shows, no_notes = K.empty_canvas()
+    eq(shows, true, "analysing with frames already in: still the form")
+    eq(no_notes, false, "no 'No pitched notes found' / Re-Analyze while running")
+    form, reason = K.canvas_form(true, false)
+    eq(reason, K.LOCKED_REASON, "locked with the inline reason")
+    eq(form ~= st.analysis_form, true, "not the open item's form")
+    for _, key in ipairs(K.ANALYSIS_KEYS) do eq(form.values[key], st.analysis_params[key], key .. ": the running value") end
+    eq(K.form_summary(form.values), "Soprano · Breathy / Lenient · " .. select(3, K.form_part_names(form.values)))
+    eq(K.canvas_form(true, false), form, "the same run: the same form")
+    eq(K.canvas_form(false, true), form, "a batch run: the values it runs with too")
+    eq(st.analysis_form.values.min_freq, st.min_freq, "the open item's form is untouched")
+
+    -- Done with no pitched note: the no-notes canvas, and the open item's form again
+    st.is_analyzing, st.analysis_params, st.analysis_empty = false, nil, true
+    shows, no_notes = K.empty_canvas()
+    eq(shows, true); eq(no_notes, true, "finished without notes: the no-notes canvas")
+    form, reason = K.canvas_form(true, false)
+    eq(form, st.analysis_form); eq(reason, nil)
+    st.analysis_empty = false
+    eq((K.empty_canvas()), false, "notes found: the notes canvas")
+  end)
+  st.is_analyzing, st.analysis_params, st.analysis_form, st.target_take_guid, st.results = saved[1], saved[2], saved[3],
+    saved[4], saved[5]
+  st.analysis_empty, K.canvas_batch_form, K.canvas_running_form = saved[6], saved[7], saved[8]
+  if not ok then error(err, 0) end
+end)
+
+test("freq_drags_cannot_meet_or_cross", function()
+  local K = S.K
+  local lo, hi = K.drag_bounds("min_freq", { min_freq = 65, max_freq = 1000 })
+  eq(lo, K.LIMITS.min_freq[1]); eq(hi, 999, "Min Freq stops 1 Hz under Max Freq")
+  lo, hi = K.drag_bounds("max_freq", { min_freq = 65, max_freq = 1000 })
+  eq(lo, 66, "Max Freq stops 1 Hz over Min Freq"); eq(hi, K.LIMITS.max_freq[2])
+  lo, hi = K.drag_bounds("min_freq", { min_freq = 250, max_freq = 1200 })
+  eq(250 >= lo and 250 <= hi, true, "Soprano's 250 Hz is inside Min Freq's range (not snapped to 200)")
+  lo, hi = K.drag_bounds("min_freq", { min_freq = 100, max_freq = 200 })
+  eq(lo, K.LIMITS.min_freq[1]); eq(hi, 199)
+  local v = K.analysis_defaults(); v.min_freq, v.max_freq = hi, 200
+  eq(K.analysis_values(v) ~= nil, true, "the closest the drags allow is a valid analysis")
+  lo, hi = K.drag_bounds("threshold", { threshold = 0.1 })
+  eq(lo, K.LIMITS.threshold[1]); eq(hi, K.LIMITS.threshold[2])
+  for _, r in ipairs({ { 65, 1000 }, { 250, 1200 }, { 170, 800 }, { 130, 500 }, { 80, 350 } }) do   -- VOCAL_RANGES
+    local a, b = K.drag_bounds("min_freq", { min_freq = r[1], max_freq = r[2] })
+    eq(r[1] >= a and r[1] <= b, true, r[1] .. " Hz inside Min Freq's range")
+    a, b = K.drag_bounds("max_freq", { min_freq = r[1], max_freq = r[2] })
+    eq(r[2] >= a and r[2] <= b, true, r[2] .. " Hz inside Max Freq's range")
+  end
+end)
+
+test("stored_soprano_min_freq_loads_unclamped", function()
+  local T = load_script({ pitch_min_freq = "250", pitch_max_freq = "1200" })
+  reaper.GetExtState = function() return "" end   -- the harness's own stub again
+  eq(T.state.min_freq, 250, "not snapped to 200")
+  eq(T.state.max_freq, 1200)
+end)
+
+test("analysis_begin_falls_back_when_min_is_not_below_max", function()
+  local K, st = S.K, S.state
+  local saved_params = st.analysis_params
+  local stubs = {
+    GetMediaItemTake_Source = function() return "src" end, GetMediaSourceSampleRate = function() return 44100 end,
+    GetMediaItemInfo_Value = function() return 1 end, new_array = function() return {} end,
+  }
+  local saved_open, saved_state = K.open_accessor, {}
+  for _, key in ipairs({ "is_analyzing", "results", "target_take_guid", "accessor", "buffer", "sample_rate",
+      "item_len", "end_time", "current_time", "start_time", "progress", "separation", "analysis_empty" }) do
+    saved_state[key] = st[key]
+  end
+  for k, f in pairs(stubs) do reaper[k] = f end
+  local ok, err = pcall(function()
+    K.open_accessor = function() return "acc" end
+    local bad = { min_freq = 200, max_freq = 200, threshold = 0.25, block_size = 2048, hop_size = 512 }
+    eq(K.analysis_begin("take", "item", { values = bad, defer_envelope = true }), true)
+    local d = K.analysis_defaults()
+    eq(st.analysis_params.min_freq, d.min_freq, "zero-width range: the Settings' values")
+    eq(st.analysis_params.max_freq, d.max_freq)
+    eq(st.analysis_params.threshold, d.threshold, "the whole set, not a mix")
+    eq(K.analysis_values(st.analysis_params) ~= nil, true, "what it stores is a valid record")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  K.open_accessor = saved_open
+  for key, v in pairs(saved_state) do st[key] = v end
+  st.is_analyzing = saved_state.is_analyzing
+  st.analysis_params = saved_params
+  if not ok then error(err, 0) end
+end)
+
+test("analyzed_with_tip_ignores_a_malformed_record", function()
+  eq(S.K.analyzed_with_tip({ analysis = { min_freq = 200, max_freq = 200, threshold = 0.15, block_size = 2048,
+    hop_size = 512 } }), nil, "min not below max: not recorded")
+  eq(S.K.analyzed_with_tip({ analysis = "x" }), nil)
+end)
+
+test("form_defaults_request_is_safe_and_fit", function()
+  local req = S.K.form_defaults_request(S.K.analysis_defaults())
+  eq(req.safe, true, "CL3: no red added")
+  eq(req.fit, true, "sized to its two lines")
 end)
 
 -- Tests appended by later tasks go above this line.
