@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.26.0
+-- @version 2.27.0
 -- @changelog
---   Analysis settings at the Analyze button: an "Analyze with" form on the empty canvas, each item remembers the settings it was analysed with, the Re-Analyze... menu item and Analyze Selected Items (N)... open them (the no-notes Re-Analyze button analyses at once), Save as Default, Settings section renamed "Analysis Defaults"
+--   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui

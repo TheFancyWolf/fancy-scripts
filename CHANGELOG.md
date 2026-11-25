@@ -4,6 +4,12 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.27.0 (`Pitch/Fancy_Pitch Correct.lua`)** — System and Track Defaults:
+  - **Set as System Default…**: the "This item" menu saves this item's values (Separation, Mode, Tighten, Tolerance, Strength, Slide In) as the values every new analysis starts with, after a confirm. Each value's right-click menu saves just that value.
+  - **Set as Track Default**: saves the values on the item's track, so each singer's track starts its new analyses with its own values. It is part of the project and one Cmd+Z undoes it. Clear Track Default removes it.
+  - **Which default applies**: a new or re-analysed item starts at its track's default, else your System Default, else the factory values. Reset, double-click, Reset this item to defaults and the `*` mark follow the same default, and the value tooltips say where it comes from ("Default: 12¢ (track)"). Key and Scale are not part of a default, and items already analysed keep their values.
+  - **Restore Factory Defaults…**: a new Settings section, Item Value Defaults, lists your System Default and brings back the factory values.
+  - **Right-click the pill**: the "This item" pill opens its menu on right-click as well as click.
 - **Fancy Pitch Correct v2.26.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Analysis settings at the Analyze button:
   - **"Analyze with" at the button**: the empty canvas shows the settings the next analysis will use (Vocal Range, Detection, and Advanced) right above Analyze, as a full form, a stacked form on a narrow window or a one-line summary with Change… on a short one. Changing them there does not change your defaults, and they stay locked while an analysis runs.
   - **Each item remembers its analysis settings**: an item stores the settings it was analysed with, as part of the same undo step as its notes. An item analysed before this version shows "not recorded, your defaults".
