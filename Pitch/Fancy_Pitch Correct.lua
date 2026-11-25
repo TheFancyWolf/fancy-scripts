@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.27.0
 -- @changelog
---   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas shows Analyze above its Analysis Settings (renamed from Analyze with), without the "your defaults" line; fix: the pitch line draws in again while an analysis runs
+--   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas shows Analyze above its Analysis Settings (renamed from Analyze with), without the "your defaults" and "Matches your defaults" lines; tooltips for each Vocal Range, Detection Mode and Quality; fix: the pitch line draws in again while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -3112,7 +3112,7 @@ end
 --- The lines under the canvas button for what K.batch_peek returned: the first, and the second or nil.
 K.batch_lines = function(peek)
   if peek.n < 2 then
-    return "No data. Select an item and click Analyze.", "Select several items in REAPER to analyze them all at once."
+    return "Select an item and click Analyze.", "Select several items in REAPER to analyze them all at once."
   end
   local first = string.format("%d audio items selected", peek.n)
   if peek.skipped == 1 then
@@ -10984,10 +10984,23 @@ end
 K.ANALYSIS_DEFAULTS_NOTE = "New analyses start with these. Each item keeps the settings it was analyzed with."
 
 --- Tooltips of the three preset rows (shared by the Settings and the analysis form).
+-- One paragraph per choice, its key difference first. The note names are the VOCAL_RANGES limits rounded to the
+-- nearest note; the lowest notes of each Quality are its block's limit (half a block per period) at 48 kHz.
 K.ROW_TIPS = {
-  range = "Vocal Range\n\nThe pitch range searched for this analysis. Pick the singer's range to avoid octave errors.",
-  mode = "Detection Mode\n\nHow sure the detector must be before it calls a sound a note. Lenient finds breathy notes; Strict ignores noise.",
-  quality = "Quality / CPU\n\nFiner timing or finer pitch, and how long the analysis takes.",
+  range = "Vocal Range\n\nThe pitches searched. Pick the singer's range to avoid octave errors."
+    .. "\n\nGeneric Vocal: C2 to B5 (65 to 1000 Hz), any voice."
+    .. "\n\nSoprano: B3 to D6 (250 to 1200 Hz)."
+    .. "\n\nAlto: F3 to G5 (170 to 800 Hz)."
+    .. "\n\nTenor: C3 to B4 (130 to 500 Hz)."
+    .. "\n\nBass: E2 to F4 (80 to 350 Hz).",
+  mode = "Detection Mode\n\nHow clear a sound must be to count as a note."
+    .. "\n\nClean / Strict: only clear, steady tone. Ignores breath and noise; may drop soft notes."
+    .. "\n\nStandard: the balance for most takes."
+    .. "\n\nBreathy / Lenient: catches airy, soft singing; may also catch breath and noise.",
+  quality = "Quality / CPU\n\nHow finely the audio is measured, and how long it takes."
+    .. "\n\nHigh Quality (Offline): finest pitch and timing, reaches the lowest voices. Slowest."
+    .. "\n\nStandard (Realtime): quicker, coarser timing. Misses notes below about F#2 (94 Hz)."
+    .. "\n\nLow Latency: fastest, fine timing. Misses notes below about F#3 (188 Hz).",
 }
 
 -- The Settings forms: Pitch Shift Engine, Analysis Defaults, Advanced DSP. A row knows its label, whether its
@@ -11203,7 +11216,6 @@ K.FORM_COPY = {
   default_reason = "Already the default",
   save = "Save as Default",
   save_tip = "Use these values for every new analysis",
-  matches = "Matches your defaults",
   change = "Change…",
   change_tip = "Change the values this item is analyzed with",
   summary = "Analysis Settings: ",
@@ -11253,7 +11265,7 @@ K.form_canvas_metrics = function()
   m = {
     key = key, label_w = label_w, control_w = control_w, reset_w = reset_w, frame_h = frame_h,
     save_w = save_w, change_w = text_w(K.FORM_COPY.change) + pad_x * 2,
-    slot_w = math.max(save_w, text_w(K.FORM_COPY.matches)),
+    slot_w = save_w,
     -- Three table columns, each with its L.md gap and the cells' padding on both sides
     row_w = label_w + control_w + reset_w + L.md * 3 + cell_x * 6 + win_x * 2,
     stacked_w = math.max(label_w, Theme.calc_combo_width(ctx, { K.CUSTOM_PRESET }) + L.sm + reset_w) + win_x * 2,
@@ -11347,17 +11359,14 @@ K.window_modal_open = function()
     or (c ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c)))
 end
 
---- Save as Default, or "Matches your defaults" in its place while `form` holds the defaults (EP2), right-aligned in
---- a slot as wide as the wider of the two (K.form_canvas_metrics' slot_w). why (optional): why it is disabled.
---- Returns true when it was clicked (the caller asks K.form_defaults_request's confirm).
+--- Save as Default, right-aligned in its slot (K.form_canvas_metrics' slot_w); nothing in its place while `form`
+--- holds the defaults. why (optional): why it is disabled. Returns true when it was clicked (the caller asks
+--- K.form_defaults_request's confirm).
 K.form_save_draw = function(form, id, why)
-  local P = Theme.get_palette()
   local m = K.form_canvas_metrics()
   local cur_x = reaper.ImGui_GetCursorPosX(ctx)
   if K.form_changed_rows(form.values) == 0 then
-    reaper.ImGui_SetCursorPosX(ctx, cur_x + m.slot_w - ((reaper.ImGui_CalcTextSize(ctx, K.FORM_COPY.matches)) or 0))
-    Theme.align(ctx)
-    reaper.ImGui_TextColored(ctx, P.text_dim, K.FORM_COPY.matches)
+    reaper.ImGui_Dummy(ctx, m.slot_w, m.frame_h)   -- the slot stays, empty: the row keeps its height
     return false
   end
   reaper.ImGui_SetCursorPosX(ctx, cur_x + m.slot_w - m.save_w)

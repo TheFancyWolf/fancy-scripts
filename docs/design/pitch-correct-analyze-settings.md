@@ -336,3 +336,5 @@ None. The form reuses the Settings form code inside the script (generalised to r
 - The canvas form no longer shows the line under the heading ("your defaults", "N changed from defaults", "as analyzed before"); the modal keeps it.
 - On the empty canvas the Analyze button and its hint lines come first, the form under them (the summary layout is unchanged).
 - While an analysis runs the locked form shows only until its first slice; then the pitch line draws in.
+- "Matches your defaults" beside Advanced is gone (the slot stays empty), and the hint reads "Select an item and click Analyze." (no "No data.").
+- The Vocal Range, Detection Mode and Quality / CPU tooltips list each choice in its own paragraph with its key difference.
