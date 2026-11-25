@@ -2477,15 +2477,27 @@ test("batch_copy", function()
   local K = S.K
   eq(K.batch_label(1), "Analyze Item"); eq(K.batch_label(0), "Analyze Item")
   eq(K.batch_label(2), "Analyze All Selected Items"); eq(K.batch_label(12, true), "Analyze All")
-  local a, b = K.batch_lines({ n = 1, skipped = 0, with_notes = 0, target_in = true })
-  eq(a, "No data. Select an item and click Analyze."); eq(b, "Select several items in REAPER to analyze them all at once.")
-  a, b = K.batch_lines({ n = 12, skipped = 0, with_notes = 0, target_in = true })
-  eq(a, "12 audio items selected."); eq(b, nil)
-  a, b = K.batch_lines({ n = 12, skipped = 2, with_notes = 3, target_in = false })
-  eq(a, "12 audio items selected (2 other items are skipped). This item is not one of them.")
-  eq(b, "3 already have notes. You will be asked before they are replaced.")
-  a, b = K.batch_lines({ n = 2, skipped = 1, with_notes = 1, target_in = true })
-  eq(a, "2 audio items selected (1 other item is skipped)."); eq(b, "1 already has notes. You will be asked before it is replaced.")
+  local a, b = K.batch_lines({ n = 1, skipped = 0, with_notes = 0, target_in = true, names = { "Verse" } }, "Verse")
+  eq(a, "1 item selected: Verse", "one item: its name"); eq(b, nil)
+  a, b = K.batch_lines({ n = 0, skipped = 0, with_notes = 0, target_in = false, names = {} }, nil)
+  eq(a, "Select one or more items and click Analyze."); eq(b, nil)
+  a, b = K.batch_lines({ n = 2, skipped = 0, with_notes = 0, target_in = true, names = { "A", "B" } }, "A")
+  eq(a, "2 items selected: A, B"); eq(b, nil)
+  a, b = K.batch_lines({ n = 3, skipped = 2, with_notes = 3, target_in = false, names = { "A", "B", "C" } }, "X")
+  eq(a, "3 items selected: A, B, C")
+  eq(b, "2 other selected items are skipped. This item is not one of them. 3 already have notes. You will be asked before they are replaced.")
+  a, b = K.batch_lines({ n = 2, skipped = 1, with_notes = 1, target_in = true, names = { "A", "B" } }, "A")
+  eq(a, "2 items selected: A, B"); eq(b, "1 other selected item is skipped. 1 already has notes. You will be asked before it is replaced.")
+  -- Fitted to the width (one unit per character here)
+  local len = function(text) return #text end
+  local names = { "Verse 1", "Verse 2", "Chorus", "Bridge" }
+  eq(K.batch_names_fit({ "Verse 1", "Verse 2" }, 100, len), "2 items selected: Verse 1, Verse 2")
+  eq(K.batch_names_fit({ "Verse 1", "Verse 2", "Chorus" }, 100, len), "3 items selected: Verse 1, Verse 2, …",
+    "3 or more: two names and an ellipsis")
+  eq(K.batch_names_fit(names, 100, len), "4 items selected: Verse 1, Verse 2, …")
+  eq(K.batch_names_fit(names, 30, len), "4 items selected: Verse 1, …", "narrow: fewer names")
+  eq(K.batch_names_fit(names, 20, len), "4 items selected")
+  eq(K.batch_names_tip({ "A", "B" }), "2 selected items\n\nA\nB")
   eq(K.batch_tip(12), "Detect the pitch of the 12 selected audio items, one after another.\n\nOne undo step for all of them.")
   eq(K.batch_undo_label(12), "Analyze Pitch (12 items)"); eq(K.batch_undo_label(1), "Analyze Pitch (1 item)")
 end)
@@ -2691,6 +2703,7 @@ local function with_write_stubs(gone, fn, no_env)
     return true, rec.stored[take] or ""
   end
   local order = #st.session_order
+  S.K.drop_project_cache()   -- nothing an earlier test resolved (without these stubs) is reused
   local ok, err = pcall(fn, rec)
   for _, name in ipairs({ "Undo_BeginBlock", "Undo_EndBlock", "GetMediaItemTakeByGUID", "GetMediaItemTake_Item",
     "GetTakeEnvelopeByName", "DeleteEnvelopePointRange", "NamedCommandLookup", "CountSelectedMediaItems",
@@ -3255,6 +3268,149 @@ test("item_seed_keeps_existing", function()
   S.K.item_seed(data)
   eq(data.separation, 0.2, "separation")
   eq(data.overrides.tighten, 0.3, "tighten")
+end)
+
+-- Saved defaults: track -> system -> factory (2026-11-25) ------------------------------------------------------------
+-- track_json: what the track of take {t} holds under its Track Default key (nil: the take has no track)
+local function with_track(track_json, sys, fn)
+  local K = S.K
+  local saved_sys = K.sys_defaults
+  local ext = {}
+  K.sys_defaults = sys or {}
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{t}" and "take_t" or nil end
+  reaper.GetMediaItemTake_Track = function(take) return (take == "take_t" and track_json) and "track_t" or nil end
+  reaper.GetSetMediaTrackInfo_String = function(track, key, value, set)
+    if track ~= "track_t" or key ~= K.TRACK_DEFAULT_KEY then return false, "" end
+    if set then track_json = value end
+    return true, track_json or ""
+  end
+  reaper.SetExtState = function(_, key, value) ext[key] = value end
+  reaper.DeleteExtState = function(_, key) ext[key] = "deleted" end
+  K.drop_project_cache()
+  local ok, err = pcall(fn, ext, function() return track_json end)
+  for _, name in ipairs({ "GetMediaItemTakeByGUID", "GetMediaItemTake_Track", "GetSetMediaTrackInfo_String",
+    "SetExtState", "DeleteExtState" }) do reaper[name] = nil end
+  K.sys_defaults = saved_sys
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+
+test("saved_defaults_levels", function()
+  local K, D = S.K, S.DEFAULTS
+  with_track(nil, nil, function()
+    local v, lvl = K.item_default("tolerance", "{t}")
+    eq(v, D.tolerance); eq(lvl, "factory")
+  end)
+  with_track(nil, { tolerance = 20, tighten = 0.4 }, function()
+    local v, lvl = K.item_default("tolerance", "{t}")
+    eq(v, 20); eq(lvl, "system")
+  end)
+  with_track('{"tolerance":12}', { tolerance = 20, tighten = 0.4 }, function()
+    local v, lvl = K.item_default("tolerance", "{t}")
+    eq(v, 12, "the track's"); eq(lvl, "track")
+    v, lvl = K.item_default("tighten", "{t}")
+    eq(v, 0.4, "a key the track does not set: the system's"); eq(lvl, "system")
+    v, lvl = K.item_default("slide_in", "{t}")
+    eq(v, D.slide_in); eq(lvl, "factory")
+    v, lvl = K.item_default("tolerance", "{gone}")
+    eq(v, 20, "a take with no track: the system's"); eq(lvl, "system")
+  end)
+end)
+
+test("saved_defaults_invalid_ignored", function()
+  local K, D = S.K, S.DEFAULTS
+  eq(K.item_value_valid("tolerance", "abc"), nil); eq(K.item_value_valid("tolerance", "nan"), nil)
+  eq(K.item_value_valid("tolerance", 999), 50, "clamped"); eq(K.item_value_valid("tighten", -1), 0, "clamped")
+  eq(K.item_value_valid("correct_mode", 1.5), nil); eq(K.item_value_valid("correct_mode", 2), 2)
+  eq(K.item_value_valid("key_idx", 3), nil, "Key is never a default")
+  with_track('{"tolerance":"x","correct_mode":7,"tighten":0.25}', nil, function()
+    eq(K.item_default("tolerance", "{t}"), D.tolerance); eq(K.item_default("correct_mode", "{t}"), D.correct_mode)
+    eq(K.item_default("tighten", "{t}"), 0.25)
+  end)
+  with_track("not json", nil, function() eq(K.item_default("tighten", "{t}"), D.tighten) end)
+end)
+
+test("item_seed_uses_track_default", function()
+  local K, D = S.K, S.DEFAULTS
+  with_track('{"tolerance":12,"separation":0.7}', { correct_mode = 2 }, function()
+    local data = { guid = "{t}" }
+    K.item_seed(data)
+    eq(data.overrides.tolerance, 12); eq(data.separation, 0.7); eq(data.overrides.correct_mode, 2)
+    eq(data.overrides.tighten, D.tighten)
+    eq(K.item_off_defaults(data), 0, "at its own defaults")
+    data.overrides.tolerance = D.tolerance
+    eq(K.item_off_defaults(data), 1, "the factory value differs from the track's")
+    K.item_reset_values(data)
+    eq(data.overrides.tolerance, 12, "reset goes to the track default")
+  end)
+end)
+
+test("unanalysed_take_shows_its_track_default", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.separation }
+  with_track('{"tighten":0.3,"separation":0.8}', nil, function()
+    st.target_take_guid = "{t}"
+    eq(S.get_effective(nil, "tighten"), 0.3, "not analysed: its track's default")
+    eq(S.get_override_level(nil, "tighten"), "default")
+    K.adopt_new_item_values()
+    eq(st.separation, 0.8, "the Separation its first analysis uses")
+  end)
+  st.target_take_guid, st.separation = saved[1], saved[2]
+end)
+
+-- The open item {t}, analysed, with `overrides` and Separation `sep`, while fn runs
+local function with_open_t(overrides, sep, fn)
+  local st = S.state
+  local saved = { st.target_take_guid, st.session_takes["{t}"], st.status.text, st.confirm }
+  st.target_take_guid = "{t}"
+  st.session_takes["{t}"] = { guid = "{t}", notes = {}, results = {}, separation = sep, overrides = overrides }
+  reaper.time_precise = function() return 0 end
+  local ok, err = pcall(fn)
+  reaper.time_precise = nil
+  st.target_take_guid, st.session_takes["{t}"], st.status.text, st.confirm = saved[1], saved[2], saved[3], saved[4]
+  if not ok then error(err, 0) end
+end
+
+test("set_track_default_one_undo", function()
+  local K = S.K
+  with_track('{"tighten":0.2}', nil, function(_, track_json)
+    local labels = {}
+    reaper.Undo_BeginBlock = function() end
+    reaper.Undo_EndBlock = function(label) labels[#labels + 1] = label end
+    with_open_t({ tolerance = 15, tighten = 0.5, correct_mode = 1, retune_speed = 1, slide_in = 0 }, 0.6, function()
+      eq(K.set_track_default({ "tolerance" }), true)
+      eq(labels[1], "Set Tolerance as track default", "one undo point")
+      local t = S.K.track_defaults("track_t")
+      eq(t.tolerance, 15); eq(t.tighten, 0.2, "the track's other keys stay")
+      eq(K.default_reason({ "tolerance" }, "track"), "Already the track default")
+      eq(K.set_track_default(nil), true)
+      eq(labels[2], "Set track default")
+      eq(K.track_defaults("track_t").separation, 0.6)
+      eq(K.clear_track_default(), true); eq(labels[3], "Clear track default")
+      eq(track_json(), "", "cleared"); eq(K.clear_track_reason(), "No track default")
+    end)
+    reaper.Undo_BeginBlock, reaper.Undo_EndBlock = nil, nil
+  end)
+end)
+
+test("sys_default_request_saves_on_confirm", function()
+  local K = S.K
+  with_track(nil, nil, function(ext)
+    with_open_t({ tolerance = 15, tighten = 0, correct_mode = 0, retune_speed = 1, slide_in = 0 }, 0.5, function()
+      eq(K.default_reason({ "tighten" }, "system"), "Already the system default", "equals the factory value")
+      eq(K.default_reason({ "tolerance" }, "system"), nil)
+      local req = K.sys_default_request({ "tolerance" })
+      eq(req.title, "Make Tolerance 15\xC2\xA2 your System Default?")
+      eq(req.body_lines[1], "New analyses on tracks without a Track Default start with: Tolerance 15\xC2\xA2 (was Tolerance 8\xC2\xA2).")
+      eq(next(ext), nil, "nothing saved before the confirm")
+      req.on_confirm()
+      eq(ext.pitch_def_tolerance, "15"); eq(K.sys_defaults.tolerance, 15)
+      eq(K.item_default("tolerance", "{t}"), 15, "the item on a track without a default follows it")
+      eq(K.sys_defaults_changed(), 1)
+      K.sys_defaults_clear()
+      eq(ext.pitch_def_tolerance, "deleted"); eq(K.sys_defaults_changed(), 0)
+    end)
+  end)
 end)
 
 test("unanalysed_take_takes_the_defaults", function()
@@ -4577,14 +4733,14 @@ test("form_seeds_from_item_not_defaults", function()
   local f = S.K.form_new("{a}", { notes = { {} }, analysis = SOPRANO_ANALYSIS })
   eq(f.source, "item"); eq(f.values.min_freq, 250); eq(f.values.max_freq, 1200)
   eq(f.seed, SOPRANO_ANALYSIS, "the seed is the stored table")
-  eq(S.K.form_header(f), "ANALYZE WITH · as analyzed before")
+  eq(S.K.form_header(f), "ANALYSIS SETTINGS · as analyzed before")
 end)
 test("form_unrecorded_item_uses_defaults", function()
   local f = S.K.form_new("{a}", { notes = { {} } })
   eq(f.source, "unrecorded"); eq(f.values.min_freq, S.state.min_freq)
-  eq(S.K.form_header(f), "ANALYZE WITH · not recorded, your defaults")
+  eq(S.K.form_header(f), "ANALYSIS SETTINGS · not recorded, your defaults")
   local u = S.K.form_new("{b}", nil)
-  eq(u.source, "defaults"); eq(S.K.form_header(u), "ANALYZE WITH · your defaults")
+  eq(u.source, "defaults"); eq(S.K.form_header(u), "ANALYSIS SETTINGS · your defaults")
   eq(S.K.form_new("batch", nil).guid, "batch")
 end)
 test("form_reseeds_when_stored_analysis_changes", function()
@@ -4636,9 +4792,9 @@ test("form_changed_rows_counts_rows_not_keys", function()
   eq(S.K.form_changed_rows(v), 1)
   v.threshold = 0.25; eq(S.K.form_changed_rows(v), 2)
   local f = { source = "defaults", values = v }
-  eq(S.K.form_header(f), "ANALYZE WITH · 2 changed from defaults")
+  eq(S.K.form_header(f), "ANALYSIS SETTINGS · 2 changed from defaults")
   v.threshold = S.state.threshold
-  eq(S.K.form_header(f), "ANALYZE WITH · 1 changed from defaults")
+  eq(S.K.form_header(f), "ANALYSIS SETTINGS · 1 changed from defaults")
 end)
 test("form_summary_names_presets_and_custom", function()
   local v = S.K.analysis_defaults()
@@ -4808,7 +4964,7 @@ test("reanalyze_request_carries_form_copy", function()
   eq(req.fit, true)
   eq(req.form ~= f, true, "a copy"); eq(req.form.values ~= f.values, true, "its own values")
   eq(req.form.values.min_freq, 250); eq(req.form.source, "item")
-  eq(S.K.form_header(req.form), "ANALYZE WITH · as analyzed before")
+  eq(S.K.form_header(req.form), "ANALYSIS SETTINGS · as analyzed before")
   eq(#req.body_lines, 3)
   eq(req.body_lines[1], "This replaces the detected notes and discards your edits to 4 notes.")
   eq(req.body_lines[2], S.K.REANALYZE_VALUES_LINE)
@@ -5068,12 +5224,12 @@ test("canvas_form_while_analyzing_shows_the_running_values_locked", function()
     local form, reason = K.canvas_form(true, false)
     eq(form, st.analysis_form, "idle: the open item's form"); eq(reason, nil)
 
-    -- A Re-Analyze from the modal with Soprano: the first slice fills state.results
+    -- A Re-Analyze from the modal with Soprano, before its first slice: the form, locked
     st.is_analyzing = true
     st.analysis_params = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 512 }
-    st.results = { { time = 0 } }
+    st.results = {}
     shows, no_notes = K.empty_canvas()
-    eq(shows, true, "analysing with frames already in: still the form")
+    eq(shows, true, "analysing, no frames yet: the form")
     eq(no_notes, false, "no 'No pitched notes found' / Re-Analyze while running")
     form, reason = K.canvas_form(true, false)
     eq(reason, K.LOCKED_REASON, "locked with the inline reason")
@@ -5083,6 +5239,14 @@ test("canvas_form_while_analyzing_shows_the_running_values_locked", function()
     eq(K.canvas_form(true, false), form, "the same run: the same form")
     eq(K.canvas_form(false, true), form, "a batch run: the values it runs with too")
     eq(st.analysis_form.values.min_freq, st.min_freq, "the open item's form is untouched")
+
+    -- The first slice fills state.results: the pitch line draws in (the notes canvas), never the no-notes canvas,
+    -- even when the last analysis of this item found no pitched note
+    st.results = { { time = 0 } }
+    eq((K.empty_canvas()), false, "analysing with frames in: the pitch line, not the form")
+    st.analysis_empty = true
+    shows, no_notes = K.empty_canvas()
+    eq(shows, false, "a stale 'no notes' flag does not hide the pitch line while running"); eq(no_notes, false)
 
     -- Done with no pitched note: the no-notes canvas, and the open item's form again
     st.is_analyzing, st.analysis_params, st.analysis_empty = false, nil, true

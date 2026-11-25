@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.26.0
+-- @version 2.27.0
 -- @changelog
---   Analysis settings at the Analyze button: an "Analyze with" form on the empty canvas, each item remembers the settings it was analysed with, the Re-Analyze... menu item and Analyze Selected Items (N)... open them (the no-notes Re-Analyze button analyses at once), Save as Default, Settings section renamed "Analysis Defaults"
+--   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas reads top to bottom: the selected item names, Analysis Settings (renamed from Analyze with), then Analyze as wide as the settings, without the "your defaults" and "Matches your defaults" lines; tooltips for each Vocal Range, Detection Mode and Quality; fix: the pitch line draws in again while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -209,6 +209,10 @@ local PARAM_LABELS = {
 local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
+  -- Track extension key holding the track's Track Default (JSON: only the value keys set); ExtState key prefix of
+  -- the System Default of each value (pitch_def_<key>). See K.item_default
+  TRACK_DEFAULT_KEY = "P_EXT:fancy_pitch_track_defaults",
+  SYS_DEFAULT_EXT = "pitch_def_",
 
   -- The note action bar's grip offset is kept within this many pixels of its place under the note
   NOTE_BAR_OFFSET_MAX = 2000,
@@ -452,8 +456,9 @@ local state = {
 
   -- What the script asked REAPER about, valid for one value of GetProjectStateChangeCount(0) of one project (see
   -- K.refresh_project_cache, K.drop_project_cache): takes by GUID (take = pointer, or false when the item is not in
-  -- the project; scanned = the full item scan ran), the item of a take, and whether a take's pitch envelope is bypassed
-  cache = { count = nil, proj = nil, takes = {}, items = {}, bypass = {} },
+  -- the project; scanned = the full item scan ran), the item of a take, whether a take's pitch envelope is bypassed,
+  -- the track of a take (false: none) and the Track Default of a track (K.track_defaults)
+  cache = { count = nil, proj = nil, takes = {}, items = {}, bypass = {}, tracks = {}, trackdef = {} },
   -- The target as loop_body resolved it this frame (see K.frame_target)
   frame = { guid = nil, take = nil, item = nil },
   -- The canvas's drawing cache (see K.canvas_cache_begin): the mapping the cached coordinates belong to (map, gen counts
@@ -535,20 +540,20 @@ K.item_value = function(data, key)
   return data.overrides and data.overrides[key]
 end
 
---- The values a new item starts with: the script's DEFAULTS for every value key, and the Key and Scale last chosen
---- in the bar (K.new_key).
-K.new_item_values = function()
+--- The values a new item `guid` starts with: its default of every value key (K.item_default: its track's, else the
+--- System Default, else DEFAULTS), and the Key and Scale last chosen in the bar (K.new_key).
+K.new_item_values = function(guid)
   local t = {}
-  for _, key in ipairs(K.ITEM_KEYS) do t[key] = DEFAULTS[key] end
+  for _, key in ipairs(K.ITEM_KEYS) do t[key] = (K.item_default(key, guid)) end
   t.key_idx, t.scale_idx = K.new_key.key_idx, K.new_key.scale_idx
   return t
 end
 
---- Fill every missing value of an item's model with a new item's (K.new_item_values: the defaults; a model change
---- only: it is written with the item's next save). A new analysis, and an item analysed before 2.22 that holds no
---- values, get them here. Returns true when it filled one.
+--- Fill every missing value of an item's model with a new item's (K.new_item_values: its defaults, by data.guid; a
+--- model change only: it is written with the item's next save). A new analysis, and an item analysed before 2.22
+--- that holds no values, get them here. Returns true when it filled one.
 K.item_seed = function(data)
-  local start, filled = K.new_item_values(), false
+  local start, filled = K.new_item_values(data.guid), false
   for _, key in ipairs(K.ITEM_KEYS) do
     if K.item_value(data, key) == nil then
       if key == "separation" then
@@ -573,37 +578,38 @@ K.item_carry_key = function(data, before)
   if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
 end
 
---- How many of the item's values (K.ITEM_KEYS) differ from the script's defaults (DEFAULTS). A missing value is the
---- default. Key and Scale are not values with a default.
+--- How many of the item's values (K.ITEM_KEYS) differ from its defaults (K.item_default, by data.guid). A missing
+--- value is the default. Key and Scale are not values with a default.
 K.item_off_defaults = function(data)
   if not data then return 0 end
   local n = 0
   for _, key in ipairs(K.ITEM_KEYS) do
-    local v = K.item_value(data, key)
-    if v ~= nil and DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then n = n + 1 end
+    local v, d = K.item_value(data, key), K.item_default(key, data.guid)
+    if v ~= nil and d ~= nil and K.value_changed(v, d) then n = n + 1 end
   end
   return n
 end
 
---- The model part of "Reset this item to defaults": every item value (K.ITEM_KEYS) becomes the script's default
---- (DEFAULTS); Key and Scale are not changed, and the notes keep their own values. A model change only
---- (K.reset_item_all writes it).
+--- The model part of "Reset this item to defaults": every item value (K.ITEM_KEYS) becomes its default
+--- (K.item_default, by data.guid); Key and Scale are not changed, and the notes keep their own values. A model change
+--- only (K.reset_item_all writes it).
 K.item_reset_values = function(data)
   if not data then return end
   for _, key in ipairs(K.ITEM_KEYS) do
-    if DEFAULTS[key] ~= nil then
+    local d = K.item_default(key, data.guid)
+    if d ~= nil then
       if key == "separation" then
-        data.separation = DEFAULTS[key]
+        data.separation = d
       else
         data.overrides = data.overrides or {}
-        data.overrides[key] = DEFAULTS[key]
+        data.overrides[key] = d
       end
     end
   end
 end
 
---- Resolve an effective value: the note's own, else the target item's, else the script's default (an item not
---- analysed yet, or not seeded).
+--- Resolve an effective value: the note's own, else the target item's, else its default (K.item_default: an item
+--- not analysed yet, or not seeded).
 local function get_effective(note, key)
   if note and note.controls and note.controls[key] ~= nil then
     return note.controls[key]
@@ -612,16 +618,17 @@ local function get_effective(note, key)
     local v = K.item_value(state.session_takes[state.target_take_guid], key)
     if v ~= nil then return v end
   end
-  return DEFAULTS[key]
+  return (K.item_default(key, state.target_take_guid))
 end
 
---- Returns the override level for display: "note" (the note has its own), "item" (the item differs from the
---- script's default: the "*" mark) or "default".
+--- Returns the override level for display: "note" (the note has its own), "item" (the item differs from its
+--- default, K.item_default: the "*" mark) or "default".
 local function get_override_level(note, key)
   if note and note.controls and note.controls[key] ~= nil then return "note" end
-  if state.target_take_guid then
-    local v = K.item_value(state.session_takes[state.target_take_guid], key)
-    if v ~= nil and DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then return "item" end
+  local guid = state.target_take_guid
+  if guid then
+    local v, d = K.item_value(state.session_takes[guid], key), K.item_default(key, guid)
+    if v ~= nil and d ~= nil and K.value_changed(v, d) then return "item" end
   end
   return "default"
 end
@@ -956,7 +963,7 @@ end
 K.drop_project_cache = function()
   local cache = state.cache
   cache.count, cache.proj = nil, nil
-  cache.takes, cache.items, cache.bypass = {}, {}, {}
+  cache.takes, cache.items, cache.bypass, cache.tracks, cache.trackdef = {}, {}, {}, {}, {}
 end
 
 --- Once per frame, before anything reads the cache: one GetProjectStateChangeCount call and one EnumProjects call;
@@ -1021,6 +1028,108 @@ K.take_item = function(take)
     items[take] = item
   end
   return item or nil
+end
+
+-------------------------------------------------------------------------------
+-- Saved defaults (docs/design/pitch-correct-saved-defaults.md). An item's default of a value, the level its
+-- "Reset to default", its "*" mark and a new analysis of it go by, is the first of: its track's Track Default
+-- (track P_EXT, only the keys set, part of the project and its undo history), the System Default (ExtState
+-- pitch_def_<key>, every project), the script's DEFAULTS. Key and Scale are never part of a default.
+-------------------------------------------------------------------------------
+
+--- A stored default of `key` checked: a finite number clamped to the value's range (Mode one of 0, 1, 2), or nil.
+K.item_value_valid = function(key, v)
+  v = tonumber(v)
+  if not v or v ~= v or math.abs(v) == math.huge then return nil end
+  if key == "correct_mode" then
+    if v ~= 0 and v ~= 1 and v ~= 2 then return nil end
+    return v
+  end
+  local lim = (key == "tolerance") and K.LIMITS.tolerance or { 0, 1 }
+  if DEFAULTS[key] == nil then return nil end
+  return math.max(lim[1], math.min(lim[2], v))
+end
+
+--- The System Default of each value key that has one ({ [key] = number }), read at start (K.sys_defaults_load).
+K.sys_defaults = {}
+
+K.sys_defaults_load = function()
+  K.sys_defaults = {}
+  for _, key in ipairs(K.ITEM_KEYS) do
+    K.sys_defaults[key] = K.item_value_valid(key, reaper.GetExtState("FancyScripts", K.SYS_DEFAULT_EXT .. key))
+  end
+end
+K.sys_defaults_load()   -- at start, with the other settings (K.load_settings)
+
+--- Save `values` ({ [key] = number }) as the System Default of those keys (outside the undo history).
+K.sys_default_set = function(values)
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = values[key] ~= nil and K.item_value_valid(key, values[key]) or nil
+    if v ~= nil then
+      K.sys_defaults[key] = v
+      reaper.SetExtState("FancyScripts", K.SYS_DEFAULT_EXT .. key, string.format("%.14g", v), true)
+    end
+  end
+end
+
+--- Forget every System Default: the factory DEFAULTS apply again.
+K.sys_defaults_clear = function()
+  for _, key in ipairs(K.ITEM_KEYS) do
+    reaper.DeleteExtState("FancyScripts", K.SYS_DEFAULT_EXT .. key, true)
+  end
+  K.sys_defaults = {}
+end
+
+--- How many values have a System Default that differs from the factory one.
+K.sys_defaults_changed = function()
+  local n = 0
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = K.sys_defaults[key]
+    if v ~= nil and math.abs(v - DEFAULTS[key]) > 1e-9 then n = n + 1 end
+  end
+  return n
+end
+
+--- The track a take (by GUID) is on, cached per project state; nil when the take or its track is gone.
+K.take_track = function(guid)
+  if not guid then return nil end
+  local tracks = state.cache.tracks
+  local track = tracks[guid]
+  if track == nil then
+    local take = resolve_take_by_guid(guid, true)
+    track = take and reaper.GetMediaItemTake_Track(take) or false
+    tracks[guid] = track
+  end
+  return track or nil
+end
+
+--- The Track Default of `track` ({ [key] = number }, only the keys set and valid; empty when none), cached per
+--- project state.
+K.track_defaults = function(track)
+  if not track then return {} end
+  local cache = state.cache.trackdef
+  local t = cache[track]
+  if t then return t end
+  t = {}
+  local ok, raw = reaper.GetSetMediaTrackInfo_String(track, K.TRACK_DEFAULT_KEY, "", false)
+  if ok and raw and raw ~= "" then
+    local parsed_ok, parsed = pcall(JSON.decode, raw)
+    if parsed_ok and type(parsed) == "table" then
+      for _, key in ipairs(K.ITEM_KEYS) do t[key] = K.item_value_valid(key, parsed[key]) end
+    end
+  end
+  cache[track] = t
+  return t
+end
+
+--- The default of value `key` for the item `guid`, and where it comes from: "track", "system" or "factory". A key
+--- that is not an item value gives DEFAULTS[key], "factory".
+K.item_default = function(key, guid)
+  local tv = K.track_defaults(K.take_track(guid))[key]
+  if tv ~= nil then return tv, "track" end
+  local sv = K.sys_defaults[key]
+  if sv ~= nil then return sv, "system" end
+  return DEFAULTS[key], "factory"
 end
 
 --- GUID string of a take, or nil.
@@ -1845,11 +1954,11 @@ end
 
 --- The form's header line.
 K.form_header = function(form)
-  if form.source == "item" then return "ANALYZE WITH · as analyzed before" end
-  if form.source == "unrecorded" then return "ANALYZE WITH · not recorded, your defaults" end
+  if form.source == "item" then return "ANALYSIS SETTINGS · as analyzed before" end
+  if form.source == "unrecorded" then return "ANALYSIS SETTINGS · not recorded, your defaults" end
   local n = K.form_changed_rows(form.values)
-  if n == 0 then return "ANALYZE WITH · your defaults" end
-  return string.format("ANALYZE WITH · %d changed from defaults", n)
+  if n == 0 then return "ANALYSIS SETTINGS · your defaults" end
+  return string.format("ANALYSIS SETTINGS · %d changed from defaults", n)
 end
 
 --- The Save as Default confirm (a request_confirm request) for `values`.
@@ -1907,10 +2016,10 @@ K.analysis_begin = function(take, item, opts)
   local guid = get_take_guid(take)
   if guid then state.target_take_guid = guid end
   state.target_take_name = reaper.GetTakeName(take) or state.target_take_name
-  -- An item analysed before starts again at the defaults: it is split at the default Separation, not its own (its
+  -- An item analysed before starts again at its defaults (K.item_default): it is split at its default Separation, not its own (its
   -- Key and Scale stay). An item not analysed yet uses the Separation the bar shows for it (the default, unless it
   -- was set for this item before its first analysis)
-  if guid and state.session_takes[guid] then state.separation = DEFAULTS.separation end
+  if guid and state.session_takes[guid] then state.separation = (K.item_default("separation", guid)) end
 
   state.start_time = 0 -- Relative to item start
   state.item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
@@ -2967,7 +3076,7 @@ end
 K.BATCH_PEEK_S = 0.25
 
 --- What the window says about a possible batch: { n = audio items selected, skipped = other selected items,
---- with_notes = how many of the n hold notes, target_in = the open item is one of them }. The selection is not
+--- with_notes = how many of the n hold notes, target_in = the open item is one of them, names = their take names }. The selection is not
 --- walked every frame: the answer is kept until the number of selected items, the project state or the open item
 --- changes, and for K.BATCH_PEEK_S at most (a selection change need not move the project's change count).
 --- A batch never uses this: it reads the selection afresh when it starts (K.batch_request).
@@ -2980,8 +3089,9 @@ K.batch_peek = function(now)
     return cache.peek
   end
   local sel = K.batch_selection()
-  local peek = { n = #sel.takes, skipped = sel.skipped, with_notes = 0, target_in = false }
+  local peek = { n = #sel.takes, skipped = sel.skipped, with_notes = 0, target_in = false, names = {} }
   for _, entry in ipairs(sel.takes) do
+    peek.names[#peek.names + 1] = entry.name
     if entry.has_notes then peek.with_notes = peek.with_notes + 1 end
     if entry.guid == state.target_take_guid then peek.target_in = true end
   end
@@ -3000,26 +3110,55 @@ K.batch_tip = function(n)
   return string.format("Detect the pitch of the %d selected audio items, one after another.\n\nOne undo step for all of them.", n)
 end
 
---- The lines under the canvas button for what K.batch_peek returned: the first, and the second or nil.
-K.batch_lines = function(peek)
+--- The lines above the canvas form for what K.batch_peek returned: the first, and the second or nil. The first
+--- names what Analyze will analyse: the open item (target_name, nil when there is none) unless two or more audio
+--- items are selected, then "N items selected: a, b, …" (the full list here; the canvas fits it to its width, K.batch_names_fit). With nothing to
+--- analyse it is the instruction. Both read "N item(s) selected: …".
+K.batch_lines = function(peek, target_name)
   if peek.n < 2 then
-    return "No data. Select an item and click Analyze.", "Select several items in REAPER to analyze them all at once."
+    if target_name and target_name ~= "" then return "1 item selected: " .. target_name, nil end
+    return "Select one or more items and click Analyze.", nil
   end
-  local first = string.format("%d audio items selected", peek.n)
+  local first = string.format("%d items selected: %s", peek.n, table.concat(peek.names or {}, ", "))
+  local parts = {}
   if peek.skipped == 1 then
-    first = first .. " (1 other item is skipped)"
+    parts[#parts + 1] = "1 other selected item is skipped."
   elseif peek.skipped > 1 then
-    first = first .. string.format(" (%d other items are skipped)", peek.skipped)
+    parts[#parts + 1] = string.format("%d other selected items are skipped.", peek.skipped)
   end
-  first = first .. "."
-  if not peek.target_in then first = first .. " This item is not one of them." end
-  local second = nil
+  if not peek.target_in then parts[#parts + 1] = "This item is not one of them." end
   if peek.with_notes == 1 then
-    second = "1 already has notes. You will be asked before it is replaced."
+    parts[#parts + 1] = "1 already has notes. You will be asked before it is replaced."
   elseif peek.with_notes > 1 then
-    second = string.format("%d already have notes. You will be asked before they are replaced.", peek.with_notes)
+    parts[#parts + 1] = string.format("%d already have notes. You will be asked before they are replaced.", peek.with_notes)
   end
-  return first, second
+  return first, (#parts > 0 and table.concat(parts, " ") or nil)
+end
+
+-- At most this many names are listed in the batch line's tooltip
+K.BATCH_NAMES_MAX = 20
+-- The batch line names this many items at most: with more selected it ends in "…" (the count leads the line)
+K.BATCH_NAMES_SHOWN = 2
+
+--- "N items selected: a, b, …": the first K.BATCH_NAMES_SHOWN of `names` (fewer when they do not fit max_w by
+--- measure(text) -> width), "…" when some are left out. When not even the first name fits: "N items selected".
+K.batch_names_fit = function(names, max_w, measure)
+  local n = #names
+  for k = math.min(n, K.BATCH_NAMES_SHOWN), 1, -1 do
+    local text = string.format("%d items selected: %s", n, table.concat(names, ", ", 1, k))
+    if k < n then text = text .. ", …" end
+    if measure(text) <= max_w then return text end
+  end
+  return string.format("%d items selected", n)
+end
+
+--- The batch line's tooltip: every name, one per line (K.BATCH_NAMES_MAX at most, the rest counted).
+K.batch_names_tip = function(names)
+  local n = #names
+  local lines = { string.format("%d selected items", n), "" }
+  for i = 1, math.min(n, K.BATCH_NAMES_MAX) do lines[#lines + 1] = names[i] end
+  if n > K.BATCH_NAMES_MAX then lines[#lines + 1] = string.format("+%d more", n - K.BATCH_NAMES_MAX) end
+  return table.concat(lines, "\n")
 end
 
 --- What to ask before a batch over `entries` (K.batch_selection's takes) replaces existing notes: the fields of a
@@ -3246,7 +3385,7 @@ K.batch_next = function()
       -- It is split at the default Separation and keeps its own Key and Scale (an item analysed for the first time:
       -- the ones last chosen), never those of the item that was open. An analysis stored on the item that the window
       -- has not loaded (pasted later) counts too: it is read here and kept on the entry for K.batch_item_done
-      local before, start = state.session_takes[entry.guid], K.new_item_values()
+      local before, start = state.session_takes[entry.guid], K.new_item_values(entry.guid)
       if not before then before = load_take_data(take) end
       entry.before = before
       state.separation = start.separation
@@ -3321,9 +3460,9 @@ K.analysis_progress = function()
   return state.progress or 0
 end
 
---- The open item has no stored data: Separation is the default, Key and Scale the ones last chosen.
+--- The open item has no stored data: Separation is its default (K.item_default), Key and Scale the ones last chosen.
 K.adopt_new_item_values = function()
-  local start = K.new_item_values()
+  local start = K.new_item_values(state.target_take_guid)
   state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
   update_scale_pitch_classes()
 end
@@ -6960,9 +7099,9 @@ local function draw_graph(draw_ctx, w, h)
   -- Returns true when it was clicked (never while it is disabled). It moves the layout cursor into the canvas:
   -- whoever used it calls restore_canvas_layout() before leaving draw_graph.
   -- preset: a Theme button preset table (default the large one); the Analyze button uses K.ANALYZE_BTN, the canvas's
-  -- one call to action, and its height is K.analyze_btn_h(draw_ctx)
+  -- one call to action, and its height is K.analyze_btn_h(draw_ctx). min_w (optional): the width it takes at least
   local buttons_used = false
-  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label, preset)
+  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label, preset, min_w)
     buttons_used = true
     preset = preset or L.btn_lg
     local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, preset)
@@ -6972,6 +7111,7 @@ local function draw_graph(draw_ctx, w, h)
       label = narrow_label
       btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + preset.pad_x * 2
     end
+    if min_w and btn_w < min_w then btn_w = min_w end   -- as wide as what it sits under (the Analysis Settings form)
     reaper.ImGui_SetCursorScreenPos(draw_ctx, cx - btn_w * 0.5, y)
     if not enabled then reaper.ImGui_BeginDisabled(draw_ctx) end
     local clicked
@@ -7002,12 +7142,12 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  -- Nothing to edit yet: not analysed (the "Analyze with" form above Analyze Item, the hint lines under it), or
-  -- analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes one of three
-  -- layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary line beside
-  -- the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
-  -- analysis runs (its first slice already fills state.results) the form stays in place, locked, showing the values
-  -- it runs with (K.canvas_form), and the button is disabled.
+  -- Nothing to edit yet: not analysed (the instruction line, the "Analysis Settings" form, then Analyze Item as wide
+  -- as the form), or analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes
+  -- one of three layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary
+  -- line beside the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
+  -- analysis runs and has no frames yet the form stays in place, locked, showing the values it runs with
+  -- (K.canvas_form), and the button is disabled; its first slice in state.results draws the pitch line instead.
   local form_canvas, no_notes = K.empty_canvas()
   if form_canvas then
     local cx = full_px + full_w * 0.5
@@ -7032,9 +7172,16 @@ local function draw_graph(draw_ctx, w, h)
     else
       peek = K.batch_peek(reaper.time_precise())
       is_batch = peek.n >= 2
-      for _, line in ipairs({ K.batch_lines(peek) }) do
-        shown[#shown + 1] = K.wrap_lines(draw_ctx, line, avail_w)
+      local first, second = K.batch_lines(peek, target_take ~= nil and state.target_take_name or nil)
+      if is_batch then
+        -- One line, fitted: the full list is its tooltip
+        first = K.batch_names_fit(peek.names, avail_w,
+          function(t) return (reaper.ImGui_CalcTextSize(draw_ctx, t)) or 0 end)
+        shown[1] = { { text = first, w = (reaper.ImGui_CalcTextSize(draw_ctx, first)) or 0 } }
+      else
+        shown[1] = K.wrap_lines(draw_ctx, first, avail_w)
       end
+      if second then shown[2] = K.wrap_lines(draw_ctx, second, avail_w) end
     end
 
     local form, reason = K.canvas_form(target_take ~= nil, is_batch)
@@ -7074,7 +7221,24 @@ local function draw_graph(draw_ctx, w, h)
       or (target_take ~= nil and "Detect the pitch of the selected audio item"
         or "Select an audio item in REAPER to analyze it.")
 
-    local btn_cx = cx
+    -- The instruction (or what a batch will do) first, then the form, then the button as wide as the form: one
+    -- column. The summary layout keeps its one row (summary, Change…, button) under the lines.
+    for i, rows in ipairs(shown) do
+      if i > 1 then y = y + L.xs end
+      for _, row in ipairs(rows) do
+        local x = cx - row.w * 0.5
+        reaper.ImGui_DrawList_AddText(draw_list, x, y, P.text_dim, row.text)
+        -- The batch line lists every selected item in its tooltip
+        if i == 1 and is_batch and not K.window_modal_now and reaper.ImGui_IsWindowHovered(draw_ctx)
+          and reaper.ImGui_IsMouseHoveringRect(draw_ctx, x, y, x + row.w, y + text_h) then
+          Theme.tooltip(draw_ctx, K.batch_names_tip(peek.names))
+        end
+        y = y + text_h
+      end
+    end
+    if #shown > 0 then y = y + gap end
+
+    local btn_cx, btn_min_w = cx, nil
     if layout == "summary" then
       -- One row, centred: the summary line (shortened to the room left), Change…, the button
       local m = K.form_canvas_metrics()
@@ -7095,21 +7259,12 @@ local function draw_graph(draw_ctx, w, h)
     else
       local drawn_h = K.form_canvas_draw(form, cx - form_w * 0.5, y, form_w, layout, reason, form_max_h)
       K.form_canvas_last = { layout = layout, adv = K.form_adv_open, h = drawn_h, scroll = form_max_h ~= nil }
-      y = y + form_h + gap
+      y = y + drawn_h + gap
+      btn_min_w = form_w
     end
 
-    if canvas_button(label, btn_id, btn_cx, y, can_analyze, tip, narrow_label, K.ANALYZE_BTN) then
+    if canvas_button(label, btn_id, btn_cx, y, can_analyze, tip, narrow_label, K.ANALYZE_BTN, btn_min_w) then
       if is_batch then K.batch_request(form.values) else start_analysis(form.values) end
-    end
-
-    -- Centred text below the button
-    y = y + analyze_h
-    for i, rows in ipairs(shown) do
-      y = y + (i == 1 and gap or L.xs)
-      for _, row in ipairs(rows) do
-        reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
-        y = y + text_h
-      end
     end
 
     -- The empty canvases carry their own centred message: the pill adds only a status message or the selection issue
@@ -10872,10 +11027,23 @@ end
 K.ANALYSIS_DEFAULTS_NOTE = "New analyses start with these. Each item keeps the settings it was analyzed with."
 
 --- Tooltips of the three preset rows (shared by the Settings and the analysis form).
+-- One paragraph per choice, its key difference first. The note names are the VOCAL_RANGES limits rounded to the
+-- nearest note; the lowest notes of each Quality are its block's limit (half a block per period) at 48 kHz.
 K.ROW_TIPS = {
-  range = "Vocal Range\n\nThe pitch range searched for this analysis. Pick the singer's range to avoid octave errors.",
-  mode = "Detection Mode\n\nHow sure the detector must be before it calls a sound a note. Lenient finds breathy notes; Strict ignores noise.",
-  quality = "Quality / CPU\n\nFiner timing or finer pitch, and how long the analysis takes.",
+  range = "Vocal Range\n\nThe pitches searched. Pick the singer's range to avoid octave errors."
+    .. "\n\nGeneric Vocal: C2 to B5 (65 to 1000 Hz), any voice."
+    .. "\n\nSoprano: B3 to D6 (250 to 1200 Hz)."
+    .. "\n\nAlto: F3 to G5 (170 to 800 Hz)."
+    .. "\n\nTenor: C3 to B4 (130 to 500 Hz)."
+    .. "\n\nBass: E2 to F4 (80 to 350 Hz).",
+  mode = "Detection Mode\n\nHow clear a sound must be to count as a note."
+    .. "\n\nClean / Strict: only clear, steady tone. Ignores breath and noise; may drop soft notes."
+    .. "\n\nStandard: the balance for most takes."
+    .. "\n\nBreathy / Lenient: catches airy, soft singing; may also catch breath and noise.",
+  quality = "Quality / CPU\n\nHow finely the audio is measured, and how long it takes."
+    .. "\n\nHigh Quality (Offline): finest pitch and timing, reaches the lowest voices. Slowest."
+    .. "\n\nStandard (Realtime): quicker, coarser timing. Misses notes below about F#2 (94 Hz)."
+    .. "\n\nLow Latency: fastest, fine timing. Misses notes below about F#3 (188 Hz).",
 }
 
 -- The Settings forms: Pitch Shift Engine, Analysis Defaults, Advanced DSP. A row knows its label, whether its
@@ -11085,16 +11253,15 @@ K.form_rows_draw = function(section, b, opts)
   return section_clicked
 end
 
--- The "Analyze with" form on the empty canvas (spec: Analysis Settings at the Analyze Button). Its copy:
+-- The "Analysis Settings" form on the empty canvas (spec: Analysis Settings at the Analyze Button). Its copy:
 K.FORM_COPY = {
   reset_hint = "Back to your default (from Settings)",
   default_reason = "Already the default",
   save = "Save as Default",
   save_tip = "Use these values for every new analysis",
-  matches = "Matches your defaults",
   change = "Change…",
   change_tip = "Change the values this item is analyzed with",
-  summary = "Analyze with: ",
+  summary = "Analysis Settings: ",
   no_target = "Select an audio item in REAPER to analyze it.",
 }
 
@@ -11135,13 +11302,13 @@ K.form_canvas_metrics = function()
   local reset_w = text_w("Reset") + L.md * 2
   local save_w = text_w(K.FORM_COPY.save) + pad_x * 2
   local table_row_h = frame_h + cell_y * 2
-  -- The header: the divider (spacing, label, separator, spacing) and the count line under it, then the reason line
-  local head_h = spacing_y * 4 + frame_h + 1 + line_h + line_h
+  -- The header: the divider (spacing, label, separator, spacing), then the reason line
+  local head_h = spacing_y * 4 + frame_h + 1 + line_h
   local n_det, n_dsp = #detection.rows, #dsp.rows
   m = {
     key = key, label_w = label_w, control_w = control_w, reset_w = reset_w, frame_h = frame_h,
     save_w = save_w, change_w = text_w(K.FORM_COPY.change) + pad_x * 2,
-    slot_w = math.max(save_w, text_w(K.FORM_COPY.matches)),
+    slot_w = save_w,
     -- Three table columns, each with its L.md gap and the cells' padding on both sides
     row_w = label_w + control_w + reset_w + L.md * 3 + cell_x * 6 + win_x * 2,
     stacked_w = math.max(label_w, Theme.calc_combo_width(ctx, { K.CUSTOM_PRESET }) + L.sm + reset_w) + win_x * 2,
@@ -11235,17 +11402,14 @@ K.window_modal_open = function()
     or (c ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c)))
 end
 
---- Save as Default, or "Matches your defaults" in its place while `form` holds the defaults (EP2), right-aligned in
---- a slot as wide as the wider of the two (K.form_canvas_metrics' slot_w). why (optional): why it is disabled.
---- Returns true when it was clicked (the caller asks K.form_defaults_request's confirm).
+--- Save as Default, right-aligned in its slot (K.form_canvas_metrics' slot_w); nothing in its place while `form`
+--- holds the defaults. why (optional): why it is disabled. Returns true when it was clicked (the caller asks
+--- K.form_defaults_request's confirm).
 K.form_save_draw = function(form, id, why)
-  local P = Theme.get_palette()
   local m = K.form_canvas_metrics()
   local cur_x = reaper.ImGui_GetCursorPosX(ctx)
   if K.form_changed_rows(form.values) == 0 then
-    reaper.ImGui_SetCursorPosX(ctx, cur_x + m.slot_w - ((reaper.ImGui_CalcTextSize(ctx, K.FORM_COPY.matches)) or 0))
-    Theme.align(ctx)
-    reaper.ImGui_TextColored(ctx, P.text_dim, K.FORM_COPY.matches)
+    reaper.ImGui_Dummy(ctx, m.slot_w, m.frame_h)   -- the slot stays, empty: the row keeps its height
     return false
   end
   reaper.ImGui_SetCursorPosX(ctx, cur_x + m.slot_w - m.save_w)
@@ -11314,8 +11478,8 @@ K.confirm_form_draw = function(c)
   end
 end
 
---- The "Analyze with" form of the empty canvas: a child window at x, y (screen), w wide, over the canvas: the header
---- (ANALYZE WITH and the changed count), the three rows, the Advanced fold, and Save as Default right-aligned.
+--- The "Analysis Settings" form of the empty canvas: a child window at x, y (screen), w wide, over the canvas: the header
+--- (ANALYSIS SETTINGS), the three rows, the Advanced fold, and Save as Default right-aligned.
 --- layout "full" or "stacked" (K.form_layout). reason (optional): why the form is disabled (no item). While an
 --- analysis runs everything is disabled with K.LOCKED_REASON under the header. max_h (optional): the height it is
 --- held to, scrolling inside (K.form_canvas_plan); else it takes its content's height. Returns the height it took.
@@ -11346,11 +11510,11 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   reaper.ImGui_PopStyleColor(ctx, 1)
   if child_open then
     local content_w = reaper.ImGui_GetContentRegionAvail(ctx)   -- less the scrollbar when it scrolls
+    -- The heading alone (no "your defaults" / changed-count line under it, unlike the modal)
     local header = K.form_header(form)
-    local head, tail = header:match("^(.-) · (.+)$")
-    Theme.section_divider(ctx, head or header, { color = P.yellow })
-    if tail then reaper.ImGui_TextColored(ctx, P.text_dim, tail) end
-    if why then reaper.ImGui_TextColored(ctx, P.text_dim, why) end
+    Theme.section_divider(ctx, header:match("^(.-) · ") or header, { color = P.yellow })
+    -- No item: the line above the form already says to select one (the disabled controls keep it as their tooltip)
+    if why and why ~= K.FORM_COPY.no_target then reaper.ImGui_TextColored(ctx, P.text_dim, why) end
 
     local b = K.form_binding(form)
     local opts = {
@@ -11388,7 +11552,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   return h
 end
 
---- The summary line of a short canvas: dim "Analyze with: Soprano · ..." (shortened to text_w with the whole line
+--- The summary line of a short canvas: dim "Analysis Settings: Soprano · ..." (shortened to text_w with the whole line
 --- in its tooltip) and Change… at x, centred on a row row_h tall at y. Returns the width it took. Change… opens the
 --- analysis modal (K.analyze_change_request), or the batch modal seeded with the form when the canvas button is a
 --- batch (is_batch). reason (optional): why Change… is disabled, its tooltip then.
@@ -11421,11 +11585,12 @@ K.form_summary_draw = function(form, x, y, text_w, row_h, reason, is_batch)
   return used + m.change_w
 end
 
---- Whether the canvas shows the "Analyze with" form instead of notes (not analysed, no pitched note found, or an
---- analysis running), and whether it is the no-notes canvas (title, hint and Re-Analyze; never while analysing).
+--- Whether the canvas shows the "Analysis Settings" form instead of notes (not analysed, no pitched note found, or an
+--- analysis running that has no frames yet), and whether it is the no-notes canvas (title, hint and Re-Analyze;
+--- never while analysing). Once the first slice of an analysis fills state.results the pitch line draws in.
 K.empty_canvas = function()
   local running = state.is_analyzing == true
-  local shows = #state.results == 0 or state.analysis_empty == true or running
+  local shows = #state.results == 0 or (state.analysis_empty == true and not running)
   return shows, shows and #state.results > 0 and not running
 end
 
@@ -11506,6 +11671,34 @@ K.request_settings_reset = function(section)
       b.commit()
       set_status(string.format("Reset %d %s to %s (not undoable)", done, plural(done, "setting", "settings"),
         plural(done, "its default", "their defaults")))
+    end,
+  })
+end
+
+--- The line under the Item Value Defaults divider, and the values it lists, one line each.
+K.ITEM_DEFAULTS_NOTE = "New analyses start with these, unless the item's track has a Track Default."
+K.ITEM_DEFAULTS_LINES = { { "separation", "correct_mode", "tighten" }, { "tolerance", "retune_speed", "slide_in" } }
+
+--- Settings > Restore Factory Defaults…: ask, then forget every System Default (outside the undo history). Track
+--- Defaults are not touched.
+K.request_factory_defaults = function()
+  local n = K.sys_defaults_changed()
+  if n == 0 then return end
+  local factory = {}
+  for _, key in ipairs(K.ITEM_KEYS) do factory[key] = DEFAULTS[key] end
+  request_confirm({
+    id = "restore_factory_defaults",
+    title = "Restore the factory defaults?",
+    body_lines = {
+      string.format("New analyses start with: %s.", K.apply_values_line(factory, K.ITEM_KEYS)),
+      "Tracks with a Track Default keep it. Items already analyzed keep their values.",
+      string.format("Not part of the undo history: %s+Z does not bring your System Default back.", K.MOD_LABEL),
+    },
+    confirm_label = "Restore Factory Defaults",
+    fit = true,
+    on_confirm = function()
+      K.sys_defaults_clear()
+      set_status("Factory defaults restored.")
     end,
   })
 end
@@ -11609,6 +11802,35 @@ local function draw_settings_modal()
     reaper.ImGui_Dummy(ctx, 0, L.sm)
     if Theme.collapsing_header(ctx, dsp.title) then
       draw_form(dsp)
+    end
+
+    -- The System Default of the item values (saved from the "This item" menu), and its way back to the factory ones
+    Theme.section_divider(ctx, "Item Value Defaults", { color = P.yellow })
+    local sys = {}
+    for _, key in ipairs(K.ITEM_KEYS) do sys[key] = K.sys_defaults[key] or DEFAULTS[key] end
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, P.text_dim, K.ITEM_DEFAULTS_NOTE)
+    for _, keys in ipairs(K.ITEM_DEFAULTS_LINES) do
+      Theme.align(ctx)
+      reaper.ImGui_Text(ctx, K.apply_values_line(sys, keys))
+    end
+    local factory_text = "Restore Factory Defaults\xE2\x80\xA6"
+    local factory_reason = (K.sys_defaults_changed() == 0) and "Already at the factory defaults" or nil
+    Theme.align(ctx)
+    reaper.ImGui_BeginDisabled(ctx, factory_reason ~= nil)
+    local factory_clicked = reaper.ImGui_Button(ctx, factory_text .. "###restore_factory", text_w(factory_text) + L.md * 2, 0)
+    reaper.ImGui_EndDisabled(ctx)
+    if factory_reason then
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
+      Theme.align(ctx)
+      reaper.ImGui_TextColored(ctx, P.text_dim, factory_reason)
+    elseif reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      Theme.tooltip(ctx, "New analyses start at the factory values again (tracks with a Track Default keep it)")
+    end
+    if factory_clicked then
+      -- The confirm is the only modal: close Settings first
+      reaper.ImGui_CloseCurrentPopup(ctx)
+      K.request_factory_defaults()
     end
 
     -- The confirm is the only modal: close Settings first
@@ -12920,8 +13142,9 @@ K.apply_plan = function(src, entries, keys, keep)
       local item_lose = false
       for _, key in ipairs(keys) do
         local v, cur = src[key], K.apply_item_get(data, key)
-        -- A value of the item's own: it differs from the script's default
-        local differs = cur ~= nil and DEFAULTS[key] ~= nil and K.value_changed(cur, DEFAULTS[key])
+        -- A value of the item's own: it differs from its default (K.item_default)
+        local def = K.item_default(key, entry.guid)
+        local differs = cur ~= nil and def ~= nil and K.value_changed(cur, def)
         local own = keep and differs
         if v ~= nil and not own and K.value_changed(cur, v) then
           if key == "separation" and keep and edited then
@@ -13798,8 +14021,8 @@ do
   local BAR_RANGE_SEP = "\xE2\x80\x93"   -- between the lowest and highest value of a mixed selection
   -- The selection pill: what a drag in the bar changes
   local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "This item", "1 note", "%d notes"
-  local BAR_PILL_TIP_NONE = "Your edits change this item only.\n\nSelect notes to change just those notes.\n\nClick: apply to other items."
-  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes.\n\nEsc goes back to this item.\n\nClick: apply to other items."
+  local BAR_PILL_TIP_NONE = "Your edits change this item only.\n\nSelect notes to change just those notes.\n\nClick or right-click: apply to other items, save as a default."
+  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes.\n\nEsc goes back to this item.\n\nClick or right-click: apply to other items, save as a default."
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
   local BAR_REASON_NO_TARGET = "Select an audio item"
@@ -13811,6 +14034,8 @@ do
   local BAR_SCOPE_NOTE = "Changes the selected note."
   local BAR_SCOPE_NOTES = "Changes the %d selected notes; each keeps its difference from the others."
   local BAR_LEVELS = "Default: %s. This item: %s."
+  -- After the default in BAR_LEVELS: where it comes from (K.item_default); the factory one has no tag
+  local BAR_LEVEL_TAG = { track = " (track)", system = " (system)" }
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = K.TOLERANCE_IDLE_TIP
@@ -13946,7 +14171,7 @@ do
 
   --- The value of `spec` in effect on `note`, in display units.
   local function bar_note_value(note, spec)
-    return (tonumber(get_effective(note, spec.key)) or DEFAULTS[spec.key] or 0) * spec.scale
+    return (tonumber(get_effective(note, spec.key)) or 0) * spec.scale
   end
 
   --- Give `note` its own value of `spec` (display units, clamped to the range).
@@ -13981,7 +14206,7 @@ do
   end
 
   --- Reset `key` (double-click, or the right-click menu): the `sel_n` selected notes lose their own value (they
-  --- follow the item again), else this item takes the script's default (DEFAULTS, HC3). One undo point when
+  --- follow the item again), else this item takes its default (K.item_default, HC3). One undo point when
   --- something changed (none when the item is at the default already: UC1); true when it was written. Separation
   --- is reset by draw_separation (a re-split).
   K.reset_target = function(key, sel_notes, sel_n)
@@ -13995,7 +14220,7 @@ do
     else
       local data = state.target_take_guid and state.session_takes[state.target_take_guid]
       if not data then return false end
-      local default, now = DEFAULTS[key], K.item_value(data, key)
+      local default, now = K.item_default(key, state.target_take_guid), K.item_value(data, key)
       if now == nil then now = default end
       if default ~= nil and K.value_changed(now, default) then
         K.bar_write(key, default, sel_notes, 0)
@@ -14007,7 +14232,8 @@ do
   end
 
   --- The right-click menu of the value `key` named `label` (call right after its control): reset (to the item's
-  --- value with notes selected, else to the script's default), and apply it to other items (K.apply_open).
+  --- value with notes selected, else to its default), apply it to other items (K.apply_open), and save it as the
+  --- System or Track Default (K.default_menu_items).
   --- Returns true when Reset was chosen: the caller resets (K.reset_target, or Separation's re-split).
   K.value_menu = function(bctx, key, label, sel_n)
     if not reaper.ImGui_BeginPopupContextItem(bctx, "##ctx_" .. key) then return false end
@@ -14015,6 +14241,8 @@ do
     if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
     local reset = reaper.ImGui_MenuItem(bctx, (sel_n > 0) and BAR_MENU_RESET_NOTES or BAR_MENU_RESET_ITEM)
     K.apply_menu_item(bctx, string.format(BAR_MENU_APPLY, label), { key })
+    reaper.ImGui_Separator(bctx)
+    K.default_menu_items(bctx, { key }, label)
     reaper.ImGui_EndPopup(bctx)
     return reset == true
   end
@@ -14079,6 +14307,166 @@ do
       end
     end
     return table.concat(parts, " \xC2\xB7 ")
+  end
+
+  -- Saved defaults: the copy of the menu entries, their reasons, the System Default confirm and the status lines
+  -- (docs/design/pitch-correct-saved-defaults.md)
+  local DEFAULT_COPY = {
+    sys_all = "Set as System Default\xE2\x80\xA6",
+    sys_one = "Set %s as System Default\xE2\x80\xA6",
+    track_all = "Set as Track Default",
+    track_one = "Set %s as Track Default",
+    track_clear = "Clear Track Default",
+    sys_same = "Already the system default",
+    track_same = "Already the track default",
+    track_none = "No track default",
+    no_track = "The item has no track",
+    sys_title_all = "Make this item's values your System Default?",
+    sys_title_one = "Make %s your System Default?",
+    sys_body = "New analyses on tracks without a Track Default start with: %s.",
+    sys_keep = "Items already analyzed keep their values. Restore Factory Defaults in Settings brings back the factory values.",
+    sys_confirm = "Set as System Default",
+    sys_done = "System default saved: %s.",
+    track_done = "Track default of %s: %s (%s+Z undoes it).",
+    track_cleared = "Track default of %s cleared (%s+Z undoes it).",
+    undo_set_all = "Set track default",
+    undo_set_one = "Set %s as track default",
+    undo_clear = "Clear track default",
+    was = "%s (was %s)",
+  }
+  -- The value keys a default holds (Key and Scale never)
+  local DEFAULT_ALL_KEYS = K.ITEM_KEYS
+
+  --- This item's value of each of `keys` (K.apply_source), nil when no analysed item is open.
+  local function default_source(keys)
+    local guid = state.target_take_guid
+    if not (guid and state.session_takes[guid]) then return nil end
+    return K.apply_source(keys)
+  end
+
+  --- The track of the open item and its name ("this track" when it has none).
+  local function default_track()
+    local track = K.take_track(state.target_take_guid)
+    if not track then return nil, nil end
+    local _, name = reaper.GetTrackName(track)
+    return track, (name and name ~= "") and name or "this track"
+  end
+
+  --- Why "Set as System Default" / "Set as Track Default" for `keys` cannot run now (nil = it can). `level` is
+  --- "system" or "track".
+  K.default_reason = function(keys, level)
+    if state.is_analyzing or K.batch then return BAR_REASON_ANALYZING end
+    local src = default_source(keys)
+    if not src then return BAR_REASON_NOT_ANALYZED end
+    local have
+    if level == "track" then
+      local track = default_track()
+      if not track then return DEFAULT_COPY.no_track end
+      have = K.track_defaults(track)
+    end
+    for _, key in ipairs(keys) do
+      local d
+      if level == "track" then d = have[key] else d = K.sys_defaults[key] or DEFAULTS[key] end
+      if d == nil or K.value_changed(src[key], d) then return nil end
+    end
+    return (level == "track") and DEFAULT_COPY.track_same or DEFAULT_COPY.sys_same
+  end
+
+  --- The System Default confirm for `keys` (nil: every value): names what new analyses start with, and what it was.
+  K.sys_default_request = function(keys)
+    keys = keys or DEFAULT_ALL_KEYS
+    local src = default_source(keys)
+    if not src then return nil end
+    local parts = {}
+    for _, key in ipairs(keys) do
+      local old = { [key] = K.sys_defaults[key] or DEFAULTS[key] }
+      local now_t, old_t = K.apply_values_line(src, { key }), K.apply_values_line(old, { key })
+      parts[#parts + 1] = (now_t ~= old_t) and string.format(DEFAULT_COPY.was, now_t, old_t) or now_t
+    end
+    local line = table.concat(parts, ", ")
+    local title = (#keys == 1) and string.format(DEFAULT_COPY.sys_title_one, K.apply_values_line(src, keys))
+      or DEFAULT_COPY.sys_title_all
+    return {
+      title = title,
+      body_lines = { string.format(DEFAULT_COPY.sys_body, line), DEFAULT_COPY.sys_keep },
+      confirm_label = DEFAULT_COPY.sys_confirm,
+      fit = true,
+      safe = true,   -- nothing the user made is lost (items keep their values)
+      on_confirm = function()
+        K.sys_default_set(src)
+        set_status(string.format(DEFAULT_COPY.sys_done, K.apply_values_line(src, keys)))
+      end,
+    }
+  end
+
+  --- Write `t` ({ [key] = number }, empty: none) as the Track Default of `track`, as one undo point `undo`.
+  local function track_default_write(track, t, undo)
+    local any = next(t) ~= nil
+    reaper.Undo_BeginBlock()
+    reaper.GetSetMediaTrackInfo_String(track, K.TRACK_DEFAULT_KEY, any and JSON.encode(t) or "", true)
+    reaper.Undo_EndBlock(undo, -1)
+    note_own_write()
+  end
+
+  --- "Set as Track Default" (keys nil: every value): this item's values of `keys` become its track's default; the
+  --- track's other keys stay. One undo point; nothing else changes. Returns true when it was written.
+  K.set_track_default = function(keys)
+    keys = keys or DEFAULT_ALL_KEYS
+    if K.default_reason(keys, "track") then return false end
+    local src = default_source(keys)
+    local track, name = default_track()
+    local t = {}
+    for k, v in pairs(K.track_defaults(track)) do t[k] = v end
+    for _, key in ipairs(keys) do t[key] = K.item_value_valid(key, src[key]) end
+    local undo = (#keys == 1) and string.format(DEFAULT_COPY.undo_set_one, APPLY_LABEL[keys[1]] or keys[1])
+      or DEFAULT_COPY.undo_set_all
+    track_default_write(track, t, undo)
+    set_status(string.format(DEFAULT_COPY.track_done, name, K.apply_values_line(src, keys), K.MOD_LABEL))
+    return true
+  end
+
+  --- Why "Clear Track Default" cannot run now (nil = it can).
+  K.clear_track_reason = function()
+    if state.is_analyzing or K.batch then return BAR_REASON_ANALYZING end
+    local track = default_track()
+    if not track then return DEFAULT_COPY.no_track end
+    if next(K.track_defaults(track)) == nil then return DEFAULT_COPY.track_none end
+    return nil
+  end
+
+  --- "Clear Track Default": the open item's track has no default any more (one undo point).
+  K.clear_track_default = function()
+    if K.clear_track_reason() then return false end
+    local track, name = default_track()
+    track_default_write(track, {}, DEFAULT_COPY.undo_clear)
+    set_status(string.format(DEFAULT_COPY.track_cleared, name, K.MOD_LABEL))
+    return true
+  end
+
+  --- The default entries of a menu for `keys` (nil: every value; label: the value's name, for one): Set as System
+  --- Default…, Set as Track Default and, for every value (the pill menu), Clear Track Default. Each disabled entry
+  --- says why beside it (EP2).
+  K.default_menu_items = function(mctx, keys, label)
+    local one = keys ~= nil
+    keys = keys or DEFAULT_ALL_KEYS
+    local sys_reason = K.default_reason(keys, "system")
+    local sys_text = one and string.format(DEFAULT_COPY.sys_one, label) or DEFAULT_COPY.sys_all
+    if reaper.ImGui_MenuItem(mctx, sys_text, sys_reason, false, sys_reason == nil) and sys_reason == nil then
+      local req = K.sys_default_request(keys)
+      if req then request_confirm(req) end
+    end
+    local track_reason = K.default_reason(keys, "track")
+    local track_text = one and string.format(DEFAULT_COPY.track_one, label) or DEFAULT_COPY.track_all
+    if reaper.ImGui_MenuItem(mctx, track_text, track_reason, false, track_reason == nil) and track_reason == nil then
+      K.set_track_default(keys)
+    end
+    if not one then
+      local clear_reason = K.clear_track_reason()
+      if reaper.ImGui_MenuItem(mctx, DEFAULT_COPY.track_clear, clear_reason, false, clear_reason == nil)
+          and clear_reason == nil then
+        K.clear_track_default()
+      end
+    end
   end
 
   --- "Apply to other items…" (keys nil: every value, Key and Scale included) or "Apply <Value> to other items…"
@@ -14331,7 +14719,7 @@ do
       local key = spec.key
       view = { lo_v = spec.lo, hi_v = spec.lo, mixed = false, marked = false, target = "item" }
       views[spec.id] = view
-      local item_v = (tonumber(get_effective(nil, key)) or DEFAULTS[key] or 0) * spec.scale
+      local item_v = (tonumber(get_effective(nil, key)) or 0) * spec.scale
       local function differs(a, b) return string.format(spec.num, a) ~= string.format(spec.num, b) end
       if sel_n > 0 then
         view.target = "notes"
@@ -14348,7 +14736,7 @@ do
       else
         view.lo_v, view.hi_v = item_v, item_v
         view.marked = get_override_level(nil, key) == "item"
-          and differs(item_v, (tonumber(DEFAULTS[key]) or 0) * spec.scale)
+          and differs(item_v, (tonumber((K.item_default(key, state.target_take_guid))) or 0) * spec.scale)
       end
       if inspector_reason then
         view.disabled, view.reason = true, inspector_reason
@@ -14370,10 +14758,11 @@ do
       return spec.label .. " " .. spec.num .. unit .. mark
     end
 
-    --- The last line of a value's tooltip: its default and this item's (stored units).
+    --- The last line of a value's tooltip: its default (with where it comes from) and this item's (stored units).
     local function levels_line(spec, item_raw)
       local function text(raw) return string.format(spec.num, (tonumber(raw) or 0) * spec.scale) .. spec.unit end
-      return string.format(BAR_LEVELS, text(DEFAULTS[spec.key]), text(item_raw))
+      local d, level = K.item_default(spec.key, state.target_take_guid)
+      return string.format(BAR_LEVELS, text(d) .. (BAR_LEVEL_TAG[level] or ""), text(item_raw))
     end
 
     --- Tooltip for the item just drawn, gated on the hover delay. A disabled item passes
@@ -14562,7 +14951,8 @@ do
       end
     end
 
-    --- The pill's menu: where edits go, Apply to other items… and Reset this item to defaults. A disabled entry says
+    --- The pill's menu: where edits go, Apply to other items…, the System / Track Default entries
+    --- (K.default_menu_items) and Reset this item to defaults. A disabled entry says
     --- why beside it (EP2: readable with tooltips off).
     local function draw_pill_menu(open_x, open_y)
       -- Under the pill: set right before BeginPopup (a tooltip in between would take the position)
@@ -14576,6 +14966,9 @@ do
       reaper.ImGui_Separator(bctx)
 
       K.apply_menu_item(bctx, BAR_PILL_MENU.apply, nil)
+      reaper.ImGui_Separator(bctx)
+      K.default_menu_items(bctx, nil)
+      reaper.ImGui_Separator(bctx)
       local reset_reason = inspector_reason or (not take_data and BAR_REASON_NOT_ANALYZED)
         or ((K.item_off_defaults(take_data) == 0) and BAR_PILL_MENU.reset_none) or nil
       if reaper.ImGui_MenuItem(bctx, BAR_PILL_MENU.reset, reset_reason, false, reset_reason == nil)
@@ -14585,15 +14978,17 @@ do
       reaper.ImGui_EndPopup(bctx)
     end
 
-    --- The selection pill: what a drag on a value changes. A click opens its menu (draw_pill_menu), under it.
+    --- The selection pill: what a drag on a value changes. A click or a right-click opens its menu (draw_pill_menu),
+    --- under it.
     local function draw_pill()
       local text = (sel_n == 0) and BAR_PILL_NONE or (sel_n == 1) and BAR_PILL_ONE or string.format(BAR_PILL_MANY, sel_n)
       local fg, bg = P.text, P.well
       if sel_n > 0 then fg, bg = Theme.label_on(P.accent2), P.accent2 end
       Theme.align(bctx)
       local open_x, open_y
-      if Theme.badge(bctx, text, { color = fg, bg = bg, text_color = fg, id = "bar_pill", w = s.unit_w.pill,
-          interactive = true }) then
+      local clicked = Theme.badge(bctx, text, { color = fg, bg = bg, text_color = fg, id = "bar_pill", w = s.unit_w.pill,
+        interactive = true })
+      if clicked or reaper.ImGui_IsItemClicked(bctx, reaper.ImGui_MouseButton_Right()) then
         open_x = reaper.ImGui_GetItemRectMin(bctx)
         open_y = select(2, reaper.ImGui_GetItemRectMax(bctx))
         reaper.ImGui_OpenPopup(bctx, "##bar_pill_menu")
@@ -14620,7 +15015,7 @@ do
         bar_sep_before = nil
       end
 
-      local default = DEFAULTS[key]
+      local default = K.item_default(key, state.target_take_guid)
       local marked = has_target
         and string.format(spec.num, state[key] * spec.scale) ~= string.format(spec.num, default * spec.scale)
       reaper.ImGui_BeginDisabled(bctx, disabled)
@@ -14671,7 +15066,7 @@ do
         if active then bar_sep_before = state[key] end
       elseif reset or menu_reset or (changed and typed) then
         local prev = state[key]
-        state[key] = (reset or menu_reset) and DEFAULTS[key] or v / spec.scale
+        state[key] = (reset or menu_reset) and default or v / spec.scale
         commit(prev)
         -- Still held (a double-click whose second press goes on into a drag): that drag starts from the value just
         -- committed, and letting go commits it as its own edit
@@ -14699,7 +15094,8 @@ do
       local scope = (sel_n == 0) and BAR_MODE.scope_item or (sel_n == 1) and BAR_MODE.scope_note
         or string.format(BAR_MODE.scope_notes, sel_n)
       local function mode_name(raw) return K.MODES[(tonumber(raw) or 0) + 1] or K.MODES[1] end
-      local levels = string.format(BAR_LEVELS, mode_name(DEFAULTS.correct_mode),
+      local mode_d, mode_level = K.item_default("correct_mode", state.target_take_guid)
+      local levels = string.format(BAR_LEVELS, mode_name(mode_d) .. (BAR_LEVEL_TAG[mode_level] or ""),
         mode_name(get_effective(nil, "correct_mode")))
       local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
         w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
