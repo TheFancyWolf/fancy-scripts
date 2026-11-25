@@ -3215,8 +3215,10 @@ test("item_seed_fills_all_with_the_defaults", function()
     if v == nil then error("missing " .. key) end
     eq(v, S.DEFAULTS[key], key)
   end
-  eq(data.key_idx, K.new_key.key_idx, "key_idx: the last chosen")
-  eq(data.scale_idx, K.new_key.scale_idx, "scale_idx: the last chosen")
+  -- the last chosen, or (Auto, the fresh default) the real key it stands for: never Auto
+  local want_key, want_scale = K.key_resolve(K.new_key.key_idx, K.new_key.scale_idx, nil)
+  eq(data.key_idx, want_key, "key_idx: the last chosen")
+  eq(data.scale_idx, want_scale, "scale_idx: the last chosen")
   eq(K.item_seed(data), false, "second seed fills nothing")
 end)
 
@@ -3680,7 +3682,8 @@ test("key_scale_undo_labels", function()
     reaper.GetMediaItemTakeByGUID, reaper.Undo_EndBlock }
   reaper.GetMediaItemTakeByGUID = function() return "TAKE" end
   reaper.Undo_EndBlock = function(label) labels[#labels + 1] = label end
-  st.target_take_guid, st.session_takes["{KL}"] = "{KL}", { notes = {}, results = {} }
+  st.target_take_guid, st.session_takes["{KL}"] = "{KL}", { notes = {}, results = {}, key_idx = 3, scale_idx = 1 }
+  st.key_idx, st.scale_idx = 3, 1   -- an analysed item shows its real key
   local ok, err = pcall(function()
     K.scale_changed("key")
     K.scale_changed("scale")
@@ -6023,6 +6026,167 @@ test("analysis_begin_freezes_auto_range", function()
   end
   st.is_analyzing = saved_state.is_analyzing
   st.analysis_params = saved_params
+  if not ok then error(err, 0) end
+end)
+
+-- Key "Auto" (auto range and key, Task 5) ---------------------------------------------------------------------------
+-- Runs fn with K.take_track / K.track_record stubbed: every guid is on track "TR", whose record is `rec` (nil = none)
+local function with_track_record(rec, fn)
+  local K = S.K
+  local old_track, old_record = K.take_track, K.track_record
+  K.take_track = function(guid) if guid then return "TR" end return nil end
+  K.track_record = function(track) if track == "TR" then return rec end return nil end
+  local ok, err = pcall(fn)
+  K.take_track, K.track_record = old_track, old_record
+  if not ok then error(err, 0) end
+end
+
+test("key_auto_is_fresh_default", function()
+  local T = load_script({})
+  reaper.GetExtState = function() return "" end   -- the harness's own stub again
+  local NK = T.K.new_key
+  eq(NK.key_idx, 0, "Auto on a fresh install"); eq(NK.scale_idx, 1)
+  eq(NK.hand_key_idx, 1, "the hand key: C"); eq(NK.hand_scale_idx, 1, "the hand scale: Major")
+  eq(T.state.key_idx, 0, "the bar shows Auto before anything is open")
+  local T2 = load_script({ pitch_key_idx = "0", pitch_key_hand_idx = "7", pitch_scale_hand_idx = "2" })
+  reaper.GetExtState = function() return "" end
+  eq(T2.K.new_key.key_idx, 0, "a stored Auto")
+  eq(T2.K.new_key.hand_key_idx, 7); eq(T2.K.new_key.hand_scale_idx, 2)
+  local T3 = load_script({ pitch_key_idx = "13", pitch_key_hand_idx = "0", pitch_scale_hand_idx = "99" })
+  reaper.GetExtState = function() return "" end
+  eq(T3.K.new_key.key_idx, 12, "clamped to the last key")
+  eq(T3.K.new_key.hand_key_idx, 1, "the hand key is never Auto")
+  eq(T3.K.new_key.hand_scale_idx, #T3.SCALE_DEFINITIONS, "clamped to the last scale")
+end)
+
+test("key_resolve_from_track", function() with_track_record({ st = {}, takes = {}, key_idx = 5, scale_idx = 1 },
+  function()
+    local k, sc, from = S.K.key_resolve(0, 2, "{r}")
+    eq(k, 5); eq(sc, 1); eq(from, true)
+    k, sc, from = S.K.key_resolve(9, 3, "{r}")
+    eq(k, 9, "a real key passes through"); eq(sc, 3); eq(from, false)
+  end) end)
+
+test("key_resolve_falls_to_hand", function() with_track_record(nil, function()
+  local NK = S.K.new_key
+  local saved = { NK.hand_key_idx, NK.hand_scale_idx }
+  NK.hand_key_idx, NK.hand_scale_idx = 3, 2
+  local k, sc, from, k2, sc2, from2
+  local ok, err = pcall(function()
+    k, sc, from = S.K.key_resolve(0, 1, "{r}")
+    k2, sc2, from2 = S.K.key_resolve(0, 1, nil)   -- no item at all
+  end)
+  NK.hand_key_idx, NK.hand_scale_idx = saved[1], saved[2]
+  if not ok then error(err, 0) end
+  eq(k, 3); eq(sc, 2); eq(from, false)
+  eq(k2, 3); eq(sc2, 2); eq(from2, false)
+end) end)
+
+test("item_seed_never_stores_auto", function()
+  local K, NK = S.K, S.K.new_key
+  local saved = { NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx }
+  local ok, err = pcall(function()
+    NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = 0, 1, 3, 2
+    with_track_record({ st = {}, takes = {}, key_idx = 5, scale_idx = 1 }, function()
+      local data = { guid = "{s}" }
+      K.item_seed(data)
+      eq(data.key_idx, 5, "the track's key"); eq(data.scale_idx, 1); eq(data.key_from_track, true)
+      -- a finished analysis copies the bar's Auto (0) and its hidden scale into the model before seeding
+      data = { guid = "{s}", key_idx = 0, scale_idx = 4 }
+      eq(K.item_seed(data), true, "Auto resolved counts as filled")
+      eq(data.key_idx, 5); eq(data.scale_idx, 1, "the found scale, not the hidden one"); eq(data.key_from_track, true)
+    end)
+    with_track_record(nil, function()
+      local data = { guid = "{s}", key_idx = 0, scale_idx = 4 }
+      K.item_seed(data)
+      eq(data.key_idx, 3, "no record: the hand key"); eq(data.scale_idx, 2); eq(data.key_from_track, nil)
+      -- a real key on the item is its own
+      data = { guid = "{s}", key_idx = 8, scale_idx = 3 }
+      K.item_seed(data)
+      eq(data.key_idx, 8); eq(data.scale_idx, 3); eq(data.key_from_track, nil)
+    end)
+  end)
+  NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
+end)
+
+test("scale_classes_with_auto", function()
+  local st, NK = S.state, S.K.new_key
+  local saved = { NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx, st.target_take_guid }
+  local ok, err = pcall(function()
+    st.target_take_guid = nil
+    NK.key_idx, NK.scale_idx = 0, 1
+    S.K.adopt_new_item_values()   -- the bar shows Auto and the scale classes follow
+    eq(st.key_idx, 0)
+    for pc = 0, 11 do eq(st.scale_pc_set[pc], true, "pitch class " .. pc) end
+    local pcs = S.K.scale_pcs(0, 1)
+    for pc = 0, 11 do eq(pcs[pc], true, "scale_pcs " .. pc) end
+  end)
+  NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx, st.target_take_guid = table.unpack(saved, 1, 6)
+  S.K.adopt_new_item_values()
+  if not ok then error(err, 0) end
+end)
+
+test("hand_key_tracks_bar_choice", function()
+  local st, K, NK = S.state, S.K, S.K.new_key
+  local writes = {}
+  local set_ext = reaper.SetExtState
+  reaper.SetExtState = function(_, key, value) writes[key] = value end
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, NK.hand_key_idx,
+    NK.hand_scale_idx, st.session_takes["{H}"] }
+  local ok, err = pcall(function()
+    st.target_take_guid = nil   -- an item not analysed yet
+    st.key_idx, st.scale_idx = 7, 2
+    K.scale_changed("key")
+    eq(NK.key_idx, 7); eq(NK.hand_key_idx, 7, "a real key: the hand key follows"); eq(NK.hand_scale_idx, 2)
+    eq(writes.pitch_key_hand_idx, "7"); eq(writes.pitch_scale_hand_idx, "2")
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(NK.key_idx, 0, "Auto for new items"); eq(writes.pitch_key_idx, "0")
+    eq(NK.hand_key_idx, 7, "Auto leaves the hand key"); eq(NK.hand_scale_idx, 2)
+    -- an analysed item never takes Auto (Task 7 finds its key): the choice keeps the item's key
+    st.session_takes["{H}"] = { guid = "{H}", notes = {}, results = {}, key_idx = 4, scale_idx = 1 }
+    st.target_take_guid, st.key_idx, st.scale_idx = "{H}", 0, 1
+    K.scale_changed("key")
+    eq(st.key_idx, 4, "the bar keeps the item's key"); eq(st.session_takes["{H}"].key_idx, 4)
+    eq(NK.key_idx, 0, "the Key for new items is untouched"); eq(NK.hand_key_idx, 7)
+  end)
+  reaper.SetExtState = set_ext
+  st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx,
+    st.session_takes["{H}"] = table.unpack(saved, 1, 8)
+  K.save_settings("key")   -- the stored mirror follows the put-back values
+  if not ok then error(err, 0) end
+end)
+
+test("apply_source_never_gives_auto", function() with_track_record(nil, function()
+  local st, NK = S.state, S.K.new_key
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.hand_key_idx, NK.hand_scale_idx }
+  st.target_take_guid, st.key_idx, st.scale_idx = "{none}", 0, 1   -- not analysed, Key Auto
+  NK.hand_key_idx, NK.hand_scale_idx = 6, 2
+  local ok, src = pcall(S.K.apply_source, { "key_idx", "scale_idx" })
+  st.target_take_guid, st.key_idx, st.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved, 1, 5)
+  if not ok then error(src, 0) end
+  eq(src.key_idx, 6, "the key Auto stands for"); eq(src.scale_idx, 2)
+end) end)
+
+test("key_tooltip_names_the_track_and_runner_up", function()
+  local K = S.K
+  local get_name = reaper.GetTrackName
+  reaper.GetTrackName = function() return true, "V _ Main" end
+  local ok, err = pcall(function()
+    with_track_record({ st = {}, takes = {}, key_idx = 5, scale_idx = 1, alt_key_idx = 2, alt_scale_idx = 2 },
+      function()
+        eq(K.key_found_text({ guid = "{f}", key_idx = 5, scale_idx = 1, key_from_track = true }),
+          "Found from V _ Main. C# Minor also fits.")
+        eq(K.key_found_text({ guid = "{f}", key_idx = 5, scale_idx = 1 }), nil, "a key chosen by hand")
+        eq(K.key_found_text({ guid = "{f}", key_idx = 7, scale_idx = 1, key_from_track = true }), nil,
+          "the track's key is another now")
+      end)
+    with_track_record({ st = {}, takes = {}, key_idx = 5, scale_idx = 1 }, function()
+      eq(K.key_found_text({ guid = "{f}", key_idx = 5, scale_idx = 1, key_from_track = true }), "Found from V _ Main.")
+    end)
+  end)
+  reaper.GetTrackName = get_name
   if not ok then error(err, 0) end
 end)
 
