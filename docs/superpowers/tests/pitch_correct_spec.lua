@@ -4798,6 +4798,8 @@ test("form_changed_rows_counts_rows_not_keys", function()
 end)
 test("form_summary_names_presets_and_custom", function()
   local v = S.K.analysis_defaults()
+  eq(S.K.form_summary(v), "Auto · Clean / Strict · Standard (Realtime)", "the factory range is Auto")
+  v.auto_range = false   -- the same Hz picked by hand
   eq(S.K.form_summary(v), "Generic Vocal · Clean / Strict · Standard (Realtime)")
   v.max_freq = 999; eq(S.K.form_summary(v):match("^Custom") ~= nil, true)
   eq(S.K.analyzed_with_tip({ analysis = SOPRANO_ANALYSIS }), "Analyzed with Soprano · Clean / Strict · Standard (Realtime)")
@@ -4805,26 +4807,28 @@ test("form_summary_names_presets_and_custom", function()
 end)
 test("form_defaults_request_names_changes", function()
   local K, st = S.K, S.state
-  local v = K.analysis_defaults(); v.min_freq, v.max_freq = 250, 1200
+  local v = K.analysis_defaults(); v.min_freq, v.max_freq, v.auto_range = 250, 1200, false   -- Soprano by hand
   local req = K.form_defaults_request(v)
   eq(req.title, "Make these your defaults?")
-  eq(req.body_lines[1], "New analyses will start with: Soprano (was Generic Vocal).")
+  eq(req.body_lines[1], "New analyses will start with: Soprano (was Auto).")
   eq(req.body_lines[2], "Items already analyzed keep their own settings.")
   eq(req.confirm_label, "Save as Default")
-  local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time }
+  local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time,
+    st.auto_range }
   local group
   K.save_settings = function(g) group = g end
   reaper.time_precise = function() return 0 end
   req.on_confirm()
   eq(st.min_freq, 250); eq(st.max_freq, 1200); eq(group, "engine"); eq(st.status.text, "Defaults saved.")
+  eq(st.auto_range, false)
   K.save_settings, st.min_freq, st.max_freq, reaper.time_precise = saved[1], saved[2], saved[3], saved[4]
-  st.status.text, st.status.until_time = saved[5], saved[6]
+  st.status.text, st.status.until_time, st.auto_range = saved[5], saved[6], saved[7]
 end)
 
 test("form_defaults_saved_from_the_modal_reach_the_canvas_form", function()
   local K, st = S.K, S.state
   local saved = { K.save_settings, st.min_freq, st.max_freq, reaper.time_precise, st.status.text, st.status.until_time,
-    st.target_take_guid, st.analysis_form }
+    st.target_take_guid, st.analysis_form, st.auto_range }
   local ok, err = pcall(function()
     K.save_settings = function() end
     reaper.time_precise = function() return 0 end
@@ -4835,9 +4839,11 @@ test("form_defaults_saved_from_the_modal_reach_the_canvas_form", function()
     K.form_defaults_request(modal.values).on_confirm()
     eq(st.analysis_form.values.min_freq, 130, "the untouched canvas form follows the new defaults")
     eq(st.analysis_form.values.max_freq, 500)
+    eq(st.analysis_form.values.auto_range, false, "and is no longer Auto")
   end)
   K.save_settings, st.min_freq, st.max_freq, reaper.time_precise = saved[1], saved[2], saved[3], saved[4]
   st.status.text, st.status.until_time, st.target_take_guid, st.analysis_form = saved[5], saved[6], saved[7], saved[8]
+  st.auto_range = saved[9]
   if not ok then error(err, 0) end
 end)
 
@@ -5722,6 +5728,230 @@ test("pre_skipped_counts_this_run_only", function()
     pre_run_out()
     eq(K.track_records_pending["tr"].skipped, 0, "take b heard cleanly: nothing skipped this run")
   end)
+end)
+
+-- Vocal Range "Auto" (Task 4) --------------------------------------------------------------------
+
+local function vocal_range(name, list)
+  for i, r in ipairs(list or S.VOCAL_RANGES) do
+    if r.name == name then return r, i end
+  end
+  error("no vocal range named " .. name, 2)
+end
+
+test("auto_is_factory_range", function()
+  eq(S.DEFAULTS.auto_range, true)
+  local auto, idx = vocal_range("Auto")
+  eq(auto.auto, true); eq(auto.min, 65); eq(auto.max, 1000)
+  eq(idx, S.DEFAULTS.preset_range_idx, "the default pick is Auto")
+  eq(vocal_range("Generic Vocal").auto, nil, "Generic Vocal is a range of its own")
+  local T = load_script({})
+  reaper.GetExtState = function() return "" end   -- the harness's own stub again
+  local d = T.K.analysis_defaults()
+  eq(d.auto_range, true, "nothing stored: Auto")
+  eq(d.min_freq, 65); eq(d.max_freq, 1000)
+end)
+
+test("auto_range_persists", function()
+  local T = load_script({ pitch_auto_range = "0" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, false); eq(T.K.analysis_defaults().auto_range, false)
+  T = load_script({ pitch_auto_range = "yes" })
+  reaper.GetExtState = function() return "" end
+  eq(T.state.auto_range, true, "unknown text: the factory value")
+  local entry
+  for _, e in ipairs(T.K.PERSIST) do if e.ext == "pitch_auto_range" then entry = e end end
+  eq(entry ~= nil, true, "persisted"); eq(entry.group, "engine")
+  eq(entry.read(), "1")
+  T.state.auto_range = false; eq(entry.read(), "0")
+end)
+
+test("range_name_variants", function()
+  local K = S.K
+  local v = { auto_range = true, min_freq = 65, max_freq = 1000 }
+  eq(K.range_name(v), "Auto")
+  v.auto_lo_st, v.auto_hi_st = 40, 69
+  eq(K.range_name(v), "Auto: E2\xE2\x80\x93A4")
+  v.auto_lo_st, v.auto_hi_st, v.auto_none = nil, nil, true
+  eq(K.range_name(v), "Auto: Generic Vocal (nothing found)")
+  eq(K.range_name({ auto_range = false, min_freq = 65, max_freq = 1000 }), "Generic Vocal", "65 / 1000 Hz by hand")
+  eq(K.range_name({ min_freq = 65, max_freq = 1000 }), "Generic Vocal", "no flag: not Auto")
+  eq(K.range_name({ auto_range = false, min_freq = 66, max_freq = 1000 }), K.CUSTOM_PRESET)
+  eq(K.range_name({ auto_range = true, min_freq = 82, max_freq = 440, auto_lo_st = 40, auto_hi_st = 69 }),
+    "Auto: E2\xE2\x80\x93A4", "an Auto analysis keeps its name whatever Hz it ran with")
+  eq((K.form_part_names({ auto_range = true, min_freq = 82, max_freq = 440, threshold = 0.08, block_size = 1024,
+    hop_size = 512 })), "Auto")
+end)
+
+test("range_index_matches_flag_first", function()
+  local K = S.K
+  local _, auto_i = vocal_range("Auto")
+  local _, generic_i = vocal_range("Generic Vocal")
+  eq(K.range_index({ auto_range = true, min_freq = 250, max_freq = 1200 }), auto_i, "Auto whatever the Hz")
+  eq(K.range_index({ auto_range = false, min_freq = 65, max_freq = 1000 }), generic_i, "by Hz: never Auto")
+  eq(K.range_index({ min_freq = 65, max_freq = 1000 }), generic_i)
+  eq(K.range_index({ auto_range = false, min_freq = 66, max_freq = 1000 }), 0)
+end)
+
+test("analysis_values_keeps_auto", function()
+  local K = S.K
+  local function with(extra)
+    local t = { min_freq = 65, max_freq = 1000, threshold = 0.08, block_size = 1024, hop_size = 512 }
+    for k, v in pairs(extra) do t[k] = v end
+    return K.analysis_values(t)
+  end
+  eq(with({ auto_range = true }).auto_range, true)
+  eq(with({ auto_range = "yes" }).auto_range, false, "not a boolean: false")
+  eq(with({}).auto_range, false, "absent: false")
+  local v = with({ auto_range = true, auto_lo_st = 40, auto_hi_st = 69 })
+  eq(v.auto_lo_st, 40); eq(v.auto_hi_st, 69)
+  v = with({ auto_range = true, auto_lo_st = 69, auto_hi_st = 40 })
+  eq(v.auto_lo_st, nil, "lo above hi: dropped"); eq(v.auto_hi_st, nil)
+  v = with({ auto_range = true, auto_lo_st = 40.5, auto_hi_st = 69 })
+  eq(v.auto_lo_st, nil, "not a whole note: dropped"); eq(v.auto_hi_st, nil)
+  v = with({ auto_range = true, auto_lo_st = 40, auto_hi_st = 40 })
+  eq(v.auto_lo_st, 40, "one note: kept"); eq(v.auto_hi_st, 40)
+  eq(with({ auto_range = true, auto_none = true }).auto_none, true)
+  eq(with({ auto_range = true, auto_none = 1 }).auto_none, false, "not a boolean: false")
+end)
+
+test("form_pick_range_clears_auto", function()
+  local K = S.K
+  local f = K.form_new("{auto}", nil)
+  eq(f.values.auto_range, true, "a new form starts at Auto")
+  K.form_set(f, "range", vocal_range("Tenor"))
+  eq(f.values.auto_range, false); eq(f.values.min_freq, 130); eq(f.values.max_freq, 500)
+  eq(f.edited.auto_range, true, "picking a range is an edit of Auto too")
+  K.form_set(f, "range", vocal_range("Auto"))
+  eq(f.values.auto_range, true); eq(f.values.min_freq, 65); eq(f.values.max_freq, 1000)
+  K.form_set(f, "range", vocal_range("Bass"))
+  K.form_reset_row(f, "range")
+  eq(f.values.auto_range, S.state.auto_range, "Reset: back to the default, Auto included")
+  eq(f.edited.auto_range, nil)
+  K.form_set(f, "min_freq", 80)
+  eq(f.values.auto_range, false, "a Min Freq edit is not Auto")
+  K.form_set(f, "range", vocal_range("Auto"))
+  K.form_reset_row(f, "max_freq")
+  eq(f.values.auto_range, false, "a Max Freq reset is not Auto")
+end)
+
+test("existing_presets_shift", function()
+  local K = S.K
+  eq(K.range_name({ auto_range = false, min_freq = 250, max_freq = 1200 }), "Soprano")
+  eq((K.form_part_names(SOPRANO_ANALYSIS)), "Soprano", "a record from before Auto")
+  eq(K.ROW_TIPS.range:find("\n\nAuto: Listens through the whole track first to find the singer's lowest and "
+    .. "highest notes. Done once per track.", 1, true) ~= nil, true, "the Auto paragraph in the row's tooltip")
+end)
+
+test("range_row_default_compares_auto", function()
+  local K = S.K
+  local row = K.SETTINGS_SECTIONS[2].rows[1]
+  eq(row.id, "range")
+  local base = K.analysis_defaults()
+  local v = K.analysis_defaults()
+  eq(row.is_default({ v = v, base = base }), true, "Auto from the factory: already the default")
+  v.auto_range = false   -- Generic Vocal: the same Hz, not Auto
+  eq(row.is_default({ v = v, base = base }), false)
+  eq(K.form_changed_rows(v), 1, "Generic Vocal differs from Auto")
+end)
+
+test("range_tip_names_found_hz", function()
+  local K = S.K
+  eq(K.range_tip({ auto_range = true, auto_lo_st = 40, auto_hi_st = 69 }),
+    "Auto: E2\xE2\x80\x93A4\n\n82\xE2\x80\x93440 Hz, with a little room either side")
+  eq(K.range_tip({ auto_range = true }), K.ROW_TIPS.range, "nothing found yet: the row's own tooltip")
+  eq(K.range_tip({ auto_range = false, auto_lo_st = 40, auto_hi_st = 69 }), K.ROW_TIPS.range)
+end)
+
+test("auto_hz_rows_disabled_with_reason", function()
+  local K = S.K
+  eq(K.auto_hz_reason({ auto_range = true }), "Found from the track")
+  eq(K.auto_hz_reason({ auto_range = false }), nil)
+  eq(K.auto_hz_reason({}), nil)
+end)
+
+test("settings_binding_auto_range", function()
+  local K, st = S.K, S.state
+  local saved = { st.auto_range, st.min_freq, st.max_freq }
+  local ok, err = pcall(function()
+    local b = K.settings_binding()
+    b.set("range", vocal_range("Tenor"))
+    eq(st.auto_range, false); eq(st.min_freq, 130)
+    b.reset("range")
+    eq(st.auto_range, S.DEFAULTS.auto_range); eq(st.min_freq, S.DEFAULTS.min_freq)
+    b.reset("min_freq")
+    eq(st.auto_range, false, "a Min Freq reset is not Auto")
+  end)
+  st.auto_range, st.min_freq, st.max_freq = saved[1], saved[2], saved[3]
+  if not ok then error(err, 0) end
+end)
+
+test("save_as_default_carries_auto", function()
+  local K, st = S.K, S.state
+  local saved = { K.save_settings, st.min_freq, st.max_freq, st.auto_range, reaper.time_precise, st.status.text,
+    st.status.until_time }
+  local ok, err = pcall(function()
+    K.save_settings = function() end
+    reaper.time_precise = function() return 0 end
+    local f = K.form_new("{sad}", nil)
+    K.form_set(f, "range", vocal_range("Tenor"))
+    local req = K.form_defaults_request(f.values)
+    eq(req.body_lines[1], "New analyses will start with: Tenor (was Auto).")
+    req.on_confirm()
+    eq(st.auto_range, false); eq(st.min_freq, 130)
+    -- An item analysed with Auto: its form holds the Hz it ran with; the default saved is Auto itself
+    local seeded = K.analysis_values({ auto_range = true, min_freq = 82, max_freq = 440, threshold = st.threshold,
+      block_size = st.block_size, hop_size = st.hop_size, auto_lo_st = 40, auto_hi_st = 69 })
+    req = K.form_defaults_request(seeded)
+    req.on_confirm()
+    eq(st.auto_range, true); eq(st.min_freq, 65); eq(st.max_freq, 1000)
+  end)
+  K.save_settings, st.min_freq, st.max_freq, st.auto_range, reaper.time_precise = saved[1], saved[2], saved[3],
+    saved[4], saved[5]
+  st.status.text, st.status.until_time = saved[6], saved[7]
+  if not ok then error(err, 0) end
+end)
+
+test("form_reseeded_from_auto_analysis", function()
+  local K = S.K
+  local stored = { auto_range = true, min_freq = 82, max_freq = 440, threshold = 0.08, block_size = 1024,
+    hop_size = 512, auto_lo_st = 40, auto_hi_st = 69 }
+  local f = K.form_new("{seed}", { notes = { {} }, analysis = stored })
+  eq(f.source, "item")
+  eq(f.values.auto_range, true); eq(f.values.min_freq, 82)
+  eq(K.range_name(f.values), "Auto: E2\xE2\x80\x93A4")
+  eq(K.range_index(f.values), select(2, vocal_range("Auto")), "the row shows Auto selected")
+end)
+
+test("analysis_begin_freezes_auto_range", function()
+  local K, st = S.K, S.state
+  local saved_params = st.analysis_params
+  local stubs = {
+    GetMediaItemTake_Source = function() return "src" end, GetMediaSourceSampleRate = function() return 44100 end,
+    GetMediaItemInfo_Value = function() return 1 end, new_array = function() return {} end,
+  }
+  local saved_open, saved_state = K.open_accessor, {}
+  for _, key in ipairs({ "is_analyzing", "results", "target_take_guid", "accessor", "buffer", "sample_rate",
+      "item_len", "end_time", "current_time", "start_time", "progress", "separation", "analysis_empty" }) do
+    saved_state[key] = st[key]
+  end
+  for k, f in pairs(stubs) do reaper[k] = f end
+  local ok, err = pcall(function()
+    K.open_accessor = function() return "acc" end
+    local v = K.analysis_defaults(); v.auto_range = true
+    eq(K.analysis_begin("take", "item", { values = v, defer_envelope = true }), true)
+    eq(st.analysis_params.auto_range, true, "frozen with the run")
+    eq(K.analysis_values(st.analysis_params).auto_range, true, "what it stores keeps it")
+    v.auto_range = false
+    eq(K.analysis_begin("take", "item", { values = v, defer_envelope = true }), true)
+    eq(st.analysis_params.auto_range, false)
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  K.open_accessor = saved_open
+  for key, v in pairs(saved_state) do st[key] = v end
+  st.is_analyzing = saved_state.is_analyzing
+  st.analysis_params = saved_params
+  if not ok then error(err, 0) end
 end)
 
 -- Tests appended by later tasks go above this line.

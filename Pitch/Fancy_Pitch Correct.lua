@@ -35,7 +35,10 @@ Theme.attach_fonts(ctx, fonts)
 local show_settings_modal = false
 local show_info_modal = false
 
+-- "Auto" (auto = true) finds the range from the track before the analysis; its Hz are what an analysis with it uses
+-- until then. Generic Vocal has the same Hz but is a range picked by hand (an entry matches by the flag first)
 local VOCAL_RANGES = {
+  { name = "Auto",          min = 65,  max = 1000, auto = true },
   { name = "Generic Vocal", min = 65,  max = 1000 },
   { name = "Soprano",       min = 250, max = 1200 },
   { name = "Alto",          min = 170, max = 800  },
@@ -191,6 +194,7 @@ local DEFAULTS = {
 -- can never drift apart
 DEFAULTS.min_freq = VOCAL_RANGES[DEFAULTS.preset_range_idx].min
 DEFAULTS.max_freq = VOCAL_RANGES[DEFAULTS.preset_range_idx].max
+DEFAULTS.auto_range = VOCAL_RANGES[DEFAULTS.preset_range_idx].auto == true   -- Vocal Range "Auto"
 DEFAULTS.threshold = DETECTION_MODES[DEFAULTS.preset_mode_idx].threshold
 DEFAULTS.block_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].block
 DEFAULTS.hop_size = QUALITY_MODES[DEFAULTS.preset_quality_idx].hop   -- how many samples to advance per block
@@ -291,8 +295,9 @@ local K = {
     separation = { 0, 1 },
   },
 
-  -- The five detection values an analysis is run with, and the item stores (take data field `analysis`)
-  ANALYSIS_KEYS = { "min_freq", "max_freq", "threshold", "block_size", "hop_size" },
+  -- The detection values an analysis is run with, and the item stores (take data field `analysis`): five numbers
+  -- and auto_range (Vocal Range "Auto", a boolean)
+  ANALYSIS_KEYS = { "min_freq", "max_freq", "threshold", "block_size", "hop_size", "auto_range" },
 
   -- Note tone: a sine on the Monitoring FX chain (REAPER's JS: Tone Generator) that sounds while a note is dragged
   -- (see K.tone_tick). The P_* entries are its 0-based parameter indices; MON is added to an FX index to address the
@@ -380,9 +385,10 @@ local state = {
   threshold = DEFAULTS.threshold,
   min_freq = DEFAULTS.min_freq,
   max_freq = DEFAULTS.max_freq,
+  auto_range = DEFAULTS.auto_range, -- Vocal Range "Auto": the range is found from the track
   hop_size = DEFAULTS.hop_size, -- How many samples to advance per block
   separation = DEFAULTS.separation, -- how readily notes are split (K.segment)
-  analysis_params = nil,        -- the five detection values above (not separation), frozen by start_analysis
+  analysis_params = nil,        -- the detection values above (not separation), frozen by start_analysis
 
   -- Analysis state
   accessor = nil,
@@ -867,6 +873,7 @@ K.PERSIST = (function()
   number("engine", "pitch_threshold", state, "threshold", K.LIMITS.threshold)
   number("engine", "pitch_min_freq", state, "min_freq", K.LIMITS.min_freq)
   number("engine", "pitch_max_freq", state, "max_freq", K.LIMITS.max_freq)
+  flag("engine", "pitch_auto_range", state, "auto_range")
   flag("engine", "pitch_keep_pitch_mode", state, "keep_pitch_mode")
   add("engine", "pitch_algorithm", function() return string.format("%.14g", state.pitchmode_value) end, function(raw)
     local value = finite(raw)
@@ -2204,7 +2211,9 @@ end
 
 --- A validated copy of the K.ANALYSIS_KEYS of `t`, or nil when `t` is not a table or any of them is missing or
 --- invalid: a finite number (not a string): Hz within the widest Settings span with min below max, threshold inside K.LIMITS, a block size and a hop size from the lists,
---- with the hop no longer than the block.
+--- with the hop no longer than the block. auto_range is true only when it is true (absent or anything else: false);
+--- an Auto analysis's found notes auto_lo_st / auto_hi_st are kept when both are whole numbers with lo <= hi, and
+--- auto_none (nothing was found) is true only when it is true.
 K.analysis_values = function(t)
   if type(t) ~= "table" then return nil end
   local function listed(list, v)
@@ -2214,9 +2223,17 @@ K.analysis_values = function(t)
   local values = {}
   for _, key in ipairs(K.ANALYSIS_KEYS) do
     local v = t[key]
-    if type(v) ~= "number" or v ~= v then return nil end
+    if key == "auto_range" then
+      v = v == true
+    elseif type(v) ~= "number" or v ~= v then
+      return nil
+    end
     values[key] = v
   end
+  local function whole(n) return type(n) == "number" and math.abs(n) < math.huge and n == math.floor(n) end
+  local lo, hi = t.auto_lo_st, t.auto_hi_st
+  if whole(lo) and whole(hi) and lo <= hi then values.auto_lo_st, values.auto_hi_st = lo, hi end
+  values.auto_none = t.auto_none == true
   -- Both Hz values are held to the widest span the Settings allow (Min Freq's low end to Max Freq's high end), and
   -- the low end must be below the high end
   local hz_lo, hz_hi = K.LIMITS.min_freq[1], K.LIMITS.max_freq[2]
@@ -2231,13 +2248,51 @@ K.analysis_values = function(t)
   return values
 end
 
+--- The index of the VOCAL_RANGES entry `values` show, 0 for none: the Auto entry when values.auto_range is true
+--- (whatever Hz an Auto analysis ran with), else the hand-picked range with both Hz.
+K.range_index = function(values)
+  local auto = values.auto_range == true
+  return K.match_preset(VOCAL_RANGES, function(e)
+    if auto then return e.auto == true end
+    return not e.auto and e.min == values.min_freq and e.max == values.max_freq
+  end)
+end
+
+--- The Vocal Range `values` show by name: "Auto"; on an item analysed with it "Auto: E2–A4" (the notes found) or
+--- "Auto: Generic Vocal (nothing found)"; else the range's name, K.CUSTOM_PRESET for Hz that match none.
+K.range_name = function(values)
+  if values.auto_range == true then
+    if type(values.auto_lo_st) == "number" and type(values.auto_hi_st) == "number" then
+      return "Auto: " .. K.pre_range_text(values.auto_lo_st, values.auto_hi_st)
+    end
+    if values.auto_none == true then return "Auto: Generic Vocal (nothing found)" end
+  end
+  local entry = VOCAL_RANGES[K.range_index(values)]
+  return entry and entry.name or K.CUSTOM_PRESET
+end
+
+--- The Vocal Range row's tooltip for `values`: on an item whose range was found, that range in Hz; else the row's
+--- own (K.ROW_TIPS.range).
+K.range_tip = function(values)
+  local lo, hi = values.auto_lo_st, values.auto_hi_st
+  if values.auto_range ~= true or type(lo) ~= "number" or type(hi) ~= "number" then return K.ROW_TIPS.range end
+  local function hz(st) return 440 * 2 ^ ((st - 69) / 12) end
+  return K.range_name(values) .. "\n\n"
+    .. string.format("%.0f\xE2\x80\x93%.0f Hz, with a little room either side", hz(lo), hz(hi))
+end
+
+--- Why Min Freq and Max Freq are disabled for `values`: nil, or "Found from the track" while Vocal Range is Auto.
+K.auto_hz_reason = function(values)
+  if values.auto_range == true then return "Found from the track" end
+  return nil
+end
+
 --- Which of the three rows (Vocal Range, Detection Mode, Quality) of `values` match a preset: the names of the
---- presets, K.CUSTOM_PRESET for a row that matches none.
+--- presets (Vocal Range: K.range_name), K.CUSTOM_PRESET for a row that matches none.
 K.form_part_names = function(values)
-  local r = K.match_preset(VOCAL_RANGES, function(e) return e.min == values.min_freq and e.max == values.max_freq end)
   local m = K.match_preset(DETECTION_MODES, function(e) return e.threshold == values.threshold end)
   local q = K.match_preset(QUALITY_MODES, function(e) return e.block == values.block_size and e.hop == values.hop_size end)
-  return VOCAL_RANGES[r] and VOCAL_RANGES[r].name or K.CUSTOM_PRESET,
+  return K.range_name(values),
     DETECTION_MODES[m] and DETECTION_MODES[m].name or K.CUSTOM_PRESET,
     QUALITY_MODES[q] and QUALITY_MODES[q].name or K.CUSTOM_PRESET
 end
@@ -2294,10 +2349,12 @@ K.form_sync = function(guid, data)
   end
 end
 
---- The values a row writes for `key`: "range" takes a VOCAL_RANGES entry (both Hz) and "quality" a QUALITY_MODES
---- entry (block and hop); any other key is one value of its own.
+--- The values a row writes for `key`: "range" takes a VOCAL_RANGES entry (both Hz, and whether it is Auto) and
+--- "quality" a QUALITY_MODES entry (block and hop); Min Freq or Max Freq set by hand is no longer Auto; any other key
+--- is one value of its own.
 K.value_pairs = function(key, value)
-  if key == "range" then return { min_freq = value.min, max_freq = value.max } end
+  if key == "range" then return { min_freq = value.min, max_freq = value.max, auto_range = value.auto == true } end
+  if key == "min_freq" or key == "max_freq" then return { [key] = value, auto_range = false } end
   if key == "quality" then return { block_size = value.block, hop_size = value.hop } end
   return { [key] = value }
 end
@@ -2312,10 +2369,10 @@ K.form_set = function(form, key, value)
 end
 
 --- Put a row back to the Settings' default: row_id "range", "mode", "quality", "block", "hop", "threshold",
---- "min_freq" or "max_freq".
+--- "min_freq" or "max_freq" (either Hz reset by itself is no longer Auto).
 K.form_reset_row = function(form, row_id)
   local keys_of = {
-    range = { "min_freq", "max_freq" }, mode = { "threshold" }, quality = { "block_size", "hop_size" },
+    range = { "min_freq", "max_freq", "auto_range" }, mode = { "threshold" }, quality = { "block_size", "hop_size" },
     block = { "block_size" }, hop = { "hop_size" }, threshold = { "threshold" },
     min_freq = { "min_freq" }, max_freq = { "max_freq" },
   }
@@ -2324,13 +2381,14 @@ K.form_reset_row = function(form, row_id)
     form.values[key] = defaults[key]
     form.edited[key] = nil
   end
+  if row_id == "min_freq" or row_id == "max_freq" then K.form_set(form, "auto_range", false) end
 end
 
 --- How many of the three rows (Vocal Range, Detection Mode, Quality) of `values` differ from the Settings' defaults.
 K.form_changed_rows = function(values)
   local d = K.analysis_defaults()
   local n = 0
-  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq then n = n + 1 end
+  if values.min_freq ~= d.min_freq or values.max_freq ~= d.max_freq or values.auto_range ~= d.auto_range then n = n + 1 end
   if values.threshold ~= d.threshold then n = n + 1 end
   if values.block_size ~= d.block_size or values.hop_size ~= d.hop_size then n = n + 1 end
   return n
@@ -2349,6 +2407,11 @@ end
 K.form_defaults_request = function(values)
   local copy = {}
   for _, key in ipairs(K.ANALYSIS_KEYS) do copy[key] = values[key] end
+  -- The default is Auto itself, never the Hz an Auto analysis of an item ran with
+  if copy.auto_range then
+    local auto = VOCAL_RANGES[K.range_index(copy)]
+    copy.min_freq, copy.max_freq = auto.min, auto.max
+  end
   local nr, nm, nq = K.form_part_names(copy)
   local or_, om, oq = K.form_part_names(K.analysis_defaults())
   local parts = {}
@@ -2430,7 +2493,7 @@ K.analysis_begin = function(take, item, opts)
   -- and a value changed some other way cannot overrun the sample buffer or mix two parameter sets
   state.analysis_params = {
     block_size = block, hop_size = hop, threshold = values.threshold,
-    min_freq = values.min_freq, max_freq = values.max_freq,
+    min_freq = values.min_freq, max_freq = values.max_freq, auto_range = values.auto_range == true,
   }
 
   state.accessor = accessor
@@ -6038,7 +6101,7 @@ local function process_analysis_step()
   if not params then
     params = {
       block_size = state.block_size, hop_size = state.hop_size, threshold = state.threshold,
-      min_freq = state.min_freq, max_freq = state.max_freq,
+      min_freq = state.min_freq, max_freq = state.max_freq, auto_range = state.auto_range == true,
     }
     state.analysis_params = params
   end
@@ -6101,7 +6164,7 @@ local function process_analysis_step()
         key_idx = state.key_idx,
         scale_idx = state.scale_idx,
         separation = state.separation,
-        analysis = params,   -- the frozen snapshot: the five values this analysis ran with
+        analysis = params,   -- the frozen snapshot: the values this analysis ran with (K.ANALYSIS_KEYS)
       }
       -- Every new analysis starts at the defaults (K.item_seed); its Separation, Key and Scale are the state mirrors
       -- above (K.analysis_begin or, in a batch, K.batch_next put the default Separation; the Key and Scale are the
@@ -11341,6 +11404,30 @@ local function settings_drag(id, key, fmt, width, b)
   if committed then b.commit() end
 end
 
+--- The control of the Min Freq / Max Freq row (`key`), `w` wide: a settings_drag, disabled while Vocal Range is
+--- Auto with its reason (K.auto_hz_reason) as its tooltip and, when `inline`, as dim text after it (the drag then
+--- takes what is left of `w`).
+K.hz_row_draw = function(id, key, w, b, inline)
+  local reason = K.auto_hz_reason(b.v)
+  if not reason then
+    settings_drag(id, key, "%.0f Hz", w, b)
+    return
+  end
+  local L = Theme.layout
+  local text_w = inline and ((reaper.ImGui_CalcTextSize(ctx, reason)) or 0) + L.sm or 0
+  reaper.ImGui_BeginDisabled(ctx, true)
+  settings_drag(id, key, "%.0f Hz", math.max(w - text_w, 1), b)
+  reaper.ImGui_EndDisabled(ctx)
+  if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+    Theme.tooltip(ctx, reason)
+  end
+  if inline then
+    reaper.ImGui_SameLine(ctx, 0, L.sm)
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, Theme.get_palette().text_dim, reason)
+  end
+end
+
 --- Index of the entry of `list` for which `same(entry)` holds, 0 when none does (its combo then reads "Custom").
 K.match_preset = function(list, same)
   for i, entry in ipairs(list) do
@@ -11386,14 +11473,17 @@ K.settings_binding = function()
       for k, v in pairs(K.value_pairs(key, value)) do state[k] = v end
     end,
     reset = function(row_id)
-      if row_id == "range" then restore({ "min_freq", "max_freq" })
+      if row_id == "range" then restore({ "min_freq", "max_freq", "auto_range" })
       elseif row_id == "mode" then restore({ "threshold" })
       elseif row_id == "quality" then restore({ "block_size", "hop_size" })
       elseif row_id == "block" then
         state.block_size = DEFAULTS.block_size
         if state.hop_size > state.block_size then state.hop_size = state.block_size end
       elseif row_id == "hop" then state.hop_size = math.min(DEFAULTS.hop_size, state.block_size)
-      else restore({ row_id }) end   -- threshold, min_freq, max_freq
+      else   -- threshold, min_freq, max_freq (either Hz reset by itself is no longer Auto)
+        restore({ row_id })
+        if row_id == "min_freq" or row_id == "max_freq" then state.auto_range = false end
+      end
     end,
     commit = function()
       K.save_settings("engine")
@@ -11425,6 +11515,7 @@ K.ANALYSIS_DEFAULTS_NOTE = "New analyses start with these. Each item keeps the s
 -- nearest note; the lowest notes of each Quality are its block's limit (half a block per period) at 48 kHz.
 K.ROW_TIPS = {
   range = "Vocal Range\n\nThe pitches searched. Pick the singer's range to avoid octave errors."
+    .. "\n\nAuto: Listens through the whole track first to find the singer's lowest and highest notes. Done once per track."
     .. "\n\nGeneric Vocal: C2 to B5 (65 to 1000 Hz), any voice."
     .. "\n\nSoprano: B3 to D6 (250 to 1200 Hz)."
     .. "\n\nAlto: F3 to G5 (170 to 800 Hz)."
@@ -11480,12 +11571,16 @@ K.SETTINGS_SECTIONS = {
   } },
   { id = "detection", title = "Analysis Defaults", rows = {
     { id = "range", label = "Vocal Range", labels = COMBO_LABELS.ranges,
-      is_default = function(b) return b.v.min_freq == b.base.min_freq and b.v.max_freq == b.base.max_freq end,
+      is_default = function(b)
+        return b.v.min_freq == b.base.min_freq and b.v.max_freq == b.base.max_freq
+          and (b.v.auto_range == true) == (b.base.auto_range == true)
+      end,
       reset = function(b) b.reset("range") end,
       draw = function(w, b)
-        local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == b.v.min_freq and r.max == b.v.max_freq end)
-        local idx, changed = Theme.combo(ctx, "##settings_range", VOCAL_RANGES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.range,
+        -- Auto is matched by its flag first: an item analysed with it shows "Auto: E2–A4" whatever Hz it ran with
+        local idx, changed = Theme.combo(ctx, "##settings_range", VOCAL_RANGES, K.range_index(b.v), {
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.range_tip(b.v),
+          get_label = function(r) return (r.auto and b.v.auto_range == true) and K.range_name(b.v) or r.name end,
         })
         if changed and VOCAL_RANGES[idx] then
           b.set("range", VOCAL_RANGES[idx])
@@ -11555,14 +11650,15 @@ K.SETTINGS_SECTIONS = {
           Theme.tooltip(ctx, "Detection Threshold\n\nThe confidence threshold for pitch detection. Lower is stricter.")
         end
       end },
+    -- Disabled while Vocal Range is Auto (K.auto_hz_reason): the reason inline after Min Freq and as both tooltips
     { id = "min_freq", label = "Min Freq (Hz)",
       is_default = function(b) return b.v.min_freq == b.base.min_freq end,
       reset = function(b) b.reset("min_freq") end,
-      draw = function(w, b) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w, b) end },
+      draw = function(w, b) K.hz_row_draw("dsp_min_freq", "min_freq", w, b, true) end },
     { id = "max_freq", label = "Max Freq (Hz)",
       is_default = function(b) return b.v.max_freq == b.base.max_freq end,
       reset = function(b) b.reset("max_freq") end,
-      draw = function(w, b) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w, b) end },
+      draw = function(w, b) K.hz_row_draw("dsp_max_freq", "max_freq", w, b, false) end },
   } },
 }
 
@@ -15918,7 +16014,7 @@ local function main()
 end
 
 if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/tests/pitch_correct_spec.lua)
-  return { K = K, state = state, DEFAULTS = DEFAULTS, extract_note_features = extract_note_features,
+  return { K = K, state = state, DEFAULTS = DEFAULTS, VOCAL_RANGES = VOCAL_RANGES, extract_note_features = extract_note_features,
            SCALE_DEFINITIONS = SCALE_DEFINITIONS, rdp_simplify = rdp_simplify,
            run_hybrid_segmentation = run_hybrid_segmentation, yin_process_block = yin_process_block,
            request_confirm = request_confirm, draw_confirm_modal = draw_confirm_modal, sync_with_project = sync_with_project,
