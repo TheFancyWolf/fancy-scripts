@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 90 30" width="90" height="30">
+  <!-- Fancy Pitch Correct toolbar strip, one-colour master. Three 30x30 frames for REAPER:
+       normal (#C2C6CE), hover (#FFFFFF), on (Fancy accent #46B9FE). The line through the note is cut out of it. -->
+  <defs>
+    <mask id="cut" maskUnits="userSpaceOnUse" x="0" y="0" width="24" height="24">
+      <rect width="24" height="24" fill="#fff"/>
+      <line x1="12" y1="6.8" x2="23" y2="6.8" stroke="#000" stroke-width="1.4"/>
+    </mask>
+    <g id="art">
+      <line x1="1.5" y1="6.8" x2="12" y2="6.8" stroke="currentColor" stroke-width="1" opacity=".35"/>
+      <line x1="1.5" y1="17.2" x2="22.5" y2="17.2" stroke="currentColor" stroke-width="1" opacity=".35"/>
+      <rect x="12.4" y="4.3" width="10" height="5" rx="1.4" fill="currentColor" mask="url(#cut)"/>
+      <path d="M1.6 13.8 C2.3 11.2, 3 11.2, 3.7 13.8 S5.1 16.4, 5.8 13.8 S7.1 11.6, 7.8 13.8 S9 15.3, 9.6 13.8 C10.5 10.8, 10.9 6.8, 12.8 6.8"
+            fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </defs>
+  <use xlink:href="#art" href="#art" transform="translate(3 3)" color="#C2C6CE"/>
+  <use xlink:href="#art" href="#art" transform="translate(33 3)" color="#FFFFFF"/>
+  <use xlink:href="#art" href="#art" transform="translate(63 3)" color="#46B9FE"/>
+</svg>
