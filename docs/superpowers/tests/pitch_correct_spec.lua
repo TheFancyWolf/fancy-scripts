@@ -2691,6 +2691,7 @@ local function with_write_stubs(gone, fn, no_env)
     return true, rec.stored[take] or ""
   end
   local order = #st.session_order
+  S.K.drop_project_cache()   -- nothing an earlier test resolved (without these stubs) is reused
   local ok, err = pcall(fn, rec)
   for _, name in ipairs({ "Undo_BeginBlock", "Undo_EndBlock", "GetMediaItemTakeByGUID", "GetMediaItemTake_Item",
     "GetTakeEnvelopeByName", "DeleteEnvelopePointRange", "NamedCommandLookup", "CountSelectedMediaItems",
@@ -3330,6 +3331,19 @@ test("item_seed_uses_track_default", function()
     K.item_reset_values(data)
     eq(data.overrides.tolerance, 12, "reset goes to the track default")
   end)
+end)
+
+test("unanalysed_take_shows_its_track_default", function()
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.separation }
+  with_track('{"tighten":0.3,"separation":0.8}', nil, function()
+    st.target_take_guid = "{t}"
+    eq(S.get_effective(nil, "tighten"), 0.3, "not analysed: its track's default")
+    eq(S.get_override_level(nil, "tighten"), "default")
+    K.adopt_new_item_values()
+    eq(st.separation, 0.8, "the Separation its first analysis uses")
+  end)
+  st.target_take_guid, st.separation = saved[1], saved[2]
 end)
 
 test("unanalysed_take_takes_the_defaults", function()

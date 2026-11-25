@@ -2016,10 +2016,10 @@ K.analysis_begin = function(take, item, opts)
   local guid = get_take_guid(take)
   if guid then state.target_take_guid = guid end
   state.target_take_name = reaper.GetTakeName(take) or state.target_take_name
-  -- An item analysed before starts again at the defaults: it is split at the default Separation, not its own (its
+  -- An item analysed before starts again at its defaults (K.item_default): it is split at its default Separation, not its own (its
   -- Key and Scale stay). An item not analysed yet uses the Separation the bar shows for it (the default, unless it
   -- was set for this item before its first analysis)
-  if guid and state.session_takes[guid] then state.separation = DEFAULTS.separation end
+  if guid and state.session_takes[guid] then state.separation = (K.item_default("separation", guid)) end
 
   state.start_time = 0 -- Relative to item start
   state.item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
@@ -3355,7 +3355,7 @@ K.batch_next = function()
       -- It is split at the default Separation and keeps its own Key and Scale (an item analysed for the first time:
       -- the ones last chosen), never those of the item that was open. An analysis stored on the item that the window
       -- has not loaded (pasted later) counts too: it is read here and kept on the entry for K.batch_item_done
-      local before, start = state.session_takes[entry.guid], K.new_item_values()
+      local before, start = state.session_takes[entry.guid], K.new_item_values(entry.guid)
       if not before then before = load_take_data(take) end
       entry.before = before
       state.separation = start.separation
@@ -3430,9 +3430,9 @@ K.analysis_progress = function()
   return state.progress or 0
 end
 
---- The open item has no stored data: Separation is the default, Key and Scale the ones last chosen.
+--- The open item has no stored data: Separation is its default (K.item_default), Key and Scale the ones last chosen.
 K.adopt_new_item_values = function()
-  local start = K.new_item_values()
+  local start = K.new_item_values(state.target_take_guid)
   state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
   update_scale_pitch_classes()
 end
@@ -13029,8 +13029,9 @@ K.apply_plan = function(src, entries, keys, keep)
       local item_lose = false
       for _, key in ipairs(keys) do
         local v, cur = src[key], K.apply_item_get(data, key)
-        -- A value of the item's own: it differs from the script's default
-        local differs = cur ~= nil and DEFAULTS[key] ~= nil and K.value_changed(cur, DEFAULTS[key])
+        -- A value of the item's own: it differs from its default (K.item_default)
+        local def = K.item_default(key, entry.guid)
+        local differs = cur ~= nil and def ~= nil and K.value_changed(cur, def)
         local own = keep and differs
         if v ~= nil and not own and K.value_changed(cur, v) then
           if key == "separation" and keep and edited then
@@ -13920,6 +13921,8 @@ do
   local BAR_SCOPE_NOTE = "Changes the selected note."
   local BAR_SCOPE_NOTES = "Changes the %d selected notes; each keeps its difference from the others."
   local BAR_LEVELS = "Default: %s. This item: %s."
+  -- After the default in BAR_LEVELS: where it comes from (K.item_default); the factory one has no tag
+  local BAR_LEVEL_TAG = { track = " (track)", system = " (system)" }
   local BAR_GESTURES = string.format("Drag to change (%s-drag: fine). Double-click: reset. %s-click: type a value. Right-click: more.",
     K.MOD_LABEL, K.MOD_LABEL)
   local BAR_TOLERANCE_IDLE = K.TOLERANCE_IDLE_TIP
@@ -14055,7 +14058,7 @@ do
 
   --- The value of `spec` in effect on `note`, in display units.
   local function bar_note_value(note, spec)
-    return (tonumber(get_effective(note, spec.key)) or DEFAULTS[spec.key] or 0) * spec.scale
+    return (tonumber(get_effective(note, spec.key)) or 0) * spec.scale
   end
 
   --- Give `note` its own value of `spec` (display units, clamped to the range).
@@ -14090,7 +14093,7 @@ do
   end
 
   --- Reset `key` (double-click, or the right-click menu): the `sel_n` selected notes lose their own value (they
-  --- follow the item again), else this item takes the script's default (DEFAULTS, HC3). One undo point when
+  --- follow the item again), else this item takes its default (K.item_default, HC3). One undo point when
   --- something changed (none when the item is at the default already: UC1); true when it was written. Separation
   --- is reset by draw_separation (a re-split).
   K.reset_target = function(key, sel_notes, sel_n)
@@ -14104,7 +14107,7 @@ do
     else
       local data = state.target_take_guid and state.session_takes[state.target_take_guid]
       if not data then return false end
-      local default, now = DEFAULTS[key], K.item_value(data, key)
+      local default, now = K.item_default(key, state.target_take_guid), K.item_value(data, key)
       if now == nil then now = default end
       if default ~= nil and K.value_changed(now, default) then
         K.bar_write(key, default, sel_notes, 0)
@@ -14440,7 +14443,7 @@ do
       local key = spec.key
       view = { lo_v = spec.lo, hi_v = spec.lo, mixed = false, marked = false, target = "item" }
       views[spec.id] = view
-      local item_v = (tonumber(get_effective(nil, key)) or DEFAULTS[key] or 0) * spec.scale
+      local item_v = (tonumber(get_effective(nil, key)) or 0) * spec.scale
       local function differs(a, b) return string.format(spec.num, a) ~= string.format(spec.num, b) end
       if sel_n > 0 then
         view.target = "notes"
@@ -14457,7 +14460,7 @@ do
       else
         view.lo_v, view.hi_v = item_v, item_v
         view.marked = get_override_level(nil, key) == "item"
-          and differs(item_v, (tonumber(DEFAULTS[key]) or 0) * spec.scale)
+          and differs(item_v, (tonumber((K.item_default(key, state.target_take_guid))) or 0) * spec.scale)
       end
       if inspector_reason then
         view.disabled, view.reason = true, inspector_reason
@@ -14479,10 +14482,11 @@ do
       return spec.label .. " " .. spec.num .. unit .. mark
     end
 
-    --- The last line of a value's tooltip: its default and this item's (stored units).
+    --- The last line of a value's tooltip: its default (with where it comes from) and this item's (stored units).
     local function levels_line(spec, item_raw)
       local function text(raw) return string.format(spec.num, (tonumber(raw) or 0) * spec.scale) .. spec.unit end
-      return string.format(BAR_LEVELS, text(DEFAULTS[spec.key]), text(item_raw))
+      local d, level = K.item_default(spec.key, state.target_take_guid)
+      return string.format(BAR_LEVELS, text(d) .. (BAR_LEVEL_TAG[level] or ""), text(item_raw))
     end
 
     --- Tooltip for the item just drawn, gated on the hover delay. A disabled item passes
@@ -14729,7 +14733,7 @@ do
         bar_sep_before = nil
       end
 
-      local default = DEFAULTS[key]
+      local default = K.item_default(key, state.target_take_guid)
       local marked = has_target
         and string.format(spec.num, state[key] * spec.scale) ~= string.format(spec.num, default * spec.scale)
       reaper.ImGui_BeginDisabled(bctx, disabled)
@@ -14780,7 +14784,7 @@ do
         if active then bar_sep_before = state[key] end
       elseif reset or menu_reset or (changed and typed) then
         local prev = state[key]
-        state[key] = (reset or menu_reset) and DEFAULTS[key] or v / spec.scale
+        state[key] = (reset or menu_reset) and default or v / spec.scale
         commit(prev)
         -- Still held (a double-click whose second press goes on into a drag): that drag starts from the value just
         -- committed, and letting go commits it as its own edit
@@ -14808,7 +14812,8 @@ do
       local scope = (sel_n == 0) and BAR_MODE.scope_item or (sel_n == 1) and BAR_MODE.scope_note
         or string.format(BAR_MODE.scope_notes, sel_n)
       local function mode_name(raw) return K.MODES[(tonumber(raw) or 0) + 1] or K.MODES[1] end
-      local levels = string.format(BAR_LEVELS, mode_name(DEFAULTS.correct_mode),
+      local mode_d, mode_level = K.item_default("correct_mode", state.target_take_guid)
+      local levels = string.format(BAR_LEVELS, mode_name(mode_d) .. (BAR_LEVEL_TAG[mode_level] or ""),
         mode_name(get_effective(nil, "correct_mode")))
       local choice, changed = Theme.combo(bctx, "##bar_mode", K.MODES, idx, {
         w = s.unit_w.mode, placeholder = BAR_MODE.mixed, disabled = inspector_reason ~= nil,
