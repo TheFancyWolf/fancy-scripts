@@ -5422,7 +5422,7 @@ test("track_record_valid_rejects", function()
   end
   eq(K.track_record_valid("text"), nil, "string")
   bad(function(r) r.key_idx = 13 end, "key 13")
-  bad(function(r) r.scale_idx = 3 end, "scale 3")
+  bad(function(r) r.scale_idx = 7 end, "scale 7")
   bad(function(r) r.lo_st, r.hi_st = 61, 60 end, "lo > hi")
   bad(function(r) r.hi_st = nil end, "lo without hi")
   bad(function(r) r.st["52"] = "x" end, "st non-number")
@@ -6146,7 +6146,7 @@ test("hand_key_tracks_bar_choice", function()
     K.scale_changed("key")
     eq(NK.key_idx, 0, "Auto for new items"); eq(writes.pitch_key_idx, "0")
     eq(NK.hand_key_idx, 7, "Auto leaves the hand key"); eq(NK.hand_scale_idx, 2)
-    -- an analysed item never takes Auto (Task 7 finds its key): the choice keeps the item's key
+    -- an analysed item never takes Auto (Find Key: here its track is unknown, so nothing changes)
     st.session_takes["{H}"] = { guid = "{H}", notes = {}, results = {}, key_idx = 4, scale_idx = 1 }
     st.target_take_guid, st.key_idx, st.scale_idx = "{H}", 0, 1
     K.scale_changed("key")
@@ -6823,6 +6823,428 @@ test("item_gone_in_stage_one_says_so", function()
     eq(st.status.text, "This item is no longer in the project")
     eq(#w.log, 0); eq(next(K.track_records_pending), nil); eq(st.is_analyzing, false)
   end)
+end)
+
+-- A corrected key follows the track; Key Auto on an analysed item; Find Range and Key Again ---------------------------
+
+-- A stored record of track "tr" (ONE_TRACK) that covers both its takes: A3 heard, key `key_idx` / `scale_idx` (nil:
+-- no key), with a runner-up when alt is given
+local function t7_record(key_idx, scale_idx, alt)
+  local r = { st = { ["57"] = 500 }, takes = { ["{a}"] = true, ["{b}"] = true }, lo_st = 57, hi_st = 57, skipped = 0,
+    key_idx = key_idx, scale_idx = scale_idx }
+  if alt then r.alt_key_idx, r.alt_scale_idx = alt[1], alt[2] end
+  return r
+end
+
+-- The analysed item "{a}" as the open item: its model (key, scale, key_from_track), no notes in a mode
+local function t7_open(key_idx, scale_idx, from_track)
+  local st = S.state
+  local data = { guid = "{a}", name = "Lead Vox", notes = {}, results = {}, key_idx = key_idx, scale_idx = scale_idx,
+    key_from_track = from_track or nil }
+  st.session_takes["{a}"] = data
+  st.target_take_guid, st.target_take_name, st.notes = "{a}", "Lead Vox", {}
+  st.key_idx, st.scale_idx = key_idx, scale_idx
+  return data
+end
+
+-- Runs fn(ext_writes, sync) with reaper.SetExtState recorded ({ [key] = value }); sync() brings the stored mirror to
+-- K.new_key as the test set it and forgets that write. Puts SetExtState back, and the stored mirror, after
+local function t7_ext(fn)
+  local writes = {}
+  local set_ext = rawget(reaper, "SetExtState")
+  rawset(reaper, "SetExtState", function(_, key, value) writes[key] = value end)
+  -- the stored mirror follows K.new_key as the test sets it: only the test's own writes are recorded
+  local function sync()
+    S.K.save_settings("key")
+    for k in pairs(writes) do writes[k] = nil end
+  end
+  local ok, err = pcall(fn, writes, sync)
+  rawset(reaper, "SetExtState", set_ext)
+  S.K.save_settings("key")
+  if not ok then error(err, 0) end
+end
+
+local function t7_stored(w)
+  local raw = w.ext.tr[S.K.TRACK_SCAN_KEY]
+  return raw ~= "" and S.K.track_record_valid(JSON.decode(raw)) or nil
+end
+
+test("key_fix_follows_track", function() t7_ext(function(ext, ext_sync)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx, NK.hand_key_idx, NK.hand_scale_idx = 0, 9, 1
+    ext_sync()
+    local data = t7_open(5, 1, true)
+    st.key_idx = 3   -- D, chosen in the bar
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Key", "the item and the track in one block")
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 3); eq(rec.scale_idx, 1); eq(rec.alt_key_idx, nil); eq(rec.alt_scale_idx, nil)
+    eq(rec.lo_st, 57, "the rest of the record is kept"); eq(rec.takes["{a}"], true)
+    eq(data.key_idx, 3); eq(data.key_from_track, true, "the item still follows its track")
+    eq(NK.key_idx, 0, "Auto stays on for new items"); eq(NK.hand_key_idx, 3, "the hand key follows")
+    eq(NK.hand_scale_idx, 1)
+    eq(next(ext), nil, "no ExtState written")
+    eq(next(K.track_records_pending), nil)
+    eq(st.status.text, "Key for V _ Main is now D Major. New items on this track follow.")
+  end)
+end) end)
+
+test("key_fix_follows_track_envelope_path", function() t7_ext(function(ext, ext_sync)
+  local mode_count = S.K.mode_note_count
+  S.K.mode_note_count = function() return 2 end   -- the item has Classic / Hard notes: the envelope is rewritten
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx = 0
+    ext_sync()
+    local data = t7_open(5, 1, true)
+    st.scale_idx = 2
+    K.scale_changed("scale")
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale")
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 5); eq(rec.scale_idx, 2)
+    eq(data.scale_idx, 2); eq(data.key_from_track, true); eq(NK.key_idx, 0); eq(NK.hand_scale_idx, 2)
+    eq(next(ext), nil); eq(next(K.track_records_pending), nil)
+    eq(st.status.text, "Key for V _ Main is now E Minor. New items on this track follow.",
+      "this message replaces the Key changed one")
+  end)
+  S.K.mode_note_count = mode_count
+  if not ok then error(err, 0) end
+end) end)
+
+test("key_fix_follows_track_failed_write_leaves_nothing_pending", function() t7_ext(function()
+  local mode_count, count_items = S.K.mode_note_count, rawget(reaper, "CountMediaItems")
+  S.K.mode_note_count = function() return 2 end
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    -- the envelope cannot be written: the block closes with the model and the record, nothing stays pending
+    K.write_take_envelope = function() return false end
+    t7_open(5, 1, true)
+    st.key_idx = 8
+    K.scale_changed("key")
+    local b, t, e = index_of(w.log, "begin"), index_of(w.log, "track:tr"), index_of(w.log, "end:Apply Pitch Correction")
+    eq(b ~= nil and t ~= nil and e ~= nil and b < t and t < e, true, "inside the block: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil)
+    -- the item is gone: no block is opened, nothing written, nothing pending
+    w.log = {}
+    K.write_take_envelope = function() return true end
+    rawset(reaper, "CountMediaItems", function() return 0 end)
+    w.dead["tk_a"] = true
+    K.drop_project_cache()
+    st.key_idx = 10
+    K.scale_changed("key")
+    eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil)
+  end)
+  rawset(reaper, "CountMediaItems", count_items)
+  S.K.mode_note_count = mode_count
+  if not ok then error(err, 0) end
+end) end)
+
+test("key_fix_follows_track_plain_save_no_take", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(5, 1, true)
+    K.take_track("{a}")   -- the track is known; then the take goes
+    local count_items = rawget(reaper, "CountMediaItems")
+    rawset(reaper, "CountMediaItems", function() return 0 end)
+    w.dead["tk_a"] = true
+    st.cache.takes = {}
+    st.key_idx = 10
+    local ok, err = pcall(K.scale_changed, "key")
+    rawset(reaper, "CountMediaItems", count_items)
+    if not ok then error(err, 0) end
+    eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil, "nothing pending")
+  end)
+end) end)
+
+test("key_fix_other_item_as_before", function() t7_ext(function(ext, ext_sync)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx = 0
+    ext_sync()
+    local data = t7_open(5, 1, false)   -- the key was chosen by hand
+    st.key_idx = 3
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "no track write")
+    eq(t7_stored(w).key_idx, 5, "the track keeps its key")
+    eq(data.key_idx, 3); eq(data.key_from_track, nil)
+    eq(NK.key_idx, 3, "the Key for new items follows, as today"); eq(ext.pitch_key_idx, "3")
+  end)
+  -- from its track, but the track has no record (undone): as today too
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx = 0
+    t7_open(5, 1, true)
+    st.key_idx = 4
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key")
+    eq(NK.key_idx, 4); eq(next(K.track_records_pending), nil)
+  end)
+end) end)
+
+test("find_key_uses_record", function() t7_ext(function(ext, ext_sync)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx, NK.hand_key_idx = 0, 6
+    ext_sync()
+    local data = t7_open(3, 1, false)
+    st.key_idx = 0   -- Auto chosen in the bar
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Find Key: Lead Vox", "one undo point")
+    eq(data.key_idx, 10); eq(data.scale_idx, 2); eq(data.key_from_track, true)
+    eq(st.key_idx, 10, "the bar shows the real key"); eq(st.scale_idx, 2)
+    eq(NK.key_idx, 0); eq(NK.hand_key_idx, 6); eq(next(ext), nil)
+    eq(w.pre_calls, 0, "the record is there: nothing is heard")
+  end)
+end) end)
+
+test("find_key_envelope_path_says_key_changed", function()
+  local mode_count = S.K.mode_note_count
+  S.K.mode_note_count = function() return 2 end
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Find Key: Lead Vox")
+    eq(st.status.text, "Key changed: 2 Classic / Hard notes follow A Natural Minor")
+  end)
+  S.K.mode_note_count = mode_count
+  if not ok then error(err, 0) end
+end)
+
+test("find_key_without_key_changes_nothing", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(nil, nil)) } }, function(w)
+    local K, st = S.K, S.state
+    local data = t7_open(3, 1, true)
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(#w.log, 0, "no undo block, nothing written")
+    eq(data.key_idx, 3); eq(st.key_idx, 3, "the bar keeps the item's key")
+    eq(st.status.text, "Not enough singing to tell the key: kept D Major.")
+  end)
+end)
+
+test("find_key_already_the_tracks_key_is_a_no_op", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(5, 1, true)
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(#w.log, 0, "no undo point"); eq(st.key_idx, 5)
+    eq(next(K.track_records_pending), nil)
+  end)
+end)
+
+test("find_key_refused_while_analysing", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
+    local K, st = S.K, S.state
+    local data = t7_open(3, 1, false)
+    st.is_analyzing = true
+    st.key_idx = 0
+    K.find_key_request()
+    eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 0, "find_key_request itself touches nothing")
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 3, "the bar shows the item's key again")
+    eq(w.pre_calls, 0)
+    st.is_analyzing = false
+  end)
+end)
+
+test("find_key_hears_the_track_first", function() t7_ext(function(ext, ext_sync)
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st, NK = S.K, S.state, S.K.new_key
+    NK.key_idx = 0
+    ext_sync()
+    local data = t7_open(3, 1, false)
+    st.key_idx = 0
+    K.scale_changed("key")
+    eq(st.pre ~= nil, true, "stage 1 runs"); eq(st.is_analyzing, true)
+    eq(st.key_idx, 3, "the bar keeps the item's key meanwhile")
+    eq(K.locked_reason(), "Finding range and key\xE2\x80\xA6 0%")
+    K.analysis_tick(); K.analysis_tick()
+    local p = K.analysis_progress()
+    eq(p > 0 and p < 1, true, "progress: " .. p)
+    eq(#w.log, 0, "nothing written while the track is heard")
+    auto_run_out()
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Find Key: Lead Vox", "item and record, one block")
+    local rec = t7_stored(w)
+    eq(type(rec.key_idx), "number", "a key was found")
+    eq(data.key_idx, rec.key_idx); eq(data.scale_idx, rec.scale_idx); eq(data.key_from_track, true)
+    eq(st.key_idx, rec.key_idx)
+    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(st.is_analyzing, false)
+    eq(NK.key_idx, 0); eq(next(ext), nil)
+  end)
+end) end)
+
+test("find_key_nothing_heard_drops_the_fresh_record", function()
+  auto_world({ tracks = ONE_TRACK, unreadable = { tk_a = true, tk_b = true } }, function(w)
+    local K, st = S.K, S.state
+    local data = t7_open(3, 1, false)
+    st.key_idx = 0
+    K.scale_changed("key")
+    auto_run_out()
+    eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(w.ext.tr[K.TRACK_SCAN_KEY], "", "the track holds no record")
+    eq(next(K.track_records_pending), nil, "the record found is dropped")
+    eq(data.key_idx, 3); eq(st.key_idx, 3)
+    eq(st.status.text, "Not enough singing to tell the key: kept D Major.")
+  end)
+end)
+
+test("find_key_cancel_in_stage_one_writes_nothing", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    local data = t7_open(3, 1, false)
+    st.key_idx = 0
+    K.scale_changed("key")
+    K.analysis_tick()
+    eq(st.pre ~= nil, true)
+    eq(K.cancel_analysis(), true)
+    auto_run_out()
+    eq(#w.log, 0, "no undo point"); eq(next(K.track_records_pending), nil); eq(K.auto_run, nil)
+    eq(st.is_analyzing, false); eq(data.key_idx, 3); eq(st.status.text, K.CANCELLED_TEXT)
+  end)
+end)
+
+test("find_again_replaces_record", function() t7_ext(function(ext)
+  local old = t7_record(7, 1)
+  old.takes = { ["{old}"] = true }
+  old.st = { ["40"] = 900 }
+  old.lo_st, old.hi_st = 40, 40
+  auto_world({ tracks = ONE_TRACK, step = 0.003, ext = { tr = JSON.encode(old) } }, function(w)
+    local K, st = S.K, S.state
+    local data = t7_open(7, 1, true)
+    eq(K.find_again_reason(true), nil, "enabled with a target")
+    K.find_again_request()
+    eq(st.pre ~= nil, true, "the track is heard"); eq(st.is_analyzing, true)
+    eq(K.find_again_reason(true), K.REASON_ANALYZING, "disabled while it runs")
+    K.analysis_tick(); K.analysis_tick()
+    local p = K.analysis_progress()
+    eq(p > 0 and p < 1, true, "progress: " .. p)
+    auto_run_out()
+    eq(table.concat(w.log, ","), "begin,track:tr,end:Find Range and Key: V _ Main", "only the record, one block")
+    local rec = t7_stored(w)
+    eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], true); eq(rec.takes["{old}"], nil, "heard afresh")
+    eq(rec.st["40"], nil, "the old tally is gone"); eq(rec.lo_st, 57); eq(rec.hi_st, 57)
+    eq(data.key_idx, 7, "the item keeps its key"); eq(data.key_from_track, true); eq(st.key_idx, 7)
+    eq(st.status.text, string.format("Found %s, %s on V _ Main. Items already analyzed keep theirs. %s+Z to undo.",
+      K.pre_range_text(57, 57), K.key_text(rec.key_idx, rec.scale_idx), MOD))
+    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(st.is_analyzing, false)
+    eq(next(ext), nil, "no ExtState")
+  end)
+end) end)
+
+test("find_again_disabled_reasons", function()
+  local K, st = S.K, S.state
+  local saved = { st.is_analyzing, K.batch }
+  local ok, err = pcall(function()
+    st.is_analyzing, K.batch = false, nil
+    eq(K.find_again_reason(false), "Select an audio item")
+    eq(K.find_again_reason(true), nil)
+    st.is_analyzing = true
+    eq(K.find_again_reason(true), K.REASON_ANALYZING)
+    st.is_analyzing, K.batch = false, {}
+    eq(K.find_again_reason(true), K.REASON_ANALYZING)
+  end)
+  st.is_analyzing, K.batch = saved[1], saved[2]
+  if not ok then error(err, 0) end
+end)
+
+test("find_again_refused_while_analysing", function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    st.is_analyzing = true
+    K.find_again_request()
+    eq(w.pre_calls, 0); eq(#w.log, 0)
+    st.is_analyzing = false
+  end)
+end)
+
+test("find_again_nothing_found_keeps_the_record", function()
+  local old = JSON.encode(t7_record(7, 1))
+  auto_world({ tracks = ONE_TRACK, unreadable = { tk_a = true, tk_b = true }, ext = { tr = old } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    auto_run_out()
+    eq(#w.log, 0, "no undo point: " .. table.concat(w.log, ","))
+    eq(w.ext.tr[K.TRACK_SCAN_KEY], old, "the record is kept untouched")
+    eq(next(K.track_records_pending), nil)
+    eq(st.status.text, "Not enough singing to tell the key: kept D Major.", "the bar's key")
+  end)
+end)
+
+test("find_again_range_only_keeps_the_key", function()
+  local min_frames = S.K.PRE.KEY_MIN_FRAMES
+  S.K.PRE.KEY_MIN_FRAMES = math.huge   -- a range is heard, too little for a key
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(7, 2, { 10, 1 })) } },
+    function(w)
+      local K, st = S.K, S.state
+      t7_open(3, 1, false)
+      K.find_again_request()
+      auto_run_out()
+      eq(table.concat(w.log, ","), "begin,track:tr,end:Find Range and Key: V _ Main")
+      local rec = t7_stored(w)
+      eq(rec.lo_st, 57); eq(rec.key_idx, 7, "the previous key is carried"); eq(rec.scale_idx, 2)
+      eq(rec.alt_key_idx, 10); eq(rec.alt_scale_idx, 1)
+      eq(st.status.text, string.format("Found %s on V _ Main. Items already analyzed keep theirs. %s+Z to undo.",
+        K.pre_range_text(57, 57), MOD))
+    end)
+  S.K.PRE.KEY_MIN_FRAMES = min_frames
+  if not ok then error(err, 0) end
+end)
+
+test("find_again_unreadable_media_says_so", function()
+  auto_world({ tracks = ONE_TRACK, unreadable = { tk_b = true } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    auto_run_out()
+    eq(table.concat(w.log, ","), "begin,track:tr,end:Find Range and Key: V _ Main")
+    eq(t7_stored(w).skipped, 1)
+    eq(st.status.text, "Couldn't read 1 of 2 items on V _ Main (media offline). Used the rest.")
+  end)
+end)
+
+test("find_again_cancel_writes_nothing", function()
+  local old = JSON.encode(t7_record(7, 1))
+  auto_world({ tracks = ONE_TRACK, step = 0.003, ext = { tr = old } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    K.analysis_tick()
+    eq(st.pre ~= nil, true)
+    eq(K.cancel_analysis(), true)
+    auto_run_out()
+    eq(#w.log, 0, "no undo point"); eq(w.ext.tr[K.TRACK_SCAN_KEY], old)
+    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(st.is_analyzing, false)
+    eq(st.status.text, K.CANCELLED_TEXT)
+  end)
+end)
+
+test("track_record_holds_a_corrected_scale", function()
+  local K = S.K
+  local r = t7_record(5, 3)   -- E Dorian, chosen by hand on an item that follows its track
+  eq(type(K.track_record_valid(r)), "table", "any scale of the bar")
+  eq(K.track_record_valid(t7_record(5, 7)), nil, "no scale 7")
+  eq(K.track_record_valid(t7_record(5, 3, { 2, 3 })), nil, "a runner-up is only ever Major or Minor")
+end)
+
+test("info_explains_auto_and_find_again", function()
+  local auto, again = false, false
+  for _, section in ipairs(S.K.INFO_SECTIONS) do
+    for _, row in ipairs(section.rows) do
+      local text = row[1] .. " " .. row[2]
+      if text:find("Auto", 1, true) and text:find("whole track", 1, true) then auto = true end
+      if text:find("Find Range and Key Again", 1, true) and text:find("keep theirs", 1, true) then again = true end
+    end
+  end
+  eq(auto, true, "a sentence on Auto"); eq(again, true, "a sentence on Find Range and Key Again")
 end)
 
 -- Tests appended by later tasks go above this line.
