@@ -11619,6 +11619,34 @@ K.request_settings_reset = function(section)
   })
 end
 
+--- The line under the Item Value Defaults divider, and the values it lists, one line each.
+K.ITEM_DEFAULTS_NOTE = "New analyses start with these, unless the item's track has a Track Default."
+K.ITEM_DEFAULTS_LINES = { { "separation", "correct_mode", "tighten" }, { "tolerance", "retune_speed", "slide_in" } }
+
+--- Settings > Restore Factory Defaults…: ask, then forget every System Default (outside the undo history). Track
+--- Defaults are not touched.
+K.request_factory_defaults = function()
+  local n = K.sys_defaults_changed()
+  if n == 0 then return end
+  local factory = {}
+  for _, key in ipairs(K.ITEM_KEYS) do factory[key] = DEFAULTS[key] end
+  request_confirm({
+    id = "restore_factory_defaults",
+    title = "Restore the factory defaults?",
+    body_lines = {
+      string.format("New analyses start with: %s.", K.apply_values_line(factory, K.ITEM_KEYS)),
+      "Tracks with a Track Default keep it. Items already analyzed keep their values.",
+      string.format("Not part of the undo history: %s+Z does not bring your System Default back.", K.MOD_LABEL),
+    },
+    confirm_label = "Restore Factory Defaults",
+    fit = true,
+    on_confirm = function()
+      K.sys_defaults_clear()
+      set_status("Factory defaults restored.")
+    end,
+  })
+end
+
 --- Danger styling of the Settings "Wipe" button and the confirm modal's confirm button: the label stays P.text and
 --- every state is a translucent red over the popup surface (P.panel), so the label keeps >= 4.5:1 in all of them (HC1).
 --- Fancy, composited: rest (P.red_d) 6.2:1, hover and pressed (P.red_h) 4.9:1 (an opaque P.red pressed would be
@@ -11714,6 +11742,35 @@ local function draw_settings_modal()
     Theme.align(ctx)
     reaper.ImGui_TextColored(ctx, P.text_dim, K.ANALYSIS_DEFAULTS_NOTE)
     draw_form(detection)
+
+    -- The System Default of the item values (saved from the "This item" menu), and its way back to the factory ones
+    Theme.section_divider(ctx, "Item Value Defaults", { color = P.yellow })
+    local sys = {}
+    for _, key in ipairs(K.ITEM_KEYS) do sys[key] = K.sys_defaults[key] or DEFAULTS[key] end
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, P.text_dim, K.ITEM_DEFAULTS_NOTE)
+    for _, keys in ipairs(K.ITEM_DEFAULTS_LINES) do
+      Theme.align(ctx)
+      reaper.ImGui_Text(ctx, K.apply_values_line(sys, keys))
+    end
+    local factory_text = "Restore Factory Defaults\xE2\x80\xA6"
+    local factory_reason = (K.sys_defaults_changed() == 0) and "Already at the factory defaults" or nil
+    Theme.align(ctx)
+    reaper.ImGui_BeginDisabled(ctx, factory_reason ~= nil)
+    local factory_clicked = reaper.ImGui_Button(ctx, factory_text .. "###restore_factory", text_w(factory_text) + L.md * 2, 0)
+    reaper.ImGui_EndDisabled(ctx)
+    if factory_reason then
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
+      Theme.align(ctx)
+      reaper.ImGui_TextColored(ctx, P.text_dim, factory_reason)
+    elseif reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      Theme.tooltip(ctx, "New analyses start at the factory values again (tracks with a Track Default keep it)")
+    end
+    if factory_clicked then
+      -- The confirm is the only modal: close Settings first
+      reaper.ImGui_CloseCurrentPopup(ctx)
+      K.request_factory_defaults()
+    end
 
     reaper.ImGui_Dummy(ctx, 0, L.sm)
     if Theme.collapsing_header(ctx, dsp.title) then
@@ -13908,8 +13965,8 @@ do
   local BAR_RANGE_SEP = "\xE2\x80\x93"   -- between the lowest and highest value of a mixed selection
   -- The selection pill: what a drag in the bar changes
   local BAR_PILL_NONE, BAR_PILL_ONE, BAR_PILL_MANY = "This item", "1 note", "%d notes"
-  local BAR_PILL_TIP_NONE = "Your edits change this item only.\n\nSelect notes to change just those notes.\n\nClick: apply to other items."
-  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes.\n\nEsc goes back to this item.\n\nClick: apply to other items."
+  local BAR_PILL_TIP_NONE = "Your edits change this item only.\n\nSelect notes to change just those notes.\n\nClick or right-click: apply to other items, save as a default."
+  local BAR_PILL_TIP_NOTES = "Your edits change the selected notes.\n\nEsc goes back to this item.\n\nClick or right-click: apply to other items, save as a default."
   -- Why the controls are disabled (the tooltips say it; the canvas pill carries the state)
   local BAR_REASON_ANALYZING = "Wait for the analysis to finish"
   local BAR_REASON_NO_TARGET = "Select an audio item"
@@ -14119,7 +14176,8 @@ do
   end
 
   --- The right-click menu of the value `key` named `label` (call right after its control): reset (to the item's
-  --- value with notes selected, else to the script's default), and apply it to other items (K.apply_open).
+  --- value with notes selected, else to its default), apply it to other items (K.apply_open), and save it as the
+  --- System or Track Default (K.default_menu_items).
   --- Returns true when Reset was chosen: the caller resets (K.reset_target, or Separation's re-split).
   K.value_menu = function(bctx, key, label, sel_n)
     if not reaper.ImGui_BeginPopupContextItem(bctx, "##ctx_" .. key) then return false end
@@ -14127,6 +14185,8 @@ do
     if reaper.ImGui_Shortcut(bctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(bctx) end
     local reset = reaper.ImGui_MenuItem(bctx, (sel_n > 0) and BAR_MENU_RESET_NOTES or BAR_MENU_RESET_ITEM)
     K.apply_menu_item(bctx, string.format(BAR_MENU_APPLY, label), { key })
+    reaper.ImGui_Separator(bctx)
+    K.default_menu_items(bctx, { key }, label)
     reaper.ImGui_EndPopup(bctx)
     return reset == true
   end
@@ -14191,6 +14251,166 @@ do
       end
     end
     return table.concat(parts, " \xC2\xB7 ")
+  end
+
+  -- Saved defaults: the copy of the menu entries, their reasons, the System Default confirm and the status lines
+  -- (docs/design/pitch-correct-saved-defaults.md)
+  local DEFAULT_COPY = {
+    sys_all = "Set as System Default\xE2\x80\xA6",
+    sys_one = "Set %s as System Default\xE2\x80\xA6",
+    track_all = "Set as Track Default",
+    track_one = "Set %s as Track Default",
+    track_clear = "Clear Track Default",
+    sys_same = "Already the system default",
+    track_same = "Already the track default",
+    track_none = "No track default",
+    no_track = "The item has no track",
+    sys_title_all = "Make this item's values your System Default?",
+    sys_title_one = "Make %s your System Default?",
+    sys_body = "New analyses on tracks without a Track Default start with: %s.",
+    sys_keep = "Items already analyzed keep their values. Restore Factory Defaults in Settings brings back the factory values.",
+    sys_confirm = "Set as System Default",
+    sys_done = "System default saved: %s.",
+    track_done = "Track default of %s: %s (%s+Z undoes it).",
+    track_cleared = "Track default of %s cleared (%s+Z undoes it).",
+    undo_set_all = "Set track default",
+    undo_set_one = "Set %s as track default",
+    undo_clear = "Clear track default",
+    was = "%s (was %s)",
+  }
+  -- The value keys a default holds (Key and Scale never)
+  local DEFAULT_ALL_KEYS = K.ITEM_KEYS
+
+  --- This item's value of each of `keys` (K.apply_source), nil when no analysed item is open.
+  local function default_source(keys)
+    local guid = state.target_take_guid
+    if not (guid and state.session_takes[guid]) then return nil end
+    return K.apply_source(keys)
+  end
+
+  --- The track of the open item and its name ("this track" when it has none).
+  local function default_track()
+    local track = K.take_track(state.target_take_guid)
+    if not track then return nil, nil end
+    local _, name = reaper.GetTrackName(track)
+    return track, (name and name ~= "") and name or "this track"
+  end
+
+  --- Why "Set as System Default" / "Set as Track Default" for `keys` cannot run now (nil = it can). `level` is
+  --- "system" or "track".
+  K.default_reason = function(keys, level)
+    if state.is_analyzing or K.batch then return BAR_REASON_ANALYZING end
+    local src = default_source(keys)
+    if not src then return BAR_REASON_NOT_ANALYZED end
+    local have
+    if level == "track" then
+      local track = default_track()
+      if not track then return DEFAULT_COPY.no_track end
+      have = K.track_defaults(track)
+    end
+    for _, key in ipairs(keys) do
+      local d
+      if level == "track" then d = have[key] else d = K.sys_defaults[key] or DEFAULTS[key] end
+      if d == nil or K.value_changed(src[key], d) then return nil end
+    end
+    return (level == "track") and DEFAULT_COPY.track_same or DEFAULT_COPY.sys_same
+  end
+
+  --- The System Default confirm for `keys` (nil: every value): names what new analyses start with, and what it was.
+  K.sys_default_request = function(keys)
+    keys = keys or DEFAULT_ALL_KEYS
+    local src = default_source(keys)
+    if not src then return nil end
+    local parts = {}
+    for _, key in ipairs(keys) do
+      local old = { [key] = K.sys_defaults[key] or DEFAULTS[key] }
+      local now_t, old_t = K.apply_values_line(src, { key }), K.apply_values_line(old, { key })
+      parts[#parts + 1] = (now_t ~= old_t) and string.format(DEFAULT_COPY.was, now_t, old_t) or now_t
+    end
+    local line = table.concat(parts, ", ")
+    local title = (#keys == 1) and string.format(DEFAULT_COPY.sys_title_one, K.apply_values_line(src, keys))
+      or DEFAULT_COPY.sys_title_all
+    return {
+      title = title,
+      body_lines = { string.format(DEFAULT_COPY.sys_body, line), DEFAULT_COPY.sys_keep },
+      confirm_label = DEFAULT_COPY.sys_confirm,
+      fit = true,
+      safe = true,   -- nothing the user made is lost (items keep their values)
+      on_confirm = function()
+        K.sys_default_set(src)
+        set_status(string.format(DEFAULT_COPY.sys_done, K.apply_values_line(src, keys)))
+      end,
+    }
+  end
+
+  --- Write `t` ({ [key] = number }, empty: none) as the Track Default of `track`, as one undo point `undo`.
+  local function track_default_write(track, t, undo)
+    local any = next(t) ~= nil
+    reaper.Undo_BeginBlock()
+    reaper.GetSetMediaTrackInfo_String(track, K.TRACK_DEFAULT_KEY, any and JSON.encode(t) or "", true)
+    reaper.Undo_EndBlock(undo, -1)
+    note_own_write()
+  end
+
+  --- "Set as Track Default" (keys nil: every value): this item's values of `keys` become its track's default; the
+  --- track's other keys stay. One undo point; nothing else changes. Returns true when it was written.
+  K.set_track_default = function(keys)
+    keys = keys or DEFAULT_ALL_KEYS
+    if K.default_reason(keys, "track") then return false end
+    local src = default_source(keys)
+    local track, name = default_track()
+    local t = {}
+    for k, v in pairs(K.track_defaults(track)) do t[k] = v end
+    for _, key in ipairs(keys) do t[key] = K.item_value_valid(key, src[key]) end
+    local undo = (#keys == 1) and string.format(DEFAULT_COPY.undo_set_one, APPLY_LABEL[keys[1]] or keys[1])
+      or DEFAULT_COPY.undo_set_all
+    track_default_write(track, t, undo)
+    set_status(string.format(DEFAULT_COPY.track_done, name, K.apply_values_line(src, keys), K.MOD_LABEL))
+    return true
+  end
+
+  --- Why "Clear Track Default" cannot run now (nil = it can).
+  K.clear_track_reason = function()
+    if state.is_analyzing or K.batch then return BAR_REASON_ANALYZING end
+    local track = default_track()
+    if not track then return DEFAULT_COPY.no_track end
+    if next(K.track_defaults(track)) == nil then return DEFAULT_COPY.track_none end
+    return nil
+  end
+
+  --- "Clear Track Default": the open item's track has no default any more (one undo point).
+  K.clear_track_default = function()
+    if K.clear_track_reason() then return false end
+    local track, name = default_track()
+    track_default_write(track, {}, DEFAULT_COPY.undo_clear)
+    set_status(string.format(DEFAULT_COPY.track_cleared, name, K.MOD_LABEL))
+    return true
+  end
+
+  --- The default entries of a menu for `keys` (nil: every value; label: the value's name, for one): Set as System
+  --- Default…, Set as Track Default and, for every value (the pill menu), Clear Track Default. Each disabled entry
+  --- says why beside it (EP2).
+  K.default_menu_items = function(mctx, keys, label)
+    local one = keys ~= nil
+    keys = keys or DEFAULT_ALL_KEYS
+    local sys_reason = K.default_reason(keys, "system")
+    local sys_text = one and string.format(DEFAULT_COPY.sys_one, label) or DEFAULT_COPY.sys_all
+    if reaper.ImGui_MenuItem(mctx, sys_text, sys_reason, false, sys_reason == nil) and sys_reason == nil then
+      local req = K.sys_default_request(keys)
+      if req then request_confirm(req) end
+    end
+    local track_reason = K.default_reason(keys, "track")
+    local track_text = one and string.format(DEFAULT_COPY.track_one, label) or DEFAULT_COPY.track_all
+    if reaper.ImGui_MenuItem(mctx, track_text, track_reason, false, track_reason == nil) and track_reason == nil then
+      K.set_track_default(keys)
+    end
+    if not one then
+      local clear_reason = K.clear_track_reason()
+      if reaper.ImGui_MenuItem(mctx, DEFAULT_COPY.track_clear, clear_reason, false, clear_reason == nil)
+          and clear_reason == nil then
+        K.clear_track_default()
+      end
+    end
   end
 
   --- "Apply to other items…" (keys nil: every value, Key and Scale included) or "Apply <Value> to other items…"
@@ -14675,7 +14895,8 @@ do
       end
     end
 
-    --- The pill's menu: where edits go, Apply to other items… and Reset this item to defaults. A disabled entry says
+    --- The pill's menu: where edits go, Apply to other items…, the System / Track Default entries
+    --- (K.default_menu_items) and Reset this item to defaults. A disabled entry says
     --- why beside it (EP2: readable with tooltips off).
     local function draw_pill_menu(open_x, open_y)
       -- Under the pill: set right before BeginPopup (a tooltip in between would take the position)
@@ -14689,6 +14910,9 @@ do
       reaper.ImGui_Separator(bctx)
 
       K.apply_menu_item(bctx, BAR_PILL_MENU.apply, nil)
+      reaper.ImGui_Separator(bctx)
+      K.default_menu_items(bctx, nil)
+      reaper.ImGui_Separator(bctx)
       local reset_reason = inspector_reason or (not take_data and BAR_REASON_NOT_ANALYZED)
         or ((K.item_off_defaults(take_data) == 0) and BAR_PILL_MENU.reset_none) or nil
       if reaper.ImGui_MenuItem(bctx, BAR_PILL_MENU.reset, reset_reason, false, reset_reason == nil)
@@ -14698,15 +14922,17 @@ do
       reaper.ImGui_EndPopup(bctx)
     end
 
-    --- The selection pill: what a drag on a value changes. A click opens its menu (draw_pill_menu), under it.
+    --- The selection pill: what a drag on a value changes. A click or a right-click opens its menu (draw_pill_menu),
+    --- under it.
     local function draw_pill()
       local text = (sel_n == 0) and BAR_PILL_NONE or (sel_n == 1) and BAR_PILL_ONE or string.format(BAR_PILL_MANY, sel_n)
       local fg, bg = P.text, P.well
       if sel_n > 0 then fg, bg = Theme.label_on(P.accent2), P.accent2 end
       Theme.align(bctx)
       local open_x, open_y
-      if Theme.badge(bctx, text, { color = fg, bg = bg, text_color = fg, id = "bar_pill", w = s.unit_w.pill,
-          interactive = true }) then
+      local clicked = Theme.badge(bctx, text, { color = fg, bg = bg, text_color = fg, id = "bar_pill", w = s.unit_w.pill,
+        interactive = true })
+      if clicked or reaper.ImGui_IsItemClicked(bctx, reaper.ImGui_MouseButton_Right()) then
         open_x = reaper.ImGui_GetItemRectMin(bctx)
         open_y = select(2, reaper.ImGui_GetItemRectMax(bctx))
         reaper.ImGui_OpenPopup(bctx, "##bar_pill_menu")

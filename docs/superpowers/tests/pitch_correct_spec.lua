@@ -3346,6 +3346,61 @@ test("unanalysed_take_shows_its_track_default", function()
   st.target_take_guid, st.separation = saved[1], saved[2]
 end)
 
+-- The open item {t}, analysed, with `overrides` and Separation `sep`, while fn runs
+local function with_open_t(overrides, sep, fn)
+  local st = S.state
+  local saved = { st.target_take_guid, st.session_takes["{t}"], st.status.text, st.confirm }
+  st.target_take_guid = "{t}"
+  st.session_takes["{t}"] = { guid = "{t}", notes = {}, results = {}, separation = sep, overrides = overrides }
+  reaper.time_precise = function() return 0 end
+  local ok, err = pcall(fn)
+  reaper.time_precise = nil
+  st.target_take_guid, st.session_takes["{t}"], st.status.text, st.confirm = saved[1], saved[2], saved[3], saved[4]
+  if not ok then error(err, 0) end
+end
+
+test("set_track_default_one_undo", function()
+  local K = S.K
+  with_track('{"tighten":0.2}', nil, function(_, track_json)
+    local labels = {}
+    reaper.Undo_BeginBlock = function() end
+    reaper.Undo_EndBlock = function(label) labels[#labels + 1] = label end
+    with_open_t({ tolerance = 15, tighten = 0.5, correct_mode = 1, retune_speed = 1, slide_in = 0 }, 0.6, function()
+      eq(K.set_track_default({ "tolerance" }), true)
+      eq(labels[1], "Set Tolerance as track default", "one undo point")
+      local t = S.K.track_defaults("track_t")
+      eq(t.tolerance, 15); eq(t.tighten, 0.2, "the track's other keys stay")
+      eq(K.default_reason({ "tolerance" }, "track"), "Already the track default")
+      eq(K.set_track_default(nil), true)
+      eq(labels[2], "Set track default")
+      eq(K.track_defaults("track_t").separation, 0.6)
+      eq(K.clear_track_default(), true); eq(labels[3], "Clear track default")
+      eq(track_json(), "", "cleared"); eq(K.clear_track_reason(), "No track default")
+    end)
+    reaper.Undo_BeginBlock, reaper.Undo_EndBlock = nil, nil
+  end)
+end)
+
+test("sys_default_request_saves_on_confirm", function()
+  local K = S.K
+  with_track(nil, nil, function(ext)
+    with_open_t({ tolerance = 15, tighten = 0, correct_mode = 0, retune_speed = 1, slide_in = 0 }, 0.5, function()
+      eq(K.default_reason({ "tighten" }, "system"), "Already the system default", "equals the factory value")
+      eq(K.default_reason({ "tolerance" }, "system"), nil)
+      local req = K.sys_default_request({ "tolerance" })
+      eq(req.title, "Make Tolerance 15\xC2\xA2 your System Default?")
+      eq(req.body_lines[1], "New analyses on tracks without a Track Default start with: Tolerance 15\xC2\xA2 (was Tolerance 8\xC2\xA2).")
+      eq(next(ext), nil, "nothing saved before the confirm")
+      req.on_confirm()
+      eq(ext.pitch_def_tolerance, "15"); eq(K.sys_defaults.tolerance, 15)
+      eq(K.item_default("tolerance", "{t}"), 15, "the item on a track without a default follows it")
+      eq(K.sys_defaults_changed(), 1)
+      K.sys_defaults_clear()
+      eq(ext.pitch_def_tolerance, "deleted"); eq(K.sys_defaults_changed(), 0)
+    end)
+  end)
+end)
+
 test("unanalysed_take_takes_the_defaults", function()
   local st, NK = S.state, S.K.new_key
   local saved = { NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx }
