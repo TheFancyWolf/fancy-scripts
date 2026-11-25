@@ -209,6 +209,10 @@ local PARAM_LABELS = {
 local K = {
   -- Take extension key holding the analysis / note model (JSON)
   TAKE_DATA_KEY = "P_EXT:fancy_pitch_data",
+  -- Track extension key holding the track's Track Default (JSON: only the value keys set); ExtState key prefix of
+  -- the System Default of each value (pitch_def_<key>). See K.item_default
+  TRACK_DEFAULT_KEY = "P_EXT:fancy_pitch_track_defaults",
+  SYS_DEFAULT_EXT = "pitch_def_",
 
   -- The note action bar's grip offset is kept within this many pixels of its place under the note
   NOTE_BAR_OFFSET_MAX = 2000,
@@ -452,8 +456,9 @@ local state = {
 
   -- What the script asked REAPER about, valid for one value of GetProjectStateChangeCount(0) of one project (see
   -- K.refresh_project_cache, K.drop_project_cache): takes by GUID (take = pointer, or false when the item is not in
-  -- the project; scanned = the full item scan ran), the item of a take, and whether a take's pitch envelope is bypassed
-  cache = { count = nil, proj = nil, takes = {}, items = {}, bypass = {} },
+  -- the project; scanned = the full item scan ran), the item of a take, whether a take's pitch envelope is bypassed,
+  -- the track of a take (false: none) and the Track Default of a track (K.track_defaults)
+  cache = { count = nil, proj = nil, takes = {}, items = {}, bypass = {}, tracks = {}, trackdef = {} },
   -- The target as loop_body resolved it this frame (see K.frame_target)
   frame = { guid = nil, take = nil, item = nil },
   -- The canvas's drawing cache (see K.canvas_cache_begin): the mapping the cached coordinates belong to (map, gen counts
@@ -535,20 +540,20 @@ K.item_value = function(data, key)
   return data.overrides and data.overrides[key]
 end
 
---- The values a new item starts with: the script's DEFAULTS for every value key, and the Key and Scale last chosen
---- in the bar (K.new_key).
-K.new_item_values = function()
+--- The values a new item `guid` starts with: its default of every value key (K.item_default: its track's, else the
+--- System Default, else DEFAULTS), and the Key and Scale last chosen in the bar (K.new_key).
+K.new_item_values = function(guid)
   local t = {}
-  for _, key in ipairs(K.ITEM_KEYS) do t[key] = DEFAULTS[key] end
+  for _, key in ipairs(K.ITEM_KEYS) do t[key] = (K.item_default(key, guid)) end
   t.key_idx, t.scale_idx = K.new_key.key_idx, K.new_key.scale_idx
   return t
 end
 
---- Fill every missing value of an item's model with a new item's (K.new_item_values: the defaults; a model change
---- only: it is written with the item's next save). A new analysis, and an item analysed before 2.22 that holds no
---- values, get them here. Returns true when it filled one.
+--- Fill every missing value of an item's model with a new item's (K.new_item_values: its defaults, by data.guid; a
+--- model change only: it is written with the item's next save). A new analysis, and an item analysed before 2.22
+--- that holds no values, get them here. Returns true when it filled one.
 K.item_seed = function(data)
-  local start, filled = K.new_item_values(), false
+  local start, filled = K.new_item_values(data.guid), false
   for _, key in ipairs(K.ITEM_KEYS) do
     if K.item_value(data, key) == nil then
       if key == "separation" then
@@ -573,37 +578,38 @@ K.item_carry_key = function(data, before)
   if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
 end
 
---- How many of the item's values (K.ITEM_KEYS) differ from the script's defaults (DEFAULTS). A missing value is the
---- default. Key and Scale are not values with a default.
+--- How many of the item's values (K.ITEM_KEYS) differ from its defaults (K.item_default, by data.guid). A missing
+--- value is the default. Key and Scale are not values with a default.
 K.item_off_defaults = function(data)
   if not data then return 0 end
   local n = 0
   for _, key in ipairs(K.ITEM_KEYS) do
-    local v = K.item_value(data, key)
-    if v ~= nil and DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then n = n + 1 end
+    local v, d = K.item_value(data, key), K.item_default(key, data.guid)
+    if v ~= nil and d ~= nil and K.value_changed(v, d) then n = n + 1 end
   end
   return n
 end
 
---- The model part of "Reset this item to defaults": every item value (K.ITEM_KEYS) becomes the script's default
---- (DEFAULTS); Key and Scale are not changed, and the notes keep their own values. A model change only
---- (K.reset_item_all writes it).
+--- The model part of "Reset this item to defaults": every item value (K.ITEM_KEYS) becomes its default
+--- (K.item_default, by data.guid); Key and Scale are not changed, and the notes keep their own values. A model change
+--- only (K.reset_item_all writes it).
 K.item_reset_values = function(data)
   if not data then return end
   for _, key in ipairs(K.ITEM_KEYS) do
-    if DEFAULTS[key] ~= nil then
+    local d = K.item_default(key, data.guid)
+    if d ~= nil then
       if key == "separation" then
-        data.separation = DEFAULTS[key]
+        data.separation = d
       else
         data.overrides = data.overrides or {}
-        data.overrides[key] = DEFAULTS[key]
+        data.overrides[key] = d
       end
     end
   end
 end
 
---- Resolve an effective value: the note's own, else the target item's, else the script's default (an item not
---- analysed yet, or not seeded).
+--- Resolve an effective value: the note's own, else the target item's, else its default (K.item_default: an item
+--- not analysed yet, or not seeded).
 local function get_effective(note, key)
   if note and note.controls and note.controls[key] ~= nil then
     return note.controls[key]
@@ -612,16 +618,17 @@ local function get_effective(note, key)
     local v = K.item_value(state.session_takes[state.target_take_guid], key)
     if v ~= nil then return v end
   end
-  return DEFAULTS[key]
+  return (K.item_default(key, state.target_take_guid))
 end
 
---- Returns the override level for display: "note" (the note has its own), "item" (the item differs from the
---- script's default: the "*" mark) or "default".
+--- Returns the override level for display: "note" (the note has its own), "item" (the item differs from its
+--- default, K.item_default: the "*" mark) or "default".
 local function get_override_level(note, key)
   if note and note.controls and note.controls[key] ~= nil then return "note" end
-  if state.target_take_guid then
-    local v = K.item_value(state.session_takes[state.target_take_guid], key)
-    if v ~= nil and DEFAULTS[key] ~= nil and K.value_changed(v, DEFAULTS[key]) then return "item" end
+  local guid = state.target_take_guid
+  if guid then
+    local v, d = K.item_value(state.session_takes[guid], key), K.item_default(key, guid)
+    if v ~= nil and d ~= nil and K.value_changed(v, d) then return "item" end
   end
   return "default"
 end
@@ -956,7 +963,7 @@ end
 K.drop_project_cache = function()
   local cache = state.cache
   cache.count, cache.proj = nil, nil
-  cache.takes, cache.items, cache.bypass = {}, {}, {}
+  cache.takes, cache.items, cache.bypass, cache.tracks, cache.trackdef = {}, {}, {}, {}, {}
 end
 
 --- Once per frame, before anything reads the cache: one GetProjectStateChangeCount call and one EnumProjects call;
@@ -1021,6 +1028,108 @@ K.take_item = function(take)
     items[take] = item
   end
   return item or nil
+end
+
+-------------------------------------------------------------------------------
+-- Saved defaults (docs/design/pitch-correct-saved-defaults.md). An item's default of a value, the level its
+-- "Reset to default", its "*" mark and a new analysis of it go by, is the first of: its track's Track Default
+-- (track P_EXT, only the keys set, part of the project and its undo history), the System Default (ExtState
+-- pitch_def_<key>, every project), the script's DEFAULTS. Key and Scale are never part of a default.
+-------------------------------------------------------------------------------
+
+--- A stored default of `key` checked: a finite number clamped to the value's range (Mode one of 0, 1, 2), or nil.
+K.item_value_valid = function(key, v)
+  v = tonumber(v)
+  if not v or v ~= v or math.abs(v) == math.huge then return nil end
+  if key == "correct_mode" then
+    if v ~= 0 and v ~= 1 and v ~= 2 then return nil end
+    return v
+  end
+  local lim = (key == "tolerance") and K.LIMITS.tolerance or { 0, 1 }
+  if DEFAULTS[key] == nil then return nil end
+  return math.max(lim[1], math.min(lim[2], v))
+end
+
+--- The System Default of each value key that has one ({ [key] = number }), read at start (K.sys_defaults_load).
+K.sys_defaults = {}
+
+K.sys_defaults_load = function()
+  K.sys_defaults = {}
+  for _, key in ipairs(K.ITEM_KEYS) do
+    K.sys_defaults[key] = K.item_value_valid(key, reaper.GetExtState("FancyScripts", K.SYS_DEFAULT_EXT .. key))
+  end
+end
+K.sys_defaults_load()   -- at start, with the other settings (K.load_settings)
+
+--- Save `values` ({ [key] = number }) as the System Default of those keys (outside the undo history).
+K.sys_default_set = function(values)
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = values[key] ~= nil and K.item_value_valid(key, values[key]) or nil
+    if v ~= nil then
+      K.sys_defaults[key] = v
+      reaper.SetExtState("FancyScripts", K.SYS_DEFAULT_EXT .. key, string.format("%.14g", v), true)
+    end
+  end
+end
+
+--- Forget every System Default: the factory DEFAULTS apply again.
+K.sys_defaults_clear = function()
+  for _, key in ipairs(K.ITEM_KEYS) do
+    reaper.DeleteExtState("FancyScripts", K.SYS_DEFAULT_EXT .. key, true)
+  end
+  K.sys_defaults = {}
+end
+
+--- How many values have a System Default that differs from the factory one.
+K.sys_defaults_changed = function()
+  local n = 0
+  for _, key in ipairs(K.ITEM_KEYS) do
+    local v = K.sys_defaults[key]
+    if v ~= nil and math.abs(v - DEFAULTS[key]) > 1e-9 then n = n + 1 end
+  end
+  return n
+end
+
+--- The track a take (by GUID) is on, cached per project state; nil when the take or its track is gone.
+K.take_track = function(guid)
+  if not guid then return nil end
+  local tracks = state.cache.tracks
+  local track = tracks[guid]
+  if track == nil then
+    local take = resolve_take_by_guid(guid, true)
+    track = take and reaper.GetMediaItemTake_Track(take) or false
+    tracks[guid] = track
+  end
+  return track or nil
+end
+
+--- The Track Default of `track` ({ [key] = number }, only the keys set and valid; empty when none), cached per
+--- project state.
+K.track_defaults = function(track)
+  if not track then return {} end
+  local cache = state.cache.trackdef
+  local t = cache[track]
+  if t then return t end
+  t = {}
+  local ok, raw = reaper.GetSetMediaTrackInfo_String(track, K.TRACK_DEFAULT_KEY, "", false)
+  if ok and raw and raw ~= "" then
+    local parsed_ok, parsed = pcall(JSON.decode, raw)
+    if parsed_ok and type(parsed) == "table" then
+      for _, key in ipairs(K.ITEM_KEYS) do t[key] = K.item_value_valid(key, parsed[key]) end
+    end
+  end
+  cache[track] = t
+  return t
+end
+
+--- The default of value `key` for the item `guid`, and where it comes from: "track", "system" or "factory". A key
+--- that is not an item value gives DEFAULTS[key], "factory".
+K.item_default = function(key, guid)
+  local tv = K.track_defaults(K.take_track(guid))[key]
+  if tv ~= nil then return tv, "track" end
+  local sv = K.sys_defaults[key]
+  if sv ~= nil then return sv, "system" end
+  return DEFAULTS[key], "factory"
 end
 
 --- GUID string of a take, or nil.

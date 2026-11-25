@@ -3257,6 +3257,81 @@ test("item_seed_keeps_existing", function()
   eq(data.overrides.tighten, 0.3, "tighten")
 end)
 
+-- Saved defaults: track -> system -> factory (2026-11-25) ------------------------------------------------------------
+-- track_json: what the track of take {t} holds under its Track Default key (nil: the take has no track)
+local function with_track(track_json, sys, fn)
+  local K = S.K
+  local saved_sys = K.sys_defaults
+  local ext = {}
+  K.sys_defaults = sys or {}
+  reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{t}" and "take_t" or nil end
+  reaper.GetMediaItemTake_Track = function(take) return (take == "take_t" and track_json) and "track_t" or nil end
+  reaper.GetSetMediaTrackInfo_String = function(track, key, value, set)
+    if track ~= "track_t" or key ~= K.TRACK_DEFAULT_KEY then return false, "" end
+    if set then track_json = value end
+    return true, track_json or ""
+  end
+  reaper.SetExtState = function(_, key, value) ext[key] = value end
+  reaper.DeleteExtState = function(_, key) ext[key] = "deleted" end
+  K.drop_project_cache()
+  local ok, err = pcall(fn, ext, function() return track_json end)
+  for _, name in ipairs({ "GetMediaItemTakeByGUID", "GetMediaItemTake_Track", "GetSetMediaTrackInfo_String",
+    "SetExtState", "DeleteExtState" }) do reaper[name] = nil end
+  K.sys_defaults = saved_sys
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end
+
+test("saved_defaults_levels", function()
+  local K, D = S.K, S.DEFAULTS
+  with_track(nil, nil, function()
+    local v, lvl = K.item_default("tolerance", "{t}")
+    eq(v, D.tolerance); eq(lvl, "factory")
+  end)
+  with_track(nil, { tolerance = 20, tighten = 0.4 }, function()
+    local v, lvl = K.item_default("tolerance", "{t}")
+    eq(v, 20); eq(lvl, "system")
+  end)
+  with_track('{"tolerance":12}', { tolerance = 20, tighten = 0.4 }, function()
+    local v, lvl = K.item_default("tolerance", "{t}")
+    eq(v, 12, "the track's"); eq(lvl, "track")
+    v, lvl = K.item_default("tighten", "{t}")
+    eq(v, 0.4, "a key the track does not set: the system's"); eq(lvl, "system")
+    v, lvl = K.item_default("slide_in", "{t}")
+    eq(v, D.slide_in); eq(lvl, "factory")
+    v, lvl = K.item_default("tolerance", "{gone}")
+    eq(v, 20, "a take with no track: the system's"); eq(lvl, "system")
+  end)
+end)
+
+test("saved_defaults_invalid_ignored", function()
+  local K, D = S.K, S.DEFAULTS
+  eq(K.item_value_valid("tolerance", "abc"), nil); eq(K.item_value_valid("tolerance", "nan"), nil)
+  eq(K.item_value_valid("tolerance", 999), 50, "clamped"); eq(K.item_value_valid("tighten", -1), 0, "clamped")
+  eq(K.item_value_valid("correct_mode", 1.5), nil); eq(K.item_value_valid("correct_mode", 2), 2)
+  eq(K.item_value_valid("key_idx", 3), nil, "Key is never a default")
+  with_track('{"tolerance":"x","correct_mode":7,"tighten":0.25}', nil, function()
+    eq(K.item_default("tolerance", "{t}"), D.tolerance); eq(K.item_default("correct_mode", "{t}"), D.correct_mode)
+    eq(K.item_default("tighten", "{t}"), 0.25)
+  end)
+  with_track("not json", nil, function() eq(K.item_default("tighten", "{t}"), D.tighten) end)
+end)
+
+test("item_seed_uses_track_default", function()
+  local K, D = S.K, S.DEFAULTS
+  with_track('{"tolerance":12,"separation":0.7}', { correct_mode = 2 }, function()
+    local data = { guid = "{t}" }
+    K.item_seed(data)
+    eq(data.overrides.tolerance, 12); eq(data.separation, 0.7); eq(data.overrides.correct_mode, 2)
+    eq(data.overrides.tighten, D.tighten)
+    eq(K.item_off_defaults(data), 0, "at its own defaults")
+    data.overrides.tolerance = D.tolerance
+    eq(K.item_off_defaults(data), 1, "the factory value differs from the track's")
+    K.item_reset_values(data)
+    eq(data.overrides.tolerance, 12, "reset goes to the track default")
+  end)
+end)
+
 test("unanalysed_take_takes_the_defaults", function()
   local st, NK = S.state, S.K.new_key
   local saved = { NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx }
