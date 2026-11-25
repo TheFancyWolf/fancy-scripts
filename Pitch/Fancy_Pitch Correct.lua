@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.27.0
 -- @changelog
---   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; fix: the pitch line draws in again while an analysis runs
+--   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas shows Analyze above its Analysis Settings (renamed from Analyze with), without the "your defaults" line; fix: the pitch line draws in again while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -1954,11 +1954,11 @@ end
 
 --- The form's header line.
 K.form_header = function(form)
-  if form.source == "item" then return "ANALYZE WITH · as analyzed before" end
-  if form.source == "unrecorded" then return "ANALYZE WITH · not recorded, your defaults" end
+  if form.source == "item" then return "ANALYSIS SETTINGS · as analyzed before" end
+  if form.source == "unrecorded" then return "ANALYSIS SETTINGS · not recorded, your defaults" end
   local n = K.form_changed_rows(form.values)
-  if n == 0 then return "ANALYZE WITH · your defaults" end
-  return string.format("ANALYZE WITH · %d changed from defaults", n)
+  if n == 0 then return "ANALYSIS SETTINGS · your defaults" end
+  return string.format("ANALYSIS SETTINGS · %d changed from defaults", n)
 end
 
 --- The Save as Default confirm (a request_confirm request) for `values`.
@@ -7111,8 +7111,8 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  -- Nothing to edit yet: not analysed (the "Analyze with" form above Analyze Item, the hint lines under it), or
-  -- analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes one of three
+  -- Nothing to edit yet: not analysed (Analyze Item, the hint lines under it, then the "Analysis Settings" form), or
+  -- analysed without finding a pitched note (title and hint, Re-Analyze, the form). The form takes one of three
   -- layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary line beside
   -- the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
   -- analysis runs and has no frames yet the form stays in place, locked, showing the values it runs with
@@ -7201,10 +7201,6 @@ local function draw_graph(draw_ctx, w, h)
       local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.LOCKED_REASON or reason,
         is_batch)
       btn_cx = x0 + used + L.md + btn_w * 0.5
-    else
-      local drawn_h = K.form_canvas_draw(form, cx - form_w * 0.5, y, form_w, layout, reason, form_max_h)
-      K.form_canvas_last = { layout = layout, adv = K.form_adv_open, h = drawn_h, scroll = form_max_h ~= nil }
-      y = y + form_h + gap
     end
 
     if canvas_button(label, btn_id, btn_cx, y, can_analyze, tip, narrow_label, K.ANALYZE_BTN) then
@@ -7219,6 +7215,13 @@ local function draw_graph(draw_ctx, w, h)
         reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
         y = y + text_h
       end
+    end
+
+    -- The form under the button and its lines (the summary layout has it beside the button, above)
+    if layout ~= "summary" then
+      y = y + gap
+      local drawn_h = K.form_canvas_draw(form, cx - form_w * 0.5, y, form_w, layout, reason, form_max_h)
+      K.form_canvas_last = { layout = layout, adv = K.form_adv_open, h = drawn_h, scroll = form_max_h ~= nil }
     end
 
     -- The empty canvases carry their own centred message: the pill adds only a status message or the selection issue
@@ -11194,7 +11197,7 @@ K.form_rows_draw = function(section, b, opts)
   return section_clicked
 end
 
--- The "Analyze with" form on the empty canvas (spec: Analysis Settings at the Analyze Button). Its copy:
+-- The "Analysis Settings" form on the empty canvas (spec: Analysis Settings at the Analyze Button). Its copy:
 K.FORM_COPY = {
   reset_hint = "Back to your default (from Settings)",
   default_reason = "Already the default",
@@ -11203,7 +11206,7 @@ K.FORM_COPY = {
   matches = "Matches your defaults",
   change = "Change…",
   change_tip = "Change the values this item is analyzed with",
-  summary = "Analyze with: ",
+  summary = "Analysis Settings: ",
   no_target = "Select an audio item in REAPER to analyze it.",
 }
 
@@ -11244,8 +11247,8 @@ K.form_canvas_metrics = function()
   local reset_w = text_w("Reset") + L.md * 2
   local save_w = text_w(K.FORM_COPY.save) + pad_x * 2
   local table_row_h = frame_h + cell_y * 2
-  -- The header: the divider (spacing, label, separator, spacing) and the count line under it, then the reason line
-  local head_h = spacing_y * 4 + frame_h + 1 + line_h + line_h
+  -- The header: the divider (spacing, label, separator, spacing), then the reason line
+  local head_h = spacing_y * 4 + frame_h + 1 + line_h
   local n_det, n_dsp = #detection.rows, #dsp.rows
   m = {
     key = key, label_w = label_w, control_w = control_w, reset_w = reset_w, frame_h = frame_h,
@@ -11423,8 +11426,8 @@ K.confirm_form_draw = function(c)
   end
 end
 
---- The "Analyze with" form of the empty canvas: a child window at x, y (screen), w wide, over the canvas: the header
---- (ANALYZE WITH and the changed count), the three rows, the Advanced fold, and Save as Default right-aligned.
+--- The "Analysis Settings" form of the empty canvas: a child window at x, y (screen), w wide, over the canvas: the header
+--- (ANALYSIS SETTINGS), the three rows, the Advanced fold, and Save as Default right-aligned.
 --- layout "full" or "stacked" (K.form_layout). reason (optional): why the form is disabled (no item). While an
 --- analysis runs everything is disabled with K.LOCKED_REASON under the header. max_h (optional): the height it is
 --- held to, scrolling inside (K.form_canvas_plan); else it takes its content's height. Returns the height it took.
@@ -11455,10 +11458,9 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   reaper.ImGui_PopStyleColor(ctx, 1)
   if child_open then
     local content_w = reaper.ImGui_GetContentRegionAvail(ctx)   -- less the scrollbar when it scrolls
+    -- The heading alone (no "your defaults" / changed-count line under it, unlike the modal)
     local header = K.form_header(form)
-    local head, tail = header:match("^(.-) · (.+)$")
-    Theme.section_divider(ctx, head or header, { color = P.yellow })
-    if tail then reaper.ImGui_TextColored(ctx, P.text_dim, tail) end
+    Theme.section_divider(ctx, header:match("^(.-) · ") or header, { color = P.yellow })
     if why then reaper.ImGui_TextColored(ctx, P.text_dim, why) end
 
     local b = K.form_binding(form)
@@ -11497,7 +11499,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   return h
 end
 
---- The summary line of a short canvas: dim "Analyze with: Soprano · ..." (shortened to text_w with the whole line
+--- The summary line of a short canvas: dim "Analysis Settings: Soprano · ..." (shortened to text_w with the whole line
 --- in its tooltip) and Change… at x, centred on a row row_h tall at y. Returns the width it took. Change… opens the
 --- analysis modal (K.analyze_change_request), or the batch modal seeded with the form when the canvas button is a
 --- batch (is_batch). reason (optional): why Change… is disabled, its tooltip then.
@@ -11530,7 +11532,7 @@ K.form_summary_draw = function(form, x, y, text_w, row_h, reason, is_batch)
   return used + m.change_w
 end
 
---- Whether the canvas shows the "Analyze with" form instead of notes (not analysed, no pitched note found, or an
+--- Whether the canvas shows the "Analysis Settings" form instead of notes (not analysed, no pitched note found, or an
 --- analysis running that has no frames yet), and whether it is the no-notes canvas (title, hint and Re-Analyze;
 --- never while analysing). Once the first slice of an analysis fills state.results the pitch line draws in.
 K.empty_canvas = function()

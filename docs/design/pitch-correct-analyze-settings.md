@@ -329,3 +329,10 @@ None. The form reuses the Settings form code inside the script (generalised to r
 - **Narrow Reset:** at ~260 px the text "Reset" stays and the combo shrinks; if it gets too tight on screen, a reset icon would be a Library proposal later.
 - **Tooling:** `ds-lint.py` currently stops on a palette drift between `_lib/theme.lua` and its port; the baseline could not be taken. Worth fixing separately.
 - HC6 conflicts: None.
+
+## Changed 2026-11-25 (user)
+
+- The heading "Analyze with" is now "Analysis Settings" (canvas, modal, and the summary line "Analysis Settings: …").
+- The canvas form no longer shows the line under the heading ("your defaults", "N changed from defaults", "as analyzed before"); the modal keeps it.
+- On the empty canvas the Analyze button and its hint lines come first, the form under them (the summary layout is unchanged).
+- While an analysis runs the locked form shows only until its first slice; then the pitch line draws in.
