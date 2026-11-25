@@ -5478,8 +5478,8 @@ end)
 
 -- One track "tr" with two 20 s audio items (takes "tk_a" / "tk_b", GUIDs "{a}" / "{b}") whose audio is a 220 Hz sine
 -- read at the asked rate. opts: prev (the record the track holds), unreadable (a take K.open_accessor gives nil
--- for), step (seconds reaper.time_precise advances per call, 0 by default), offline (a take whose source has no
--- sample rate), no_source (a take with no source), silent (a take whose every read gives 0), len ({ [item] = s }:
+-- for), step (seconds reaper.time_precise advances per call, 0 by default), silent (a take whose every read
+-- gives 0), len ({ [item] = s }:
 -- an item's length, 20 s otherwise), stubs (more reaper stubs, put in over these). w.opened lists the takes
 -- K.open_accessor was asked for. fn(w) runs with the stubs in place;
 -- they are all put back afterwards, and the pre-analysis is cancelled. w records the reads, destroys, track writes
@@ -5499,11 +5499,6 @@ local function pre_world(opts, fn)
       if key == "D_LENGTH" then return opts.len and opts.len[item] or 20 end
       return 0
     end,
-    GetMediaItemTake_Source = function(take)
-      if opts.no_source == take then return nil end
-      return "src_" .. take
-    end,
-    GetMediaSourceSampleRate = function(src) if opts.offline == src:sub(5) then return 0 end return 44100 end,
     GetSetMediaItemTakeInfo_String = function(take, key)
       if key == "GUID" and guids[take] then return true, guids[take] end
       return false, ""
@@ -7470,20 +7465,20 @@ test("pre_external_change_survives_cancel", function()
 end)
 
 -- F3: offline media and takes that give no audio are skipped, not heard
-test("pre_offline_source_is_skipped", function()
-  for _, opts in ipairs({ { offline = "tk_b" }, { no_source = "tk_b" } }) do
-    pre_world(opts, function(w)
-      local K = S.K
-      eq(K.pre_begin({ "tr" }, {}), true)
-      pre_run_out()
-      for _, take in ipairs(w.opened) do eq(take ~= "tk_b", true, "no accessor for the offline take") end
-      for _, r in ipairs(w.reads) do eq(r.acc, "acc_tk_a") end
-      local rec = K.track_records_pending["tr"]
-      eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], nil, "not heard: tried again next time")
-      eq(rec.skipped, 1, "counted")
-      eq(w.destroyed, 1)
-    end)
-  end
+test("pre_trusts_the_accessor_not_the_source_rate", function()
+  -- REAPER in the background: every source reports a sample rate of 0, the accessor still reads the audio
+  pre_world({ stubs = {
+    GetMediaItemTake_Source = function(take) return "src_" .. take end,
+    GetMediaSourceSampleRate = function() return 0 end,
+  } }, function()
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    local rec = K.track_records_pending["tr"]
+    eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], true, "every take heard")
+    eq(rec.skipped, 0, "nothing called offline")
+    eq(rec.lo_st, 57); eq(rec.hi_st, 57)
+  end)
 end)
 
 test("pre_take_with_no_audio_is_skipped", function()

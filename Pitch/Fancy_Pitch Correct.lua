@@ -2069,15 +2069,13 @@ K.pre_step = function()
       pre.done_s = pre.done_s + entry.len
       pre.ti, pre.t = pre.ti + 1, 0
     elseif not pre.accessor then
-      -- Media offline (its source has no sample rate, as K.analysis_begin tests it) or no accessor: nothing to read.
-      -- Counted, and not listed as heard (tried again next time)
-      local source = reaper.GetMediaItemTake_Source(entry.take)
-      local rate = source and reaper.GetMediaSourceSampleRate(source)
-      if rate and rate > 0 then
-        K.pre_note_external(pre)
-        pre.accessor = K.open_accessor(entry.take)
-      end
+      -- No test of the source's sample rate here: it reads 0 for every source while REAPER is in the background
+      -- ("Set media items offline when application is not active") although the accessor still reads the audio. The
+      -- accessor's reads decide (a take that gives no accessor, or no audio at all, is skipped below)
+      K.pre_note_external(pre)
+      pre.accessor = K.open_accessor(entry.take)
       pre.t, pre.reads, pre.got = 0, 0, 0
+      -- No audio to read: counted, and not listed as heard (tried again next time)
       if not pre.accessor then
         tr.skipped = tr.skipped + 1
         pre.done_s = pre.done_s + entry.len
