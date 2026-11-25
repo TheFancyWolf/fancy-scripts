@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.27.0
+-- @version 2.29.0
 -- @changelog
---   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas reads top to bottom: the selected item names, Analysis Settings (renamed from Analyze with), then Analyze as wide as the settings, without the "your defaults" and "Matches your defaults" lines; tooltips for each Vocal Range, Detection Mode and Quality; fix: the pitch line draws in again while an analysis runs
+--   Auto Vocal Range and Key: Vocal Range and Key have a new first choice, Auto (the default on a fresh install); Analyze first listens through the whole track once to find the singer's lowest and highest notes and the song's key, remembered per track in the project (Find Range and Key Again in the ... menu), a corrected key follows the track, Cancel works in both stages, and a hand-picked range and key skips the extra listening.
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui

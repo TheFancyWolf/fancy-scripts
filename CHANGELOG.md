@@ -4,6 +4,16 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.29.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Auto Vocal Range and Key:
+  - **Vocal Range: Auto**: Vocal Range has a new first choice, Auto, the default on a fresh install. Before a track's first analysis the script listens through the whole track once to find the singer's lowest and highest notes, then analyses with that range. The item then shows the range it used, e.g. "Auto: E2–A4".
+  - **Key: Auto**: Key has a new first choice, Auto, for items not analysed yet (the default on a fresh install). The song's key (Major or Natural Minor) is found from the whole track. On a close call the status line and the Key tooltip name the other candidate.
+  - **Progress**: Analyze shows "Finding range and key… NN%" first, then the analysis itself. Cancel works in both stages.
+  - **Remembered per track**: the range and key are found once and kept with the track in the project. Later items on the track reuse them and only new items are listened to. One Cmd+Z of the analysis undoes this too.
+  - **Correcting the key**: correcting the key on an item whose key came from its track also corrects the track, so later items follow. Items analysed earlier keep theirs.
+  - **Find Key**: choosing Auto in Key on an analysed item gives it its track's key.
+  - **Find Range and Key Again**: the "…" menu listens to the track afresh. Items already analysed keep theirs.
+  - **Min Freq and Max Freq**: with Vocal Range on Auto, they are shown in Advanced but not editable ("Found from the track").
+  - **Hand-picked settings**: with a hand-picked range and key, no extra listening pass runs.
 - **Fancy Pitch Correct v2.27.0 (`Pitch/Fancy_Pitch Correct.lua`)** — System and Track Defaults:
   - **Set as System Default…**: the "This item" menu saves this item's values (Separation, Mode, Tighten, Tolerance, Strength, Slide In) as the values every new analysis starts with, after a confirm. Each value's right-click menu saves just that value.
   - **Set as Track Default**: saves the values on the item's track, so each singer's track starts its new analyses with its own values. It is part of the project and one Cmd+Z undoes it. Clear Track Default removes it.
