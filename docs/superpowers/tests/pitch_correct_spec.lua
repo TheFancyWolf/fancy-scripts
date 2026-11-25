@@ -5212,12 +5212,12 @@ test("canvas_form_while_analyzing_shows_the_running_values_locked", function()
     local form, reason = K.canvas_form(true, false)
     eq(form, st.analysis_form, "idle: the open item's form"); eq(reason, nil)
 
-    -- A Re-Analyze from the modal with Soprano: the first slice fills state.results
+    -- A Re-Analyze from the modal with Soprano, before its first slice: the form, locked
     st.is_analyzing = true
     st.analysis_params = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 512 }
-    st.results = { { time = 0 } }
+    st.results = {}
     shows, no_notes = K.empty_canvas()
-    eq(shows, true, "analysing with frames already in: still the form")
+    eq(shows, true, "analysing, no frames yet: the form")
     eq(no_notes, false, "no 'No pitched notes found' / Re-Analyze while running")
     form, reason = K.canvas_form(true, false)
     eq(reason, K.LOCKED_REASON, "locked with the inline reason")
@@ -5227,6 +5227,14 @@ test("canvas_form_while_analyzing_shows_the_running_values_locked", function()
     eq(K.canvas_form(true, false), form, "the same run: the same form")
     eq(K.canvas_form(false, true), form, "a batch run: the values it runs with too")
     eq(st.analysis_form.values.min_freq, st.min_freq, "the open item's form is untouched")
+
+    -- The first slice fills state.results: the pitch line draws in (the notes canvas), never the no-notes canvas,
+    -- even when the last analysis of this item found no pitched note
+    st.results = { { time = 0 } }
+    eq((K.empty_canvas()), false, "analysing with frames in: the pitch line, not the form")
+    st.analysis_empty = true
+    shows, no_notes = K.empty_canvas()
+    eq(shows, false, "a stale 'no notes' flag does not hide the pitch line while running"); eq(no_notes, false)
 
     -- Done with no pitched note: the no-notes canvas, and the open item's form again
     st.is_analyzing, st.analysis_params, st.analysis_empty = false, nil, true

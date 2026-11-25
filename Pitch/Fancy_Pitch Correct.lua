@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.27.0
 -- @changelog
---   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too
+--   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; fix: the pitch line draws in again while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -7115,8 +7115,8 @@ local function draw_graph(draw_ctx, w, h)
   -- analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes one of three
   -- layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary line beside
   -- the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
-  -- analysis runs (its first slice already fills state.results) the form stays in place, locked, showing the values
-  -- it runs with (K.canvas_form), and the button is disabled.
+  -- analysis runs and has no frames yet the form stays in place, locked, showing the values it runs with
+  -- (K.canvas_form), and the button is disabled; its first slice in state.results draws the pitch line instead.
   local form_canvas, no_notes = K.empty_canvas()
   if form_canvas then
     local cx = full_px + full_w * 0.5
@@ -11531,10 +11531,11 @@ K.form_summary_draw = function(form, x, y, text_w, row_h, reason, is_batch)
 end
 
 --- Whether the canvas shows the "Analyze with" form instead of notes (not analysed, no pitched note found, or an
---- analysis running), and whether it is the no-notes canvas (title, hint and Re-Analyze; never while analysing).
+--- analysis running that has no frames yet), and whether it is the no-notes canvas (title, hint and Re-Analyze;
+--- never while analysing). Once the first slice of an analysis fills state.results the pitch line draws in.
 K.empty_canvas = function()
   local running = state.is_analyzing == true
-  local shows = #state.results == 0 or state.analysis_empty == true or running
+  local shows = #state.results == 0 or (state.analysis_empty == true and not running)
   return shows, shows and #state.results > 0 and not running
 end
 
