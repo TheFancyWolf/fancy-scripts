@@ -1796,13 +1796,15 @@ K.pre_last_progress = 0
 --- Start the pre-analysis of `tracks` (a list of MediaTrack). opts (optional): fresh = true hears every take again and
 --- ignores the records the tracks hold; on_done(results) runs once when every track is finished, results[track] =
 --- its record. A track with nothing new to hear gives its record as it is (not pending); a track with no audio and
---- no record gets one from an empty tally (pending, so it is not heard every time). Returns true when something is
---- to be heard (state.pre is set and state.is_analyzing is true); false, after calling on_done at once, otherwise.
+--- no record gets one from an empty tally (pending, so it is not heard every time); a track that is not (or no
+--- longer) in the project gets nothing. Returns true when something is to be heard (state.pre is set and
+--- state.is_analyzing is true); false, after calling on_done at once, otherwise.
 K.pre_begin = function(tracks, opts)
   opts = opts or {}
   if state.pre then K.pre_cancel() end
   local queue, results, total = {}, {}, 0
   for _, track in ipairs(tracks or {}) do
+    if not reaper.ValidatePtr2(0, track, "MediaTrack*") then goto next_track end
     local prev = nil
     if not opts.fresh then prev = K.track_record(track) end
     local list, skipped = K.pre_takes(track, prev)
@@ -1820,6 +1822,7 @@ K.pre_begin = function(tracks, opts)
       results[track] = rec
       K.track_records_pending[track] = rec
     end
+    ::next_track::
   end
   K.pre_last_progress = 0
   if #queue == 0 then
@@ -1855,10 +1858,34 @@ K.pre_progress = function()
   return math.max(0, math.min(1, heard / pre.total_s))
 end
 
+--- Destroy the pre-analysis's open accessor, if any.
+K.pre_close_accessor = function(pre)
+  local accessor = pre.accessor
+  pre.accessor = nil
+  if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
+end
+
+--- Go on to the next queued track. After the last one state.pre is cleared, then on_done runs; when it started no
+--- analysis, state.is_analyzing goes back to false. Returns true when the pre-analysis ended.
+K.pre_next_track = function(pre)
+  pre.qi, pre.ti, pre.t = pre.qi + 1, 1, 0
+  if pre.qi > #pre.queue then
+    state.pre = nil
+    K.pre_last_progress = 1
+    if pre.on_done then pre.on_done(pre.results) end
+    if not state.accessor and not state.pre then state.is_analyzing = false end
+    return true
+  end
+  pre.track_idx = pre.qi
+  if reaper.ValidatePtr2(0, pre.queue[pre.qi].track, "MediaTrack*") then K.pre_name_track() end
+  return false
+end
+
 --- One slice (at most K.ANALYSIS_SLICE_S) of the running pre-analysis. A take is read in take time from 0, one block
 --- of K.PRE.BLOCK samples at K.PRE.RATE every K.PRE.STEP_S while the block lies whole inside the item; a voiced
---- frame's pitch goes into its track's tally. When the last track is finished state.pre is cleared, then on_done
---- runs; when it started no analysis, state.is_analyzing goes back to false.
+--- frame's pitch goes into its track's tally. The project can change between slices (REAPER's own edits go on), so
+--- every pointer is checked before it is used: a take or item that went is counted as skipped, a track that went
+--- gets no record. A record's skipped is this run's count only.
 K.pre_step = function()
   local pre = state.pre
   if not pre then return end
@@ -1870,22 +1897,25 @@ K.pre_step = function()
     if reaper.time_precise() - slice_start > K.ANALYSIS_SLICE_S then break end
     local tr = pre.queue[pre.qi]
     local entry = tr.list[pre.ti]
-    if not entry then
+    if not reaper.ValidatePtr2(0, tr.track, "MediaTrack*") then
+      -- The track went: nothing is kept for it
+      K.pre_close_accessor(pre)
+      for i = pre.ti, #tr.list do pre.done_s = pre.done_s + tr.list[i].len end
+      if K.pre_next_track(pre) then return end
+    elseif not entry then
       -- The track is finished: its record waits for the caller's undo block
       local rec = K.track_record_build(tr.tally, tr.takes, tr.prev)
-      rec.skipped = (rec.skipped or 0) + tr.skipped
+      rec.skipped = tr.skipped
       K.track_records_pending[tr.track] = rec
       pre.results[tr.track] = rec
-      pre.qi, pre.ti = pre.qi + 1, 1
-      if pre.qi > #pre.queue then
-        state.pre = nil
-        K.pre_last_progress = 1
-        if pre.on_done then pre.on_done(pre.results) end
-        if not state.accessor and not state.pre then state.is_analyzing = false end
-        return
-      end
-      pre.track_idx = pre.qi
-      K.pre_name_track()
+      if K.pre_next_track(pre) then return end
+    elseif not (reaper.ValidatePtr2(0, entry.item, "MediaItem*")
+        and reaper.ValidatePtr2(0, entry.take, "MediaItem_Take*")) then
+      -- The item or take went (deleted, glued, another take made active): skipped, like an unreadable take
+      K.pre_close_accessor(pre)
+      tr.skipped = tr.skipped + 1
+      pre.done_s = pre.done_s + entry.len
+      pre.ti, pre.t = pre.ti + 1, 0
     elseif not pre.accessor then
       pre.accessor = K.open_accessor(entry.take)
       pre.t = 0
@@ -1904,12 +1934,10 @@ K.pre_step = function()
       pre.t = pre.t + K.PRE.STEP_S
     else
       -- The take is heard to its end
-      local accessor = pre.accessor
-      pre.accessor = nil
-      pcall(reaper.DestroyAudioAccessor, accessor)
+      K.pre_close_accessor(pre)
       tr.takes[entry.guid] = true
       pre.done_s = pre.done_s + entry.len
-      pre.ti = pre.ti + 1
+      pre.ti, pre.t = pre.ti + 1, 0
     end
   end
 end

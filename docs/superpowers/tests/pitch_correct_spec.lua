@@ -5469,13 +5469,14 @@ end)
 -- read at the asked rate. opts: prev (the record the track holds), unreadable (a take K.open_accessor gives nil
 -- for), step (seconds reaper.time_precise advances per call, 0 by default). fn(w) runs with the stubs in place;
 -- they are all put back afterwards, and the pre-analysis is cancelled. w records the reads, destroys, track writes
--- and undo blocks.
+-- and undo blocks; a pointer put in w.dead is no longer valid (reaper.ValidatePtr2).
 local function pre_world(opts, fn)
   local K, st = S.K, S.state
-  local w = { reads = {}, destroyed = 0, writes = 0, undo = 0, now = 0 }
+  local w = { reads = {}, destroyed = 0, writes = 0, undo = 0, now = 0, dead = {} }
   local takes = { it_a = "tk_a", it_b = "tk_b" }
   local guids = { tk_a = "{a}", tk_b = "{b}" }
   local stubs = {
+    ValidatePtr2 = function(_, ptr) return ptr ~= nil and not w.dead[ptr] end,
     CountTrackMediaItems = function(track) return track == "tr" and 2 or 0 end,
     GetTrackMediaItem = function(_, i) return ({ [0] = "it_a", [1] = "it_b" })[i] end,
     GetActiveTake = function(item) return takes[item] end,
@@ -5653,6 +5654,73 @@ test("pre_nothing_to_hear", function()
     eq(K.track_records_pending["empty"], empty, "kept, so it is not heard every time")
     eq(st.pre, nil); eq(#w.reads, 0)
     eq(K.pre_progress(), 0, "nothing queued")
+  end)
+end)
+
+test("pre_take_gone_mid_run_is_skipped", function()
+  pre_world({ step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    eq(K.pre_begin({ "tr" }, {}), true)
+    K.pre_step()
+    eq(#w.reads > 0, true, "take a is being read")
+    w.dead["tk_a"] = true   -- the user deleted or glued it between two frames
+    local reads_a = #w.reads
+    pre_run_out()
+    for i = reads_a + 1, #w.reads do eq(w.reads[i].acc, "acc_tk_b", "the gone take is not read again") end
+    eq(w.destroyed, 2, "its accessor destroyed, and take b's")
+    local rec = K.track_records_pending["tr"]
+    eq(rec.skipped, 1); eq(rec.takes["{a}"], nil); eq(rec.takes["{b}"], true)
+    eq(st.pre, nil)
+  end)
+end)
+
+test("pre_item_gone_before_open_is_skipped", function()
+  pre_world({}, function(w)
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    w.dead["it_b"] = true
+    pre_run_out()
+    for _, r in ipairs(w.reads) do eq(r.acc, "acc_tk_a") end
+    eq(K.track_records_pending["tr"].skipped, 1)
+  end)
+end)
+
+test("pre_track_gone_mid_run_leaves_nothing", function()
+  pre_world({ step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    local calls, got = 0, nil
+    eq(K.pre_begin({ "tr", "empty" }, { on_done = function(r) calls = calls + 1; got = r end }), true)
+    eq(K.track_records_pending["empty"] ~= nil, true, "the empty track's record is pending from the start")
+    K.pre_step()
+    w.dead["tr"] = true
+    pre_run_out()
+    eq(calls, 1, "on_done once")
+    eq(got["tr"], nil, "no record for the gone track")
+    eq(K.track_records_pending["tr"], nil, "nothing pending for it")
+    eq(got["empty"] ~= nil, true, "the other track still has its record")
+    eq(w.destroyed, 1, "the open accessor destroyed")
+    eq(st.pre, nil); eq(st.is_analyzing, false)
+  end)
+end)
+
+test("pre_gone_track_is_not_queued", function()
+  pre_world({}, function(w)
+    local K = S.K
+    w.dead["tr"] = true
+    local got
+    eq(K.pre_begin({ "tr" }, { on_done = function(r) got = r end }), false)
+    eq(next(got), nil); eq(next(K.track_records_pending), nil); eq(#w.reads, 0)
+  end)
+end)
+
+test("pre_skipped_counts_this_run_only", function()
+  local K = S.K
+  local prev = K.track_record_build(K.pre_tally_new(), { ["{a}"] = true }, nil)
+  prev.skipped = 2
+  pre_world({ prev = prev }, function()
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    eq(K.track_records_pending["tr"].skipped, 0, "take b heard cleanly: nothing skipped this run")
   end)
 end)
 
