@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.26.0
 -- @changelog
---   Analysis settings at the Analyze button: an "Analyze with" form on the empty canvas, each item remembers the settings it was analysed with, Re-Analyze... and Analyze Selected Items (N)... open them, Save as Default, Settings section renamed "Analysis Defaults"
+--   Analysis settings at the Analyze button: an "Analyze with" form on the empty canvas, each item remembers the settings it was analysed with, the Re-Analyze... menu item and Analyze Selected Items (N)... open them (the no-notes Re-Analyze button analyses at once), Save as Default, Settings section renamed "Analysis Defaults"
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -274,11 +274,13 @@ local K = {
   KEEP_PITCH_LABEL = "Keep each item's own pitch algorithm",
   DEFAULT_SAMPLE_RATE = 44100,                       -- the block / hop readouts assume this until an item has been analysed
 
-  -- Value ranges { lowest, highest } of the Settings drags; a stored value is clamped to them (see K.PERSIST)
+  -- Value ranges { lowest, highest } of the Settings drags; a stored value is clamped to them (see K.PERSIST). The
+  -- two Hz drags also stop 1 Hz short of each other (K.drag_bounds), so their outer ends are what counts: a vocal
+  -- range's low end (Soprano: 250 Hz) lies well above 200 Hz
   LIMITS = {
     threshold = { 0.05, 0.5 },
-    min_freq = { 20, 200 },
-    max_freq = { 200, 2000 },
+    min_freq = { 20, 1999 },
+    max_freq = { 21, 2000 },
     tolerance = { 0, 50 },   -- cents
     separation = { 0, 1 },
   },
@@ -1722,8 +1724,8 @@ K.analysis_values = function(t)
     if type(v) ~= "number" or v ~= v then return nil end
     values[key] = v
   end
-  -- A vocal range's low end (Soprano: 250 Hz) lies above the Settings drag's min range, so both Hz values are held to
-  -- the widest span the Settings allow, and the low end must be below the high end
+  -- Both Hz values are held to the widest span the Settings allow (Min Freq's low end to Max Freq's high end), and
+  -- the low end must be below the high end
   local hz_lo, hz_hi = K.LIMITS.min_freq[1], K.LIMITS.max_freq[2]
   for _, key in ipairs({ "min_freq", "max_freq" }) do
     if values[key] < hz_lo or values[key] > hz_hi then return nil end
@@ -1755,8 +1757,9 @@ end
 
 --- "Analyzed with Soprano · ...": what an analysed item's tooltip says, nil when it has no stored analysis.
 K.analyzed_with_tip = function(data)
-  if not data or not data.analysis then return nil end
-  return "Analyzed with " .. K.form_summary(data.analysis)
+  local values = data and K.analysis_values(data.analysis)
+  if not values then return nil end
+  return "Analyzed with " .. K.form_summary(values)
 end
 
 --- Where a form for `data` starts from: "item" (it has a stored analysis), "unrecorded" (notes, no stored
@@ -1865,6 +1868,8 @@ K.form_defaults_request = function(values)
     title = "Make these your defaults?",
     body_lines = { first, "Items already analyzed keep their own settings." },
     confirm_label = "Save as Default",
+    fit = true,    -- as tall as its two lines: no empty block above the buttons
+    safe = true,   -- nothing the user made is lost (items keep their own settings)
     on_confirm = function()
       for _, key in ipairs(K.ANALYSIS_KEYS) do state[key] = copy[key] end
       K.save_settings("engine")
@@ -1916,6 +1921,13 @@ K.analysis_begin = function(take, item, opts)
   -- A bad engine value must never crash (negative array size) or hang (a hop of 0 never advances the
   -- analysis time) an analysis: clamp to 64 <= block, 1 <= hop <= block before anything is allocated
   local values = opts.values or K.analysis_defaults()
+  -- A zero-width or inverted Hz range finds nothing and is stored as "not recorded": analyse with the Settings'
+  -- values instead (and the factory Hz when those are inverted too)
+  local function hz_ok(t) return (tonumber(t.min_freq) or 0) < (tonumber(t.max_freq) or 0) end
+  if not hz_ok(values) then
+    values = K.analysis_defaults()
+    if not hz_ok(values) then values.min_freq, values.max_freq = DEFAULTS.min_freq, DEFAULTS.max_freq end
+  end
   local block = math.floor(tonumber(values.block_size) or DEFAULTS.block_size)
   block = math.max(K.BLOCK_SIZE_MIN, math.min(K.BLOCK_SIZE_MAX, block))
   local hop = math.floor(tonumber(values.hop_size) or DEFAULTS.hop_size)
@@ -6993,15 +7005,17 @@ local function draw_graph(draw_ctx, w, h)
   -- Nothing to edit yet: not analysed (the "Analyze with" form above Analyze Item, the hint lines under it), or
   -- analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes one of three
   -- layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary line beside
-  -- the button in a short one. The hint lines drop first when the height runs out, the last one first.
-  if #state.results == 0 or state.analysis_empty then
+  -- the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
+  -- analysis runs (its first slice already fills state.results) the form stays in place, locked, showing the values
+  -- it runs with (K.canvas_form), and the button is disabled.
+  local form_canvas, no_notes = K.empty_canvas()
+  if form_canvas then
     local cx = full_px + full_w * 0.5
     local cy = py + h * 0.5
     local gap = L.lg
     local avail_w = full_w - L.sm * 2
     local analyze_h = K.analyze_btn_h(draw_ctx)
     local _, text_h = reaper.ImGui_CalcTextSize(draw_ctx, "Ag")
-    local no_notes = #state.results > 0
 
     -- Above the form: the no-notes title and hint. Under the button: the hint lines (with two or more audio items
     -- selected in REAPER the button analyses them all, a batch, and the lines say what it will take)
@@ -7075,7 +7089,8 @@ local function draw_graph(draw_ctx, w, h)
       if text_w < L.xxxl then text_w = 0 end   -- no room for a readable part of it: Change… still says where it is
       local row_w = (text_w > 0 and text_w + L.md or 0) + m.change_w + L.md + btn_w
       local x0 = cx - row_w * 0.5
-      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, reason ~= nil or state.is_analyzing, is_batch)
+      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.LOCKED_REASON or reason,
+        is_batch)
       btn_cx = x0 + used + L.md + btn_w * 0.5
     else
       local drawn_h = K.form_canvas_draw(form, cx - form_w * 0.5, y, form_w, layout, reason, form_max_h)
@@ -10744,14 +10759,28 @@ local function hop_choices(block_size)
   return hops
 end
 
---- Value control of the detection rows: a param_drag on b.v[key] within K.LIMITS[key], `width` wide and without a
+--- The { lowest, highest } a detection row's drag allows for `key` of the values `v`: K.LIMITS[key], except that
+--- Min Freq stays 1 Hz below v.max_freq and Max Freq 1 Hz above v.min_freq (K.analysis_values needs min < max).
+K.drag_bounds = function(key, v)
+  local lim = K.LIMITS[key]
+  local lo, hi = lim[1], lim[2]
+  if key == "min_freq" then
+    hi = math.max(lo, math.min(hi, (tonumber(v.max_freq) or hi + 1) - 1))
+  elseif key == "max_freq" then
+    lo = math.min(hi, math.max(lo, (tonumber(v.min_freq) or lo - 1) + 1))
+  end
+  return lo, hi
+end
+
+--- Value control of the detection rows: a param_drag on b.v[key] within K.drag_bounds(key, b.v), `width` wide and without a
 --- label (the form's label column names it); double-click restores the row's default (b.reset(key); the key is the
 --- row id). `b` is the row binding (see K.settings_binding): the value is committed once the edit is done (the drag
 --- released, a typed entry confirmed, a reset), not while it moves.
 local function settings_drag(id, key, fmt, width, b)
   reaper.ImGui_SetNextItemWidth(ctx, width)
   local raw = b.v[key]
-  local changed, v, committed, reset, cancelled = param_drag(ctx, id, nil, raw, K.LIMITS[key][1], K.LIMITS[key][2], fmt)
+  local lo, hi = K.drag_bounds(key, b.v)
+  local changed, v, committed, reset, cancelled = param_drag(ctx, id, nil, raw, lo, hi, fmt)
   local back = K.drag_revert(id, raw, cancelled)
   if back ~= nil then
     b.set(key, back)   -- Esc during the drag: the value from before it, nothing committed
@@ -11362,8 +11391,9 @@ end
 --- The summary line of a short canvas: dim "Analyze with: Soprano · ..." (shortened to text_w with the whole line
 --- in its tooltip) and Change… at x, centred on a row row_h tall at y. Returns the width it took. Change… opens the
 --- analysis modal (K.analyze_change_request), or the batch modal seeded with the form when the canvas button is a
---- batch (is_batch).
-K.form_summary_draw = function(form, x, y, text_w, row_h, disabled, is_batch)
+--- batch (is_batch). reason (optional): why Change… is disabled, its tooltip then.
+K.form_summary_draw = function(form, x, y, text_w, row_h, reason, is_batch)
+  local disabled = reason ~= nil
   local P = Theme.get_palette()
   local L = Theme.layout
   local m = K.form_canvas_metrics()
@@ -11383,7 +11413,7 @@ K.form_summary_draw = function(form, x, y, text_w, row_h, disabled, is_batch)
   local clicked = reaper.ImGui_Button(ctx, K.FORM_COPY.change .. "###change", m.change_w, 0)
   reaper.ImGui_EndDisabled(ctx)
   if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-    Theme.tooltip(ctx, state.is_analyzing and K.LOCKED_REASON or K.FORM_COPY.change_tip)
+    Theme.tooltip(ctx, reason or K.FORM_COPY.change_tip)
   end
   if clicked and not disabled then
     if is_batch then K.batch_request(nil, form) else request_confirm(K.analyze_change_request(form)) end
@@ -11391,11 +11421,31 @@ K.form_summary_draw = function(form, x, y, text_w, row_h, disabled, is_batch)
   return used + m.change_w
 end
 
+--- Whether the canvas shows the "Analyze with" form instead of notes (not analysed, no pitched note found, or an
+--- analysis running), and whether it is the no-notes canvas (title, hint and Re-Analyze; never while analysing).
+K.empty_canvas = function()
+  local running = state.is_analyzing == true
+  local shows = #state.results == 0 or state.analysis_empty == true or running
+  return shows, shows and #state.results > 0 and not running
+end
+
 --- The form the empty canvas shows: the open item's (state.analysis_form), or, with no item to analyse, a form of
 --- the defaults that is shown disabled with why. A batch without an open item gets a form of its own, kept here
---- (never in state.analysis_form) until there is an open item again. Returns the form and the reason (nil when it
---- can be edited).
+--- (never in state.analysis_form) until there is an open item again. While an analysis runs: a form of the values it
+--- runs with (state.analysis_params: a Re-Analyze from the modal or a batch may run with others than the open
+--- form's), locked with K.LOCKED_REASON. Returns the form and the reason (nil when it can be edited).
 K.canvas_form = function(has_target, is_batch)
+  local params = state.is_analyzing and state.analysis_params
+  if params then
+    local running = K.canvas_running_form
+    if not running or running.params ~= params then
+      running = { guid = "running", edited = {}, source = "running", params = params, values = {} }
+      for _, key in ipairs(K.ANALYSIS_KEYS) do running.values[key] = params[key] end
+      K.canvas_running_form = running
+    end
+    return running, K.LOCKED_REASON
+  end
+  K.canvas_running_form = nil
   local form = state.analysis_form
   if has_target and form and form.guid == state.target_take_guid then
     K.canvas_batch_form = nil

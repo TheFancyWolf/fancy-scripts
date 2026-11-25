@@ -5055,6 +5055,122 @@ test("child_dim_fills_the_child_rect_with_dim_bg", function()
   if not ok then error(err, 0) end
 end)
 
+test("canvas_form_while_analyzing_shows_the_running_values_locked", function()
+  local K, st = S.K, S.state
+  local saved = { st.is_analyzing, st.analysis_params, st.analysis_form, st.target_take_guid, st.results,
+    st.analysis_empty, K.canvas_batch_form, K.canvas_running_form }
+  local ok, err = pcall(function()
+    st.target_take_guid = "{run}"
+    st.analysis_form = K.form_new("{run}", nil)        -- the open item's form: the Settings' values
+    st.results, st.analysis_empty, st.is_analyzing = {}, false, false
+    local shows, no_notes = K.empty_canvas()
+    eq(shows, true, "not analysed: the form"); eq(no_notes, false)
+    local form, reason = K.canvas_form(true, false)
+    eq(form, st.analysis_form, "idle: the open item's form"); eq(reason, nil)
+
+    -- A Re-Analyze from the modal with Soprano: the first slice fills state.results
+    st.is_analyzing = true
+    st.analysis_params = { min_freq = 250, max_freq = 1200, threshold = 0.25, block_size = 2048, hop_size = 512 }
+    st.results = { { time = 0 } }
+    shows, no_notes = K.empty_canvas()
+    eq(shows, true, "analysing with frames already in: still the form")
+    eq(no_notes, false, "no 'No pitched notes found' / Re-Analyze while running")
+    form, reason = K.canvas_form(true, false)
+    eq(reason, K.LOCKED_REASON, "locked with the inline reason")
+    eq(form ~= st.analysis_form, true, "not the open item's form")
+    for _, key in ipairs(K.ANALYSIS_KEYS) do eq(form.values[key], st.analysis_params[key], key .. ": the running value") end
+    eq(K.form_summary(form.values), "Soprano · Breathy / Lenient · " .. select(3, K.form_part_names(form.values)))
+    eq(K.canvas_form(true, false), form, "the same run: the same form")
+    eq(K.canvas_form(false, true), form, "a batch run: the values it runs with too")
+    eq(st.analysis_form.values.min_freq, st.min_freq, "the open item's form is untouched")
+
+    -- Done with no pitched note: the no-notes canvas, and the open item's form again
+    st.is_analyzing, st.analysis_params, st.analysis_empty = false, nil, true
+    shows, no_notes = K.empty_canvas()
+    eq(shows, true); eq(no_notes, true, "finished without notes: the no-notes canvas")
+    form, reason = K.canvas_form(true, false)
+    eq(form, st.analysis_form); eq(reason, nil)
+    st.analysis_empty = false
+    eq((K.empty_canvas()), false, "notes found: the notes canvas")
+  end)
+  st.is_analyzing, st.analysis_params, st.analysis_form, st.target_take_guid, st.results = saved[1], saved[2], saved[3],
+    saved[4], saved[5]
+  st.analysis_empty, K.canvas_batch_form, K.canvas_running_form = saved[6], saved[7], saved[8]
+  if not ok then error(err, 0) end
+end)
+
+test("freq_drags_cannot_meet_or_cross", function()
+  local K = S.K
+  local lo, hi = K.drag_bounds("min_freq", { min_freq = 65, max_freq = 1000 })
+  eq(lo, K.LIMITS.min_freq[1]); eq(hi, 999, "Min Freq stops 1 Hz under Max Freq")
+  lo, hi = K.drag_bounds("max_freq", { min_freq = 65, max_freq = 1000 })
+  eq(lo, 66, "Max Freq stops 1 Hz over Min Freq"); eq(hi, K.LIMITS.max_freq[2])
+  lo, hi = K.drag_bounds("min_freq", { min_freq = 250, max_freq = 1200 })
+  eq(250 >= lo and 250 <= hi, true, "Soprano's 250 Hz is inside Min Freq's range (not snapped to 200)")
+  lo, hi = K.drag_bounds("min_freq", { min_freq = 100, max_freq = 200 })
+  eq(lo, K.LIMITS.min_freq[1]); eq(hi, 199)
+  local v = K.analysis_defaults(); v.min_freq, v.max_freq = hi, 200
+  eq(K.analysis_values(v) ~= nil, true, "the closest the drags allow is a valid analysis")
+  lo, hi = K.drag_bounds("threshold", { threshold = 0.1 })
+  eq(lo, K.LIMITS.threshold[1]); eq(hi, K.LIMITS.threshold[2])
+  for _, r in ipairs({ { 65, 1000 }, { 250, 1200 }, { 170, 800 }, { 130, 500 }, { 80, 350 } }) do   -- VOCAL_RANGES
+    local a, b = K.drag_bounds("min_freq", { min_freq = r[1], max_freq = r[2] })
+    eq(r[1] >= a and r[1] <= b, true, r[1] .. " Hz inside Min Freq's range")
+    a, b = K.drag_bounds("max_freq", { min_freq = r[1], max_freq = r[2] })
+    eq(r[2] >= a and r[2] <= b, true, r[2] .. " Hz inside Max Freq's range")
+  end
+end)
+
+test("stored_soprano_min_freq_loads_unclamped", function()
+  local T = load_script({ pitch_min_freq = "250", pitch_max_freq = "1200" })
+  reaper.GetExtState = function() return "" end   -- the harness's own stub again
+  eq(T.state.min_freq, 250, "not snapped to 200")
+  eq(T.state.max_freq, 1200)
+end)
+
+test("analysis_begin_falls_back_when_min_is_not_below_max", function()
+  local K, st = S.K, S.state
+  local saved_params = st.analysis_params
+  local stubs = {
+    GetMediaItemTake_Source = function() return "src" end, GetMediaSourceSampleRate = function() return 44100 end,
+    GetMediaItemInfo_Value = function() return 1 end, new_array = function() return {} end,
+  }
+  local saved_open, saved_state = K.open_accessor, {}
+  for _, key in ipairs({ "is_analyzing", "results", "target_take_guid", "accessor", "buffer", "sample_rate",
+      "item_len", "end_time", "current_time", "start_time", "progress", "separation", "analysis_empty" }) do
+    saved_state[key] = st[key]
+  end
+  for k, f in pairs(stubs) do reaper[k] = f end
+  local ok, err = pcall(function()
+    K.open_accessor = function() return "acc" end
+    local bad = { min_freq = 200, max_freq = 200, threshold = 0.25, block_size = 2048, hop_size = 512 }
+    eq(K.analysis_begin("take", "item", { values = bad, defer_envelope = true }), true)
+    local d = K.analysis_defaults()
+    eq(st.analysis_params.min_freq, d.min_freq, "zero-width range: the Settings' values")
+    eq(st.analysis_params.max_freq, d.max_freq)
+    eq(st.analysis_params.threshold, d.threshold, "the whole set, not a mix")
+    eq(K.analysis_values(st.analysis_params) ~= nil, true, "what it stores is a valid record")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  K.open_accessor = saved_open
+  for key, v in pairs(saved_state) do st[key] = v end
+  st.is_analyzing = saved_state.is_analyzing
+  st.analysis_params = saved_params
+  if not ok then error(err, 0) end
+end)
+
+test("analyzed_with_tip_ignores_a_malformed_record", function()
+  eq(S.K.analyzed_with_tip({ analysis = { min_freq = 200, max_freq = 200, threshold = 0.15, block_size = 2048,
+    hop_size = 512 } }), nil, "min not below max: not recorded")
+  eq(S.K.analyzed_with_tip({ analysis = "x" }), nil)
+end)
+
+test("form_defaults_request_is_safe_and_fit", function()
+  local req = S.K.form_defaults_request(S.K.analysis_defaults())
+  eq(req.safe, true, "CL3: no red added")
+  eq(req.fit, true, "sized to its two lines")
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

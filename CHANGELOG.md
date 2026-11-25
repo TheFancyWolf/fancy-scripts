@@ -7,7 +7,7 @@ All notable changes to Fancy Scripts will be documented here.
 - **Fancy Pitch Correct v2.26.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Analysis settings at the Analyze button:
   - **"Analyze with" at the button**: the empty canvas shows the settings the next analysis will use (Vocal Range, Detection, and Advanced) right above Analyze, as a full form, a stacked form on a narrow window or a one-line summary with Change… on a short one. Changing them there does not change your defaults, and they stay locked while an analysis runs.
   - **Each item remembers its analysis settings**: an item stores the settings it was analysed with, as part of the same undo step as its notes. An item analysed before this version shows "not recorded, your defaults".
-  - **Re-Analyze… opens them**: Re-Analyze… (and the Re-Analyze button on "No pitched notes found") opens a window with the item's own settings and names the edits that will be discarded. Enter analyses and Esc cancels.
+  - **Re-Analyze… opens them**: Re-Analyze… in the menu opens a window with the item's own settings and names the edits that will be discarded. Enter analyses and Esc cancels. The Re-Analyze button on "No pitched notes found" analyses again at once with the form above it.
   - **Analyze Selected Items (N)… sets one set for all**: the batch opens the same window, and every item is analysed and stores the settings you pick there.
   - **Save as Default**: copies the form into your defaults after a confirm; Reset puts a row back to your default.
   - **Settings renamed**: the Settings section is now "Analysis Defaults".
