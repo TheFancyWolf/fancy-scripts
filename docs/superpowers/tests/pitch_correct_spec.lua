@@ -5463,6 +5463,199 @@ test("track_records_flush_writes_once", function()
   if not ok then error(err, 0) end
 end)
 
+-- The pre-analysis runner (K.pre_*) ---------------------------------------------------------------
+
+-- One track "tr" with two 20 s audio items (takes "tk_a" / "tk_b", GUIDs "{a}" / "{b}") whose audio is a 220 Hz sine
+-- read at the asked rate. opts: prev (the record the track holds), unreadable (a take K.open_accessor gives nil
+-- for), step (seconds reaper.time_precise advances per call, 0 by default). fn(w) runs with the stubs in place;
+-- they are all put back afterwards, and the pre-analysis is cancelled. w records the reads, destroys, track writes
+-- and undo blocks.
+local function pre_world(opts, fn)
+  local K, st = S.K, S.state
+  local w = { reads = {}, destroyed = 0, writes = 0, undo = 0, now = 0 }
+  local takes = { it_a = "tk_a", it_b = "tk_b" }
+  local guids = { tk_a = "{a}", tk_b = "{b}" }
+  local stubs = {
+    CountTrackMediaItems = function(track) return track == "tr" and 2 or 0 end,
+    GetTrackMediaItem = function(_, i) return ({ [0] = "it_a", [1] = "it_b" })[i] end,
+    GetActiveTake = function(item) return takes[item] end,
+    TakeIsMIDI = function() return false end,
+    GetMediaItemInfo_Value = function(_, key) if key == "D_LENGTH" then return 20 end return 0 end,
+    GetSetMediaItemTakeInfo_String = function(take, key)
+      if key == "GUID" and guids[take] then return true, guids[take] end
+      return false, ""
+    end,
+    GetSetMediaTrackInfo_String = function(_, _, _, set)
+      if set then w.writes = w.writes + 1 end
+      return false, ""
+    end,
+    Undo_BeginBlock = function() w.undo = w.undo + 1 end,
+    new_array = function() return {} end,
+    GetAudioAccessorSamples = function(acc, rate, _, t, n, buf)
+      w.reads[#w.reads + 1] = { acc = acc, rate = rate, t = t, n = n }
+      for i = 1, n do buf[i] = 0.5 * math.sin(2 * math.pi * 220 * (t + (i - 1) / rate)) end
+      return 1
+    end,
+    DestroyAudioAccessor = function() w.destroyed = w.destroyed + 1 end,
+    time_precise = function()
+      w.now = w.now + (opts.step or 0)
+      return w.now
+    end,
+  }
+  local old = {}
+  for name, f in pairs(stubs) do
+    old[name] = rawget(reaper, name)
+    rawset(reaper, name, f)
+  end
+  local old_open, old_record = K.open_accessor, K.track_record
+  -- no analysis is running (an earlier test may leave its stub accessor behind)
+  local old_analyzing, old_accessor = st.is_analyzing, st.accessor
+  st.is_analyzing, st.accessor = false, nil
+  K.open_accessor = function(take)
+    if take == opts.unreadable then return nil end
+    return "acc_" .. take
+  end
+  K.track_record = function(track) if track == "tr" then return opts.prev end return nil end
+  local ok, err = pcall(fn, w)
+  K.pre_cancel()
+  K.open_accessor, K.track_record = old_open, old_record
+  st.is_analyzing, st.accessor = old_analyzing, old_accessor
+  for name in pairs(stubs) do rawset(reaper, name, old[name]) end
+  if not ok then error(err, 0) end
+end
+
+-- Steps the pre-analysis until it ends (bounded)
+local function pre_run_out()
+  for _ = 1, 100000 do
+    if S.state.pre == nil then return end
+    S.K.pre_step()
+  end
+  error("the pre-analysis never ended")
+end
+
+test("pre_runs_to_a_record", function()
+  pre_world({}, function(w)
+    local K, st = S.K, S.state
+    local calls, got = 0, nil
+    eq(K.pre_begin({ "tr" }, { on_done = function(results) calls = calls + 1; got = results end }), true)
+    eq(st.is_analyzing, true, "the pre-analysis counts as analysing")
+    eq(st.pre.n_tracks, 1)
+    eq(type(st.pre.track_name), "string")
+    pre_run_out()
+    eq(calls, 1, "on_done once")
+    local rec = got["tr"]
+    eq(type(rec), "table", "a record for the track")
+    eq((rec.st["57"] or 0) > 0, true, "220 Hz heard as MIDI 57")
+    eq(rec.lo_st, 57); eq(rec.hi_st, 57)
+    eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], true)
+    eq(K.track_records_pending["tr"], rec, "pending for the caller's undo block")
+    eq(st.pre, nil)
+    eq(st.is_analyzing, false, "on_done started nothing: no longer analysing")
+    eq(w.reads[1].rate, K.PRE.RATE); eq(w.reads[1].n, K.PRE.BLOCK)
+    eq(w.destroyed, 2, "each accessor destroyed")
+    eq(w.writes, 0, "nothing written to the track"); eq(w.undo, 0, "no undo block")
+    eq(K.pre_progress(), 1, "done")
+  end)
+end)
+
+test("pre_skips_heard_takes", function()
+  local K = S.K
+  local prev = K.track_record_build(K.pre_tally_new(), { ["{a}"] = true }, nil)
+  pre_world({ prev = prev }, function(w)
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    eq(#w.reads > 0, true)
+    for _, r in ipairs(w.reads) do eq(r.acc, "acc_tk_b", "only the take not heard yet is read") end
+    local rec = K.track_records_pending["tr"]
+    eq(rec.takes["{a}"], true, "the heard take stays listed"); eq(rec.takes["{b}"], true)
+  end)
+end)
+
+test("pre_fresh_rehears_all", function()
+  local K = S.K
+  local old_tally = K.pre_tally_new()
+  for _ = 1, 500 do K.pre_tally_add(old_tally, 440) end   -- MIDI 69, never in this audio
+  local prev = K.track_record_build(old_tally, { ["{a}"] = true, ["{b}"] = true }, nil)
+  pre_world({ prev = prev }, function(w)
+    eq(K.pre_begin({ "tr" }, { fresh = true }), true)
+    pre_run_out()
+    local seen = {}
+    for _, r in ipairs(w.reads) do seen[r.acc] = true end
+    eq(seen["acc_tk_a"], true); eq(seen["acc_tk_b"], true)
+    local rec = K.track_records_pending["tr"]
+    eq(rec.st["69"], nil, "the old tally is not merged")
+    eq(rec.lo_st, 57); eq(rec.hi_st, 57)
+  end)
+end)
+
+test("pre_slice_budget", function()
+  pre_world({ step = 0.003 }, function(w)
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    K.pre_step()
+    eq(#w.reads <= 3, true, "at most three blocks in one slice, got " .. #w.reads)
+    eq(#w.reads > 0, true, "the slice read something")
+    local p = K.pre_progress()
+    eq(p > 0 and p < 1, true, "part way")
+    local before = #w.reads
+    K.analysis_tick()
+    eq(#w.reads > before, true, "the window's analysis tick steps the pre-analysis")
+  end)
+end)
+
+test("pre_cancel_leaves_nothing", function()
+  pre_world({ step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    local done = 0
+    eq(K.pre_begin({ "tr" }, { on_done = function() done = done + 1 end }), true)
+    -- a record from an earlier run that is not flushed yet goes with the cancel too
+    K.track_records_pending["other"] = { st = {}, takes = {} }
+    K.pre_step(); K.pre_step()
+    eq(K.cancel_analysis(), true)
+    eq(st.pre, nil)
+    eq(next(K.track_records_pending), nil)
+    eq(w.destroyed, 1, "the open accessor destroyed once")
+    eq(w.writes, 0); eq(w.undo, 0)
+    eq(done, 0, "on_done not called")
+    eq(st.is_analyzing, false)
+    K.pre_cancel()   -- nothing runs: safe
+    eq(w.destroyed, 1)
+  end)
+end)
+
+test("pre_unreadable_take_is_counted", function()
+  pre_world({ unreadable = "tk_a" }, function(w)
+    local K = S.K
+    eq(K.pre_begin({ "tr" }, {}), true)
+    pre_run_out()
+    local rec = K.track_records_pending["tr"]
+    eq(rec.skipped, 1)
+    eq(rec.takes["{a}"], nil, "not heard: tried again next time")
+    eq(rec.takes["{b}"], true)
+    eq(rec.lo_st, 57)
+    for _, r in ipairs(w.reads) do eq(r.acc, "acc_tk_b") end
+  end)
+end)
+
+test("pre_nothing_to_hear", function()
+  local K = S.K
+  local prev = K.track_record_build(K.pre_tally_new(), { ["{a}"] = true, ["{b}"] = true }, nil)
+  pre_world({ prev = prev }, function(w)
+    local st = S.state
+    local got, calls = nil, 0
+    eq(K.pre_begin({ "tr", "empty" }, { on_done = function(r) got = r; calls = calls + 1 end }), false)
+    eq(calls, 1, "on_done at once")
+    eq(got["tr"], prev, "a track heard whole gives its record")
+    eq(K.track_records_pending["tr"], nil, "and is not written again")
+    local empty = got["empty"]
+    eq(type(empty), "table", "a track with no audio gets a record")
+    eq(empty.lo_st, nil); eq(empty.key_idx, nil)
+    eq(K.track_records_pending["empty"], empty, "kept, so it is not heard every time")
+    eq(st.pre, nil); eq(#w.reads, 0)
+    eq(K.pre_progress(), 0, "nothing queued")
+  end)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

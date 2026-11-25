@@ -1758,6 +1758,170 @@ K.release_analysis = function()
   state.is_analyzing = false
   state.analysis_params = nil
   if accessor then pcall(reaper.DestroyAudioAccessor, accessor) end
+  -- A running pre-analysis stops too. Records a finished one left pending stay for the caller's undo block (an
+  -- analysis or batch started from its on_done releases the analysis before it writes)
+  if state.pre then K.pre_cancel() end
+end
+
+--- Auto range and key, the pre-analysis: a coarse, time-sliced listen through every audio item on some tracks. Each
+--- track's pitches heard go into a tally (K.pre_tally_add) and a finished track's record waits in
+--- K.track_records_pending for the caller's undo block. It reads with its own accessor and buffer (state.pre), never
+--- the analysis's, opens one accessor at a time, writes nothing to REAPER and opens no undo block.
+
+--- The audio items of `track` still to be heard: a list of { take, item, guid, len } for every item whose active take
+--- is audio and not in `record.takes`, and how many audio items were skipped (no GUID, so they cannot be recorded).
+--- A take that gives no accessor is counted when K.pre_step opens it.
+K.pre_takes = function(track, record)
+  local list, skipped = {}, 0
+  local n = reaper.CountTrackMediaItems(track) or 0
+  for i = 0, n - 1 do
+    local item = reaper.GetTrackMediaItem(track, i)
+    local take = item and reaper.GetActiveTake(item) or nil
+    if take and not reaper.TakeIsMIDI(take) then
+      local guid = get_take_guid(take)
+      if not guid then
+        skipped = skipped + 1
+      elseif not (record and record.takes[guid]) then
+        local len = tonumber(reaper.GetMediaItemInfo_Value(item, "D_LENGTH")) or 0
+        list[#list + 1] = { take = take, item = item, guid = guid, len = math.max(0, len) }
+      end
+    end
+  end
+  return list, skipped
+end
+
+-- What K.pre_progress gives while no pre-analysis runs: 1 after one finished, 0 otherwise
+K.pre_last_progress = 0
+
+--- Start the pre-analysis of `tracks` (a list of MediaTrack). opts (optional): fresh = true hears every take again and
+--- ignores the records the tracks hold; on_done(results) runs once when every track is finished, results[track] =
+--- its record. A track with nothing new to hear gives its record as it is (not pending); a track with no audio and
+--- no record gets one from an empty tally (pending, so it is not heard every time). Returns true when something is
+--- to be heard (state.pre is set and state.is_analyzing is true); false, after calling on_done at once, otherwise.
+K.pre_begin = function(tracks, opts)
+  opts = opts or {}
+  if state.pre then K.pre_cancel() end
+  local queue, results, total = {}, {}, 0
+  for _, track in ipairs(tracks or {}) do
+    local prev = nil
+    if not opts.fresh then prev = K.track_record(track) end
+    local list, skipped = K.pre_takes(track, prev)
+    if #list > 0 then
+      local secs = 0
+      for _, entry in ipairs(list) do secs = secs + entry.len end
+      queue[#queue + 1] = { track = track, prev = prev, list = list, skipped = skipped, tally = K.pre_tally_new(),
+        takes = {} }
+      total = total + secs
+    elseif prev then
+      results[track] = prev
+    else
+      local rec = K.track_record_build(K.pre_tally_new(), {}, nil)
+      rec.skipped = skipped
+      results[track] = rec
+      K.track_records_pending[track] = rec
+    end
+  end
+  K.pre_last_progress = 0
+  if #queue == 0 then
+    if opts.on_done then opts.on_done(results) end
+    return false
+  end
+  state.pre = {
+    queue = queue, qi = 1, ti = 1, t = 0, accessor = nil, buffer = reaper.new_array(K.PRE.BLOCK),
+    results = results, on_done = opts.on_done, total_s = total, done_s = 0, n_tracks = #queue, track_idx = 1,
+    track_name = "",
+  }
+  K.pre_name_track()
+  state.is_analyzing = true
+  return true
+end
+
+--- state.pre.track_name: the name of the track being heard.
+K.pre_name_track = function()
+  local pre = state.pre
+  local tr = pre and pre.queue[pre.qi]
+  if not tr then return end
+  local _, name = reaper.GetTrackName(tr.track)
+  pre.track_name = type(name) == "string" and name or ""
+end
+
+--- How far the pre-analysis is: seconds heard / seconds queued across all its tracks (0..1).
+K.pre_progress = function()
+  local pre = state.pre
+  if not pre then return K.pre_last_progress end
+  if pre.total_s <= 0 then return 0 end
+  local entry = pre.queue[pre.qi] and pre.queue[pre.qi].list[pre.ti]
+  local heard = pre.done_s + (entry and pre.accessor and math.min(pre.t, entry.len) or 0)
+  return math.max(0, math.min(1, heard / pre.total_s))
+end
+
+--- One slice (at most K.ANALYSIS_SLICE_S) of the running pre-analysis. A take is read in take time from 0, one block
+--- of K.PRE.BLOCK samples at K.PRE.RATE every K.PRE.STEP_S while the block lies whole inside the item; a voiced
+--- frame's pitch goes into its track's tally. When the last track is finished state.pre is cleared, then on_done
+--- runs; when it started no analysis, state.is_analyzing goes back to false.
+K.pre_step = function()
+  local pre = state.pre
+  if not pre then return end
+  local params = { block_size = K.PRE.BLOCK, min_freq = K.PRE.MIN_HZ, max_freq = K.PRE.MAX_HZ,
+    threshold = K.PRE.THRESHOLD }
+  local block_s = K.PRE.BLOCK / K.PRE.RATE
+  local slice_start = reaper.time_precise()
+  while state.pre == pre do
+    if reaper.time_precise() - slice_start > K.ANALYSIS_SLICE_S then break end
+    local tr = pre.queue[pre.qi]
+    local entry = tr.list[pre.ti]
+    if not entry then
+      -- The track is finished: its record waits for the caller's undo block
+      local rec = K.track_record_build(tr.tally, tr.takes, tr.prev)
+      rec.skipped = (rec.skipped or 0) + tr.skipped
+      K.track_records_pending[tr.track] = rec
+      pre.results[tr.track] = rec
+      pre.qi, pre.ti = pre.qi + 1, 1
+      if pre.qi > #pre.queue then
+        state.pre = nil
+        K.pre_last_progress = 1
+        if pre.on_done then pre.on_done(pre.results) end
+        if not state.accessor and not state.pre then state.is_analyzing = false end
+        return
+      end
+      pre.track_idx = pre.qi
+      K.pre_name_track()
+    elseif not pre.accessor then
+      pre.accessor = K.open_accessor(entry.take)
+      pre.t = 0
+      if not pre.accessor then   -- no audio to read: counted, and not listed as heard (tried again next time)
+        tr.skipped = tr.skipped + 1
+        pre.done_s = pre.done_s + entry.len
+        pre.ti = pre.ti + 1
+      end
+    elseif pre.t + block_s <= entry.len then
+      local got = reaper.GetAudioAccessorSamples(pre.accessor, K.PRE.RATE, state.num_channels, pre.t, K.PRE.BLOCK,
+        pre.buffer)
+      if got and got > 0 then
+        local _, freq = yin_process_block(pre.buffer, K.PRE.RATE, params)
+        if freq then K.pre_tally_add(tr.tally, freq) end
+      end
+      pre.t = pre.t + K.PRE.STEP_S
+    else
+      -- The take is heard to its end
+      local accessor = pre.accessor
+      pre.accessor = nil
+      pcall(reaper.DestroyAudioAccessor, accessor)
+      tr.takes[entry.guid] = true
+      pre.done_s = pre.done_s + entry.len
+      pre.ti = pre.ti + 1
+    end
+  end
+end
+
+--- Stop the pre-analysis: destroy its accessor and forget it and every pending record. Safe when nothing runs. Leaves
+--- state.is_analyzing to the caller (K.release_analysis clears it).
+K.pre_cancel = function()
+  local pre = state.pre
+  state.pre = nil
+  K.track_records_pending = {}
+  K.pre_last_progress = 0
+  if pre and pre.accessor then pcall(reaper.DestroyAudioAccessor, pre.accessor) end
 end
 
 --- Developer switch (no interface): ExtState FancyScripts / pitch_dev_dump holds a folder, empty by default. While it
@@ -3198,6 +3362,12 @@ end
 K.cancel_analysis = function()
   if K.batch then   -- a batch: the finished items are kept, written as its one undo step (K.batch_finish)
     K.batch_finish(true)
+    return true
+  end
+  if state.pre then   -- the pre-analysis: nothing of the open item's model was touched yet
+    K.release_analysis()
+    state.progress = 0
+    set_status(K.CANCELLED_TEXT)
     return true
   end
   if not state.is_analyzing and not state.accessor then return false end
@@ -5956,6 +6126,10 @@ end
 --- while the batch itself ended (its write) is not an item's: it is passed on to the window's error handling, which
 --- also closes an undo block left open.
 K.analysis_tick = function()
+  if state.pre then   -- the pre-analysis runs before any analysis it leads to
+    K.pre_step()
+    return
+  end
   if K.batch and K.batch.kind == "apply" then   -- an Apply to other items: no audio is read
     K.apply_tick()
     return
