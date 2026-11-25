@@ -213,6 +213,8 @@ local K = {
   -- the System Default of each value (pitch_def_<key>). See K.item_default
   TRACK_DEFAULT_KEY = "P_EXT:fancy_pitch_track_defaults",
   SYS_DEFAULT_EXT = "pitch_def_",
+  -- Track extension key holding the track's range and key found by the coarse pre-analysis (JSON, K.track_record_valid)
+  TRACK_SCAN_KEY = "P_EXT:fancy_pitch_track_scan",
 
   -- The note action bar's grip offset is kept within this many pixels of its place under the note
   NOTE_BAR_OFFSET_MAX = 2000,
@@ -458,7 +460,7 @@ local state = {
   -- K.refresh_project_cache, K.drop_project_cache): takes by GUID (take = pointer, or false when the item is not in
   -- the project; scanned = the full item scan ran), the item of a take, whether a take's pitch envelope is bypassed,
   -- the track of a take (false: none) and the Track Default of a track (K.track_defaults)
-  cache = { count = nil, proj = nil, takes = {}, items = {}, bypass = {}, tracks = {}, trackdef = {} },
+  cache = { count = nil, proj = nil, takes = {}, items = {}, bypass = {}, tracks = {}, trackdef = {}, trackscan = {} },
   -- The target as loop_body resolved it this frame (see K.frame_target)
   frame = { guid = nil, take = nil, item = nil },
   -- The canvas's drawing cache (see K.canvas_cache_begin): the mapping the cached coordinates belong to (map, gen counts
@@ -964,6 +966,7 @@ K.drop_project_cache = function()
   local cache = state.cache
   cache.count, cache.proj = nil, nil
   cache.takes, cache.items, cache.bypass, cache.tracks, cache.trackdef = {}, {}, {}, {}, {}
+  cache.trackscan = {}
 end
 
 --- Once per frame, before anything reads the cache: one GetProjectStateChangeCount call and one EnumProjects call;
@@ -1120,6 +1123,102 @@ K.track_defaults = function(track)
   end
   cache[track] = t
   return t
+end
+
+--- True when `v` is an integer-valued number from `lo` to `hi`.
+local function whole_in(v, lo, hi)
+  return type(v) == "number" and v % 1 == 0 and v >= lo and v <= hi
+end
+
+--- `t` when it is a valid track record, else nil. Shape: { st = { ["52"] = frames }, takes = { [take_guid] = true },
+--- lo_st, hi_st (both or neither: nil = nothing sung found), key_idx + scale_idx (both or neither: nil = key not
+--- told), alt_key_idx + alt_scale_idx (both or neither, only with a key), skipped (optional, a number >= 0) }.
+K.track_record_valid = function(t)
+  if type(t) ~= "table" or type(t.st) ~= "table" or type(t.takes) ~= "table" then return nil end
+  for k, v in pairs(t.st) do
+    if type(k) ~= "string" or not tonumber(k) or type(v) ~= "number" or v < 0 then return nil end
+  end
+  for k, v in pairs(t.takes) do
+    if type(k) ~= "string" or v ~= true then return nil end
+  end
+  if (t.lo_st == nil) ~= (t.hi_st == nil) then return nil end
+  if t.lo_st ~= nil and (not whole_in(t.lo_st, 0, 127) or not whole_in(t.hi_st, 0, 127) or t.lo_st > t.hi_st) then
+    return nil
+  end
+  if (t.key_idx == nil) ~= (t.scale_idx == nil) then return nil end
+  if t.key_idx ~= nil and (not whole_in(t.key_idx, 1, 12) or not whole_in(t.scale_idx, 1, 2)) then return nil end
+  if (t.alt_key_idx == nil) ~= (t.alt_scale_idx == nil) then return nil end
+  if t.alt_key_idx ~= nil then
+    if t.key_idx == nil or not whole_in(t.alt_key_idx, 1, 12) or not whole_in(t.alt_scale_idx, 1, 2) then return nil end
+  end
+  if t.skipped ~= nil and (type(t.skipped) ~= "number" or t.skipped < 0) then return nil end
+  return t
+end
+
+--- The pre-analysis record of `track` (nil: none or not valid), cached per project state.
+K.track_record = function(track)
+  if not track then return nil end
+  local cache = state.cache.trackscan
+  local rec = cache[track]
+  if rec ~= nil then return rec or nil end
+  rec = false
+  local ok, raw = reaper.GetSetMediaTrackInfo_String(track, K.TRACK_SCAN_KEY, "", false)
+  if ok and raw and raw ~= "" then
+    local parsed_ok, parsed = pcall(JSON.decode, raw)
+    if parsed_ok then rec = K.track_record_valid(parsed) or false end
+  end
+  cache[track] = rec
+  return rec or nil
+end
+
+--- The tally (integer keys) of a record's `st` (string keys), for merging.
+K.track_record_tally = function(record)
+  local tally = K.pre_tally_new()
+  for k, v in pairs(record.st) do
+    local midi = tonumber(k)
+    if midi and v > 0 then
+      tally.st[math.floor(midi)] = v
+      tally.n = tally.n + v
+    end
+  end
+  return tally
+end
+
+--- A record from `tally` (this scan's frames) and `takes` ({ [take_guid] = true } it covered). With `prev` (the
+--- record already on the track) its frames and takes are merged in, the range is recomputed from the merged tally
+--- and its key fields are kept; without a key on `prev` the key is found from the merged tally.
+K.track_record_build = function(tally, takes, prev)
+  local merged = K.pre_tally_new()
+  K.pre_tally_merge(merged, tally)
+  local rec = { st = {}, takes = {}, skipped = 0 }
+  for guid in pairs(takes or {}) do rec.takes[guid] = true end
+  if prev then
+    K.pre_tally_merge(merged, K.track_record_tally(prev))
+    for guid in pairs(prev.takes) do rec.takes[guid] = true end
+    rec.skipped = prev.skipped or 0
+  end
+  for midi, c in pairs(merged.st) do rec.st[tostring(midi)] = c end
+  rec.lo_st, rec.hi_st = K.pre_range(merged)
+  if prev and prev.key_idx ~= nil then
+    rec.key_idx, rec.scale_idx = prev.key_idx, prev.scale_idx
+    rec.alt_key_idx, rec.alt_scale_idx = prev.alt_key_idx, prev.alt_scale_idx
+  else
+    rec.key_idx, rec.scale_idx, rec.alt_key_idx, rec.alt_scale_idx = K.pre_key(merged)
+  end
+  return rec
+end
+
+--- Records waiting to be written: [track] = record. Only K.track_records_flush writes them.
+K.track_records_pending = {}
+
+--- Write every pending record to its track and forget them (and the cache, which may hold older ones). Opens NO
+--- undo block: the caller's block is open, so the write is part of the user's one undo step.
+K.track_records_flush = function()
+  for track, rec in pairs(K.track_records_pending) do
+    reaper.GetSetMediaTrackInfo_String(track, K.TRACK_SCAN_KEY, JSON.encode(rec), true)
+  end
+  K.track_records_pending = {}
+  state.cache.trackscan = {}
 end
 
 --- The default of value `key` for the item `guid`, and where it comes from: "track", "system" or "factory". A key

@@ -5383,6 +5383,86 @@ end)
 
 test("pre_range_text", function() eq(S.K.pre_range_text(40, 69), "E2\xE2\x80\x93A4") end)
 
+local JSON = require("json")   -- on package.path since the script loaded
+
+-- Track record (2026-11-25) ------------------------------------------------------------------------------------------
+local function full_record()
+  return { st = { ["52"] = 300, ["59"] = 250 }, takes = { ["{a}"] = true }, lo_st = 52, hi_st = 59,
+    key_idx = 5, scale_idx = 1, alt_key_idx = 2, alt_scale_idx = 2, skipped = 1 }
+end
+
+test("track_record_valid_accepts", function()
+  local K = S.K
+  local back = K.track_record_valid(JSON.decode(JSON.encode(full_record())))
+  eq(type(back), "table")
+  eq(back.lo_st, 52); eq(back.hi_st, 59); eq(back.key_idx, 5); eq(back.alt_scale_idx, 2)
+  eq(back.st["52"], 300); eq(back.takes["{a}"], true)
+  local one = full_record(); one.lo_st, one.hi_st = 60, 60
+  eq(type(K.track_record_valid(one)), "table", "one note is a range")
+  local none = { st = {}, takes = {} }
+  eq(type(K.track_record_valid(none)), "table", "nothing sung, no key")
+end)
+
+test("track_record_valid_rejects", function()
+  local K = S.K
+  local function bad(mut, msg)
+    local r = full_record(); mut(r)
+    eq(K.track_record_valid(r), nil, msg)
+  end
+  eq(K.track_record_valid("text"), nil, "string")
+  bad(function(r) r.key_idx = 13 end, "key 13")
+  bad(function(r) r.scale_idx = 3 end, "scale 3")
+  bad(function(r) r.lo_st, r.hi_st = 61, 60 end, "lo > hi")
+  bad(function(r) r.hi_st = nil end, "lo without hi")
+  bad(function(r) r.st["52"] = "x" end, "st non-number")
+  bad(function(r) r.alt_scale_idx = nil end, "alt key without alt scale")
+  bad(function(r) r.skipped = -1 end, "negative skipped")
+  bad(function(r) r.takes = "x" end, "takes not a table")
+end)
+
+test("track_record_build_keeps_key", function()
+  local K = S.K
+  local prev = { st = { ["52"] = 200, ["54"] = 200 }, takes = { ["{a}"] = true }, lo_st = 52, hi_st = 54,
+    key_idx = 5, scale_idx = 1, skipped = 2 }
+  local tally = K.pre_tally_new()
+  for _ = 1, 200 do K.pre_tally_add(tally, 440 * 2 ^ ((69 - 69) / 12)) end   -- A4 = 69
+  for _ = 1, 200 do K.pre_tally_add(tally, 440 * 2 ^ ((71 - 69) / 12)) end
+  local r = K.track_record_build(tally, { ["{b}"] = true }, prev)
+  eq(r.key_idx, 5); eq(r.scale_idx, 1); eq(r.alt_key_idx, nil)
+  eq(r.lo_st, 52); eq(r.hi_st, 71)
+  eq(r.takes["{a}"], true); eq(r.takes["{b}"], true)
+  eq(r.st["52"], 200); eq(r.st["69"], 200)
+  eq(r.skipped, 2)
+  eq(type(K.track_record_valid(r)), "table")
+  local t2 = K.track_record_tally(r)
+  eq(t2.st[52], 200); eq(t2.n, 800)
+end)
+
+test("track_records_flush_writes_once", function()
+  local K = S.K
+  local writes, undo = {}, 0
+  reaper.GetSetMediaTrackInfo_String = function(track, key, value, set)
+    if set then writes[#writes + 1] = { track = track, key = key, value = value } end
+    return true, ""
+  end
+  reaper.Undo_BeginBlock = function() undo = undo + 1 end
+  local ok, err = pcall(function()
+    K.track_records_pending["tr1"] = full_record()
+    K.track_records_pending["tr2"] = full_record()
+    K.track_records_flush()
+    eq(#writes, 2)
+    eq(writes[1].key, K.TRACK_SCAN_KEY)
+    eq(K.track_record_valid(JSON.decode(writes[1].value)) ~= nil, true)
+    eq(next(K.track_records_pending), nil)
+    eq(undo, 0, "no undo block")
+    K.track_records_flush()
+    eq(#writes, 2, "second flush writes nothing")
+  end)
+  reaper.GetSetMediaTrackInfo_String, reaper.Undo_BeginBlock = nil, nil
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
