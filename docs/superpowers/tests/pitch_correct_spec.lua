@@ -5010,6 +5010,51 @@ test("info_lists_the_analysis_modal", function()
   eq(found, true)
 end)
 
+test("child_dim_skips_the_first_open_frame_and_releases_on_close", function()
+  local K = S.K
+  K.child_dim_seen = {}
+  eq(K.child_dim_due("t", false), false, "no modal: never dimmed")
+  eq(K.child_dim_due("t", true), false, "first frame open: skipped, as Theme.modal_scrim does")
+  eq(K.child_dim_due("t", true), true, "from the next frame on: dimmed")
+  eq(K.child_dim_due("t", true), true)
+  eq(K.child_dim_due("u", true), false, "each child has its own latch")
+  eq(K.child_dim_due("t", false), false, "closed: not dimmed")
+  eq(K.child_dim_due("t", true), false, "opened again: the first frame is skipped again")
+  K.child_dim_seen = {}
+end)
+
+test("child_dim_fills_the_child_rect_with_dim_bg", function()
+  local K = S.K
+  local fills, clips = {}, 0
+  local stubs = {
+    ImGui_GetWindowDrawList = function() return "dl" end,
+    ImGui_GetWindowPos = function() return 10, 20 end,
+    ImGui_GetWindowSize = function() return 300, 100 end,
+    ImGui_DrawList_PushClipRect = function() clips = clips + 1 end,
+    ImGui_DrawList_PopClipRect = function() clips = clips - 1 end,
+    ImGui_DrawList_AddRectFilled = function(dl, x1, y1, x2, y2, col)
+      fills[#fills + 1] = { dl = dl, x1 = x1, y1 = y1, x2 = x2, y2 = y2, col = col }
+    end,
+  }
+  for k, v in pairs(stubs) do reaper[k] = v end
+  local ok, err = pcall(function()
+    K.child_dim_seen = {}
+    K.child_dim("c", true)
+    eq(#fills, 0, "first open frame: nothing drawn")
+    K.child_dim("c", true)
+    eq(#fills, 1, "then one fill")
+    local f = fills[1]
+    eq(f.dl, "dl"); eq(f.x1, 10); eq(f.y1, 20); eq(f.x2, 310); eq(f.y2, 120)
+    eq(f.col, package.loaded["theme"].get_palette().dim_bg, "the scrim's own colour")
+    eq(clips, 0, "clip push / pop balanced")
+    K.child_dim("c", false)
+    eq(#fills, 1, "closed: nothing drawn")
+  end)
+  for k in pairs(stubs) do reaper[k] = nil end
+  K.child_dim_seen = {}
+  if not ok then error(err, 0) end
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do

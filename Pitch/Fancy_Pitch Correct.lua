@@ -11160,6 +11160,52 @@ K.form_canvas_plan = function(avail_w, avail_h, button_h)
   return layout, form_w, form_h, max_h
 end
 
+--- Whether a child window `key` is dimmed this frame for a modal over it (`open`: the modal is open now). Like
+--- Theme.modal_scrim, the first frame it is seen open is skipped (no dim while the modal may still be hidden), and the
+--- latch is released once it is closed. Pure but for its latch (K.child_dim_seen).
+K.child_dim_seen = {}
+K.child_dim_due = function(key, open)
+  if not open then
+    K.child_dim_seen[key] = nil
+    return false
+  end
+  if not K.child_dim_seen[key] then
+    K.child_dim_seen[key] = true
+    return false
+  end
+  return true
+end
+
+--- Dim the child window being drawn now (call right before its EndChild) while a modal is over it. A modal's scrim
+--- (Theme.modal_scrim) is drawn on its parent window's draw list, and ImGui renders a child window after its
+--- parent's list: without this the child stays bright above the scrim. Fills the child's own rect with the same
+--- palette key (dim_bg) on the child's own draw list.
+K.child_dim = function(key, open)
+  if not K.child_dim_due(key, open) then return end
+  local dl = reaper.ImGui_GetWindowDrawList(ctx)
+  local x, y = reaper.ImGui_GetWindowPos(ctx)
+  local w, h = reaper.ImGui_GetWindowSize(ctx)
+  if not (dl and x and y and w and h) then return end
+  reaper.ImGui_DrawList_PushClipRect(dl, x, y, x + w, y + h, false)
+  reaper.ImGui_DrawList_AddRectFilled(dl, x, y, x + w, y + h, Theme.get_palette().dim_bg)
+  reaper.ImGui_DrawList_PopClipRect(dl)
+end
+
+--- The popup name of the confirm `c` (stable ID after ###: the visible title may carry the item name).
+K.confirm_popup_name = function(c)
+  return c.title .. "###confirm_" .. c.id
+end
+
+--- True while a modal of the main window is open (Settings, Info or a confirm). Call in the main window's own ID
+--- scope: the popup names hash with the ID stack, and the canvas is drawn inside the body table's (its own) scope.
+--- The window asks once per frame before the body (K.window_modal_now) and the canvas form reads that.
+K.window_modal_open = function()
+  local c = state.confirm
+  return reaper.ImGui_IsPopupOpen(ctx, "Settings & Audio Engine##settings_modal")
+    or reaper.ImGui_IsPopupOpen(ctx, "Keyboard Shortcuts & Help##info_modal")
+    or (c ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c)))
+end
+
 --- Save as Default, or "Matches your defaults" in its place while `form` holds the defaults (EP2), right-aligned in
 --- a slot as wide as the wider of the two (K.form_canvas_metrics' slot_w). why (optional): why it is disabled.
 --- Returns true when it was clicked (the caller asks K.form_defaults_request's confirm).
@@ -11264,6 +11310,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   local win_flags = reaper.ImGui_WindowFlags_NoScrollbar() | reaper.ImGui_WindowFlags_NoScrollWithMouse()
   local child_flags = reaper.ImGui_ChildFlags_AutoResizeY() | reaper.ImGui_ChildFlags_Borders()
   if max_h then win_flags, child_flags = 0, reaper.ImGui_ChildFlags_Borders() end   -- held to max_h: it scrolls
+  local under_modal = K.window_modal_now == true   -- asked in the main window's scope (K.window_modal_open)
   local child_open = reaper.ImGui_BeginChild(ctx, "##canvas_form", w, max_h or 0, child_flags, win_flags)
   -- The border is drawn by BeginChild: P.border is popped at once, so the combos and buttons inside keep the
   -- theme's own outline
@@ -11303,6 +11350,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
     -- The fold's right-hand action leaves the cursor moved with no item after it: ImGui asks for an item before
     -- the child ends
     reaper.ImGui_Dummy(ctx, 0, 0)
+    K.child_dim("canvas_form", under_modal)
     reaper.ImGui_EndChild(ctx)
     local _, child_h = reaper.ImGui_GetItemRectSize(ctx)
     h = child_h or 0
@@ -11895,7 +11943,7 @@ K.confirm_draw = function(c, host, gone)
   local L = Theme.layout
   local size = c.size or L.modal_sm
   -- Stable ID after ###: the visible title may carry the item name
-  local popup_name = c.title .. "###confirm_" .. c.id
+  local popup_name = K.confirm_popup_name(c)
 
   if c.open_pending then
     reaper.ImGui_OpenPopup(ctx, popup_name)
@@ -11965,6 +12013,8 @@ K.confirm_draw = function(c, host, gone)
     local body_h = K.confirm_body_h(avail_h, btn_h, L.lg, reason_h, spacing_y or 0)
 
     local content_h = nil
+    -- Save as Default's confirm open over this one: the body child (the form) is dimmed with it (K.child_dim)
+    local nested_open = c.nested ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c.nested))
     if reaper.ImGui_BeginChild(ctx, "##confirm_body", 0, body_h, 0) then
       local top_y = reaper.ImGui_GetCursorPosY(ctx) or 0
       if c.form then K.confirm_form_draw(c) end
@@ -11988,6 +12038,7 @@ K.confirm_draw = function(c, host, gone)
       -- body's padding below is the same as above it
       local end_y = reaper.ImGui_GetCursorPosY(ctx)
       if end_y then content_h = end_y - (spacing_y or 0) + top_y end
+      K.child_dim("confirm_body_" .. c.id, nested_open)
       reaper.ImGui_EndChild(ctx)
     end
     -- A confirm sized to its content: the body is as tall as what it draws (up to the most the window it opens from
@@ -12042,8 +12093,9 @@ K.confirm_draw = function(c, host, gone)
       end
     end
 
-    -- Save as Default's confirm, over this modal: drawn last, so its scrim dims everything this modal drew. It
-    -- stays inside the window this modal is kept in
+    -- Save as Default's confirm, over this modal: its scrim (Theme.modal_scrim, on this modal's draw list) dims this
+    -- modal's frame and footer; the body child, drawn above that list, is dimmed by K.child_dim. It stays inside the
+    -- window this modal is kept in
     if c.nested then
       K.confirm_draw(c.nested, { x = host_x, y = host_y, w = host_w, h = host_h }, function() c.nested = nil end)
     end
@@ -14779,6 +14831,8 @@ local function loop_body()
       K.toggle_shortcuts()
     end
 
+    -- Asked here, in the window's own ID scope, for the canvas form (drawn inside the body table, see K.child_dim)
+    K.window_modal_now = K.window_modal_open()
     local split_drawn = false
     if total_h > 80 then
       if state.sidebar_open and sidebar_fits then
