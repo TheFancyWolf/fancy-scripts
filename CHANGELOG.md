@@ -4,6 +4,9 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.28.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Its own icon:
+  - **Window header**: a white pitch line wobbles between two note lanes, rises and runs through a green corrected note, in place of the shared Fancy logo.
+  - **Toolbar icon**: ReaPack installs `toolbar_fancy_pitch_correct.png` (100 %, 150 % and 200 %) into REAPER's toolbar icons, so you can pick it for the script's toolbar button. It lights up in the accent blue while the script runs. The SVG masters are in `toolbar_icons/svg/`.
 - **Fancy Pitch Correct v2.27.0 (`Pitch/Fancy_Pitch Correct.lua`)** — System and Track Defaults:
   - **Set as System Default…**: the "This item" menu saves this item's values (Separation, Mode, Tighten, Tolerance, Strength, Slide In) as the values every new analysis starts with, after a confirm. Each value's right-click menu saves just that value.
   - **Set as Track Default**: saves the values on the item's track, so each singer's track starts its new analyses with its own values. It is part of the project and one Cmd+Z undoes it. Clear Track Default removes it.

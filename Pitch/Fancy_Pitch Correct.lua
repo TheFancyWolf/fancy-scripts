@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.27.0
+-- @version 2.28.0
 -- @changelog
---   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas reads top to bottom: the selected item names, Analysis Settings (renamed from Analyze with), then Analyze as wide as the settings, without the "your defaults" and "Matches your defaults" lines; tooltips for each Vocal Range, Detection Mode and Quality; fix: the pitch line draws in again while an analysis runs
+--   Its own icon: the window header shows a pitch line rising into a corrected note instead of the shared Fancy logo, and a matching toolbar icon (toolbar_fancy_pitch_correct.png, 100/150/200 %) is installed for your toolbars
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -12,6 +12,9 @@
 --   [main] .
 --   [nomain] ../_lib/*.lua
 --   [nomain] ../_lib/fonts/*
+--   [data] ../toolbar_icons/toolbar_fancy_pitch_correct.png > toolbar_icons/toolbar_fancy_pitch_correct.png
+--   [data] ../toolbar_icons/150/toolbar_fancy_pitch_correct.png > toolbar_icons/150/toolbar_fancy_pitch_correct.png
+--   [data] ../toolbar_icons/200/toolbar_fancy_pitch_correct.png > toolbar_icons/200/toolbar_fancy_pitch_correct.png
 
 if not reaper.ImGui_CreateContext then
   reaper.ShowMessageBox(
@@ -13705,6 +13708,50 @@ do
     return string.format("Pitch algorithm: %s %s", name, by_script and "(set by Fancy Pitch Correct)" or "(your own setting)")
   end
 
+  -- The vibrato line of the script's icon, in the 24-unit artwork of toolbar_icons/svg/fancy_pitch_correct.svg:
+  -- the start point, then { c1x, c1y, c2x, c2y, x, y } per cubic Bezier, then the straight run through the note.
+  local APP_ICON_START = { 1.6, 13.8 }
+  local APP_ICON_CURVES = {
+    { 2.3, 11.2, 3.0, 11.2, 3.7, 13.8 },
+    { 4.4, 16.4, 5.1, 16.4, 5.8, 13.8 },
+    { 6.5, 11.2, 7.1, 11.6, 7.8, 13.8 },
+    { 8.5, 16.0, 9.0, 15.3, 9.6, 13.8 },
+    { 10.5, 10.8, 10.9, 6.8, 12.8, 6.8 },
+  }
+  local APP_ICON_END = { 21.4, 6.8 }
+
+  --- The script's own icon in place of the shared Fancy logo: on the same recessed card as Theme.brand_icon, a
+  --- vibrato line wobbles between two note lanes, rises, and runs on through a corrected (green) note.
+  local function hdr_draw_app_icon(P, size, target_h)
+    local dl = reaper.ImGui_GetWindowDrawList(ctx)
+    local x, y = reaper.ImGui_GetCursorScreenPos(ctx)
+    y = y + math.max(0, (target_h - size) * 0.5)
+    local k = size / 240   -- the card, in Theme.brand_icon's 240-unit box
+    reaper.ImGui_DrawList_AddRectFilled(dl, x + 5 * k, y + 5 * k, x + 235 * k, y + 235 * k, P.well, 50 * k)
+    reaper.ImGui_DrawList_AddRect(dl, x + 5 * k, y + 5 * k, x + 235 * k, y + 235 * k, P.outline, 50 * k, 0,
+      math.max(1, 10 * k))
+
+    local u = size / 30              -- one artwork unit: 24 units inside a 3-unit margin
+    local ox, oy = x + 3 * u, y + 3 * u
+    -- The lanes, behind the note
+    local lane_col = Theme.with_alpha(P.text_dim, 0.35)
+    local lane_w = math.max(1, u)
+    reaper.ImGui_DrawList_AddLine(dl, ox + 1.5 * u, oy + 6.8 * u, ox + 22.5 * u, oy + 6.8 * u, lane_col, lane_w)
+    reaper.ImGui_DrawList_AddLine(dl, ox + 1.5 * u, oy + 17.2 * u, ox + 22.5 * u, oy + 17.2 * u, lane_col, lane_w)
+    -- The corrected note, in front of the top lane
+    reaper.ImGui_DrawList_AddRectFilled(dl, ox + 12.4 * u, oy + 4.3 * u, ox + 22.4 * u, oy + 9.3 * u, P.green,
+      1.4 * u)
+    -- The pitch line, in front of everything
+    reaper.ImGui_DrawList_PathLineTo(dl, ox + APP_ICON_START[1] * u, oy + APP_ICON_START[2] * u)
+    for _, c in ipairs(APP_ICON_CURVES) do
+      reaper.ImGui_DrawList_PathBezierCubicCurveTo(dl, ox + c[1] * u, oy + c[2] * u, ox + c[3] * u, oy + c[4] * u,
+        ox + c[5] * u, oy + c[6] * u)
+    end
+    reaper.ImGui_DrawList_PathLineTo(dl, ox + APP_ICON_END[1] * u, oy + APP_ICON_END[2] * u)
+    reaper.ImGui_DrawList_PathStroke(dl, P.text, 0, math.max(1, 1.4 * u))
+    reaper.ImGui_Dummy(ctx, size, target_h)
+  end
+
   local function hdr_draw_target_badge(hs)
     local P, s = hs.P, hs.s
     if hs.has_target then
@@ -13980,7 +14027,7 @@ do
           end
         end
         if id == "brand" then
-          Theme.brand_icon(ctx, s.brand_sz, s.row_h)
+          hdr_draw_app_icon(P, s.brand_sz, s.row_h)
         elseif id == "badge" then
           hdr_draw_target_badge(hs)
         elseif id == "key" then
