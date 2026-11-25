@@ -3112,14 +3112,14 @@ end
 
 --- The lines above the canvas form for what K.batch_peek returned: the first, and the second or nil. The first
 --- names what Analyze will analyse: the open item (target_name, nil when there is none) unless two or more audio
---- items are selected, then "N items: a, b, …" (the canvas fits it to its width, K.batch_names_fit). With nothing to
---- analyse it is the instruction.
+--- items are selected, then "N items selected: a, b, …" (the canvas fits it to its width, K.batch_names_fit). With nothing to
+--- analyse it is the instruction. Both read "N item(s) selected: …".
 K.batch_lines = function(peek, target_name)
   if peek.n < 2 then
-    if target_name and target_name ~= "" then return target_name, nil end
+    if target_name and target_name ~= "" then return "1 item selected: " .. target_name, nil end
     return "Select one or more items and click Analyze.", nil
   end
-  local first = string.format("%d items: %s", peek.n, table.concat(peek.names or {}, ", "))
+  local first = string.format("%d items selected: %s", peek.n, table.concat(peek.names or {}, ", "))
   local parts = {}
   if peek.skipped == 1 then
     parts[#parts + 1] = "1 other selected item is skipped."
@@ -3138,12 +3138,12 @@ end
 -- At most this many names are tried on the batch line, and listed in its tooltip
 K.BATCH_NAMES_MAX = 20
 
---- "N items: a, b, +3 more": as many of `names` as fit max_w by measure(text) -> width, the rest counted. When not
+--- "N items selected: a, b, +3 more": as many of `names` as fit max_w by measure(text) -> width, the rest counted. When not
 --- even the first name fits: "N items selected".
 K.batch_names_fit = function(names, max_w, measure)
   local n = #names
   for k = math.min(n, K.BATCH_NAMES_MAX), 1, -1 do
-    local text = string.format("%d items: %s", n, table.concat(names, ", ", 1, k))
+    local text = string.format("%d items selected: %s", n, table.concat(names, ", ", 1, k))
     if k < n then text = text .. string.format(", +%d more", n - k) end
     if measure(text) <= max_w then return text end
   end
