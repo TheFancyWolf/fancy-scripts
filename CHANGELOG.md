@@ -4,6 +4,13 @@ All notable changes to Fancy Scripts will be documented here.
 
 ## [Unreleased]
 
+- **Fancy Pitch Correct v2.26.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Analysis settings at the Analyze button:
+  - **"Analyze with" at the button**: the empty canvas shows the settings the next analysis will use (Vocal Range, Detection, and Advanced) right above Analyze, as a full form, a stacked form on a narrow window or a one-line summary with Change… on a short one. Changing them there does not change your defaults, and they stay locked while an analysis runs.
+  - **Each item remembers its analysis settings**: an item stores the settings it was analysed with, as part of the same undo step as its notes. An item analysed before this version shows "not recorded, your defaults".
+  - **Re-Analyze… opens them**: Re-Analyze… (and the Re-Analyze button on "No pitched notes found") opens a window with the item's own settings and names the edits that will be discarded. Enter analyses and Esc cancels.
+  - **Analyze Selected Items (N)… sets one set for all**: the batch opens the same window, and every item is analysed and stores the settings you pick there.
+  - **Save as Default**: copies the form into your defaults after a confirm; Reset puts a row back to your default.
+  - **Settings renamed**: the Settings section is now "Analysis Defaults".
 - **Fancy Pitch Correct v2.25.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Pitched Items follows into the arrange view:
   - **Row selection selects the items**: clicking a row in Pitched Items now also selects that item in REAPER's arrange view (and only that one). Cmd-click (Ctrl on Windows) and Shift-click select every selected row's item, and Esc, putting the rows back to just the open item, selects just its item. The open item does not change when the first selected item in REAPER is another row's.
 - **Fancy Pitch Correct v2.24.3 (`Pitch/Fancy_Pitch Correct.lua`)** — Clearer right-click menus:

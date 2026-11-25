@@ -1,8 +1,8 @@
 -- @description Fancy Pitch Correct
 -- @author Fancy Scripts
--- @version 2.25.0
+-- @version 2.26.0
 -- @changelog
---   Selecting rows in Pitched Items selects their items in the arrange view
+--   Analysis settings at the Analyze button: an "Analyze with" form on the empty canvas, each item remembers the settings it was analysed with, Re-Analyze... and Analyze Selected Items (N)... open them, Save as Default, Settings section renamed "Analysis Defaults"
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
