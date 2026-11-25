@@ -1779,15 +1779,18 @@ K.form_sync = function(guid, data)
   end
 end
 
+--- The values a row writes for `key`: "range" takes a VOCAL_RANGES entry (both Hz) and "quality" a QUALITY_MODES
+--- entry (block and hop); any other key is one value of its own.
+K.value_pairs = function(key, value)
+  if key == "range" then return { min_freq = value.min, max_freq = value.max } end
+  if key == "quality" then return { block_size = value.block, hop_size = value.hop } end
+  return { [key] = value }
+end
+
 --- Set one value of the form and mark it edited. key "range" takes a VOCAL_RANGES entry (both Hz) and "quality" a
 --- QUALITY_MODES entry (block and hop).
 K.form_set = function(form, key, value)
-  local pairs_of = {
-    range = function() return { min_freq = value.min, max_freq = value.max } end,
-    quality = function() return { block_size = value.block, hop_size = value.hop } end,
-  }
-  local set = pairs_of[key] and pairs_of[key]() or { [key] = value }
-  for k, v in pairs(set) do
+  for k, v in pairs(K.value_pairs(key, value)) do
     form.values[k] = v
     form.edited[k] = true
   end
@@ -10667,22 +10670,23 @@ local function hop_choices(block_size)
   return hops
 end
 
---- Settings value control: a param_drag on state[key] within K.LIMITS[key], `width` wide and without a label (the form's
---- label column names it); double-click restores DEFAULTS[key] (engine settings are not project state: no undo point).
---- The value is saved once the edit is done (the drag released, a typed entry confirmed, a reset), not while it moves.
-local function settings_drag(id, key, fmt, width)
+--- Value control of the detection rows: a param_drag on b.v[key] within K.LIMITS[key], `width` wide and without a
+--- label (the form's label column names it); double-click restores the row's default (b.reset(key); the key is the
+--- row id). `b` is the row binding (see K.settings_binding): the value is committed once the edit is done (the drag
+--- released, a typed entry confirmed, a reset), not while it moves.
+local function settings_drag(id, key, fmt, width, b)
   reaper.ImGui_SetNextItemWidth(ctx, width)
-  local raw = state[key]
+  local raw = b.v[key]
   local changed, v, committed, reset, cancelled = param_drag(ctx, id, nil, raw, K.LIMITS[key][1], K.LIMITS[key][2], fmt)
   local back = K.drag_revert(id, raw, cancelled)
   if back ~= nil then
-    state[key] = back   -- Esc during the drag: the value from before it, nothing saved
+    b.set(key, back)   -- Esc during the drag: the value from before it, nothing committed
   elseif reset then
-    state[key] = DEFAULTS[key]
+    b.reset(key)
   elseif changed then
-    state[key] = v
+    b.set(key, v)
   end
-  if committed then K.save_settings("engine") end
+  if committed then b.commit() end
 end
 
 --- Index of the entry of `list` for which `same(entry)` holds, 0 when none does (its combo then reads "Custom").
@@ -10718,9 +10722,63 @@ K.size_combo = function(id, list, current, w, tip)
   return list[new_idx], changed
 end
 
--- The Settings forms: Pitch Shift Engine, Analysis & Detection, Advanced DSP. A row knows its label, whether its
--- value is the factory one (DEFAULTS), how to restore it, and how to draw its control `w` pixels wide; a preset combo
--- reads "Custom" when the values match none of its presets. draw_settings_modal lays the rows out as label | control |
+--- The row binding of the Settings: the rows edit `state`, a reset restores the factory DEFAULTS, and a commit saves
+--- the engine group and lets an open analysis form follow the new defaults.
+K.settings_binding = function()
+  local function restore(keys)
+    for _, key in ipairs(keys) do state[key] = DEFAULTS[key] end
+  end
+  return {
+    v = state, base = DEFAULTS,
+    set = function(key, value)
+      for k, v in pairs(K.value_pairs(key, value)) do state[k] = v end
+    end,
+    reset = function(row_id)
+      if row_id == "range" then restore({ "min_freq", "max_freq" })
+      elseif row_id == "mode" then restore({ "threshold" })
+      elseif row_id == "quality" then restore({ "block_size", "hop_size" })
+      elseif row_id == "block" then
+        state.block_size = DEFAULTS.block_size
+        if state.hop_size > state.block_size then state.hop_size = state.block_size end
+      elseif row_id == "hop" then state.hop_size = math.min(DEFAULTS.hop_size, state.block_size)
+      else restore({ row_id }) end   -- threshold, min_freq, max_freq
+    end,
+    commit = function()
+      K.save_settings("engine")
+      local guid = state.target_take_guid
+      if guid then K.form_sync(guid, state.session_takes[guid]) end
+    end,
+  }
+end
+
+--- The row binding of an analysis form (K.form_new): the rows edit form.values and mark what the user changed, a
+--- reset goes back to the Settings' values, and nothing is saved.
+K.form_binding = function(form)
+  return {
+    v = form.values, base = K.analysis_defaults(),
+    set = function(key, value) K.form_set(form, key, value) end,
+    reset = function(row_id)
+      K.form_reset_row(form, row_id)
+      if form.values.hop_size > form.values.block_size then form.values.hop_size = form.values.block_size end
+    end,
+    commit = function() end,
+  }
+end
+
+--- The line under the Analysis Defaults divider.
+K.ANALYSIS_DEFAULTS_NOTE = "New analyses start with these. Each item keeps the settings it was analyzed with."
+
+--- Tooltips of the three preset rows (shared by the Settings and the analysis form).
+K.ROW_TIPS = {
+  range = "Vocal Range\n\nThe pitch range searched for this analysis. Pick the singer's range to avoid octave errors.",
+  mode = "Detection Mode\n\nHow sure the detector must be before it calls a sound a note. Lenient finds breathy notes; Strict ignores noise.",
+  quality = "Quality / CPU\n\nFiner timing or finer pitch, and how long the analysis takes.",
+}
+
+-- The Settings forms: Pitch Shift Engine, Analysis Defaults, Advanced DSP. A row knows its label, whether its
+-- value is the factory one (DEFAULTS), how to restore it, and how to draw its control `w` pixels wide; the detection and dsp rows take the binding `b`
+-- of the table they edit (K.settings_binding, K.form_binding): is_default(b), reset(b), draw(w, b); a preset combo
+-- reads "Custom" when the values match none of its presets. K.form_rows_draw lays the rows out as label | control |
 -- Reset, and a section's "Reset section" walks the same rows. `labels` = every text the control can show and `fit` =
 -- the width it needs at least (they size the control column).
 K.SETTINGS_SECTIONS = {
@@ -10755,100 +10813,175 @@ K.SETTINGS_SECTIONS = {
         end
       end },
   } },
-  { id = "detection", title = "Analysis & Detection Presets", rows = {
+  { id = "detection", title = "Analysis Defaults", rows = {
     { id = "range", label = "Vocal Range", labels = COMBO_LABELS.ranges,
-      is_default = function() return state.min_freq == DEFAULTS.min_freq and state.max_freq == DEFAULTS.max_freq end,
-      reset = function() state.min_freq, state.max_freq = DEFAULTS.min_freq, DEFAULTS.max_freq end,
-      draw = function(w)
-        local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == state.min_freq and r.max == state.max_freq end)
+      is_default = function(b) return b.v.min_freq == b.base.min_freq and b.v.max_freq == b.base.max_freq end,
+      reset = function(b) b.reset("range") end,
+      draw = function(w, b)
+        local current = K.match_preset(VOCAL_RANGES, function(r) return r.min == b.v.min_freq and r.max == b.v.max_freq end)
         local idx, changed = Theme.combo(ctx, "##settings_range", VOCAL_RANGES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Vocal Range\n\nLimits the frequency search to avoid octave jump errors.",
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.range,
         })
         if changed and VOCAL_RANGES[idx] then
-          state.min_freq, state.max_freq = VOCAL_RANGES[idx].min, VOCAL_RANGES[idx].max
-          K.save_settings("engine")
+          b.set("range", VOCAL_RANGES[idx])
+          b.commit()
         end
       end },
     { id = "mode", label = "Detection Mode", labels = COMBO_LABELS.detection,
-      is_default = function() return state.threshold == DEFAULTS.threshold end,
-      reset = function() state.threshold = DEFAULTS.threshold end,
-      draw = function(w)
-        local current = K.match_preset(DETECTION_MODES, function(m) return m.threshold == state.threshold end)
+      is_default = function(b) return b.v.threshold == b.base.threshold end,
+      reset = function(b) b.reset("mode") end,
+      draw = function(w, b)
+        local current = K.match_preset(DETECTION_MODES, function(m) return m.threshold == b.v.threshold end)
         local idx, changed = Theme.combo(ctx, "##settings_mode", DETECTION_MODES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Detection Mode\n\nThe confidence threshold for pitched note detection.",
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.mode,
         })
         if changed and DETECTION_MODES[idx] then
-          state.threshold = DETECTION_MODES[idx].threshold
-          K.save_settings("engine")
+          b.set("threshold", DETECTION_MODES[idx].threshold)
+          b.commit()
         end
       end },
     { id = "quality", label = "Quality / CPU", labels = COMBO_LABELS.quality,
-      is_default = function() return state.block_size == DEFAULTS.block_size and state.hop_size == DEFAULTS.hop_size end,
-      reset = function() state.block_size, state.hop_size = DEFAULTS.block_size, DEFAULTS.hop_size end,
-      draw = function(w)
-        local current = K.match_preset(QUALITY_MODES, function(q) return q.block == state.block_size and q.hop == state.hop_size end)
+      is_default = function(b) return b.v.block_size == b.base.block_size and b.v.hop_size == b.base.hop_size end,
+      reset = function(b) b.reset("quality") end,
+      draw = function(w, b)
+        local current = K.match_preset(QUALITY_MODES, function(q) return q.block == b.v.block_size and q.hop == b.v.hop_size end)
         local idx, changed = Theme.combo(ctx, "##settings_quality", QUALITY_MODES, current, {
-          w = w, placeholder = K.CUSTOM_PRESET,
-          tooltip = "Quality / CPU\n\nThe trade-off between time and frequency resolution.",
+          w = w, placeholder = K.CUSTOM_PRESET, tooltip = K.ROW_TIPS.quality,
         })
         if changed and QUALITY_MODES[idx] then
-          state.block_size = QUALITY_MODES[idx].block
-          state.hop_size = QUALITY_MODES[idx].hop
-          K.save_settings("engine")
+          b.set("quality", QUALITY_MODES[idx])
+          b.commit()
         end
       end },
   } },
   { id = "dsp", title = "Advanced DSP Parameters", rows = {
     -- Discrete choices; a value outside the lists (older state) shows the nearest item. The hop never exceeds the block.
     { id = "block", label = "Block size (samples)", name = "Block size",
-      is_default = function() return state.block_size == DEFAULTS.block_size end,
-      reset = function()
-        state.block_size = DEFAULTS.block_size
-        if state.hop_size > state.block_size then state.hop_size = state.block_size end
-      end,
-      draw = function(w)
-        local size, changed = K.size_combo("##dsp_block", BLOCK_SIZES, state.block_size, w,
+      is_default = function(b) return b.v.block_size == b.base.block_size end,
+      reset = function(b) b.reset("block") end,
+      draw = function(w, b)
+        local size, changed = K.size_combo("##dsp_block", BLOCK_SIZES, b.v.block_size, w,
           "Samples analyzed per window (e.g. 512, 1024, 2048).")
         if changed then
-          state.block_size = size
+          b.set("block_size", size)
           -- The block shrank below the hop: clamp the hop down (every block up to 1024 is also a hop size)
-          if state.hop_size > state.block_size then state.hop_size = state.block_size end
-          K.save_settings("engine")
+          if b.v.hop_size > b.v.block_size then b.set("hop_size", b.v.block_size) end
+          b.commit()
         end
       end },
-    -- The factory hop never exceeds the block either: a smaller block limits what Reset can restore
+    -- The default hop never exceeds the block either: a smaller block limits what Reset can restore
     { id = "hop", label = "Hop size (samples)", name = "Hop size",
-      is_default = function() return state.hop_size == math.min(DEFAULTS.hop_size, state.block_size) end,
-      reset = function() state.hop_size = math.min(DEFAULTS.hop_size, state.block_size) end,
-      draw = function(w)
-        local size, changed = K.size_combo("##dsp_hop", hop_choices(state.block_size), state.hop_size, w,
+      is_default = function(b) return b.v.hop_size == math.min(b.base.hop_size, b.v.block_size) end,
+      reset = function(b) b.reset("hop") end,
+      draw = function(w, b)
+        local size, changed = K.size_combo("##dsp_hop", hop_choices(b.v.block_size), b.v.hop_size, w,
           "Samples to advance between analysis windows.")
         if changed then
-          state.hop_size = size
-          K.save_settings("engine")
+          b.set("hop_size", size)
+          b.commit()
         end
       end },
     { id = "threshold", label = "Detection Threshold",
-      is_default = function() return state.threshold == DEFAULTS.threshold end,
-      reset = function() state.threshold = DEFAULTS.threshold end,
-      draw = function(w)
-        settings_drag("dsp_threshold", "threshold", "%.2f", w)
+      is_default = function(b) return b.v.threshold == b.base.threshold end,
+      reset = function(b) b.reset("threshold") end,
+      draw = function(w, b)
+        settings_drag("dsp_threshold", "threshold", "%.2f", w, b)
         if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
           Theme.tooltip(ctx, "Detection Threshold\n\nThe confidence threshold for pitch detection. Lower is stricter.")
         end
       end },
     { id = "min_freq", label = "Min Freq (Hz)",
-      is_default = function() return state.min_freq == DEFAULTS.min_freq end,
-      reset = function() state.min_freq = DEFAULTS.min_freq end,
-      draw = function(w) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w) end },
+      is_default = function(b) return b.v.min_freq == b.base.min_freq end,
+      reset = function(b) b.reset("min_freq") end,
+      draw = function(w, b) settings_drag("dsp_min_freq", "min_freq", "%.0f Hz", w, b) end },
     { id = "max_freq", label = "Max Freq (Hz)",
-      is_default = function() return state.max_freq == DEFAULTS.max_freq end,
-      reset = function() state.max_freq = DEFAULTS.max_freq end,
-      draw = function(w) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w) end },
+      is_default = function(b) return b.v.max_freq == b.base.max_freq end,
+      reset = function(b) b.reset("max_freq") end,
+      draw = function(w, b) settings_drag("dsp_max_freq", "max_freq", "%.0f Hz", w, b) end },
   } },
 }
+
+--- One section as a form: a row per setting (label | control | Reset), bound to `b` (K.settings_binding or
+--- K.form_binding). opts: locked (disable everything), stacked (label above the control, and the control takes the
+--- width left after Reset), label_w, control_w, reset_w (control_w is the whole width when stacked), reset_hint (the
+--- Reset tooltip), default_reason (the disabled Reset's tooltip), id (id suffix, default the section id), and, for a
+--- "Reset section" button, section_reset_w, section_hint and section_default_reason. Returns true when
+--- "Reset section" was clicked (the caller confirms and resets).
+K.form_rows_draw = function(section, b, opts)
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local locked = opts.locked
+  local id = opts.id or section.id
+  local section_clicked = false
+
+  --- A text button that is disabled, dim and explained when `reason` is set (the tooltip waits like every tooltip and
+  --- also shows on the disabled button). Returns true when it was clicked.
+  local function reset_button(label, btn_id, w, reason, hint)
+    reaper.ImGui_BeginDisabled(ctx, reason ~= nil)
+    if reason then reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim) end
+    local clicked = reaper.ImGui_Button(ctx, label .. "###" .. btn_id, w, 0)
+    if reason then reaper.ImGui_PopStyleColor(ctx, 1) end
+    reaper.ImGui_EndDisabled(ctx)
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
+      Theme.tooltip(ctx, locked and K.LOCKED_REASON or reason or hint)
+    end
+    return clicked and not locked
+  end
+
+  local function row_reset(row)
+    local at_default = row.is_default(b)
+    if reset_button("Reset", "reset_" .. row.id, opts.reset_w, at_default and opts.default_reason or nil, opts.reset_hint) then
+      row.reset(b)
+      b.commit()
+    end
+    return at_default
+  end
+
+  local differing = 0
+  if opts.stacked then
+    reaper.ImGui_BeginDisabled(ctx, locked)
+    for _, row in ipairs(section.rows) do
+      if row.label ~= "" then reaper.ImGui_Text(ctx, row.label) end
+      row.draw(math.max(opts.control_w - opts.reset_w - L.sm, 1), b)
+      reaper.ImGui_SameLine(ctx, 0, L.sm)
+      if not row_reset(row) then differing = differing + 1 end
+    end
+    reaper.ImGui_EndDisabled(ctx)
+    return false
+  end
+
+  local form_flags = reaper.ImGui_TableFlags_SizingFixedFit() | reaper.ImGui_TableFlags_NoHostExtendX()
+  local fixed = reaper.ImGui_TableColumnFlags_WidthFixed()
+  if not reaper.ImGui_BeginTable(ctx, "##settings_form_" .. id, 3, form_flags) then return false end
+  reaper.ImGui_TableSetupColumn(ctx, "##label", fixed, opts.label_w + L.md)
+  reaper.ImGui_TableSetupColumn(ctx, "##control", fixed, opts.control_w + L.md)
+  reaper.ImGui_TableSetupColumn(ctx, "##reset", fixed, opts.reset_w + L.md)
+  reaper.ImGui_BeginDisabled(ctx, locked)
+  for _, row in ipairs(section.rows) do
+    reaper.ImGui_TableNextRow(ctx)
+    reaper.ImGui_TableSetColumnIndex(ctx, 0)
+    if row.label ~= "" then
+      Theme.align(ctx)
+      reaper.ImGui_Text(ctx, row.label)
+    end
+    reaper.ImGui_TableSetColumnIndex(ctx, 1)
+    row.draw(opts.control_w, b)
+    reaper.ImGui_TableSetColumnIndex(ctx, 2)
+    if not row_reset(row) then differing = differing + 1 end
+  end
+  if opts.section_reset_w then
+    reaper.ImGui_TableNextRow(ctx)
+    reaper.ImGui_TableSetColumnIndex(ctx, 1)
+    if reset_button("Reset section", "reset_section_" .. section.id, opts.section_reset_w,
+        differing == 0 and opts.section_default_reason or nil, opts.section_hint) then
+      section_clicked = true
+    end
+  end
+  reaper.ImGui_EndDisabled(ctx)
+  reaper.ImGui_EndTable(ctx)
+  return section_clicked
+end
+
 
 --- Ask before restoring every setting of a Settings section to its DEFAULTS value. These settings are outside the
 --- undo history (and are saved), so the confirm names how many change and which; the confirm is the only modal, so the
@@ -10858,11 +10991,12 @@ K.request_settings_reset = function(section)
   -- names and the count come from exactly the sequence on_confirm runs
   local names = {}
   local saved = {}
+  local b = K.settings_binding()
   for k, v in pairs(state) do saved[k] = v end
   for _, row in ipairs(section.rows) do
-    if not row.is_default() then
+    if not row.is_default(b) then
       names[#names + 1] = row.name or row.label
-      row.reset()
+      row.reset(b)
     end
   end
   for k, v in pairs(saved) do state[k] = v end
@@ -10880,12 +11014,12 @@ K.request_settings_reset = function(section)
     on_confirm = function()
       local done = 0
       for _, row in ipairs(section.rows) do
-        if not row.is_default() then
-          row.reset()
+        if not row.is_default(b) then
+          row.reset(b)
           done = done + 1
         end
       end
-      K.save_settings("engine")
+      b.commit()
       set_status(string.format("Reset %d %s to %s (not undoable)", done, plural(done, "setting", "settings"),
         plural(done, "its default", "their defaults")))
     end,
@@ -10960,60 +11094,17 @@ local function draw_settings_modal()
         if row.fit then control_w = math.max(control_w, row.fit()) end
       end
     end
-    local reset_w = text_w("Reset") + L.md * 2
-    local section_reset_w = text_w("Reset section") + L.md * 2
-    local form_flags = reaper.ImGui_TableFlags_SizingFixedFit() | reaper.ImGui_TableFlags_NoHostExtendX()
-    local fixed = reaper.ImGui_TableColumnFlags_WidthFixed()
+    local opts = {
+      locked = locked, label_w = label_w, control_w = control_w, reset_w = text_w("Reset") + L.md * 2,
+      section_reset_w = text_w("Reset section") + L.md * 2,
+      reset_hint = "Restore the default value", default_reason = "Already at its default",
+      section_hint = "Restore every setting of this section to its default",
+      section_default_reason = "Already at its defaults",
+    }
+    local binding = K.settings_binding()
     local section_to_reset = nil
-
-    --- A text button that is disabled, dim and explained when `reason` is set (the tooltip waits like every tooltip and
-    --- also shows on the disabled button). Returns true when it was clicked.
-    local function reset_button(label, id, w, reason, hint)
-      reaper.ImGui_BeginDisabled(ctx, reason ~= nil)
-      if reason then reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), P.text_dim) end
-      local clicked = reaper.ImGui_Button(ctx, label .. "###" .. id, w, 0)
-      if reason then reaper.ImGui_PopStyleColor(ctx, 1) end
-      reaper.ImGui_EndDisabled(ctx)
-      if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-        Theme.tooltip(ctx, locked and K.LOCKED_REASON or reason or hint)
-      end
-      return clicked and not locked
-    end
-
-    --- One section as a form: a row per setting (label | control | Reset), then the section's own Reset.
     local function draw_form(section)
-      if not reaper.ImGui_BeginTable(ctx, "##settings_form_" .. section.id, 3, form_flags) then return end
-      reaper.ImGui_TableSetupColumn(ctx, "##label", fixed, label_w + L.md)
-      reaper.ImGui_TableSetupColumn(ctx, "##control", fixed, control_w + L.md)
-      reaper.ImGui_TableSetupColumn(ctx, "##reset", fixed, reset_w + L.md)
-      reaper.ImGui_BeginDisabled(ctx, locked)
-      local differing = 0
-      for _, row in ipairs(section.rows) do
-        reaper.ImGui_TableNextRow(ctx)
-        reaper.ImGui_TableSetColumnIndex(ctx, 0)
-        if row.label ~= "" then
-          Theme.align(ctx)
-          reaper.ImGui_Text(ctx, row.label)
-        end
-        reaper.ImGui_TableSetColumnIndex(ctx, 1)
-        row.draw(control_w)
-        reaper.ImGui_TableSetColumnIndex(ctx, 2)
-        local at_default = row.is_default()
-        if not at_default then differing = differing + 1 end
-        if reset_button("Reset", "reset_" .. row.id, reset_w, at_default and "Already at its default" or nil,
-            "Restore the default value") then
-          row.reset()
-          K.save_settings("engine")
-        end
-      end
-      reaper.ImGui_TableNextRow(ctx)
-      reaper.ImGui_TableSetColumnIndex(ctx, 1)
-      if reset_button("Reset section", "reset_section_" .. section.id, section_reset_w,
-          differing == 0 and "Already at its defaults" or nil, "Restore every setting of this section to its default") then
-        section_to_reset = section
-      end
-      reaper.ImGui_EndDisabled(ctx)
-      reaper.ImGui_EndTable(ctx)
+      if K.form_rows_draw(section, binding, opts) then section_to_reset = section end
     end
 
     local engine, detection, dsp = K.SETTINGS_SECTIONS[1], K.SETTINGS_SECTIONS[2], K.SETTINGS_SECTIONS[3]
@@ -11026,6 +11117,8 @@ local function draw_settings_modal()
     draw_form(engine)
 
     Theme.section_divider(ctx, detection.title, { color = P.yellow })
+    Theme.align(ctx)
+    reaper.ImGui_TextColored(ctx, P.text_dim, K.ANALYSIS_DEFAULTS_NOTE)
     draw_form(detection)
 
     reaper.ImGui_Dummy(ctx, 0, L.sm)

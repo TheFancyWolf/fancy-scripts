@@ -4665,6 +4665,80 @@ test("form_defaults_request_names_changes", function()
   st.status.text, st.status.until_time = saved[5], saved[6]
 end)
 
+local function settings_row(section_id, row_id)
+  for _, section in ipairs(S.K.SETTINGS_SECTIONS) do
+    if section.id == section_id then
+      for _, row in ipairs(section.rows) do if row.id == row_id then return row end end
+    end
+  end
+end
+
+test("rows_edit_the_bound_table", function()
+  local st = S.state
+  local form = S.K.form_new("batch", nil)
+  local b = S.K.form_binding(form)
+  local range = settings_row("detection", "range")
+  local before = { st.min_freq, st.max_freq }
+  b.set("min_freq", 250); b.set("max_freq", 1200)
+  eq(range.is_default(b), false)
+  eq(st.min_freq, before[1], "state untouched"); eq(st.max_freq, before[2], "state untouched")
+  range.reset(b)
+  eq(range.is_default(b), true)
+  eq(form.edited.min_freq, nil)
+  eq(form.values.min_freq, st.min_freq)
+end)
+
+test("settings_binding_resets_to_factory", function()
+  local K, st = S.K, S.state
+  local saved = { st.threshold, K.save_settings }
+  local b = K.settings_binding()
+  st.threshold = 0.25
+  local row = settings_row("dsp", "threshold")
+  eq(row.is_default(b), false)
+  row.reset(b)
+  eq(st.threshold, S.DEFAULTS.threshold)
+  eq(row.is_default(b), true)
+  local group
+  K.save_settings = function(g) group = g end
+  b.commit()
+  eq(group, "engine")
+  st.threshold, K.save_settings = saved[1], saved[2]
+end)
+
+test("settings_binding_commit_syncs_the_form", function()
+  local K, st = S.K, S.state
+  local saved = { K.save_settings, st.target_take_guid, st.session_takes["{c3}"], st.analysis_form, st.min_freq, st.max_freq }
+  K.save_settings = function() end
+  st.target_take_guid = "{c3}"
+  st.session_takes["{c3}"] = {}
+  st.analysis_form = nil
+  K.form_sync("{c3}", st.session_takes["{c3}"])
+  st.min_freq, st.max_freq = 250, 1200
+  K.settings_binding().commit()
+  eq(st.analysis_form.values.min_freq, 250, "untouched rows follow the new defaults")
+  st.target_take_guid = nil
+  K.settings_binding().commit()   -- no target: no error
+  K.save_settings, st.target_take_guid, st.session_takes["{c3}"], st.analysis_form, st.min_freq, st.max_freq = table.unpack(saved, 1, 6)
+end)
+
+test("settings_section_renamed", function()
+  eq(S.K.SETTINGS_SECTIONS[2].title, "Analysis Defaults")
+  eq(S.K.ANALYSIS_DEFAULTS_NOTE, "New analyses start with these. Each item keeps the settings it was analyzed with.")
+end)
+
+test("form_binding_shape", function()
+  local K = S.K
+  local form = K.form_new("batch", nil)
+  local b = K.form_binding(form)
+  eq(b.v, form.values)
+  eq(b.base.min_freq, S.state.min_freq)
+  b.commit()   -- a no-op
+  b.set("threshold", 0.3)
+  eq(form.values.threshold, 0.3)
+  b.reset("mode")
+  eq(form.values.threshold, S.state.threshold)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
