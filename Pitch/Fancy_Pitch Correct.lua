@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.27.0
 -- @changelog
---   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas shows Analyze above its Analysis Settings (renamed from Analyze with), without the "your defaults" and "Matches your defaults" lines; tooltips for each Vocal Range, Detection Mode and Quality; fix: the pitch line draws in again while an analysis runs
+--   System and Track Defaults: Set as System Default... and Set as Track Default in the "This item" menu and each value's right-click menu, Clear Track Default, new analyses start at the track's default, else the system's; Restore Factory Defaults... in Settings; the "This item" pill opens on right-click too; the empty canvas reads top to bottom: the selected item names, Analysis Settings (renamed from Analyze with), then Analyze as wide as the settings, without the "your defaults" and "Matches your defaults" lines; tooltips for each Vocal Range, Detection Mode and Quality; fix: the pitch line draws in again while an analysis runs
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -3076,7 +3076,7 @@ end
 K.BATCH_PEEK_S = 0.25
 
 --- What the window says about a possible batch: { n = audio items selected, skipped = other selected items,
---- with_notes = how many of the n hold notes, target_in = the open item is one of them }. The selection is not
+--- with_notes = how many of the n hold notes, target_in = the open item is one of them, names = their take names }. The selection is not
 --- walked every frame: the answer is kept until the number of selected items, the project state or the open item
 --- changes, and for K.BATCH_PEEK_S at most (a selection change need not move the project's change count).
 --- A batch never uses this: it reads the selection afresh when it starts (K.batch_request).
@@ -3089,8 +3089,9 @@ K.batch_peek = function(now)
     return cache.peek
   end
   local sel = K.batch_selection()
-  local peek = { n = #sel.takes, skipped = sel.skipped, with_notes = 0, target_in = false }
+  local peek = { n = #sel.takes, skipped = sel.skipped, with_notes = 0, target_in = false, names = {} }
   for _, entry in ipairs(sel.takes) do
+    peek.names[#peek.names + 1] = entry.name
     if entry.has_notes then peek.with_notes = peek.with_notes + 1 end
     if entry.guid == state.target_take_guid then peek.target_in = true end
   end
@@ -3109,26 +3110,53 @@ K.batch_tip = function(n)
   return string.format("Detect the pitch of the %d selected audio items, one after another.\n\nOne undo step for all of them.", n)
 end
 
---- The lines under the canvas button for what K.batch_peek returned: the first, and the second or nil.
-K.batch_lines = function(peek)
+--- The lines above the canvas form for what K.batch_peek returned: the first, and the second or nil. The first
+--- names what Analyze will analyse: the open item (target_name, nil when there is none) unless two or more audio
+--- items are selected, then "N items: a, b, …" (the canvas fits it to its width, K.batch_names_fit). With nothing to
+--- analyse it is the instruction.
+K.batch_lines = function(peek, target_name)
   if peek.n < 2 then
-    return "Select an item and click Analyze.", "Select several items in REAPER to analyze them all at once."
+    if target_name and target_name ~= "" then return target_name, nil end
+    return "Select one or more items and click Analyze.", nil
   end
-  local first = string.format("%d audio items selected", peek.n)
+  local first = string.format("%d items: %s", peek.n, table.concat(peek.names or {}, ", "))
+  local parts = {}
   if peek.skipped == 1 then
-    first = first .. " (1 other item is skipped)"
+    parts[#parts + 1] = "1 other selected item is skipped."
   elseif peek.skipped > 1 then
-    first = first .. string.format(" (%d other items are skipped)", peek.skipped)
+    parts[#parts + 1] = string.format("%d other selected items are skipped.", peek.skipped)
   end
-  first = first .. "."
-  if not peek.target_in then first = first .. " This item is not one of them." end
-  local second = nil
+  if not peek.target_in then parts[#parts + 1] = "This item is not one of them." end
   if peek.with_notes == 1 then
-    second = "1 already has notes. You will be asked before it is replaced."
+    parts[#parts + 1] = "1 already has notes. You will be asked before it is replaced."
   elseif peek.with_notes > 1 then
-    second = string.format("%d already have notes. You will be asked before they are replaced.", peek.with_notes)
+    parts[#parts + 1] = string.format("%d already have notes. You will be asked before they are replaced.", peek.with_notes)
   end
-  return first, second
+  return first, (#parts > 0 and table.concat(parts, " ") or nil)
+end
+
+-- At most this many names are tried on the batch line, and listed in its tooltip
+K.BATCH_NAMES_MAX = 20
+
+--- "N items: a, b, +3 more": as many of `names` as fit max_w by measure(text) -> width, the rest counted. When not
+--- even the first name fits: "N items selected".
+K.batch_names_fit = function(names, max_w, measure)
+  local n = #names
+  for k = math.min(n, K.BATCH_NAMES_MAX), 1, -1 do
+    local text = string.format("%d items: %s", n, table.concat(names, ", ", 1, k))
+    if k < n then text = text .. string.format(", +%d more", n - k) end
+    if measure(text) <= max_w then return text end
+  end
+  return string.format("%d items selected", n)
+end
+
+--- The batch line's tooltip: every name, one per line (K.BATCH_NAMES_MAX at most, the rest counted).
+K.batch_names_tip = function(names)
+  local n = #names
+  local lines = { string.format("%d selected items", n), "" }
+  for i = 1, math.min(n, K.BATCH_NAMES_MAX) do lines[#lines + 1] = names[i] end
+  if n > K.BATCH_NAMES_MAX then lines[#lines + 1] = string.format("+%d more", n - K.BATCH_NAMES_MAX) end
+  return table.concat(lines, "\n")
 end
 
 --- What to ask before a batch over `entries` (K.batch_selection's takes) replaces existing notes: the fields of a
@@ -7069,9 +7097,9 @@ local function draw_graph(draw_ctx, w, h)
   -- Returns true when it was clicked (never while it is disabled). It moves the layout cursor into the canvas:
   -- whoever used it calls restore_canvas_layout() before leaving draw_graph.
   -- preset: a Theme button preset table (default the large one); the Analyze button uses K.ANALYZE_BTN, the canvas's
-  -- one call to action, and its height is K.analyze_btn_h(draw_ctx)
+  -- one call to action, and its height is K.analyze_btn_h(draw_ctx). min_w (optional): the width it takes at least
   local buttons_used = false
-  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label, preset)
+  local function canvas_button(label, id, cx, y, enabled, tip, narrow_label, preset, min_w)
     buttons_used = true
     preset = preset or L.btn_lg
     local var_count, pushed_font = Theme.push_button_preset(draw_ctx, fonts, preset)
@@ -7081,6 +7109,7 @@ local function draw_graph(draw_ctx, w, h)
       label = narrow_label
       btn_w = (reaper.ImGui_CalcTextSize(draw_ctx, label) or 0) + preset.pad_x * 2
     end
+    if min_w and btn_w < min_w then btn_w = min_w end   -- as wide as what it sits under (the Analysis Settings form)
     reaper.ImGui_SetCursorScreenPos(draw_ctx, cx - btn_w * 0.5, y)
     if not enabled then reaper.ImGui_BeginDisabled(draw_ctx) end
     local clicked
@@ -7111,10 +7140,10 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
 
-  -- Nothing to edit yet: not analysed (Analyze Item, the hint lines under it, then the "Analysis Settings" form), or
-  -- analysed without finding a pitched note (title and hint, Re-Analyze, the form). The form takes one of three
-  -- layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary line beside
-  -- the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
+  -- Nothing to edit yet: not analysed (the instruction line, the "Analysis Settings" form, then Analyze Item as wide
+  -- as the form), or analysed without finding a pitched note (title and hint, the form, Re-Analyze). The form takes
+  -- one of three layouts by the room there is (K.form_layout): rows, stacked rows in a narrow canvas, or one summary
+  -- line beside the button in a short one. The hint lines drop first when the height runs out, the last one first. While an
   -- analysis runs and has no frames yet the form stays in place, locked, showing the values it runs with
   -- (K.canvas_form), and the button is disabled; its first slice in state.results draws the pitch line instead.
   local form_canvas, no_notes = K.empty_canvas()
@@ -7141,9 +7170,16 @@ local function draw_graph(draw_ctx, w, h)
     else
       peek = K.batch_peek(reaper.time_precise())
       is_batch = peek.n >= 2
-      for _, line in ipairs({ K.batch_lines(peek) }) do
-        shown[#shown + 1] = K.wrap_lines(draw_ctx, line, avail_w)
+      local first, second = K.batch_lines(peek, target_take ~= nil and state.target_take_name or nil)
+      if is_batch then
+        -- One line, fitted: the full list is its tooltip
+        first = K.batch_names_fit(peek.names, avail_w,
+          function(t) return (reaper.ImGui_CalcTextSize(draw_ctx, t)) or 0 end)
+        shown[1] = { { text = first, w = (reaper.ImGui_CalcTextSize(draw_ctx, first)) or 0 } }
+      else
+        shown[1] = K.wrap_lines(draw_ctx, first, avail_w)
       end
+      if second then shown[2] = K.wrap_lines(draw_ctx, second, avail_w) end
     end
 
     local form, reason = K.canvas_form(target_take ~= nil, is_batch)
@@ -7183,7 +7219,24 @@ local function draw_graph(draw_ctx, w, h)
       or (target_take ~= nil and "Detect the pitch of the selected audio item"
         or "Select an audio item in REAPER to analyze it.")
 
-    local btn_cx = cx
+    -- The instruction (or what a batch will do) first, then the form, then the button as wide as the form: one
+    -- column. The summary layout keeps its one row (summary, Change…, button) under the lines.
+    for i, rows in ipairs(shown) do
+      if i > 1 then y = y + L.xs end
+      for _, row in ipairs(rows) do
+        local x = cx - row.w * 0.5
+        reaper.ImGui_DrawList_AddText(draw_list, x, y, P.text_dim, row.text)
+        -- The batch line lists every selected item in its tooltip
+        if i == 1 and is_batch and not K.window_modal_now and reaper.ImGui_IsWindowHovered(draw_ctx)
+          and reaper.ImGui_IsMouseHoveringRect(draw_ctx, x, y, x + row.w, y + text_h) then
+          Theme.tooltip(draw_ctx, K.batch_names_tip(peek.names))
+        end
+        y = y + text_h
+      end
+    end
+    if #shown > 0 then y = y + gap end
+
+    local btn_cx, btn_min_w = cx, nil
     if layout == "summary" then
       -- One row, centred: the summary line (shortened to the room left), Change…, the button
       local m = K.form_canvas_metrics()
@@ -7201,27 +7254,15 @@ local function draw_graph(draw_ctx, w, h)
       local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.LOCKED_REASON or reason,
         is_batch)
       btn_cx = x0 + used + L.md + btn_w * 0.5
-    end
-
-    if canvas_button(label, btn_id, btn_cx, y, can_analyze, tip, narrow_label, K.ANALYZE_BTN) then
-      if is_batch then K.batch_request(form.values) else start_analysis(form.values) end
-    end
-
-    -- Centred text below the button
-    y = y + analyze_h
-    for i, rows in ipairs(shown) do
-      y = y + (i == 1 and gap or L.xs)
-      for _, row in ipairs(rows) do
-        reaper.ImGui_DrawList_AddText(draw_list, cx - row.w * 0.5, y, P.text_dim, row.text)
-        y = y + text_h
-      end
-    end
-
-    -- The form under the button and its lines (the summary layout has it beside the button, above)
-    if layout ~= "summary" then
-      y = y + gap
+    else
       local drawn_h = K.form_canvas_draw(form, cx - form_w * 0.5, y, form_w, layout, reason, form_max_h)
       K.form_canvas_last = { layout = layout, adv = K.form_adv_open, h = drawn_h, scroll = form_max_h ~= nil }
+      y = y + drawn_h + gap
+      btn_min_w = form_w
+    end
+
+    if canvas_button(label, btn_id, btn_cx, y, can_analyze, tip, narrow_label, K.ANALYZE_BTN, btn_min_w) then
+      if is_batch then K.batch_request(form.values) else start_analysis(form.values) end
     end
 
     -- The empty canvases carry their own centred message: the pill adds only a status message or the selection issue
@@ -11470,7 +11511,8 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
     -- The heading alone (no "your defaults" / changed-count line under it, unlike the modal)
     local header = K.form_header(form)
     Theme.section_divider(ctx, header:match("^(.-) · ") or header, { color = P.yellow })
-    if why then reaper.ImGui_TextColored(ctx, P.text_dim, why) end
+    -- No item: the line above the form already says to select one (the disabled controls keep it as their tooltip)
+    if why and why ~= K.FORM_COPY.no_target then reaper.ImGui_TextColored(ctx, P.text_dim, why) end
 
     local b = K.form_binding(form)
     local opts = {

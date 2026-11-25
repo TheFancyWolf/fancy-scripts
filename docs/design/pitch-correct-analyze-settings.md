@@ -338,3 +338,4 @@ None. The form reuses the Settings form code inside the script (generalised to r
 - While an analysis runs the locked form shows only until its first slice; then the pitch line draws in.
 - "Matches your defaults" beside Advanced is gone (the slot stays empty), and the hint reads "Select an item and click Analyze." (no "No data.").
 - The Vocal Range, Detection Mode and Quality / CPU tooltips list each choice in its own paragraph with its key difference.
+- The empty canvas is one column: the line naming what Analyze will analyse (the open item, or "N items: a, b, +k more" with every name in its tooltip; the instruction when there is nothing), the form, then the button as wide as the form. The form no longer repeats "Select an audio item…" when there is no item.
