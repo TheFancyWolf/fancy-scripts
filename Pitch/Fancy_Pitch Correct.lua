@@ -252,8 +252,8 @@ local K = {
   ANALYSIS_SLICE_S = 0.008,
 
   -- Analysis Cancel: More's Analyze item turns into this while an analysis runs (see hdr_draw_more)
-  CANCEL_FMT = "Cancel %d%%",
-  CANCEL_BATCH_FMT = "Cancel Batch %d%%",   -- ... and into this while a batch runs
+  CANCEL_TEXT = "Cancel",
+  CANCEL_BATCH_TEXT = "Cancel Batch",   -- ... and into this while a batch runs (the progress is in the Analysis card)
   CANCEL_BATCH_TIP = "Stops the batch.\n\nItems already finished are kept.",
   REASON_ANALYZING = "Wait for the analysis to finish",   -- why the Pitched Items rows and the batch entry are locked
   REASON_BATCH_FEW = "Select 2 or more audio items",
@@ -2425,7 +2425,10 @@ end
 --- Drop the in-memory analysis (results, notes, selection, a running analysis). Writes nothing to
 --- REAPER: callers that also clear take data own the undo block (clear_take_analysis, wipe_entire_session).
 local function reset_analysis_model()
+  -- A run of its own dropped here (not a batch's item, which the batch follows up) leaves nothing for the card
+  local running = state.is_analyzing or state.pre ~= nil
   K.release_analysis()
+  if running and not K.batch then K.card = nil end
   state.results = {}
   state.notes = nil
   state.split_points = nil
@@ -2558,6 +2561,36 @@ K.range_tip = function(values)
   local function hz(st) return 440 * 2 ^ ((st - 69) / 12) end
   return K.range_name(values) .. "\n\n"
     .. string.format("%.0f\xE2\x80\x93%.0f Hz, with a little room either side", hz(lo), hz(hi))
+end
+
+--- The top bar's read-only Range box: its text and tooltip (nil: none). t = { has_target, data (the open item's
+--- model, nil: not analysed), values (the analysis form's values, for an item not analysed yet), track_name }. No
+--- item: "–". Not analysed: the form's Vocal Range ("Auto", "Tenor"). Analysed: the range it was analysed with, the
+--- notes found ("A3–F4") or the range's name.
+K.range_box_text = function(t)
+  if not t.has_target then return K.KEY_UNSET_TEXT, nil end
+  local function hz(st) return 440 * 2 ^ ((st - 69) / 12) end
+  local function named(values, name)
+    return name, string.format("Vocal Range: %s (%.0f\xE2\x80\x93%.0f Hz)", name, values.min_freq, values.max_freq)
+  end
+  local data = t.data
+  if data then
+    local values = K.analysis_values(data.analysis)
+    if not values then return K.KEY_UNSET_TEXT, nil end
+    if values.auto_range == true then
+      local lo, hi = values.auto_lo_st, values.auto_hi_st
+      if type(lo) == "number" and type(hi) == "number" then
+        return K.pre_range_text(lo, hi), string.format(
+          "Vocal range found on %s: %.0f\xE2\x80\x93%.0f Hz, with a little room either side", t.track_name or "this track",
+          hz(lo), hz(hi))
+      end
+      return named(values, "Generic Vocal")   -- nothing sung was found: Generic Vocal's Hz were used
+    end
+    return named(values, K.range_name(values))
+  end
+  local values = t.values or K.analysis_defaults()
+  if values.auto_range == true then return K.range_name(values), "The range is found from the whole track when you analyze" end
+  return named(values, K.range_name(values))
 end
 
 --- Why Min Freq and Max Freq are disabled for `values`: nil, or "Found from the track" while Vocal Range is Auto.
@@ -2828,9 +2861,10 @@ end
 -- want_key, skipped, total }.
 K.auto_run = nil
 K.AUTO_UNREADABLE_TEXT = "Couldn't read this item's audio. Check that its media is online, then try again."
--- Shared by the Auto analysis and Find Range and Key Again: the key kept, and items skipped of a track
+-- Find Range and Key Again that heard nothing: the key kept (status line); the items of a track that could not be
+-- read (a line of the Analysis card, K.card_lines)
 K.NO_KEY_FMT = "Not enough singing to tell the key: kept %s."
-K.SKIPPED_FMT = "Couldn't read %d of %d items on %s (media offline). Used the rest."
+K.SKIPPED_FMT = "Couldn't read %d of %d items on \"%s\" (media offline). Used the rest."
 
 --- True when analysing the item `guid` with `values` needs its track's range or key: Vocal Range is Auto, or the
 --- item is not analysed yet and has no key (none picked, none on its track: K.new_item_key).
@@ -2860,60 +2894,336 @@ K.auto_values = function(values, record)
   return out, true
 end
 
---- The status message after an Auto analysis, and its kind ("none", "no_key", "skipped", "found", "used"), or nil.
---- info = { fresh (stage 1 heard the track), range_text, key_text, alt_text, track (its name), none (no range found),
---- no_key (no key found), kept_key_text, skipped, total (items on the track this run), want_range, want_key }. One
---- message, by priority: no range > no key > unreadable media > found / used. Only what was on Auto is named.
-K.auto_status = function(info)
-  local track = info.track or ""
-  if info.want_range and info.none then
-    return string.format("Couldn't find a range on %s: used Generic Vocal.", track), "none"
-  end
-  if info.want_key and info.no_key then
-    return string.format(K.NO_KEY_FMT, info.kept_key_text or ""), "no_key"
-  end
-  if info.fresh and (info.skipped or 0) > 0 then
-    return string.format(K.SKIPPED_FMT, info.skipped,
-      math.max(info.total or 0, info.skipped), track), "skipped"
-  end
-  local parts = {}
-  if info.want_range and info.range_text then parts[#parts + 1] = info.range_text end
-  if info.want_key and info.key_text then parts[#parts + 1] = info.key_text end
-  if #parts == 0 then return nil end
-  if info.fresh then
-    local alt = (info.want_key and info.alt_text) and string.format(" (%s also fits)", info.alt_text) or ""
-    return string.format("Found %s%s. %s+Z to undo.", table.concat(parts, ", "), alt, K.MOD_LABEL), "found"
-  end
-  local what = (info.want_range and info.want_key) and "range and key" or (info.want_range and "range" or "key")
-  return string.format("Used %s's %s: %s.", track, what, table.concat(parts, ", ")), "used"
-end
-
---- The status message for the Auto analysis K.auto_run of `data` (the item's new model), and its kind, or nil.
-K.auto_run_status = function(run, data)
-  local rec = run.rec
-  local _, name = reaper.GetTrackName(run.track)
-  local info = {
-    fresh = run.fresh, track = type(name) == "string" and name or "", want_range = run.want_range,
-    want_key = run.want_key, skipped = rec and rec.skipped or 0, total = run.total,
-    none = not (rec and rec.lo_st), no_key = not (rec and rec.key_idx),
-    kept_key_text = K.key_text(data.key_idx or 0, data.scale_idx or 0),
-  }
-  if rec and rec.lo_st then info.range_text = K.pre_range_text(rec.lo_st, rec.hi_st) end
-  if rec and rec.key_idx then info.key_text = K.key_text(rec.key_idx, rec.scale_idx) end
-  if rec and rec.alt_key_idx then info.alt_text = K.key_text(rec.alt_key_idx, rec.alt_scale_idx) end
-  return K.auto_status(info)
-end
-
---- Why the analysis controls are disabled while something runs: during stage 1 how far it is ("Finding range and
---- key… 42%", with the track's name when this run hears two or more), else K.LOCKED_REASON.
+--- Why the analysis controls are disabled while something runs (its progress is in the Analysis card).
 K.locked_reason = function()
-  local pre = state.pre
-  if not pre then return K.LOCKED_REASON end
-  local pct = math.floor(K.analysis_progress() * 100)
-  if (pre.n_tracks or 1) > 1 then
-    return string.format("Finding range and key: %s… %d%%", pre.track_name or "", pct)
+  return K.LOCKED_REASON
+end
+
+-- The Analysis card (docs/design/pitch-correct-auto-range-key.md): every analysis (Analyze, Re-Analyze, a batch,
+-- Find Range and Key Again) shows its progress and what it finds in one modal of the window, open from its start
+-- until the user closes it. K.card (nil: closed) = { kind = "single" | "batch" | "again", phase = "listen" | "notes"
+-- | "done", title, step, progress (0..1), rows = { { label, value, dim, choices = { { text, key_idx, scale_idx } },
+-- note } }, lines = { text, ... }, guid (the take's), track (the track's GUID, once done), picked (1: the key in use,
+-- 2: the other candidate) }. While it runs it also keeps what it reads the live state with (name, values, before, n,
+-- tracks, track_name); a done card holds text and GUIDs only. Every decision is made by the builders below;
+-- K.card_draw only lays out what they give.
+K.card = nil
+K.CARD_POPUP = "###analysis_card"   -- the card's popup ID (its visible title changes as it runs)
+K.CARD_ROWS_MAX = 6                 -- a batch's track list scrolls past this many rows
+K.CARD_PENDING = "listening\xE2\x80\xA6"
+K.CARD_KEY_NOTE = "These two fit equally well."
+
+--- A range in the card: "A3 – F4" (the script's note names, an en dash with spaces).
+K.card_range_text = function(lo_st, hi_st)
+  return midi_to_name(lo_st) .. " \xE2\x80\x93 " .. midi_to_name(hi_st)
+end
+
+--- The card's title: "Analyzing <item>", "Analyzing 3 of 12: <item>" (a batch's item i of n; before its first item,
+--- while its tracks are heard, "Analyzing 12 items"), "Finding range and key", and "Analysis done" once done.
+K.card_title = function(kind, phase, name, i, n)
+  if phase == "done" then return "Analysis done" end
+  if kind == "again" then return "Finding range and key" end
+  if kind == "batch" then
+    n = n or 0
+    if not i or i < 1 then return n == 1 and "Analyzing 1 item" or string.format("Analyzing %d items", n) end
+    return string.format("Analyzing %d of %d: %s", math.min(i, n), n, name or "")
   end
-  return string.format("Finding range and key… %d%%", pct)
+  return "Analyzing " .. (name or "")
+end
+
+--- The step line under the title while it runs: the track being heard, or the notes being found; nil once done.
+K.card_step = function(phase, track_name)
+  if phase == "listen" then return string.format("Listening to track \"%s\"\xE2\x80\xA6", track_name or "") end
+  if phase == "notes" then return "Finding notes\xE2\x80\xA6" end
+  return nil
+end
+
+--- The Vocal Range row's value. info = { pending (still to be heard), source = "found" (by this run's listening
+--- pass) | "track" (a track heard earlier) | "picked" (a range chosen by hand) | "none" (nothing sung found), lo_st,
+--- hi_st, track (its name), name (the hand-picked range's) }.
+K.card_range_value = function(info)
+  if info.pending then return K.CARD_PENDING end
+  if info.source == "picked" then return (info.name or K.CUSTOM_PRESET) .. " (your choice)" end
+  if info.source == "none" or not (info.lo_st and info.hi_st) then return "No singing found: used Generic Vocal" end
+  local text = K.card_range_text(info.lo_st, info.hi_st)
+  if info.source == "track" then text = text .. string.format(" (from track \"%s\")", info.track or "") end
+  return text
+end
+
+--- The Key row's value. info = { pending, source = "found" | "track" | "picked" | "none" (no key could be told:
+--- `text` is the key kept) | "own" (an item analysed again keeps its key), text (the key's name), track }.
+K.card_key_value = function(info)
+  if info.pending then return K.CARD_PENDING end
+  local text = info.text or ""
+  if info.source == "picked" then return text .. " (your choice)" end
+  if info.source == "none" then return "Not enough singing to tell: kept " .. text end
+  if info.source == "track" then return text .. string.format(" (from track \"%s\")", info.track or "") end
+  return text
+end
+
+--- The Notes row's value: waiting while the track is heard, then finding, then the count (or none found).
+K.card_notes_value = function(info)
+  if info.phase == "listen" then return "waiting" end
+  if info.phase ~= "done" then return "finding\xE2\x80\xA6" end
+  if (info.count or 0) > 0 then return tostring(info.count) end
+  return "none found. Try another Vocal Range or Detection Mode."
+end
+
+--- The lines of a done card, in order: a batch's closing summary, the items of the track that could not be read,
+--- and, after Find Range and Key Again, that analysed items keep their values. info = { summary = { text, ... },
+--- skipped, total, track (its name), again }.
+K.card_lines = function(info)
+  local out = {}
+  for _, line in ipairs(info.summary or {}) do out[#out + 1] = line end
+  if (info.skipped or 0) > 0 then
+    out[#out + 1] = string.format(K.SKIPPED_FMT, info.skipped, math.max(info.total or 0, info.skipped), info.track or "")
+  end
+  if info.again then out[#out + 1] = "Items already analyzed keep theirs." end
+  return out
+end
+
+--- A batch's row for the track named `track_name`: "<range> · <key>" from its `record` (nil: not heard yet, "–").
+--- opts = { auto_range (the batch's Vocal Range is Auto), range (the hand-picked range's name), want_key (an item of
+--- the track had no key: one was to be found), kept (the key an item keeps when none could be told) }.
+K.card_batch_row = function(track_name, record, opts)
+  opts = opts or {}
+  local pending = false
+  local range, key
+  if not opts.auto_range then
+    range = K.card_range_value({ source = "picked", name = opts.range })
+  elseif not record then
+    range, pending = K.KEY_UNSET_TEXT, true
+  else
+    range = K.card_range_value({ source = record.lo_st and "found" or "none", lo_st = record.lo_st, hi_st = record.hi_st })
+  end
+  if record and record.key_idx then
+    key = K.key_text(record.key_idx, record.scale_idx)
+  elseif record and opts.want_key then
+    key = K.card_key_value({ source = "none", text = opts.kept })
+  else
+    key = K.KEY_UNSET_TEXT
+    if opts.want_key and not record then pending = true end
+  end
+  return { label = track_name, value = range .. " \xC2\xB7 " .. key, dim = pending or nil }
+end
+
+--- The rows of a "single" card in `phase`; with `result` ({ data = the item's new model, run = its K.auto_run }) the
+--- done rows, with the two key candidates when the key came from the track (found now or before) and its record
+--- holds a runner-up.
+K.card_single_rows = function(c, phase, result)
+  local data = result and result.data
+  -- Vocal Range: what the analysis runs with (its frozen values once it reads the item)
+  local params = data and data.analysis or (phase == "notes" and state.analysis_params) or nil
+  local values = params or c.values or {}
+  local range
+  if values.auto_range ~= true then
+    range = { source = "picked", name = K.range_name(values) }
+  elseif not params then
+    range = { pending = true }
+  elseif params.auto_none then
+    range = { source = "none" }
+  else
+    local run = result and result.run or K.auto_run
+    range = { source = (run and run.fresh) and "found" or "track", lo_st = params.auto_lo_st, hi_st = params.auto_hi_st,
+      track = c.track_name }
+  end
+  -- Key: an item analysed before keeps its own; else picked, found on the track (now or before), or not told
+  local key
+  local source = nil
+  local before = c.before and (data or state.session_takes[c.guid]) or nil
+  if before then
+    key = { source = "own", text = K.key_text(before.key_idx, before.scale_idx) }
+  elseif data then
+    source = K.key_source_valid(data.key_source)
+    key = { source = source or "none", text = K.key_text(data.key_idx, data.scale_idx), track = c.track_name }
+  else
+    local picked = K.pending_key[c.guid]
+    source = K.item_key_source({ guid = c.guid })
+    if picked then
+      key = { source = "picked", text = K.key_text(picked.key_idx, picked.scale_idx) }
+    elseif phase == "listen" and not source then
+      key = { pending = true }
+    elseif source then
+      local k, sc = K.key_resolve(0, nil, c.guid)
+      key = { source = source, text = K.key_text(k, sc), track = c.track_name }
+    else
+      key = { source = "none", text = K.key_text(K.new_key.hand_key_idx, K.new_key.hand_scale_idx) }
+    end
+  end
+  local key_row = { label = "Key", value = K.card_key_value(key), dim = key.pending or nil }
+  if data and (source == "found" or source == "track") then
+    local rec = K.track_record(K.take_track(c.guid))
+    if rec and rec.alt_key_idx and rec.key_idx == data.key_idx and rec.scale_idx == data.scale_idx then
+      key_row.choices = {
+        { text = K.key_text(rec.key_idx, rec.scale_idx), key_idx = rec.key_idx, scale_idx = rec.scale_idx },
+        { text = K.key_text(rec.alt_key_idx, rec.alt_scale_idx), key_idx = rec.alt_key_idx,
+          scale_idx = rec.alt_scale_idx },
+      }
+      key_row.note = K.CARD_KEY_NOTE
+    end
+  end
+  return {
+    { label = "Vocal Range", value = K.card_range_value(range), dim = range.pending or nil },
+    key_row,
+    { label = "Notes", value = K.card_notes_value({ phase = phase, count = data and #(data.notes or {}) or 0 }),
+      dim = (phase ~= "done") or nil },
+  }
+end
+
+--- The rows of an "again" card (Find Range and Key Again): pending while it runs; done with `result` = { rec (the
+--- track's new record), found_key (this run told the key), kept (the key's name when it could not) }.
+K.card_again_rows = function(result)
+  if not result then
+    return { { label = "Vocal Range", value = K.CARD_PENDING, dim = true },
+      { label = "Key", value = K.CARD_PENDING, dim = true } }
+  end
+  local rec = result.rec
+  local key
+  if result.found_key then
+    key = { source = "found", text = K.key_text(rec.key_idx, rec.scale_idx) }
+  else
+    key = { source = "none", text = result.kept }
+  end
+  return {
+    { label = "Vocal Range", value = K.card_range_value({ source = rec.lo_st and "found" or "none", lo_st = rec.lo_st,
+      hi_st = rec.hi_st }) },
+    { label = "Key", value = K.card_key_value(key) },
+  }
+end
+
+--- The rows of a "batch" card: one per track that has an item in the batch (c.tracks, in batch order), from its
+--- record once heard (a track still waiting in the running listening pass shows "–").
+K.card_batch_rows = function(c)
+  local rows = {}
+  local pre = state.pre
+  local values = c.values or {}
+  local kept = K.key_text(K.new_key.hand_key_idx, K.new_key.hand_scale_idx)
+  local range = values.auto_range ~= true and K.range_name(values) or nil
+  for _, t in ipairs(c.tracks or {}) do
+    local rec = nil
+    if reaper.ValidatePtr2(0, t.track, "MediaTrack*") then
+      local waiting = false
+      if pre then
+        for qi = pre.qi, #pre.queue do
+          if pre.queue[qi].track == t.track then waiting = true end
+        end
+      end
+      if not waiting then rec = K.track_record(t.track) end
+    end
+    rows[#rows + 1] = K.card_batch_row(t.name, rec, { auto_range = values.auto_range == true, range = range,
+      want_key = t.want_key, kept = kept })
+  end
+  return rows
+end
+
+--- Open the card for a run that has started: kind "single" (info = { guid, name, values, before, track_name }),
+--- "batch" (info = { values, n, tracks = { { track, name, want_key } } }) or "again" (info = { guid, name,
+--- track_name }). The window opens its popup on its next frame (K.card_draw).
+K.card_open = function(kind, info)
+  info = info or {}
+  K.card = { kind = kind, rows = {}, lines = {}, picked = 1, progress = 0, open_pending = true, guid = info.guid,
+    name = info.name, values = info.values, before = info.before, n = info.n, tracks = info.tracks,
+    track_name = info.track_name }
+  K.card_update()
+end
+
+--- Bring the running card up to date (the window calls it every frame): its phase, title, step and progress, and
+--- its rows when what they show may have changed. A card whose run ended without a result closes.
+K.card_update = function()
+  local c = K.card
+  if not c or c.phase == "done" then return end
+  local batch = K.batch
+  if batch and batch.kind == "apply" then batch = nil end
+  if not (state.pre or state.is_analyzing or batch) then
+    K.card = nil
+    return
+  end
+  local phase = state.pre and "listen" or "notes"
+  local index = batch and batch.index or 0
+  local entry = batch and batch.queue[index]
+  c.phase = phase
+  c.progress = K.analysis_progress()
+  c.title = K.card_title(c.kind, phase, c.kind == "batch" and (entry and entry.name) or c.name, index, c.n)
+  c.step = K.card_step(phase, state.pre and state.pre.track_name)
+  local built = phase .. ":" .. index .. ":" .. tostring(state.pre and state.pre.qi or 0)
+  if c.built == built then return end
+  c.built = built
+  if c.kind == "batch" then
+    c.rows = K.card_batch_rows(c)
+  elseif c.kind == "again" then
+    c.rows = K.card_again_rows(nil)
+  else
+    c.rows = K.card_single_rows(c, phase, nil)
+  end
+end
+
+--- The run of the open card finished with something to show: its done rows and lines from `result` (a "single"
+--- card: { data, run }; "batch": { summary = the closing message }; "again": { rec, found_key, kept, total,
+--- track_name }). It stays open until the user closes it, and holds no pointer from here on.
+K.card_done = function(result)
+  local c = K.card
+  if not c then return end
+  c.phase, c.progress = "done", 1
+  c.title = K.card_title(c.kind, "done")
+  if c.kind == "batch" then
+    c.rows = K.card_batch_rows(c)
+    c.lines = K.card_lines({ summary = { result.summary } })
+    c.step = nil
+  elseif c.kind == "again" then
+    c.rows = K.card_again_rows(result)
+    c.lines = K.card_lines({ skipped = result.rec.skipped, total = result.total, track = result.track_name,
+      again = true })
+    c.step = nil
+  else
+    c.rows = K.card_single_rows(c, "done", result)
+    local run, rec = result.run, result.run and result.run.rec
+    c.lines = K.card_lines({ skipped = (run and run.fresh and rec) and rec.skipped or 0, total = run and run.total,
+      track = c.track_name })
+    c.step = result.data and result.data.name or c.name
+    local take = c.guid and resolve_take_by_guid(c.guid, true)
+    local track = take and reaper.GetMediaItemTake_Track(take)
+    c.track = track and reaper.GetTrackGUID(track) or nil
+  end
+  c.tracks, c.values, c.built = nil, nil, nil
+end
+
+--- The key candidates of the done card `c` (its Key row's), or nil.
+K.card_choices = function(c)
+  for _, row in ipairs(c and c.rows or {}) do
+    if row.choices then return row.choices end
+  end
+  return nil
+end
+
+--- Close the card. confirm (OK / Enter on a done card): the other key candidate, when picked, becomes the item's key
+--- through the ordinary key change (K.scale_changed: one undo point "Set Key"; the track's key follows when the item
+--- follows its track). The item and its track are found again by GUID: when either is gone, or another item is open
+--- now, nothing is written. Esc, or OK with the key in use, writes nothing.
+K.card_close = function(confirm)
+  local c = K.card
+  K.card = nil
+  if not (confirm and c and c.phase == "done" and c.picked == 2) then return end
+  local choice = (K.card_choices(c) or {})[2]
+  if not choice then return end
+  if state.is_analyzing or K.batch or state.pre then return end
+  local take = c.guid and resolve_take_by_guid(c.guid, true)
+  if not take then return end
+  if c.track then
+    local track = reaper.GetMediaItemTake_Track(take)
+    if not (track and reaper.ValidatePtr2(0, track, "MediaTrack*") and reaper.GetTrackGUID(track) == c.track) then
+      return
+    end
+  end
+  if state.target_take_guid ~= c.guid or not state.session_takes[c.guid] then return end
+  state.key_idx, state.scale_idx = choice.key_idx, choice.scale_idx
+  K.scale_changed("key")
+end
+
+--- Cancel the running card (its Cancel button, Esc): the run stops as by any Cancel (K.cancel_analysis: nothing
+--- written, the cancelled message in the status line) and the card closes.
+K.card_cancel = function()
+  K.cancel_analysis()
+  K.card = nil
 end
 
 --- Analyse `take` (in `item`) with Vocal Range or Key on Auto: its track is heard first, unless its record covers
@@ -2936,6 +3246,7 @@ K.auto_begin = function(take, item, values, guid)
     if pre_ran and not (reaper.ValidatePtr2(0, take, "MediaItem_Take*") and reaper.ValidatePtr2(0, item, "MediaItem*")) then
       K.auto_drop()
       if external then state.last_change_count = nil end
+      K.card_close(false)
       set_status("This item is no longer in the project")
       return
     end
@@ -2943,6 +3254,7 @@ K.auto_begin = function(take, item, values, guid)
     if not K.analysis_begin(take, item, { values = (K.auto_values(values, rec)) }) then
       K.auto_drop()
       if external then state.last_change_count = nil end   -- after K.analysis_begin's own accessor
+      K.card_close(false)
       set_status(K.AUTO_UNREADABLE_TEXT)
       return
     end
@@ -2958,7 +3270,8 @@ K.auto_begin = function(take, item, values, guid)
 end
 
 --- Analyse the open item (Analyze / Re-Analyze, and the canvas button with one item selected). Never while an
---- analysis, a batch or a pre-analysis runs.
+--- analysis, a batch or a pre-analysis runs. The Analysis card opens once it runs (one that cannot start says why
+--- in the status line).
 local function start_analysis(values)
   if state.is_analyzing or K.batch or state.pre then return end
   -- Prefer the current target (a sidebar click sets it without touching REAPER's selection);
@@ -2971,12 +3284,19 @@ local function start_analysis(values)
   end
   K.auto_drop()
   local guid = get_take_guid(take)
-  if K.auto_needed(values or K.analysis_defaults(), guid) then
-    K.auto_begin(take, item, values or K.analysis_defaults(), guid)
-    return
-  end
-  if not K.analysis_begin(take, item, { values = values }) then
+  local before = guid ~= nil and state.session_takes[guid] ~= nil
+  local name = state.target_take_name
+  local used = values or K.analysis_defaults()
+  if K.auto_needed(used, guid) then
+    K.auto_begin(take, item, used, guid)
+  elseif not K.analysis_begin(take, item, { values = values }) then
     set_status(K.AUTO_UNREADABLE_TEXT)
+  end
+  if state.is_analyzing or state.pre then
+    local track = reaper.GetMediaItemTake_Track(take)
+    local track_name = (track and reaper.ValidatePtr2(0, track, "MediaTrack*")) and K.track_label(track) or ""
+    K.card_open("single", { guid = guid, name = name or state.target_take_name, values = used, before = before,
+      track_name = track_name })
   end
 end
 
@@ -3906,9 +4226,10 @@ local function adopt_take_data(guid, data)
   update_scale_pitch_classes()
 end
 
---- Cancel the running analysis (header Cancel, closing the window, an error): stop reading audio, put the
---- previous model back and say so in the status line. Nothing was written for the new analysis (the model is saved
---- when it completes) and no undo block is open between frames, so there is nothing to close or undo.
+--- Cancel the running analysis (the Analysis card's Cancel, "..." > Cancel, closing the window, an error): stop reading
+--- audio, put the previous model back, close the card and say so in the status line. Nothing was written for the
+--- new analysis (the model is saved when it completes) and no undo block is open between frames, so there is
+--- nothing to close or undo.
 --- Returns true when an analysis was running.
 K.cancel_analysis = function()
   if K.batch then   -- a batch: the finished items are kept, written as its one undo step (K.batch_finish)
@@ -3918,6 +4239,7 @@ K.cancel_analysis = function()
   if state.pre then   -- the pre-analysis: nothing of the open item's model was touched yet
     K.release_analysis()
     state.progress = 0
+    K.card = nil
     set_status(K.CANCELLED_TEXT)
     return true
   end
@@ -3938,6 +4260,7 @@ K.cancel_analysis = function()
   end
   -- The resync paused while analysing: a project change made meanwhile (undo etc.) is picked up next frame
   if state.last_change_count ~= reaper.GetProjectStateChangeCount(0) then state.last_change_count = nil end
+  K.card = nil
   set_status(K.CANCELLED_TEXT)
   return true
 end
@@ -4119,7 +4442,7 @@ K.batch_new = function(entries, prev_guid)
 end
 
 --- How far a batch is, 0 .. 1: the share of its audio that has been analysed. item_progress = how far the entry in
---- progress is (0 .. 1). The one number the "…" button and the status line both show.
+--- progress is (0 .. 1). Part of the one number the Analysis card shows (K.analysis_progress).
 K.batch_progress = function(batch, item_progress)
   if batch.total_len <= 0 then return 0 end
   local entry = batch.queue[batch.index]
@@ -4248,7 +4571,8 @@ end
 --- End the running batch, however it ends (its queue is done, Cancel, the window closes, a frame failed): the
 --- finished items are written as one undo step, the item in progress and the items not started are left as they
 --- were, the first written item is opened (or the item that was open before comes back) and one closing message
---- says what happened. cancelled: it was stopped before its end.
+--- says what happened (in its Analysis card, K.card_done; in the status line when nothing was kept).
+--- cancelled: it was stopped before its end.
 K.batch_finish = function(cancelled)
   local batch = K.batch
   if not batch then return end
@@ -4291,10 +4615,18 @@ K.batch_finish = function(cancelled)
   -- Nor was the project (undo, redo, deleted items): the next frame reads it again
   state.last_change_count = nil
 
-  K.status_hold(K.batch_summary({
+  local summary = K.batch_summary({
     total = #batch.queue, written = #written, empty = empty, failed = #batch.queue - #written,
     cancelled = cancelled and true or false,
-  }))
+  })
+  -- Its Analysis card shows the summary under its track list and waits for OK; a batch that was cancelled or wrote
+  -- nothing closes it and says so in the status line
+  if cancelled or #written == 0 then
+    K.card = nil
+    K.status_hold(summary)
+  else
+    K.card_done({ summary = summary })
+  end
 end
 
 --- Start the next entry of the running batch that can be analysed; entries that cannot (the item left the project,
@@ -4395,6 +4727,8 @@ K.batch_start = function(entries, values)
   local batch = K.batch
   local tracks = K.batch_auto_tracks(entries, copy)
   if #tracks == 0 then
+    -- The card first: the track rows are read before any item is (K.batch_next may end the batch at once)
+    K.batch_card_open(batch)
     K.batch_lead_keys(batch)
     K.batch_next()
     return
@@ -4405,6 +4739,29 @@ K.batch_start = function(entries, values)
       K.batch_next()
     end
   end })
+  if K.batch == batch then K.batch_card_open(batch) end
+end
+
+--- Open the Analysis card of the running `batch`: one row per track that has an item in it, in batch order, each
+--- marked when one of its items has no key yet (one is to be found).
+K.batch_card_open = function(batch)
+  local tracks, seen = {}, {}
+  for _, entry in ipairs(batch.queue) do
+    local track = entry.take and reaper.ValidatePtr2(0, entry.take, "MediaItem_Take*")
+      and reaper.GetMediaItemTake_Track(entry.take) or nil
+    if track and reaper.ValidatePtr2(0, track, "MediaTrack*") then
+      local want = not state.session_takes[entry.guid] and not entry.has_notes
+        and select(3, K.new_item_key(entry.guid)) == "unset"
+      local t = seen[track]
+      if not t then
+        t = { track = track, name = K.track_label(track), want_key = false }
+        seen[track] = t
+        tracks[#tracks + 1] = t
+      end
+      if want then t.want_key = true end
+    end
+  end
+  K.card_open("batch", { values = batch.values, n = #batch.queue, tracks = tracks })
 end
 
 --- Before any item of `batch` is read: on each track with a record (found by this batch's listening pass, or stored),
@@ -5458,26 +5815,31 @@ K.find_again_request = function()
   local list, skipped = K.pre_takes(track, nil)
   local total = #list + skipped
   local guid = get_take_guid(take)
+  local track_name = K.track_label(track)
   if K.pre_begin({ track }, { fresh = true, on_done = function(results, external)
-    K.find_again_finish(track, prev, results[track], total, guid)
+    K.find_again_finish(track, prev, results[track], total, guid, track_name)
     if external then state.last_change_count = nil end   -- K.pre_note_external: after its own write
   end }) then
     state.pre.alone = true
+    K.card_open("again", { guid = guid, name = track_name, track_name = track_name })
   end
 end
 
 --- The fresh record `rec` of `track` is heard (nil: the track went). Nothing found (no range, no key): the record
---- `prev` stays as it is. Otherwise `rec` replaces it, with prev's key when none was found, in one undo point
---- "Find Range and Key: <track>" that holds only the record. `total`: the audio items on the track; `guid`: the take
---- it was asked from. Status by the Auto analysis's priority: unreadable media > what was found. Nothing stays pending.
-K.find_again_finish = function(track, prev, rec, total, guid)
+--- `prev` stays as it is, the Analysis card closes and the status line says why. Otherwise `rec` replaces it, with
+--- prev's key when none was found, in one undo point "Find Range and Key: <track>" that holds only the record, and
+--- the card shows what was found. `total`: the audio items on the track; `guid`: the take it was asked from;
+--- `track_name`: the track's name when it was asked. Nothing stays pending.
+K.find_again_finish = function(track, prev, rec, total, guid, track_name)
   K.track_records_pending[track] = nil
   if not (rec and reaper.ValidatePtr2(0, track, "MediaTrack*")) then
     -- The track went while it was heard: said only when the item `guid` went with it (one moved off it: no status)
+    K.card_close(false)
     if not (guid and resolve_take_by_guid(guid, true)) then set_status("This item is no longer in the project") end
     return
   end
   if not rec.lo_st and not rec.key_idx then
+    K.card_close(false)
     -- Nothing heard at all, every take unreadable: say so; else the key kept (the track's, else the bar's)
     if (rec.skipped or 0) > 0 and next(rec.takes) == nil then
       set_status(K.AUTO_UNREADABLE_TEXT)
@@ -5497,6 +5859,13 @@ K.find_again_finish = function(track, prev, rec, total, guid)
     rec.key_idx, rec.scale_idx = prev.key_idx, prev.scale_idx
     rec.alt_key_idx, rec.alt_scale_idx = prev.alt_key_idx, prev.alt_scale_idx
   end
+  -- The key kept when none was told: the track's, else the bar's
+  local kept
+  if rec.key_idx then
+    kept = K.key_text(rec.key_idx, rec.scale_idx)
+  else
+    kept = K.key_text(K.key_resolve(state.key_idx, state.scale_idx, state.target_take_guid))
+  end
   local name = K.track_label(track)
   K.track_records_pending[track] = rec
   reaper.Undo_BeginBlock()
@@ -5510,17 +5879,7 @@ K.find_again_finish = function(track, prev, rec, total, guid)
     state.key_idx, state.scale_idx = K.new_item_key(state.target_take_guid)
     update_scale_pitch_classes()
   end
-  if (rec.skipped or 0) > 0 then
-    set_status(string.format(K.SKIPPED_FMT, rec.skipped,
-      math.max(total or 0, rec.skipped), name))
-    return
-  end
-  -- What this run found: a key carried over from prev is not news
-  local parts = {}
-  if rec.lo_st then parts[#parts + 1] = K.pre_range_text(rec.lo_st, rec.hi_st) end
-  if found_key then parts[#parts + 1] = K.key_text(rec.key_idx, rec.scale_idx) end
-  set_status(string.format("Found %s on %s. Items already analyzed keep theirs. %s+Z to undo.",
-    table.concat(parts, ", "), name, K.MOD_LABEL))
+  K.card_done({ rec = rec, found_key = found_key, kept = kept, total = total, track_name = track_name or name })
 end
 
 --- Whether the pitch envelope of the session take `guid` differs from what its note model and today's settings
@@ -6911,21 +7270,19 @@ local function process_analysis_step()
       local run = K.auto_run
       if run and run.guid ~= state.target_take_guid then run = nil end
       if resolve_take_by_guid(state.target_take_guid, true) then
-        if apply_envelope_to_take("Analyze Pitch", true, (run ~= nil) or picked_track) then
-          local reanalyzed = K.reanalyze_status_guid == state.target_take_guid
-          local msg, kind = nil, nil
-          if run and run.track then msg, kind = K.auto_run_status(run, take_data) end
-          -- One message: the Auto one carries news, unless it only says the track's record was used again
-          if msg and not (reanalyzed and kind == "used") then
-            set_status(msg)
-          elseif reanalyzed then
-            set_status(string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL))
-          end
+        if apply_envelope_to_take("Analyze Pitch", true, (run ~= nil) or picked_track)
+            and K.reanalyze_status_guid == state.target_take_guid then
+          set_status(string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL))
         end
+        -- What was found and used shows in the Analysis card, which stays open until the user closes it
+        K.card_done({ data = take_data, run = run })
       else
         state.missing_takes[state.target_take_guid] = true
+        K.card_close(false)   -- the item went: nothing was stored on it
       end
       K.reanalyze_status_guid = nil
+    elseif not K.batch then
+      K.card_close(false)   -- nothing to store the analysis on
     end
     if not K.batch then K.auto_drop() end   -- written above, or never: nothing waits for a later undo block
     if external_change then state.last_change_count = nil end
@@ -12618,14 +12975,15 @@ K.confirm_popup_name = function(c)
   return c.title .. "###confirm_" .. c.id
 end
 
---- True while a modal of the main window is open (Settings, Info or a confirm). Call in the main window's own ID
---- scope: the popup names hash with the ID stack, and the canvas is drawn inside the body table's (its own) scope.
---- The window asks once per frame before the body (K.window_modal_now) and the canvas form reads that.
+--- True while a modal of the main window is open (Settings, Info, a confirm or the Analysis card). Call in the main
+--- window's own ID scope: the popup names hash with the ID stack, and the canvas is drawn inside the body table's
+--- (its own) scope. The window asks once per frame before the body (K.window_modal_now) and the canvas form reads that.
 K.window_modal_open = function()
   local c = state.confirm
   return reaper.ImGui_IsPopupOpen(ctx, "Settings & Audio Engine##settings_modal")
     or reaper.ImGui_IsPopupOpen(ctx, "Keyboard Shortcuts & Help##info_modal")
     or (c ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.confirm_popup_name(c)))
+    or (K.card ~= nil and reaper.ImGui_IsPopupOpen(ctx, K.CARD_POPUP))
 end
 
 --- Save as Default, right-aligned in its slot (K.form_canvas_metrics' slot_w); nothing in its place while `form`
@@ -13635,6 +13993,146 @@ local function draw_confirm_modal()
   K.confirm_draw(c, nil, function() if state.confirm == c then state.confirm = nil end end)
 end
 
+--- The Analysis card (K.card) as a modal of the window: L.modal_sm wide, as tall as its content, centred on the
+--- window when it appears, the scrim drawn by Theme.modal_scrim. It lays out what the card's model holds: the step
+--- line, the progress bar while it runs, a batch's summary, the rows (label | value; the key candidates as radio
+--- rows), the lines, then Cancel (running) or OK (done) at the right. HC5: Esc cancels a running card and closes a
+--- done one; Enter is OK once done. Called every frame in the main window's scope; with no card it closes a popup
+--- left open (the card was closed elsewhere: a Cancel, an error, the run dropped).
+K.card_draw = function()
+  local c = K.card
+  local flags = reaper.ImGui_WindowFlags_AlwaysAutoResize()
+  if not c then
+    if reaper.ImGui_IsPopupOpen(ctx, K.CARD_POPUP) then
+      if reaper.ImGui_BeginPopupModal(ctx, K.CARD_POPUP, nil, flags) then
+        reaper.ImGui_CloseCurrentPopup(ctx)
+        reaper.ImGui_EndPopup(ctx)
+      end
+    else
+      Theme.modal_scrim(ctx, K.CARD_POPUP)   -- not open: releases the scrim's first-frame latch
+    end
+    return
+  end
+  local P = Theme.get_palette()
+  local L = Theme.layout
+  local name = c.title .. K.CARD_POPUP   -- the visible title changes as it runs; the ID after ### does not
+  if c.open_pending or not reaper.ImGui_IsPopupOpen(ctx, K.CARD_POPUP) then
+    reaper.ImGui_OpenPopup(ctx, name)
+    c.open_pending = false
+  end
+  Theme.center_next_window(ctx, L.modal_sm.w, 0, reaper.ImGui_Cond_Appearing())
+  Theme.modal_scrim(ctx, K.CARD_POPUP)
+  if not reaper.ImGui_BeginPopupModal(ctx, name, nil, flags) then return end
+
+  local running = c.phase ~= "done"
+  local cancel, close, confirm = false, false, false
+  if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then
+    if running then cancel = true else close = true end
+  elseif not running and (reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Enter())
+      or reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_KeypadEnter())) then
+    confirm = true
+  end
+
+  local content_w = reaper.ImGui_GetContentRegionAvail(ctx) or 0
+  local function tip_if_cut(shown, full)
+    if shown ~= full and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      Theme.tooltip(ctx, full)
+    end
+  end
+  local function wrapped(text, col)
+    reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), col)
+    reaper.ImGui_TextWrapped(ctx, text)
+    reaper.ImGui_PopStyleColor(ctx, 1)
+  end
+  local function draw_lines()
+    for i, line in ipairs(c.lines) do
+      if i > 1 then reaper.ImGui_Dummy(ctx, 0, L.xs) end
+      wrapped(line, P.text_dim)
+    end
+  end
+
+  -- What it is doing (the item's name once done), shortened to the card's width with the whole line in its tooltip
+  if c.step then
+    local shown = fit_text(ctx, c.step, content_w, "card_step")
+    Theme.align(ctx)
+    reaper.ImGui_Text(ctx, shown)
+    tip_if_cut(shown, c.step)
+  end
+  if running then
+    reaper.ImGui_Dummy(ctx, 0, L.sm)
+    local progress = math.max(0, math.min(1, c.progress or 0))
+    Theme.progress_bar(ctx, progress, { overlay = string.format("%d%%", math.floor(progress * 100)) })
+    reaper.ImGui_Dummy(ctx, 0, L.sm)
+  end
+  -- A batch's summary sits above its track list
+  if c.kind == "batch" and #c.lines > 0 then
+    reaper.ImGui_Dummy(ctx, 0, L.md)
+    draw_lines()
+  end
+
+  if #c.rows > 0 then
+    reaper.ImGui_Dummy(ctx, 0, L.md)
+    local label_w = 0
+    for _, row in ipairs(c.rows) do label_w = math.max(label_w, (reaper.ImGui_CalcTextSize(ctx, row.label)) or 0) end
+    label_w = math.min(label_w, math.floor(content_w / 2))   -- a long track name is shortened, not the values
+    local table_flags = reaper.ImGui_TableFlags_None()
+    local outer_h = 0
+    if #c.rows > K.CARD_ROWS_MAX then   -- a long track list scrolls inside the card
+      table_flags = table_flags | reaper.ImGui_TableFlags_ScrollY()
+      outer_h = K.CARD_ROWS_MAX * ((reaper.ImGui_GetTextLineHeight(ctx) or 0) + L.xs * 2)
+    end
+    if reaper.ImGui_BeginTable(ctx, "##card_rows", 2, table_flags, 0, outer_h) then
+      reaper.ImGui_TableSetupColumn(ctx, "##label", reaper.ImGui_TableColumnFlags_WidthFixed(), label_w + L.md)
+      reaper.ImGui_TableSetupColumn(ctx, "##value", reaper.ImGui_TableColumnFlags_WidthStretch(), 1)
+      for _, row in ipairs(c.rows) do
+        reaper.ImGui_TableNextRow(ctx)
+        reaper.ImGui_TableSetColumnIndex(ctx, 0)
+        local label = fit_text(ctx, row.label, label_w, "card_label")
+        reaper.ImGui_TextColored(ctx, P.text_dim, label)
+        tip_if_cut(label, row.label)
+        reaper.ImGui_TableSetColumnIndex(ctx, 1)
+        if row.choices then
+          -- A close call: the two candidates, the one in use marked (CL2: a radio mark, not colour alone)
+          for ci, choice in ipairs(row.choices) do
+            if ci > 1 then reaper.ImGui_Dummy(ctx, 0, L.xs) end
+            if reaper.ImGui_RadioButton(ctx, choice.text .. "###card_key_" .. ci, c.picked == ci) then c.picked = ci end
+          end
+          if row.note then wrapped(row.note, P.text_dim) end
+        else
+          wrapped(row.value, row.dim and P.text_dim or P.text)
+        end
+      end
+      reaper.ImGui_EndTable(ctx)
+    end
+  end
+  if c.kind ~= "batch" and #c.lines > 0 then
+    reaper.ImGui_Dummy(ctx, 0, L.md)
+    draw_lines()
+  end
+
+  -- One button at a time: Cancel while it runs, then OK (the primary look), at the right
+  reaper.ImGui_Dummy(ctx, 0, L.lg)
+  local label = running and "Cancel" or "OK"
+  local btn_w = ((reaper.ImGui_CalcTextSize(ctx, label)) or 0) + L.md * 2
+  Theme.right_align(ctx, btn_w)
+  if running then
+    if reaper.ImGui_Button(ctx, "Cancel###card_cancel", btn_w, 0) then cancel = true end
+  elseif Theme.toggle_button(ctx, "card_ok", "OK", true, { w = btn_w }) then
+    confirm = true
+  end
+  if cancel or close or confirm then reaper.ImGui_CloseCurrentPopup(ctx) end
+  reaper.ImGui_EndPopup(ctx)
+
+  -- The action runs once the popup's stacks are balanced
+  if cancel then
+    K.card_cancel()
+  elseif confirm then
+    K.card_close(true)
+  elseif close then
+    K.card_close(false)
+  end
+end
+
 --- Number of notes the note-level commands (Reset, R / Delete) act on: the selection, if any.
 local function count_selected_notes()
   if not state.notes then return 0 end
@@ -13820,12 +14318,9 @@ K.request_analyze = function()
       return
     end
     start_analysis(values)
-    if state.is_analyzing then
-      if edited > 0 then
-        set_status(string.format("Re-analyzing %s…", name))
-      elseif K.item_off_defaults(state.session_takes[guid or ""]) > 0 then
-        K.reanalyze_status_guid = guid   -- told once the new analysis is written
-      end
+    -- Its progress shows in the Analysis card; an item whose values go back to the defaults is told so once written
+    if (state.is_analyzing or state.pre) and edited == 0 and K.item_off_defaults(state.session_takes[guid or ""]) > 0 then
+      K.reanalyze_status_guid = guid
     end
   end
   request_confirm(req)
@@ -14751,7 +15246,6 @@ local measure_header_static, hdr_min_content_w, hdr_fit_text, draw_header
 do
   local HDR_NO_TARGET_TEXT = "No Audio Item"
   local HDR_ELLIPSIS = "…"
-  local HDR_PROGRESS_LONGEST = "100%"
   -- Why Analyze / Reset are disabled (in the More popup, beside the item)
   local HDR_REASON_NO_TARGET = K.REASON_NO_TARGET
   local HDR_REASON_NO_NOTES = "Analyze an item first"
@@ -14764,11 +15258,12 @@ do
   -- The Values group is the pill, then three named groups (K.BAR_GROUP: Notes, Correction, Shaping), split by
   -- hairline separators.
   local HDR_CLIP = { "brand", "badge", "key", "scale" }
+  local HDR_CLIP_RANGE = { "brand", "badge", "key", "scale", "range" }   -- with the read-only Range box after Scale
   local HDR_VALUES = { "pill", "sep", "mode", "tight", "tol", "strength", "slide" }
   K.BAR_GROUP = { pill = "values", sep = "notes", mode = "correction", tight = "correction", tol = "correction",
     strength = "shaping", slide = "shaping" }
   local HDR_GROUP = {}
-  for _, id in ipairs(HDR_CLIP) do HDR_GROUP[id] = "clip" end
+  for _, id in ipairs(HDR_CLIP_RANGE) do HDR_GROUP[id] = "clip" end
   for id, group in pairs(K.BAR_GROUP) do HDR_GROUP[id] = group end
 
   --- One row holding the units of every list given, in order.
@@ -14780,17 +15275,20 @@ do
     return row
   end
 
-  -- From the widest to the narrowest (LG4). At the narrowest the Values group wraps by group, Shaping on its own
-  -- row, so the main controls stay together.
+  -- From the widest to the narrowest (LG4). The Range box is the first unit to go when a row runs out of width:
+  -- every plan that holds it is followed by the same plan without it, before the groups wrap onto more rows. At the
+  -- narrowest the Values group wraps by group, Shaping on its own row, so the main controls stay together.
   local HDR_PLANS = {
+    { rows = { hdr_row(HDR_CLIP_RANGE, HDR_VALUES) } },
     { rows = { hdr_row(HDR_CLIP, HDR_VALUES) } },
+    { rows = { HDR_CLIP_RANGE, HDR_VALUES } },
     { rows = { HDR_CLIP, HDR_VALUES } },
     { rows = { { "brand", "badge" }, { "key", "scale" }, { "pill", "sep" }, { "mode", "tight" }, { "tol" },
       { "strength", "slide" } } },
   }
   K.HDR_PLANS = HDR_PLANS
-  -- The plan a first-use window is sized for: two rows
-  local HDR_FIRST_USE_PLAN = HDR_PLANS[2]
+  -- The plan a first-use window is sized for: two rows, with the Range box
+  local HDR_FIRST_USE_PLAN = HDR_PLANS[3]
   for _, plan in ipairs(HDR_PLANS) do
     for r, row in ipairs(plan.rows) do
       for _, id in ipairs(row) do
@@ -14828,7 +15326,18 @@ do
     -- rows are given the width of the longest name ("C# / Db") plus the text padding on both sides
     s.key_list_w = math.max(s.key_w, hdr_max_text_w(COMBO_LABELS.key_names) + L.sm * 2)
     s.scale_w = Theme.calc_combo_width(ctx, COMBO_LABELS.scales)
-    s.more_w = math.max(hdr_text_w(HDR_ELLIPSIS), hdr_text_w(HDR_PROGRESS_LONGEST)) + s.pad_x
+    s.more_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
+    -- The Range box, as wide as the longest text it can show (LG3): "Auto", a range's name, "Custom", or two note
+    -- names of the widest the listening pass can find ("G#4–G#4")
+    local range_texts = { K.KEY_UNSET_TEXT, K.CUSTOM_PRESET }
+    for _, r in ipairs(VOCAL_RANGES) do range_texts[#range_texts + 1] = r.name end
+    local lo_st = math.floor(freq_to_note(K.PRE.MIN_HZ))
+    local widest = lo_st
+    for st = lo_st, math.ceil(freq_to_note(K.PRE.MAX_HZ)) do
+      if hdr_text_w(midi_to_name(st)) > hdr_text_w(midi_to_name(widest)) then widest = st end
+    end
+    range_texts[#range_texts + 1] = K.pre_range_text(widest, widest)
+    s.range_w = hdr_max_text_w(range_texts) + s.pad_x
     s.no_target_w = hdr_text_w(HDR_NO_TARGET_TEXT) + s.pad_x  -- the badge never plans narrower than this
     s.badge_min_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
     -- More, Panel, Close: the real gaps between them (see hdr_draw_right)
@@ -14879,6 +15388,7 @@ do
     if id == "badge" then return badge_w end
     if id == "key" then return s.key_w end
     if id == "scale" then return s.scale_w end
+    if id == "range" then return s.range_w end
     return s.bar.unit_w[id] or 0
   end
 
@@ -15081,6 +15591,18 @@ do
     hdr_key_menu("##ctx_scale")
   end
 
+  --- The read-only Range box after Scale: the range the open item uses (K.range_box_text), its tooltip on hover.
+  local function hdr_draw_range(hs)
+    local s = hs.s
+    local guid = hs.has_target and state.target_take_guid or nil
+    local track = guid and K.take_track(guid)
+    local form = K.target_form()
+    local text, tip = K.range_box_text({ has_target = hs.has_target, data = guid and state.session_takes[guid],
+      values = form and form.values or nil, track_name = track and K.track_label(track) or nil })
+    Theme.badge(ctx, hdr_fit_text(text, s.range_w - s.pad_x), { id = "range", w = s.range_w })
+    if tip and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then Theme.tooltip(ctx, tip) end
+  end
+
   --- The Layers submenu of More: each layer shows how it looks on the canvas, a swatch from the same canvas
   --- tokens and shape, before its label (the labels carry no colour word).
   local function hdr_draw_layers(hs)
@@ -15116,16 +15638,13 @@ do
   end
 
   --- "…" (More) and its popup: Analyze / Re-Analyze, Analyze Selected Items and Reset (with the reason beside a
-  --- disabled one), then Layers, Settings and Help. While analysing the button reads the progress ("42%") and the
-  --- popup offers Cancel (Cancel Batch for a batch) in place of Analyze (Esc is not bound to Cancel: on a floating window Esc closes the window, which
-  --- cancels too).
+  --- disabled one), then Layers, Settings and Help. While analysing the popup offers Cancel (Cancel Batch for a
+  --- batch) in place of Analyze; the progress itself is in the Analysis card (Esc there cancels).
   local function hdr_draw_more(hs)
     local s = hs.s
     local batch = K.batch
     local analyzing = state.is_analyzing or batch ~= nil
-    -- One number for a batch, here and in the status line: the share of its audio that is analysed
-    local pct = math.floor(K.analysis_progress() * 100)
-    if reaper.ImGui_Button(ctx, (analyzing and string.format("%d%%", pct) or HDR_ELLIPSIS) .. "###hdr_more", s.more_w, 0) then
+    if reaper.ImGui_Button(ctx, HDR_ELLIPSIS .. "###hdr_more", s.more_w, 0) then
       reaper.ImGui_OpenPopup(ctx, "##hdr_more_popup")
     end
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
@@ -15142,7 +15661,7 @@ do
       -- HC5: Esc closes this popup (innermost); the window-level handler ignores Esc while a popup is open
       if reaper.ImGui_Shortcut(ctx, reaper.ImGui_Key_Escape()) then reaper.ImGui_CloseCurrentPopup(ctx) end
       if analyzing then
-        if reaper.ImGui_MenuItem(ctx, string.format(batch and K.CANCEL_BATCH_FMT or K.CANCEL_FMT, pct) .. "###more_analyze") then
+        if reaper.ImGui_MenuItem(ctx, (batch and K.CANCEL_BATCH_TEXT or K.CANCEL_TEXT) .. "###more_analyze") then
           K.cancel_analysis()
         end
         if batch and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
@@ -15292,6 +15811,8 @@ do
           hdr_draw_key(hs)
         elseif id == "scale" then
           hdr_draw_scale(hs)
+        elseif id == "range" then
+          hdr_draw_range(hs)
         else
           draw_unit(id)
         end
@@ -15932,20 +16453,13 @@ do
     if state.status.text ~= "" and reaper.time_precise() < state.status.until_time then
       return state.status.text
     end
-    if state.pre then return K.locked_reason() end   -- stage 1 of an Auto analysis
     local batch = K.batch
     if batch and batch.kind == "apply" then
       return string.format("Applying values to %d of %d items\xE2\x80\xA6 %d%%", math.min(batch.index, #batch.queue),
         #batch.queue, math.floor(K.analysis_progress() * 100))
     end
-    if batch then
-      local entry = batch.queue[batch.index]
-      return string.format("Analyzing %d of %d: %s… %d%%", math.min(batch.index, #batch.queue), #batch.queue,
-        entry and entry.name or "item", math.floor(K.analysis_progress() * 100))
-    end
-    if state.is_analyzing then
-      return string.format("Analyzing %s… %d%%", state.target_take_name or "this item", math.floor(K.analysis_progress() * 100))
-    end
+    -- An analysis shows its progress in the Analysis card only
+    if batch or state.pre or state.is_analyzing then return "" end
     if not (state.frame.take and state.target_take_name) then
       return state.selection_issue or ""
     end
@@ -16446,6 +16960,7 @@ local function loop_body()
     K.form_sync(form_guid, state.session_takes[form_guid])
   end
   K.analysis_tick()
+  K.card_update()   -- the Analysis card follows the run (drawn with the window's modals)
   K.stale_check_step(ctx)
 
   local P = Theme.get_palette()
@@ -16619,6 +17134,7 @@ local function loop_body()
     draw_settings_modal()
     draw_info_modal()
     draw_confirm_modal()
+    K.card_draw()
 
     -- HC5: Esc, innermost first, only through Shortcut(). Modals own Esc while open (handled inside each
     -- BeginPopupModal); an active edit consumes it itself. What is left: the note selection, then the
@@ -16719,7 +17235,7 @@ end
 
 --- After a frame failed: close an undo block it left open, cancel the running analysis (a batch writes its finished
 --- items here, in an undo block of its own), and keep no track record an analysis or batch found (K.auto_drop):
---- after any failed analysis or batch nothing is pending.
+--- after any failed analysis or batch nothing is pending. The Analysis card closes (its popup with the window).
 K.recover_after_error = function()
   if state.undo_open then   -- the frame failed inside an undo block (a note edit, a batch's write): close it
     state.undo_open = false
@@ -16733,6 +17249,7 @@ K.recover_after_error = function()
     pcall(reaper.Undo_EndBlock, "Analyze Pitch (interrupted)", -1)
   end
   K.auto_drop()
+  K.card = nil
 end
 
 --- One frame of the window, every cycle. A frame that fails does not end the script: the failure is logged to the
@@ -16768,6 +17285,7 @@ local function loop()
     reaper.defer(loop)
   else
     pcall(K.cancel_analysis)   -- closed while analysing: stop reading audio before the script ends
+    K.card = nil               -- the Analysis card goes with the window
     pcall(K.tone_kill)         -- and never leave the tone on the Monitoring FX chain
   end
 end

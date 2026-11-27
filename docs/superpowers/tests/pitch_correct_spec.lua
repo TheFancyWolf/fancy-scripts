@@ -2567,7 +2567,7 @@ local function with_batch(fn)
   local ok, err = pcall(fn, rec)
   K.analysis_begin, K.batch_write, st.target_take_guid, st.target_take_name = table.unpack(saved, 1, 4)
   st.results, st.notes, st.split_points, st.analysis_empty, st.progress = table.unpack(saved_model, 1, 5)
-  K.batch, st.is_analyzing = nil, false
+  K.batch, st.is_analyzing, K.card = nil, false, nil
   st.status.text, st.status.hold = "", nil
   reaper.GetMediaItemTakeByGUID, reaper.GetMediaItemTake_Item = nil, nil
   K.drop_project_cache()
@@ -2593,7 +2593,9 @@ test("batch_runs_queue_in_order", function() with_batch(function(rec)
   eq(#rec.writes, 1, "one write"); eq(#rec.writes[1], 3)
   eq(rec.writes[1][1].guid, "{a}"); eq(rec.writes[1][3].guid, "{c}"); eq(type(rec.writes[1][1].json), "string")
   eq(K.batch, nil); eq(S.state.is_analyzing, false)
-  eq(S.state.status.text, "Analyzed 3 items. " .. MOD .. "+Z to undo.")
+  eq(K.card.phase, "done", "the Analysis card waits for OK")
+  eq(K.card.lines[1], "Analyzed 3 items. " .. MOD .. "+Z to undo.", "the summary is in the card")
+  eq(S.state.status.text, "", "not in the status line")
 end) end)
 
 test("batch_skips_missing_and_offline", function() with_batch(function(rec)
@@ -2603,7 +2605,7 @@ test("batch_skips_missing_and_offline", function() with_batch(function(rec)
   K.batch_start(e)
   eq(#rec.begun, 1); eq(rec.begun[1].take, "c", "the deleted and the offline item never start")
   K.batch_item_done(model("{c}"))
-  eq(S.state.status.text, "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
+  eq(S.K.card.lines[1], "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
 end) end)
 
 test("batch_uses_rates_from_the_click", function() with_batch(function(rec)
@@ -2620,14 +2622,14 @@ test("batch_item_failure_carries_on", function() with_batch(function(rec)
   eq(rec.begun[#rec.begun].take, "c", "b was refused, c is running")
   K.batch_item_failed(nil)
   eq(#rec.writes, 1); eq(#rec.writes[1], 1)
-  eq(S.state.status.text, "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
+  eq(K.card.lines[1], "Analyzed 1 of 3 items. 2 could not be analyzed. " .. MOD .. "+Z to undo.")
 end) end)
 
 test("batch_counts_items_without_notes", function() with_batch(function()
   local K = S.K
   K.batch_start(entries3())
   K.batch_item_done(model("{a}", {})); K.batch_item_done(model("{b}")); K.batch_item_done(model("{c}"))
-  eq(S.state.status.text, "Analyzed 3 items (1 has no pitched notes). " .. MOD .. "+Z to undo.")
+  eq(K.card.lines[1], "Analyzed 3 items (1 has no pitched notes). " .. MOD .. "+Z to undo.")
 end) end)
 
 test("batch_cancel_keeps_finished", function() with_batch(function(rec)
@@ -2636,6 +2638,7 @@ test("batch_cancel_keeps_finished", function() with_batch(function(rec)
   eq(K.cancel_analysis(), true)
   eq(#rec.writes, 1); eq(#rec.writes[1], 1); eq(K.batch, nil); eq(S.state.is_analyzing, false)
   eq(S.state.status.text, "Batch cancelled. 1 of 3 items was analyzed and kept. " .. MOD .. "+Z to undo.")
+  eq(K.card, nil, "cancelled: the card closes, the status line says what was kept")
 end) end)
 
 test("batch_cancel_before_any_item", function() with_batch(function(rec)
@@ -2872,10 +2875,10 @@ test("batch_opens_the_first_written_item", function() with_write_stubs({}, funct
     K.batch_start({ e[1], e[2] })
     K.batch_item_done(a); K.batch_item_done(b)
     eq(K.batch, nil); eq(st.target_take_guid, "{a}", "the first item of the batch is open"); eq(st.results, a.results)
-    eq(st.status.text, "Analyzed 2 items (2 have no pitched notes). " .. MOD .. "+Z to undo.")
+    eq(K.card.lines[1], "Analyzed 2 items (2 have no pitched notes). " .. MOD .. "+Z to undo.")
   end)
   K.analysis_begin, st.target_take_guid, st.target_take_name, st.results, st.notes = table.unpack(saved, 1, 5)
-  K.batch, st.is_analyzing, st.status.text, st.status.hold = nil, false, "", nil
+  K.batch, st.is_analyzing, st.status.text, st.status.hold, K.card = nil, false, "", nil, nil
   if not ok then error(err, 0) end
 end) end)
 
@@ -3110,9 +3113,12 @@ test("batch_status_line", function()
   st.status.text, st.status.hold = "", nil
   K.batch = K.batch_new({ { len = 10, name = "A" }, { len = 30, name = "V Main Verse 3" } })
   K.batch.index, K.batch.done_len, st.is_analyzing, st.progress = 2, 10, true, 0.5
-  eq(K.status_line(false), "Analyzing 2 of 2: V Main Verse 3… 62%")
+  local ok, err = pcall(function()
+    eq(K.status_line(false), "", "a batch's progress is in the Analysis card, not the status line")
+  end)
   K.batch, st.is_analyzing, st.progress = nil, false, 0
   reaper.time_precise = nil
+  if not ok then error(err, 0) end
 end)
 
 test("confirm_carries_the_list", function()
@@ -3825,12 +3831,25 @@ test("hdr_plan_widths_ordered", function()
   local ok, err = pcall(function()
     local s = S.measure_header_static()
     local plans = S.K.HDR_PLANS
-    eq(#plans, 3, "plans")
+    eq(#plans, 5, "plans")
     for i = 1, #plans - 1 do
       local a, b = S.hdr_min_content_w(s, false, i), S.hdr_min_content_w(s, false, i + 1)
-      if a <= b then error(string.format("plan %d (%g) is not wider than plan %d (%g)", i, a, i + 1, b), 0) end
+      if a < b then error(string.format("plan %d (%g) is narrower than plan %d (%g)", i, a, i + 1, b), 0) end
     end
-    eq(#plans[1].rows, 1, "one row"); eq(#plans[2].rows, 2, "Clip row + Values row"); eq(#plans[3].rows, 6, "narrow")
+    if S.hdr_min_content_w(s, false, 1) <= S.hdr_min_content_w(s, false, 3) then error("one row is not wider", 0) end
+    if S.hdr_min_content_w(s, false, 3) <= S.hdr_min_content_w(s, false, 5) then error("two rows are not wider", 0) end
+    local function has_range(plan)
+      for _, row in ipairs(plan.rows) do
+        for _, id in ipairs(row) do if id == "range" then return true end end
+      end
+      return false
+    end
+    -- The Range box is the first unit to go: each plan with it is followed by the same plan without it
+    eq(has_range(plans[1]), true); eq(has_range(plans[2]), false); eq(has_range(plans[3]), true)
+    eq(has_range(plans[4]), false); eq(has_range(plans[5]), false, "not at the narrowest")
+    if S.hdr_min_content_w(s, false, 1) <= S.hdr_min_content_w(s, false, 2) then error("the box takes width", 0) end
+    eq(#plans[1].rows, 1, "one row"); eq(#plans[2].rows, 1, "one row")
+    eq(#plans[3].rows, 2, "Clip row + Values row"); eq(#plans[4].rows, 2); eq(#plans[5].rows, 6, "narrow")
     for pi, plan in ipairs(plans) do
       eq(plan.captions, nil, "plan " .. pi .. " has no captions")
       for _, row in ipairs(plan.rows) do
@@ -3841,7 +3860,7 @@ test("hdr_plan_widths_ordered", function()
     end
     -- The first-use window is sized for the two-row plan
     local w2, rows = S.hdr_min_content_w(s, true)
-    eq(w2, S.hdr_min_content_w(s, false, 2), "first use: plan 2"); eq(rows, 2, "first use: two rows")
+    eq(w2, S.hdr_min_content_w(s, false, 3), "first use: two rows with the Range box"); eq(rows, 2, "first use: two rows")
     -- Strength and Slide In are measured in the default font, as the other values: nothing pushes a font
     local Theme, pushes = package.loaded["theme"], 0
     local push = Theme.push_font
@@ -6273,6 +6292,7 @@ local function auto_world(opts, fn)
     end,
     GetTakeName = function(take) return take end,
     GetTrackName = function(track) return true, opts.tracks[track] and opts.tracks[track].name or "V _ Main" end,
+    GetTrackGUID = function(track) return "{track:" .. tostring(track) .. "}" end,
     GetTakeEnvelopeByName = function(take) return "env_" .. take end,
     GetEnvelopeStateChunk = function()
       if opts.real_open then return true, "<PITCHENV\nACT 1 -1\nVIS 1 1 1\nPT 0 0 0\n>" end
@@ -6341,7 +6361,7 @@ local function auto_world(opts, fn)
     st.undone_takes[g], st.stale_env[g], st.unreadable_takes[g] = nil, nil, nil
   end
   while #st.session_order > saved_order do table.remove(st.session_order) end
-  K.batch, K.auto_run, K.reanalyze_status_guid = nil, nil, saved_reanalyze
+  K.batch, K.auto_run, K.reanalyze_status_guid, K.card = nil, nil, saved_reanalyze, nil
   K.track_records_pending = {}
   K.drop_project_cache()
   if not ok then error(err, 0) end
@@ -6410,42 +6430,6 @@ test("auto_values_from_record", function()
     40, "the found notes are kept by what is stored")
 end)
 
-test("auto_status_strings", function()
-  local K = S.K
-  local base = { track = "V _ Main", range_text = "E2\xE2\x80\x93A4", key_text = "E Major", want_range = true,
-    want_key = true, fresh = true }
-  local function with(t)
-    local out = {}
-    for k, v in pairs(base) do out[k] = v end
-    for k, v in pairs(t) do out[k] = v end
-    return out
-  end
-  eq(K.auto_status(with({})), "Found E2\xE2\x80\x93A4, E Major. " .. MOD .. "+Z to undo.")
-  eq(K.auto_status(with({ alt_text = "C# Minor" })),
-    "Found E2\xE2\x80\x93A4, E Major (C# Minor also fits). " .. MOD .. "+Z to undo.")
-  eq(K.auto_status(with({ want_key = false, alt_text = "C# Minor" })), "Found E2\xE2\x80\x93A4. " .. MOD .. "+Z to undo.")
-  eq(K.auto_status(with({ want_range = false })), "Found E Major. " .. MOD .. "+Z to undo.")
-  eq(K.auto_status(with({ fresh = false })), "Used V _ Main's range and key: E2\xE2\x80\x93A4, E Major.")
-  eq(K.auto_status(with({ fresh = false, want_key = false })), "Used V _ Main's range: E2\xE2\x80\x93A4.")
-  eq(K.auto_status(with({ fresh = false, want_range = false })), "Used V _ Main's key: E Major.")
-  eq(K.auto_status(with({ none = true, range_text = false })), "Couldn't find a range on V _ Main: used Generic Vocal.")
-  eq(K.auto_status(with({ no_key = true, key_text = false, kept_key_text = "E Major" })),
-    "Not enough singing to tell the key: kept E Major.")
-  eq(K.auto_status(with({ skipped = 2, total = 12 })),
-    "Couldn't read 2 of 12 items on V _ Main (media offline). Used the rest.")
-  -- one message only, by priority: no range > no key > unreadable media > found / used
-  eq(K.auto_status(with({ none = true, no_key = true, kept_key_text = "E Major", skipped = 2, total = 12 })),
-    "Couldn't find a range on V _ Main: used Generic Vocal.")
-  eq(K.auto_status(with({ no_key = true, kept_key_text = "E Major", skipped = 2, total = 12 })),
-    "Not enough singing to tell the key: kept E Major.")
-  eq(K.auto_status(with({ none = true, want_range = false })), "Found E Major. " .. MOD .. "+Z to undo.",
-    "no range found matters only when the range was wanted")
-  eq(K.auto_status(with({ fresh = false, skipped = 2, total = 12 })),
-    "Used V _ Main's range and key: E2\xE2\x80\x93A4, E Major.", "a reused record's old skips are not news")
-  eq(select(2, K.auto_status(with({ fresh = false }))), "used")
-  eq(select(2, K.auto_status(with({}))), "found")
-end)
-
 test("track_record_sees_pending", function()
   local K = S.K
   local reads = 0
@@ -6473,7 +6457,7 @@ test("analyze_auto_then_stores", function()
     S.start_analysis(auto_values(true))
     eq(st.pre ~= nil, true, "stage 1 runs first")
     eq(st.is_analyzing, true)
-    eq(K.locked_reason(), "Finding range and key\xE2\x80\xA6 0%", "one track: no name")
+    eq(K.card.phase, "listen", "the Analysis card shows stage 1")
     eq(K.analysis_progress(), 0)
     auto_run_out()
     local data = st.session_takes["{a}"]
@@ -6494,13 +6478,12 @@ test("analyze_auto_then_stores", function()
     eq(at > b and at < e, true, "between its Undo_BeginBlock and Undo_EndBlock")
     eq(#w.log, 4, "begin, the take, the track, end: " .. table.concat(w.log, ","))
     eq(next(K.track_records_pending), nil)
-    -- the key came from the track, the bar shows it, the status line says what was found
+    -- the key came from the track, the bar shows it, the Analysis card says what was found
     eq(type(rec.key_idx), "number", "a key was found")
     eq(data.key_idx, rec.key_idx); eq(data.scale_idx, rec.scale_idx); eq(data.key_from_track, true)
     eq(st.key_idx, rec.key_idx, "the bar shows the found key")
-    local key = K.key_text(rec.key_idx, rec.scale_idx)
-    local alt = rec.alt_key_idx and (" (" .. K.key_text(rec.alt_key_idx, rec.alt_scale_idx) .. " also fits)") or ""
-    eq(st.status.text, "Found " .. K.pre_range_text(57, 57) .. ", " .. key .. alt .. ". " .. MOD .. "+Z to undo.")
+    eq(K.card.rows[1].value, "A3 \xE2\x80\x93 A3"); eq(K.card.rows[2].value, K.key_text(rec.key_idx, rec.scale_idx))
+    eq(st.status.text, "", "nothing in the status line")
     eq(st.is_analyzing, false); eq(st.pre, nil); eq(K.auto_run, nil)
   end)
 end)
@@ -6542,8 +6525,9 @@ test("analyze_auto_reuses_record", function()
     local lo, hi = K.pre_range_hz(rec.lo_st, rec.hi_st)
     eq(data.analysis.min_freq, lo); eq(data.analysis.max_freq, hi)
     eq(data.key_idx, rec.key_idx); eq(data.key_source, "track"); eq(data.key_from_track, true)
-    -- the key was the track's already (the bar showed it): only the range is news
-    eq(st.status.text, string.format("Used V _ Main's range: %s.", K.pre_range_text(rec.lo_st, rec.hi_st)))
+    -- the range and the key were the track's already: the Analysis card says where they came from
+    eq(K.card.rows[1].value, K.card_range_text(rec.lo_st, rec.hi_st) .. " (from track \"V _ Main\")")
+    eq(st.status.text, "")
   end)
 end)
 
@@ -6575,7 +6559,8 @@ test("cancel_in_stage_one_writes_nothing", function()
     eq(st.pre ~= nil, true, "still in stage 1")
     local p = K.analysis_progress()
     eq(p > 0 and p <= K.PRE.SHARE, true, "stage 1 is the first share of the whole, got " .. p)
-    eq(K.locked_reason(), string.format("Finding range and key\xE2\x80\xA6 %d%%", math.floor(p * 100)))
+    K.card_update()
+    near(K.card.progress, p, 1e-12, "the Analysis card shows it")
     eq(K.cancel_analysis(), true)
     eq(index_of(w.log, "begin"), nil, "no undo block"); eq(#w.log, 0, "no take or track write")
     eq(st.is_analyzing, false); eq(st.pre, nil); eq(next(K.track_records_pending), nil)
@@ -6594,7 +6579,9 @@ test("auto_progress_spans_both_stages", function()
     eq(K.locked_reason(), K.LOCKED_REASON, "stage 2: the usual locked line")
     st.progress = 0.5
     near(K.analysis_progress(), K.PRE.SHARE + (1 - K.PRE.SHARE) * 0.5, 1e-12)
-    eq(K.status_line(false), string.format("Analyzing tk_a… %d%%", math.floor(K.analysis_progress() * 100)))
+    K.card_update()
+    near(K.card.progress, K.analysis_progress(), 1e-12, "the Analysis card's one number")
+    eq(K.status_line(false), "", "not in the status line")
   end)
 end)
 
@@ -6680,9 +6667,9 @@ test("batch_two_tracks_each_own_range", function()
     K.batch_start(two_entries(), auto_values(true))
     eq(st.pre ~= nil, true, "stage 1 before the first item"); eq(st.pre.n_tracks, 2)
     K.analysis_tick()
-    eq(K.locked_reason():find("^Finding range and key: Low\xE2\x80\xA6 %d+%%$") ~= nil, true,
-      "two tracks: the one being heard is named, got " .. K.locked_reason())
-    eq(K.status_line(false), K.locked_reason())
+    K.card_update()
+    eq(K.card.step, "Listening to track \"Low\"\xE2\x80\xA6", "two tracks: the one being heard is named")
+    eq(K.status_line(false), "")
     eq(K.analysis_progress() <= K.PRE.SHARE, true)
     auto_run_out()
     local recs = {}
@@ -6707,7 +6694,8 @@ test("batch_two_tracks_each_own_range", function()
     eq(w.log[ends], "end:Analyze Pitch (2 items)")
     eq(at1 ~= nil and at1 > starts and at1 < ends, true, "tr1 written inside it")
     eq(at2 ~= nil and at2 > starts and at2 < ends, true, "tr2 too")
-    eq(st.status.text, "Analyzed 2 items. " .. MOD .. "+Z to undo.", "the batch's own summary, nothing added")
+    eq(K.card.lines[1], "Analyzed 2 items. " .. MOD .. "+Z to undo.", "the batch's own summary, nothing added")
+    eq(#K.card.lines, 1); eq(st.status.text, "")
     eq(next(K.track_records_pending), nil)
   end)
 end)
@@ -7050,8 +7038,8 @@ test("find_again_replaces_record", function() t7_ext(function(ext)
     eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], true); eq(rec.takes["{old}"], nil, "heard afresh")
     eq(rec.st["40"], nil, "the old tally is gone"); eq(rec.lo_st, 57); eq(rec.hi_st, 57)
     eq(data.key_idx, 7, "the item keeps its key"); eq(data.key_from_track, true); eq(st.key_idx, 7)
-    eq(st.status.text, string.format("Found %s, %s on V _ Main. Items already analyzed keep theirs. %s+Z to undo.",
-      K.pre_range_text(57, 57), K.key_text(rec.key_idx, rec.scale_idx), MOD))
+    eq(K.card.rows[1].value, "A3 \xE2\x80\x93 A3"); eq(K.card.rows[2].value, K.key_text(rec.key_idx, rec.scale_idx))
+    eq(K.card.lines[1], "Items already analyzed keep theirs."); eq(st.status.text, "")
     eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(st.is_analyzing, false)
     eq(next(ext), nil, "no ExtState")
   end)
@@ -7179,8 +7167,9 @@ test("find_again_range_only_keeps_the_key", function()
       local rec = t7_stored(w)
       eq(rec.lo_st, 57); eq(rec.key_idx, 7, "the previous key is carried"); eq(rec.scale_idx, 2)
       eq(rec.alt_key_idx, 10); eq(rec.alt_scale_idx, 1)
-      eq(st.status.text, string.format("Found %s on V _ Main. Items already analyzed keep theirs. %s+Z to undo.",
-        K.pre_range_text(57, 57), MOD))
+      eq(K.card.rows[1].value, "A3 \xE2\x80\x93 A3")
+      eq(K.card.rows[2].value, "Not enough singing to tell: kept F# Minor", "the previous key, carried")
+      eq(st.status.text, "")
     end)
   S.K.PRE.KEY_MIN_FRAMES = min_frames
   if not ok then error(err, 0) end
@@ -7194,7 +7183,8 @@ test("find_again_unreadable_media_says_so", function()
     auto_run_out()
     eq(table.concat(w.log, ","), "begin,track:tr,end:Find Range and Key: V _ Main")
     eq(t7_stored(w).skipped, 1)
-    eq(st.status.text, "Couldn't read 1 of 2 items on V _ Main (media offline). Used the rest.")
+    eq(K.card.lines[1], "Couldn't read 1 of 2 items on \"V _ Main\" (media offline). Used the rest.")
+    eq(K.card.lines[2], "Items already analyzed keep theirs."); eq(st.status.text, "")
   end)
 end)
 
@@ -7920,6 +7910,438 @@ end) end)
 test("find_key_is_gone", function()
   eq(S.K.find_key_request, nil); eq(S.K.find_key_finish, nil)
   eq(S.K.new_key.key_idx, nil); eq(S.K.new_key.scale_idx, nil)
+end)
+
+-- The Analysis card: progress and results in one modal; the range box in the top bar --------------------------------
+
+-- Ticks the window's analysis, and the card as the window does each frame, until nothing runs (bounded)
+local function card_run_out()
+  for _ = 1, 100000 do
+    if not S.state.is_analyzing and not S.state.pre and not S.K.batch then return end
+    S.K.analysis_tick()
+    S.K.card_update()
+  end
+  error("the analysis never ended")
+end
+
+local function card_row(label)
+  for _, row in ipairs(S.K.card and S.K.card.rows or {}) do
+    if row.label == label then return row end
+  end
+  return nil
+end
+
+test("card_text_builders", function()
+  local K = S.K
+  eq(K.card_title("single", "listen", "07_LeadVox copy.wav"), "Analyzing 07_LeadVox copy.wav")
+  eq(K.card_title("single", "notes", "07_LeadVox copy.wav"), "Analyzing 07_LeadVox copy.wav")
+  eq(K.card_title("batch", "notes", "Lead take 3.wav", 3, 12), "Analyzing 3 of 12: Lead take 3.wav")
+  eq(K.card_title("batch", "listen", nil, 0, 12), "Analyzing 12 items", "the batch's listening pass, before item 1")
+  eq(K.card_title("again", "listen"), "Finding range and key")
+  eq(K.card_title("single", "done", "x"), "Analysis done")
+  eq(K.card_title("batch", "done", "x", 12, 12), "Analysis done")
+  eq(K.card_step("listen", "Test"), "Listening to track \"Test\"\xE2\x80\xA6")
+  eq(K.card_step("notes", "Test"), "Finding notes\xE2\x80\xA6")
+  eq(K.card_range_value({ pending = true }), "listening\xE2\x80\xA6")
+  eq(K.card_range_value({ source = "found", lo_st = 57, hi_st = 65 }), "A3 \xE2\x80\x93 F4")
+  eq(K.card_range_value({ source = "track", lo_st = 57, hi_st = 65, track = "Test" }),
+    "A3 \xE2\x80\x93 F4 (from track \"Test\")")
+  eq(K.card_range_value({ source = "picked", name = "Tenor" }), "Tenor (your choice)")
+  eq(K.card_range_value({ source = "picked", name = "Custom" }), "Custom (your choice)")
+  eq(K.card_range_value({ source = "none" }), "No singing found: used Generic Vocal")
+  eq(K.card_key_value({ pending = true }), "listening\xE2\x80\xA6")
+  eq(K.card_key_value({ source = "found", text = "C Minor" }), "C Minor")
+  eq(K.card_key_value({ source = "track", text = "C Minor", track = "Test" }), "C Minor (from track \"Test\")")
+  eq(K.card_key_value({ source = "picked", text = "D Major" }), "D Major (your choice)")
+  eq(K.card_key_value({ source = "none", text = "E Major" }), "Not enough singing to tell: kept E Major")
+  eq(K.card_key_value({ source = "own", text = "E Major" }), "E Major", "a re-analysed item keeps its own key")
+  eq(K.card_notes_value({ phase = "listen" }), "waiting")
+  eq(K.card_notes_value({ phase = "notes" }), "finding\xE2\x80\xA6")
+  eq(K.card_notes_value({ phase = "done", count = 31 }), "31")
+  eq(K.card_notes_value({ phase = "done", count = 0 }), "none found. Try another Vocal Range or Detection Mode.")
+  local lines = K.card_lines({ skipped = 2, total = 12, track = "Test" })
+  eq(#lines, 1); eq(lines[1], "Couldn't read 2 of 12 items on \"Test\" (media offline). Used the rest.")
+  lines = K.card_lines({ again = true })
+  eq(#lines, 1); eq(lines[1], "Items already analyzed keep theirs.")
+  lines = K.card_lines({ summary = { "Analyzed 3 items." }, skipped = 1, total = 3, track = "T", again = true })
+  eq(table.concat(lines, "|"), "Analyzed 3 items.|Couldn't read 1 of 3 items on \"T\" (media offline). Used the rest."
+    .. "|Items already analyzed keep theirs.", "the summary first, the problem, then the note")
+  eq(#K.card_lines({ skipped = 0, total = 3, track = "T" }), 0, "nothing skipped: no line")
+  local row = K.card_batch_row("Lead Vox", { lo_st = 47, hi_st = 69, key_idx = 5, scale_idx = 1 },
+    { auto_range = true, want_key = true })
+  eq(row.label .. "   " .. row.value, "Lead Vox   B2 \xE2\x80\x93 A4 \xC2\xB7 E Major")
+  eq(row.choices, nil, "a batch offers no key candidates")
+  row = K.card_batch_row("Lead Vox", nil, { auto_range = true, want_key = true })
+  eq(row.value, "\xE2\x80\x93 \xC2\xB7 \xE2\x80\x93", "not heard yet"); eq(row.dim, true)
+  row = K.card_batch_row("Quiet", { st = {}, takes = {} }, { auto_range = true, want_key = true, kept = "D Major" })
+  eq(row.value, "No singing found: used Generic Vocal \xC2\xB7 Not enough singing to tell: kept D Major")
+  row = K.card_batch_row("Lead Vox", { lo_st = 47, hi_st = 69 }, { auto_range = false, range = "Tenor" })
+  eq(row.value, "Tenor (your choice) \xC2\xB7 \xE2\x80\x93", "a fixed range; no key wanted and none found")
+end)
+
+test("card_follows_a_single_analysis", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    local c = K.card
+    eq(type(c), "table", "the card opens"); eq(c.kind, "single"); eq(c.phase, "listen")
+    eq(c.title, "Analyzing tk_a"); eq(c.step, "Listening to track \"V _ Main\"\xE2\x80\xA6")
+    eq(card_row("Vocal Range").value, "listening\xE2\x80\xA6"); eq(card_row("Key").value, "listening\xE2\x80\xA6")
+    eq(card_row("Notes").value, "waiting"); eq(card_row("Vocal Range").dim, true)
+    eq(c.guid, "{a}")
+    while st.pre do K.analysis_tick(); K.card_update() end
+    eq(c.phase, "notes"); eq(c.step, "Finding notes\xE2\x80\xA6")
+    eq(card_row("Vocal Range").value, "A3 \xE2\x80\x93 A3", "found by this run's own listening pass")
+    local rec = K.track_record("tr")
+    eq(card_row("Key").value, K.key_text(rec.key_idx, rec.scale_idx))
+    eq(card_row("Notes").value, "finding\xE2\x80\xA6")
+    near(c.progress, K.analysis_progress(), 1e-12)
+    card_run_out()
+    eq(K.card, c, "still open at the end"); eq(c.phase, "done"); eq(c.title, "Analysis done"); eq(c.step, "tk_a")
+    eq(st.is_analyzing, false)
+    local data = st.session_takes["{a}"]
+    eq(card_row("Notes").value, K.card_notes_value({ phase = "done", count = #data.notes }))
+    eq(card_row("Vocal Range").value, "A3 \xE2\x80\x93 A3")
+    eq(card_row("Key").value ~= nil, true)
+    eq(st.status.text, "", "no Found / Used message in the status line")
+    eq(c.tracks, nil, "the done card holds no pointers")
+  end)
+end)
+
+test("card_close_call_offers_both", function() t7_ext(function(_, ext_sync)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    ext_sync()
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    local c = K.card
+    eq(c.phase, "done")
+    local key = card_row("Key")
+    eq(#key.choices, 2, "two candidates"); eq(key.choices[1].text, "E Major", "the best first")
+    eq(key.choices[1].key_idx, 5); eq(key.choices[2].text, "C# Minor")
+    eq(key.choices[2].key_idx, 2); eq(key.choices[2].scale_idx, 2)
+    eq(key.note, "These two fit equally well."); eq(c.picked, 1)
+    w.log = {}
+    c.picked = 2
+    K.card_close(true)
+    eq(K.card, nil)
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Key", "one block, item and track")
+    local data = st.session_takes["{a}"]
+    eq(data.key_idx, 2); eq(data.scale_idx, 2)
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 2); eq(rec.scale_idx, 2); eq(rec.alt_key_idx, nil); eq(rec.alt_scale_idx, nil)
+  end)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    w.log = {}
+    K.card_close(true)   -- OK with the key in use
+    eq(K.card, nil); eq(#w.log, 0, "nothing written, no undo block"); eq(st.session_takes["{a}"].key_idx, 5)
+  end)
+end) end)
+
+test("card_no_candidates_for_a_picked_key", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx, st.scale_idx = "{a}", "tk_a", 3, 1
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 1 }
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    eq(card_row("Key").value, "D Major (your choice)"); eq(card_row("Key").choices, nil)
+  end)
+end)
+
+test("card_esc_on_done_applies_nothing", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    w.log = {}
+    K.card.picked = 2
+    K.card_close(false)   -- Esc
+    eq(K.card, nil); eq(#w.log, 0, "nothing written"); eq(st.session_takes["{a}"].key_idx, 5)
+    eq(t7_stored(w).alt_key_idx, 2, "the record keeps its runner-up")
+  end)
+end) end)
+
+test("card_cancel_in_each_phase", function()
+  local function after_cancel(w, st, K)
+    eq(K.card, nil, "the card closes"); eq(next(K.track_records_pending), nil); eq(K.auto_run, nil)
+    eq(index_of(w.log, "begin"), nil, "no undo block: " .. table.concat(w.log, ","))
+    eq(st.is_analyzing, false); eq(st.pre, nil)
+  end
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    K.analysis_tick(); K.card_update()
+    eq(K.card.phase, "listen")
+    K.card_cancel()
+    after_cancel(w, st, K)
+    eq(st.status.text, K.CANCELLED_TEXT)
+    S.start_analysis(auto_values(true))
+    while st.pre do K.analysis_tick() end
+    K.analysis_tick(); K.card_update()
+    eq(K.card.phase, "notes")
+    K.card_cancel()
+    after_cancel(w, st, K)
+    eq(st.status.text, K.CANCELLED_TEXT)
+  end)
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.batch_start(two_entries(), auto_values(true))
+    K.analysis_tick(); K.card_update()
+    eq(K.card.kind, "batch"); eq(K.card.phase, "listen")
+    K.card_cancel()
+    after_cancel(w, st, K)
+    eq(K.batch, nil); eq(st.status.text, "Batch cancelled. Nothing was changed.")
+  end)
+  auto_world({ tracks = ONE_TRACK, step = 0.003, ext = { tr = JSON.encode(t7_record(7, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    K.analysis_tick(); K.card_update()
+    eq(K.card.kind, "again"); eq(K.card.phase, "listen")
+    K.card_cancel()
+    after_cancel(w, st, K)
+    eq(st.status.text, K.CANCELLED_TEXT)
+  end)
+end)
+
+test("card_closes_when_its_run_is_dropped", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    K.analysis_tick()
+    K.release_analysis()   -- something dropped the run without an outcome
+    K.card_update()
+    eq(K.card, nil, "a card with nothing running and no result closes")
+  end)
+end)
+
+test("card_reused_track_and_hand_range", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    eq(K.card.phase, "notes", "the record covers every take: no listening")
+    eq(card_row("Vocal Range").value, "A3 \xE2\x80\x93 A3 (from track \"V _ Main\")")
+    eq(card_row("Key").value, "E Major (from track \"V _ Main\")")
+    card_run_out()
+    eq(card_row("Vocal Range").value, "A3 \xE2\x80\x93 A3 (from track \"V _ Main\")")
+    eq(card_row("Key").value, "E Major (from track \"V _ Main\")"); eq(card_row("Key").choices, nil)
+    eq(st.status.text, "")
+  end)
+  auto_world({ tracks = ONE_TRACK }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx, st.scale_idx = "{a}", "tk_a", 3, 1
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 1 }
+    S.start_analysis(auto_values(false))   -- Tenor and a picked key: nothing to listen for
+    eq(K.card.phase, "notes")
+    eq(card_row("Vocal Range").value, "Tenor (your choice)"); eq(card_row("Key").value, "D Major (your choice)")
+    card_run_out()
+    eq(card_row("Vocal Range").value, "Tenor (your choice)"); eq(card_row("Key").value, "D Major (your choice)")
+  end)
+  auto_world({ tracks = ONE_TRACK }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx, st.scale_idx = "{a}", "tk_a", 3, 1
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 1 }
+    local v = auto_values(false)
+    v.min_freq, v.max_freq = 100, 400
+    S.start_analysis(v)
+    card_run_out()
+    eq(card_row("Vocal Range").value, "Custom (your choice)")
+  end)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local st = S.state
+    t7_open(7, 2, false)   -- analysed before, with its own key
+    st.target_take_name = "tk_a"
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    eq(card_row("Key").value, "F# Minor", "a re-analysed item keeps its own key"); eq(card_row("Key").choices, nil)
+  end)
+end)
+
+test("card_batch_lists_tracks", function()
+  local tracks = { tr1 = { items = { "it_a" }, freq = 110, name = "Low" },
+    tr2 = { items = { "it_b" }, freq = 0, name = "Quiet" } }
+  auto_world({ tracks = tracks, step = 0.003 }, function()
+    local K, st = S.K, S.state
+    K.batch_start(two_entries(), auto_values(true))
+    local c = K.card
+    eq(c.kind, "batch"); eq(c.phase, "listen"); eq(c.title, "Analyzing 2 items")
+    eq(#c.rows, 2, "one row per track"); eq(c.rows[1].label, "Low"); eq(c.rows[2].label, "Quiet")
+    eq(c.rows[1].value, "\xE2\x80\x93 \xC2\xB7 \xE2\x80\x93", "not heard yet")
+    while st.pre do K.analysis_tick(); K.card_update() end
+    eq(c.phase, "notes"); eq(c.title, "Analyzing 1 of 2: A")
+    card_run_out()
+    eq(K.card, c); eq(c.phase, "done"); eq(c.title, "Analysis done")
+    eq(c.rows[1].value:sub(1, #"A2 \xE2\x80\x93 A2 \xC2\xB7 "), "A2 \xE2\x80\x93 A2 \xC2\xB7 ", "the range heard on Low")
+    local NK = K.new_key
+    eq(c.rows[2].value, "No singing found: used Generic Vocal \xC2\xB7 Not enough singing to tell: kept "
+      .. K.key_text(NK.hand_key_idx, NK.hand_scale_idx))
+    eq(c.lines[1], "Analyzed 2 items (1 has no pitched notes). " .. MOD .. "+Z to undo.", "the batch's summary")
+    for _, row in ipairs(c.rows) do eq(row.choices, nil, "no key candidates in a batch") end
+    eq(st.status.text, "", "the summary is not posted"); eq(c.tracks, nil)
+  end)
+end)
+
+test("card_find_again", function()
+  local old = t7_record(7, 1)
+  old.takes = { ["{old}"] = true }
+  auto_world({ tracks = ONE_TRACK, step = 0.003, ext = { tr = JSON.encode(old) } }, function()
+    local K, st = S.K, S.state
+    t7_open(7, 1, true)
+    K.find_again_request()
+    local c = K.card
+    eq(c.kind, "again"); eq(c.title, "Finding range and key"); eq(c.step, "Listening to track \"V _ Main\"\xE2\x80\xA6")
+    eq(#c.rows, 2); eq(card_row("Vocal Range").value, "listening\xE2\x80\xA6")
+    eq(card_row("Key").value, "listening\xE2\x80\xA6"); eq(card_row("Notes"), nil)
+    card_run_out()
+    eq(c.phase, "done"); eq(c.title, "Analysis done")
+    local rec = K.track_record("tr")
+    eq(card_row("Vocal Range").value, "A3 \xE2\x80\x93 A3")
+    eq(card_row("Key").value, K.key_text(rec.key_idx, rec.scale_idx))
+    eq(c.lines[#c.lines], "Items already analyzed keep theirs.")
+    eq(st.status.text, "")
+  end)
+  auto_world({ tracks = SILENT_TRACK, ext = { tr = JSON.encode(t7_record(7, 1)) } }, function()
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    card_run_out()
+    eq(K.card, nil, "nothing found: the card closes")
+    eq(st.status.text, "Not enough singing to tell the key: kept F# Major.")
+  end)
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    t7_open(3, 1, false)
+    K.find_again_request()
+    K.analysis_tick()
+    w.dead["tr"], w.dead["tk_a"], w.dead["it_a"] = true, true, true
+    K.drop_project_cache()
+    card_run_out()
+    eq(K.card, nil, "the track went: the card closes"); eq(st.status.text, "This item is no longer in the project")
+  end)
+end)
+
+test("card_survives_a_vanished_item", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    w.dead["tk_a"], w.dead["it_a"] = true, true   -- the item is deleted while the done card is open
+    K.drop_project_cache()
+    w.log = {}
+    K.card.picked = 2
+    K.card_close(true)
+    eq(K.card, nil); eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(st.session_takes["{a}"].key_idx, 5)
+  end)
+end) end)
+
+test("card_short_analysis_still_waits", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    eq(st.pre, nil); eq(K.card.phase, "notes", "straight to finding notes")
+    K.analysis_tick()   -- the whole item in one frame
+    eq(st.is_analyzing, false)
+    K.card_update()
+    eq(K.card ~= nil and K.card.phase, "done", "open at done, waiting for OK")
+  end)
+end)
+
+test("card_not_opened_when_nothing_starts", function()
+  auto_world({ tracks = ONE_TRACK, offline = { tk_a = true }, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx, st.scale_idx = "{a}", "tk_a", 3, 1
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 1 }
+    S.start_analysis(auto_values(false))
+    eq(K.card, nil); eq(st.status.text, K.AUTO_UNREADABLE_TEXT)
+  end)
+  auto_world({ tracks = ONE_TRACK, offline = { tk_a = true } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    eq(K.card ~= nil, true, "the track is heard first")
+    card_run_out()
+    eq(K.card, nil, "the item could not be read: the card closes"); eq(st.status.text, K.AUTO_UNREADABLE_TEXT)
+  end)
+end)
+
+test("frame_error_closes_the_card", function()
+  local K = S.K
+  K.card = { kind = "single", phase = "notes", rows = {}, lines = {}, picked = 1 }
+  local ok, err = pcall(K.recover_after_error)
+  local left = K.card
+  K.card, K.track_records_pending, K.auto_run = nil, {}, nil
+  if not ok then error(err, 0) end
+  eq(left, nil)
+end)
+
+test("card_counts_as_a_window_modal", function()
+  local K = S.K
+  local is_open = rawget(reaper, "ImGui_IsPopupOpen")
+  rawset(reaper, "ImGui_IsPopupOpen", function(_, name) return name == K.CARD_POPUP end)
+  local saved = S.state.confirm
+  S.state.confirm = nil
+  K.card = { kind = "single", phase = "notes", rows = {}, lines = {}, picked = 1 }
+  local ok, err = pcall(function() eq(K.window_modal_open() == true, true) end)
+  K.card = nil
+  local ok2, err2 = pcall(function() eq(K.window_modal_open() == true, false, "closed: not a modal") end)
+  rawset(reaper, "ImGui_IsPopupOpen", is_open)
+  S.state.confirm = saved
+  if not ok then error(err, 0) end
+  if not ok2 then error(err2, 0) end
+end)
+
+test("locked_reason_has_no_progress", function()
+  auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function()
+    local K, st = S.K, S.state
+    K.batch_start(two_entries(), auto_values(true))
+    K.analysis_tick()
+    eq(st.pre ~= nil, true)
+    eq(K.locked_reason(), K.LOCKED_REASON, "no progress in the form")
+    eq(K.status_line(false), "", "no progress in the status line")
+    while st.pre do K.analysis_tick() end
+    K.analysis_tick()
+    eq(K.locked_reason(), K.LOCKED_REASON); eq(K.status_line(false), "")
+  end)
+end)
+
+test("more_menu_cancel_has_no_percent", function()
+  local K = S.K
+  eq(K.CANCEL_TEXT, "Cancel"); eq(K.CANCEL_BATCH_TEXT, "Cancel Batch")
+  eq(K.CANCEL_FMT, nil); eq(K.CANCEL_BATCH_FMT, nil)
+  eq(K.CANCEL_TEXT:find("%", 1, true), nil); eq(K.CANCEL_BATCH_TEXT:find("%", 1, true), nil)
+  eq(K.auto_status, nil, "no Found / Used messages any more"); eq(K.auto_run_status, nil)
+end)
+
+test("range_box_texts", function()
+  local K = S.K
+  local text, tip = K.range_box_text({ has_target = false })
+  eq(text, "\xE2\x80\x93"); eq(tip, nil)
+  text, tip = K.range_box_text({ has_target = true, values = auto_values(true), track_name = "Test" })
+  eq(text, "Auto"); eq(tip, "The range is found from the whole track when you analyze")
+  text, tip = K.range_box_text({ has_target = true, values = auto_values(false), track_name = "Test" })
+  eq(text, "Tenor"); eq(tip, "Vocal Range: Tenor (130\xE2\x80\x93500 Hz)")
+  local found = K.auto_values(auto_values(true), { st = {}, takes = {}, lo_st = 57, hi_st = 65 })
+  text, tip = K.range_box_text({ has_target = true, data = { analysis = found }, values = auto_values(false),
+    track_name = "Test" })
+  eq(text, "A3\xE2\x80\x93F4", "analysed: the range found, not the form's")
+  eq(tip, "Vocal range found on Test: 220\xE2\x80\x93349 Hz, with a little room either side")
+  text, tip = K.range_box_text({ has_target = true, data = { analysis = auto_values(false) },
+    values = auto_values(true), track_name = "Test" })
+  eq(text, "Tenor"); eq(tip, "Vocal Range: Tenor (130\xE2\x80\x93500 Hz)")
 end)
 
 -- Tests appended by later tasks go above this line.
