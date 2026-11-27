@@ -6675,7 +6675,7 @@ end
 test("batch_two_tracks_each_own_range", function()
   auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
     local K, st = S.K, S.state
-    -- a key picked for each item: only the range is found
+    -- a key picked for each item: only the range is found, and each track takes its item's key
     for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     K.batch_start(two_entries(), auto_values(true))
     eq(st.pre ~= nil, true, "stage 1 before the first item"); eq(st.pre.n_tracks, 2)
@@ -6695,7 +6695,9 @@ test("batch_two_tracks_each_own_range", function()
     eq(a.analysis.min_freq, (K.pre_range_hz(recs.tr1.lo_st, recs.tr1.hi_st)), "a: its own track's range")
     eq(b.analysis.min_freq, (K.pre_range_hz(recs.tr2.lo_st, recs.tr2.hi_st)), "b: its own track's range")
     eq(a.analysis.min_freq ~= b.analysis.min_freq, true)
-    eq(a.key_idx, 3, "the picked key"); eq(a.key_source, "picked")
+    eq(a.key_idx, 3, "the picked key"); eq(a.key_source, "picked"); eq(a.key_from_track, true, "a leads tr1")
+    eq(recs.tr1.key_idx, 3, "tr1 takes a's key"); eq(recs.tr2.key_idx, 3, "tr2 takes b's key")
+    eq(recs.tr1.alt_key_idx, nil); eq(recs.tr2.alt_key_idx, nil)
     local begins, starts, ends, at1, at2 = 0, nil, nil, index_of(w.log, "track:tr1"), index_of(w.log, "track:tr2")
     for i, s in ipairs(w.log) do
       if s == "begin" then begins = begins + 1; starts = i end
@@ -7693,14 +7695,31 @@ test("scale_locked_while_unset", function()
   eq(K.key_tooltip(nil, 5):find(K.KEY_UNSET_TOOLTIP, 1, true), nil, "not once a key is set")
   eq(K.key_tooltip(nil, 5):find("Auto", 1, true), nil, "no Auto in the Key tooltip")
   eq(K.key_tooltip(nil, 0):find("Auto", 1, true), nil)
+  -- what the Scale combo is drawn with (hdr_draw_scale uses it)
+  local disabled, idx, placeholder, tip = K.scale_combo_state(0, 4)
+  eq(disabled, true, "locked while no key is set"); eq(idx, 0, "no row selected"); eq(placeholder, "\xE2\x80\x93")
+  eq(tip, "Pick a key first, or it is found when you analyze")
+  disabled, idx, placeholder, tip = K.scale_combo_state(5, 2)
+  eq(disabled, false); eq(idx, 2, "the scale"); eq(placeholder, "\xE2\x80\x93")
+  eq(tip:find("^Scale\n\n") ~= nil, true, "the Scale tooltip")
 end)
 
 test("new_key_extstate_not_written", function() with_pending(function()
   local K, st = S.K, S.state
-  local writes, blocks = {}, 0
+  local writes, blocks, project_writes = {}, 0, 0
   local set_ext, begin = rawget(reaper, "SetExtState"), rawget(reaper, "Undo_BeginBlock")
+  local take_str, track_str = rawget(reaper, "GetSetMediaItemTakeInfo_String"),
+    rawget(reaper, "GetSetMediaTrackInfo_String")
   rawset(reaper, "SetExtState", function(_, key, value) writes[key] = value end)
   rawset(reaper, "Undo_BeginBlock", function() blocks = blocks + 1 end)
+  rawset(reaper, "GetSetMediaItemTakeInfo_String", function(_, _, _, set)
+    if set then project_writes = project_writes + 1 end
+    return false, ""
+  end)
+  rawset(reaper, "GetSetMediaTrackInfo_String", function(_, _, _, set)
+    if set then project_writes = project_writes + 1 end
+    return false, ""
+  end)
   local saved = { st.target_take_guid, st.key_idx, st.scale_idx, st.stored.pitch_key_hand_idx,
     st.stored.pitch_scale_hand_idx }
   st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx = nil, nil   -- every save is seen
@@ -7718,12 +7737,183 @@ test("new_key_extstate_not_written", function() with_pending(function()
     K.scale_changed("key")
     eq(K.pending_key["{n}"].scale_idx, 3, "a scale picked already stays")
     eq(writes.pitch_key_idx, nil); eq(writes.pitch_scale_idx, nil)
-    eq(blocks, 0, "no undo block")
+    eq(blocks, 0, "no undo block"); eq(project_writes, 0, "no take or track write")
   end)
   rawset(reaper, "SetExtState", set_ext)
   rawset(reaper, "Undo_BeginBlock", begin)
+  rawset(reaper, "GetSetMediaItemTakeInfo_String", take_str)
+  rawset(reaper, "GetSetMediaTrackInfo_String", track_str)
   st.target_take_guid, st.key_idx, st.scale_idx, st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx =
     table.unpack(saved, 1, 5)
+  if not ok then error(err, 0) end
+end) end)
+
+-- Fix round 1: a picked key leads its track in a batch too; Scale on a pick; a hand key on an analysed item ---------
+
+local function one_track_entries()
+  return { { guid = "{a}", take = "tk_a", item = "it_a", name = "A", len = 6, sample_rate = 8000, has_notes = false },
+    { guid = "{b}", take = "tk_b", item = "it_b", name = "B", len = 6, sample_rate = 8000, has_notes = false } }
+end
+
+local function track_writes(w, track)
+  local n, at = 0, nil
+  for i, s in ipairs(w.log) do if s == "track:" .. track then n, at = n + 1, i end end
+  return n, at
+end
+
+test("batch_picked_key_leads_track", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 2 }   -- A picked D Minor; B has no key
+    K.batch_start(one_track_entries(), auto_values(true))
+    auto_run_out()
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 3, "the track takes A's key"); eq(rec.scale_idx, 2); eq(rec.alt_key_idx, nil)
+    local a, b = st.session_takes["{a}"], st.session_takes["{b}"]
+    eq(a.key_idx, 3); eq(a.scale_idx, 2); eq(a.key_source, "picked"); eq(a.key_from_track, true)
+    eq(b.key_idx, 3, "B takes the track's key"); eq(b.scale_idx, 2); eq(b.key_source, "track")
+    eq(b.key_from_track, true)
+    local n, at = track_writes(w, "tr")
+    local bi, ei = index_of(w.log, "begin"), index_of(w.log, "end:Analyze Pitch (2 items)")
+    eq(n, 1, "one track write: " .. table.concat(w.log, ","))
+    eq(bi ~= nil and ei ~= nil and bi < at and at < ei, true, "inside the batch's block")
+    eq(next(K.track_records_pending), nil); eq(K.pending_key["{a}"], nil)
+  end)
+end) end)
+
+test("batch_two_picks_first_leads", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 2 }
+    K.pending_key["{b}"] = { key_idx = 8, scale_idx = 1 }
+    K.batch_start(one_track_entries(), auto_values(true))
+    auto_run_out()
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 3, "the first pick in batch order"); eq(rec.scale_idx, 2)
+    local a, b = st.session_takes["{a}"], st.session_takes["{b}"]
+    eq(a.key_idx, 3); eq(a.key_from_track, true)
+    eq(b.key_idx, 8, "B keeps its own pick"); eq(b.scale_idx, 1); eq(b.key_source, "picked")
+    eq(b.key_from_track, nil, "B does not follow the track")
+  end)
+end) end)
+
+test("batch_fixed_range_record_takes_pick", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    K.pending_key["{a}"] = { key_idx = 8, scale_idx = 2 }
+    K.batch_start(one_track_entries(), auto_values(false))
+    auto_run_out()
+    eq(w.pre_calls, 0, "no listening pass")
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 8); eq(rec.scale_idx, 2); eq(rec.alt_key_idx, nil); eq(rec.lo_st, 57, "the rest is kept")
+    local n, at = track_writes(w, "tr")
+    local bi, ei = index_of(w.log, "begin"), index_of(w.log, "end:Analyze Pitch (2 items)")
+    eq(n, 1); eq(bi < at and at < ei, true, "inside the batch's block: " .. table.concat(w.log, ","))
+    eq(st.session_takes["{b}"].key_idx, 8, "B follows"); eq(st.session_takes["{b}"].key_source, "track")
+  end)
+end) end)
+
+test("batch_picked_cancelled_writes_nothing", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
+    local K, st = S.K, S.state
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 2 }
+    K.batch_start(one_track_entries(), auto_values(true))
+    while st.pre do K.analysis_tick() end
+    eq(K.track_records_pending.tr ~= nil and K.track_records_pending.tr.key_idx, 3, "the pick leads, pending")
+    K.cancel_analysis()
+    eq(track_writes(w, "tr"), 0); eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil)
+    eq(K.pending_key["{a}"].key_idx, 3, "the pick stays for the next analysis")
+  end)
+end) end)
+
+test("key_pick_scale_rule", function() with_pending(function()
+  local K, st = S.K, S.state
+  local set_ext = rawget(reaper, "SetExtState")
+  rawset(reaper, "SetExtState", function() end)
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx }
+  local ok, err = pcall(function()
+    with_track_record(nil, function()
+      st.target_take_guid, st.key_idx, st.scale_idx = "{u}", 0, 1
+      st.key_idx, st.scale_idx = 4, 3   -- picked while "–" (the hidden scale is not a choice)
+      K.scale_changed("key")
+      eq(st.scale_idx, 1, "Major"); eq(K.pending_key["{u}"].scale_idx, 1)
+    end)
+    with_track_record({ st = {}, takes = {}, key_idx = 5, scale_idx = 2 }, function()
+      st.target_take_guid = "{t}"
+      K.adopt_new_item_values()
+      eq(st.key_idx, 5); eq(st.scale_idx, 2, "the track's E Minor")
+      st.key_idx = 3
+      K.scale_changed("key")
+      eq(st.scale_idx, 2, "the scale shown stays"); eq(K.pending_key["{t}"].scale_idx, 2)
+    end)
+  end)
+  rawset(reaper, "SetExtState", set_ext)
+  st.target_take_guid, st.key_idx, st.scale_idx = table.unpack(saved, 1, 3)
+  K.save_settings("key")
+  if not ok then error(err, 0) end
+end) end)
+
+test("hand_key_on_analysed_item_is_picked", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    local data = t7_open(5, 1, false)
+    data.key_source = "found"
+    st.key_idx = 3
+    K.scale_changed("key")
+    eq(data.key_source, "picked", "a key set by hand")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "written with the item in one block")
+    -- the item follows its track: its source stays
+    w.log = {}
+    data = t7_open(5, 1, true)
+    data.key_source = "found"
+    st.key_idx = 7
+    K.scale_changed("key")
+    eq(data.key_source, "found", "follows the track: unchanged")
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Key")
+  end)
+end) end)
+
+test("track_record_stored_ignores_pending", function()
+  local K = S.K
+  local old = rawget(reaper, "GetSetMediaTrackInfo_String")
+  rawset(reaper, "GetSetMediaTrackInfo_String", function() return true, "" end)
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    local rec = K.track_record_build(K.pre_tally_new(), {}, nil)
+    K.track_records_pending.trS = rec
+    eq(K.track_record("trS"), rec); eq(K.track_record_stored("trS"), nil, "nothing stored")
+    local copy = K.track_record_with_key({ st = {}, takes = {}, key_idx = 1, scale_idx = 1, alt_key_idx = 2,
+      alt_scale_idx = 2, lo_st = 40, hi_st = 50 }, 6, 2)
+    eq(copy.key_idx, 6); eq(copy.scale_idx, 2); eq(copy.alt_key_idx, nil); eq(copy.alt_scale_idx, nil)
+    eq(copy.lo_st, 40)
+  end)
+  rawset(reaper, "GetSetMediaTrackInfo_String", old)
+  K.track_records_pending = {}
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end)
+
+test("pending_key_pruned_on_project_change", function() with_pending(function()
+  local K, st = S.K, S.state
+  local by_guid, change_count = rawget(reaper, "GetMediaItemTakeByGUID"),
+    rawget(reaper, "GetProjectStateChangeCount")
+  local n = 50
+  rawset(reaper, "GetMediaItemTakeByGUID", function(_, guid) if guid == "{keep}" then return "tk" end end)
+  rawset(reaper, "GetProjectStateChangeCount", function() return n end)
+  local saved = { st.last_change_count, st.target_take_guid, st.key_idx, st.scale_idx }
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    K.pending_key["{keep}"] = { key_idx = 2, scale_idx = 1 }
+    K.pending_key["{gone}"] = { key_idx = 4, scale_idx = 1 }
+    st.target_take_guid, st.last_change_count = nil, 49
+    S.sync_with_project()
+    eq(K.pending_key["{gone}"], nil, "its item was deleted"); eq(K.pending_key["{keep}"].key_idx, 2)
+  end)
+  rawset(reaper, "GetMediaItemTakeByGUID", by_guid)
+  rawset(reaper, "GetProjectStateChangeCount", change_count)
+  st.last_change_count, st.target_take_guid, st.key_idx, st.scale_idx = table.unpack(saved, 1, 4)
+  K.drop_project_cache()
   if not ok then error(err, 0) end
 end) end)
 

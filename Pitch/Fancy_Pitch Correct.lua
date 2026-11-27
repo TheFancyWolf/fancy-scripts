@@ -556,6 +556,15 @@ K.KEY_UNSET_TEXT = "\xE2\x80\x93"   -- the Key and Scale combos' preview while n
 K.KEY_UNSET_TOOLTIP = "Pick the key if you know it. Otherwise it is found from the whole track when you analyze."
 K.SCALE_UNSET_REASON = "Pick a key first, or it is found when you analyze"
 
+--- How the Scale combo is drawn for the bar's `key_idx` / `scale_idx`: disabled, the selected row (0: none), the
+--- preview with no row ("–") and the tooltip (while no key is set: why it is locked).
+K.scale_combo_state = function(key_idx, scale_idx)
+  if key_idx == 0 then return true, 0, K.KEY_UNSET_TEXT, K.SCALE_UNSET_REASON end
+  return false, scale_idx, K.KEY_UNSET_TEXT,
+    "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\n"
+    .. "Right-click: apply Key and Scale to other items."
+end
+
 --- The Key combo's preview for key index `key_idx`: its short name ("C#"), or "–" while no key is set (0).
 K.key_preview = function(key_idx)
   local key = SCALE_KEYS[key_idx]
@@ -600,11 +609,10 @@ K.item_key_source = function(data)
   local track = K.take_track(guid)
   local rec = track and K.track_record(track)
   if not (rec and rec.key_idx) then return nil end
-  local pending = K.track_records_pending[track]
-  if pending then
-    K.track_records_pending[track] = nil
-    local stored = K.track_record(track)
-    K.track_records_pending[track] = pending
+  -- A batch whose pick gave the track its key (K.batch_lead_keys): the key is the track's, not found
+  if K.batch and K.batch.led and K.batch.led[track] then return "track" end
+  if K.track_records_pending[track] then
+    local stored = K.track_record_stored(track)
     if not (stored and stored.key_idx) then return "found" end
   end
   return "track"
@@ -613,7 +621,8 @@ end
 --- Settle the key of the new model `data` of an item analysed for the first time (K.item_key_source, stored as
 --- data.key_source). A picked key is the item's; with `records` (a single analysis) and a record on the item's
 --- track (stored, or found by this analysis), that record takes the picked key and scale (its runner-up dropped),
---- pending for the analysis's undo block, and the item follows its track. Any other key is the track's, else the
+--- pending for the analysis's undo block, and the item follows its track. In a batch (no `records`) the track's
+--- record was given its first pick already (K.batch_lead_keys); the item follows it when it holds the same key. Any other key is the track's, else the
 --- key last chosen by hand (K.key_resolve). A model change only. Returns the track whose record was given the picked
 --- key, or nil.
 K.item_key_settle = function(data, records)
@@ -626,13 +635,16 @@ K.item_key_settle = function(data, records)
   end
   local picked = K.pending_key[data.guid]
   data.key_idx, data.scale_idx, data.key_from_track = picked.key_idx, picked.scale_idx, nil
-  local track = records and K.take_track(data.guid)
+  local track = K.take_track(data.guid)
   local rec = track and K.track_record(track)
   if not rec then return nil end
-  local new = {}
-  for k, v in pairs(rec) do new[k] = v end
-  new.key_idx, new.scale_idx, new.alt_key_idx, new.alt_scale_idx = picked.key_idx, picked.scale_idx, nil, nil
-  K.track_records_pending[track] = new
+  if not records then
+    -- A batch gave each track its first pick before any item was read (K.batch_lead_keys): the item follows its
+    -- track when the track holds its key; another pick on that track is the item's alone
+    if rec.key_idx == picked.key_idx and rec.scale_idx == picked.scale_idx then data.key_from_track = true end
+    return nil
+  end
+  K.track_records_pending[track] = K.track_record_with_key(rec, picked.key_idx, picked.scale_idx)
   data.key_from_track = true
   return track
 end
@@ -1357,6 +1369,13 @@ K.track_record = function(track)
   if not track then return nil end
   local pending = K.track_records_pending and K.track_records_pending[track]
   if pending then return pending end
+  return K.track_record_stored(track)
+end
+
+--- The record stored on `track` (nil: none or not valid), whatever waits in K.track_records_pending; cached per
+--- project state.
+K.track_record_stored = function(track)
+  if not track then return nil end
   local cache = state.cache.trackscan
   local rec = cache[track]
   if rec ~= nil then return rec or nil end
@@ -1368,6 +1387,14 @@ K.track_record = function(track)
   end
   cache[track] = rec
   return rec or nil
+end
+
+--- A copy of the record `rec` that holds the key `key_idx` / `scale_idx` (a key chosen by hand: no runner-up).
+K.track_record_with_key = function(rec, key_idx, scale_idx)
+  local new = {}
+  for k, v in pairs(rec) do new[k] = v end
+  new.key_idx, new.scale_idx, new.alt_key_idx, new.alt_scale_idx = key_idx, scale_idx, nil, nil
+  return new
 end
 
 --- The tally (integer keys) of a record's `st` (string keys), for merging.
@@ -4368,12 +4395,35 @@ K.batch_start = function(entries, values)
   local batch = K.batch
   local tracks = K.batch_auto_tracks(entries, copy)
   if #tracks == 0 then
+    K.batch_lead_keys(batch)
     K.batch_next()
     return
   end
   batch.pre_ran = K.pre_begin(tracks, { on_done = function()
-    if K.batch == batch then K.batch_next() end
+    if K.batch == batch then
+      K.batch_lead_keys(batch)
+      K.batch_next()
+    end
   end })
+end
+
+--- Before any item of `batch` is read: on each track with a record (found by this batch's listening pass, or stored),
+--- the first item in batch order not analysed yet that has a picked key (K.pending_key) gives the track its key and
+--- scale (K.track_record_with_key, pending for the batch's one undo block, written only with an item of that track).
+--- batch.led[track] = true for those tracks: their other new items take that key as the track's.
+K.batch_lead_keys = function(batch)
+  batch.led = {}
+  for _, entry in ipairs(batch.queue) do
+    local picked = K.pending_key[entry.guid]
+    if picked and not state.session_takes[entry.guid] and not entry.has_notes then
+      local track = K.take_track(entry.guid)
+      local rec = track and not batch.led[track] and K.track_record(track)
+      if rec then
+        K.track_records_pending[track] = K.track_record_with_key(rec, picked.key_idx, picked.scale_idx)
+        batch.led[track] = true
+      end
+    end
+  end
 end
 
 --- The distinct tracks of `entries` (a batch's) whose items need the range or key found first: every item's when
@@ -4482,6 +4532,7 @@ local function sync_with_project()
   if state.last_change_count == count then return end
   state.last_change_count = count
   K.queue_stale_checks()   -- an undo, a redo or an edit in REAPER may have changed an envelope
+  K.pending_key_prune()   -- a key picked for an item that was deleted goes with it
 
   -- Whether an item's stored analysis is not what this window last saw (undo, redo): a held closing message
   -- ("Analyzed 3 items") then no longer describes the items and goes. Any other change in REAPER leaves it.
@@ -5365,11 +5416,9 @@ K.scale_changed = function(what)
   if not (state.is_analyzing or K.batch or state.pre) then follow, rec = K.key_follow_track(data) end
   if follow then
     -- The track's record takes the key (its runner-up no longer applies); written inside the item's undo block
-    local new = {}
-    for k, v in pairs(rec) do new[k] = v end
-    new.key_idx, new.scale_idx, new.alt_key_idx, new.alt_scale_idx = state.key_idx, state.scale_idx, nil, nil
-    K.track_records_pending[follow] = new
+    K.track_records_pending[follow] = K.track_record_with_key(rec, state.key_idx, state.scale_idx)
   else
+    data.key_source = "picked"   -- set by hand now: written with the item below
     K.save_settings("key")   -- ExtState: a preference, not part of the item's undo point
   end
   local count = K.mode_note_count(state.notes or {})
@@ -15018,13 +15067,12 @@ do
     local s = hs.s
     -- While no key is set (an item not analysed yet) the scale is "–", disabled with its reason (Theme.combo's
     -- tooltip shows on a disabled combo too)
-    local unset = (state.key_idx == 0)
-    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, unset and 0 or state.scale_idx, {
+    local disabled, idx, placeholder, tooltip = K.scale_combo_state(state.key_idx, state.scale_idx)
+    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, idx, {
       w = s.scale_w,
-      disabled = unset,
-      placeholder = K.KEY_UNSET_TEXT,
-      tooltip = unset and K.SCALE_UNSET_REASON
-        or "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\nRight-click: apply Key and Scale to other items.",
+      disabled = disabled,
+      placeholder = placeholder,
+      tooltip = tooltip,
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
