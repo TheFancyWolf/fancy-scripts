@@ -155,11 +155,11 @@ The same card with the title "Finding range and key", step 1 only; done: "Vocal 
 
 ### Narrow docker (~260 px)
 
-The card is the window's small modal size, wider than a 260 px docker, so it opens as its own OS window, undimmed, exactly as the window's existing modals do there (RB9, see Open questions). Its rows wrap: the label on one line, the value under it. In the top bar the Range box is the first thing to go when the bar runs out of width (the existing header rule for what hides first); the range stays readable in the Re-Analyze dialog.
+The card is capped to the script window's size, like the window's other modals, so it stays inside the window and is dimmed like them; its width shrinks with the window and long values wrap inside their column (the two columns stay). Only a window too small for any modal makes it its own OS window (RB9, see Open questions). In the top bar the Range box is the first thing to go when the bar runs out of width (the existing header rule for what hides first); the range stays readable in the Re-Analyze dialog.
 
 ### Wide short strip (e.g. 1200×150)
 
-The summary layout of the form is unchanged ("Analysis Settings: Auto · Clean / Strict · Standard   Change…   [Analyze Item]"). The card is centred on the window and may cover the whole strip; if the strip is shorter than the card, the card opens as its own OS window (RB9).
+The summary layout of the form is unchanged ("Analysis Settings: Auto · Clean / Strict · Standard   Change…   [Analyze Item]"). The card is centred on the note canvas, held inside the window, and may cover the whole strip; if the strip is shorter than the card can shrink to, the card opens as its own OS window (RB9).
 
 ## State inventory
 
@@ -205,9 +205,9 @@ Keyboard map: no new shortcut. Esc per HC5: the card is a modal, so Esc goes to 
 
 | Where | String |
 |---|---|
-| labels | "–" (Key and Scale not set; Range box with no item) · "Auto" (Vocal Range entry; Range box before analysis) · "Auto: E2–A4" (an analysed item's Vocal Range in the form) · "Find Range and Key Again" · card titles: "Analyzing 07_LeadVox copy.wav" · "Analyzing 3 of 12: Lead take 3.wav" · "Finding range and key" · "Analysis done" · rows: "Vocal Range" · "Key" · "Notes" · buttons: "Cancel" · "OK" |
+| labels | "–" (Key and Scale not set; Range box with no item) · "Auto" (Vocal Range entry; Range box before analysis) · "Auto: E2–A4" (an analysed item's Vocal Range in the form) · "Find Range and Key Again" · card titles: "Analyzing 07_LeadVox copy.wav" · "Analyzing 3 of 12: Lead take 3.wav" · "Analyzing 12 items" (a batch while it listens, before its first item) · "Finding range and key" · "Analysis done" · rows: "Vocal Range" · "Key" · "Notes" · buttons: "Cancel" · "OK" |
 | card step lines | "Listening to track "Test"…" · "Finding notes…" |
-| card row values | "listening…" · "waiting" · "finding…" · "A3 – F4" · "A3 – F4 (from track "Test")" · "Tenor (your choice)" · "C Minor" · "D Major (your choice)" · "31" · "none found. Try another Vocal Range or Detection Mode." · "These two fit equally well." · "No singing found: used Generic Vocal" · "Not enough singing to tell: kept E Major" · "Couldn't read 2 of 12 items on "Test" (media offline). Used the rest." · "Items already analyzed keep theirs." · batch row: "Lead Vox   B2 – A4 · E Major" |
+| card row values | "listening…" · "waiting" · "finding…" · "A3 – F4" · "A3 – F4 (from track "Test")" · "Tenor (your choice)" · "C Minor" · "C Minor (from track "Test")" · "D Major (your choice)" · "Custom (your choice)" (a hand-set Hz range) · "31" · "none found. Try another Vocal Range or Detection Mode." · "These two fit equally well." · "No singing found: used Generic Vocal" · "Not enough singing to tell: kept E Major" · "Couldn't read 2 of 12 items on "Test" (media offline). Used the rest." · "Items already analyzed keep theirs." · "Re-analyzed: values back to the defaults (Cmd+Z undoes)." (the existing sentence, as a line of the finished card) · batch row: "Lead Vox   B2 – A4 · E Major" (a value not known yet is "–"; problem texts and "(your choice)" notes may appear on either side of the dot) |
 | tooltips | Vocal Range "Auto": "Auto: Listens through the whole track first to find the singer's lowest and highest notes. Done once per track." · Key while "–": "Pick the key if you know it. Otherwise it is found from the whole track when you analyze." · Scale while disabled: "Pick a key first, or it is found when you analyze" · Key on an item whose key was found: "Found from Test. D# Major also fits." / "Found from Test." · Range box: "Vocal range found on Test: 208–370 Hz, with a little room either side" / "Vocal Range: Tenor (130–500 Hz)" / "The range is found from the whole track when you analyze" · disabled Min / Max Freq: "Found from the track" |
 | status messages | "Key for Test is now D Major. New items on this track follow." (unchanged) · the existing cancelled, unreadable-audio and item-gone messages |
 | undo labels | The existing analysis labels · "Set Key" · "Find Range and Key: Test" |
@@ -220,14 +220,14 @@ Keyboard map: no new shortcut. Esc per HC5: the card is a modal, so Esc goes to 
 |---|---|---|
 | Key "–" preview, Scale "–" | `Theme.combo` with its placeholder option (existing top bar combos) | n/a |
 | Range box | `Theme.badge` (read-only) + `Theme.tooltip` behind `HoveredFlags_ForTooltip` | palette keys of the badge preset; width from its text |
-| Analysis card | pending flag → `OpenPopup` once → `Theme.center_next_window` (on the canvas's centre) → `Theme.modal_scrim` → `BeginPopupModal`, height from its content | `L.modal_sm` |
+| Analysis card | pending flag → `OpenPopup` once → the window's modal size cap → centred on the note canvas each frame (window centre when no canvas is drawn) → `Theme.modal_scrim` → `BeginPopupModal`, height from its content | `L.modal_sm` |
 | Step line | `Theme.align` + text | `P.text` |
 | Progress bar | `Theme.progress_bar` with the percentage as its label | its preset; `L.sm` above and below |
 | Row labels ("Vocal Range", "Key", "Notes"; batch track names) | `Theme.align` + text in a two-column table | `P.text_dim`; `L.md` column gap |
 | Row values | text | `P.text`; waiting / listening values `P.text_dim` |
 | Problem lines | text | `P.text_dim` (no red: nothing failed that the user must fix) |
 | Key candidates | `reaper.ImGui_RadioButton` | `L.xs` between rows |
-| Cancel / OK | `Theme.right_align` + `reaper.ImGui_Button`; OK with the window's existing primary button preset | `L.md`, `L.sm` |
+| Cancel / OK | `Theme.right_align` + `reaper.ImGui_Button`, both plain, like the safe confirm of the window's other modals | `L.md`, `L.sm` |
 | Disabled Scale reason, Min / Max Freq reason | `Theme.tooltip` behind `HoveredFlags_ForTooltip | HoveredFlags_AllowWhenDisabled` | `P.text_dim` |
 
 ## Library proposals
@@ -308,6 +308,7 @@ None.
 - **Assumption (my call): a batch offers no key candidates** in its finished card; a close call is corrected per item afterwards.
 - Carried from revision 1: only Major and Natural Minor are found; the key is remembered per track; the key is found once per track and then stays; a result written by a cancelled or failed analysis never survives.
 - **Measured in real REAPER (2026-11-25):** the listening pass took 16.4 s for a track of 101 takes (19 minutes of audio), 0.85 s per minute. **Accuracy is not measured** beyond two tracks (E Major and C Minor found; the user has not yet confirmed C Minor).
-- **RB9:** in a docker narrower or shorter than the card, it opens as its own OS window, undimmed, like the window's existing modals.
+- **RB9:** the card is capped to the script window like the window's other modals (seen in REAPER on 2026-11-27: dimmed dark, not a separate window). Only a window too small for any modal makes it its own OS window.
+- **Decided while building (2026-11-27):** in a batch, the first item with a picked key leads its track, and items without a pick on that track follow it; picking a key applies Major only when Key was "–" (over a shown track key the shown scale is kept); a key changed by hand always counts as "your choice" afterwards; the finished card's OK is a plain button; a re-analysis that sets values back to the defaults says so in the card.
 - `ds-lint.py` baseline: not available. The linter stops with "theme.lua palette drifted from ds-lint's port of build_palette" (a tooling issue, recorded since 2026-11-24).
 - HC6 conflicts: None.
