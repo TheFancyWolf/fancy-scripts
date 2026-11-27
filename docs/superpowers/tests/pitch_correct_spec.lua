@@ -7186,6 +7186,12 @@ test("info_explains_auto_and_find_again", function()
   for _, note in ipairs(K.INFO_NOTES) do text[#text + 1] = note[1] .. " " .. note[2] end
   eq(text[1]:find("Auto", 1, true) ~= nil and text[1]:find("whole track", 1, true) ~= nil, true, "Auto")
   eq(text[2]:find("Key", 1, true) ~= nil and text[2]:find("found from the whole track", 1, true) ~= nil, true, "Key")
+  eq(text[2]:find("C Chromatic", 1, true) ~= nil and text[2]:find("change first is kept", 1, true) ~= nil, true,
+    "Key: a new item starts at C Chromatic; a key changed first is kept")
+  local header = io.open(SCRIPT):read(2000)
+  local changelog = header:match("%-%- @changelog\n%-%-   ([^\n]*)")
+  eq(changelog:find("C Chromatic", 1, true) ~= nil and changelog:find("change first is kept", 1, true) ~= nil, true,
+    "the @changelog line says it too")
   eq(text[3]:find("Find Range and Key Again", 1, true) ~= nil and text[3]:find("keep theirs", 1, true) ~= nil, true,
     "Find Range and Key Again")
   for _, section in ipairs(K.INFO_SECTIONS) do
@@ -7496,11 +7502,14 @@ test("picked_key_does_not_leak", function() with_pending(function()
     K.scale_changed("key")
     eq(K.pending_key["{A}"].key_idx, 4); eq(K.pending_key["{A}"].scale_idx, CHROMATIC, "the scale shown stays")
     eq(st.scale_idx, CHROMATIC, "the bar shows Chromatic")
+    st.scale_idx = 3   -- and Dorian: both halves differ from the default
+    K.scale_changed("scale")
+    eq(K.pending_key["{A}"].key_idx, 4); eq(K.pending_key["{A}"].scale_idx, 3)
     select_item("{B}")
-    eq(st.key_idx, C_KEY, "B is at the default, not A's pick"); eq(st.scale_idx, CHROMATIC)
+    eq(st.key_idx, C_KEY, "B is at the default, not A's pick"); eq(st.scale_idx, CHROMATIC, "nor A's scale")
     eq(K.pending_key["{B}"], nil)
     select_item("{A}")
-    eq(st.key_idx, 4, "A shows its picked key again")
+    eq(st.key_idx, 4, "A shows its picked key again"); eq(st.scale_idx, 3, "and its picked scale")
     -- A leaves the project: its key is forgotten the next time the open item changes
     rawset(reaper, "GetMediaItemTakeByGUID", function(_, guid) if guid ~= "{A}" then return "take" .. guid end end)
     K.drop_project_cache()
@@ -7525,13 +7534,15 @@ test("switch_pick_does_not_follow_to_the_next_item", function() t7_ext(function(
     eq(st.target_take_guid, "{a}"); eq(st.key_idx, C_KEY, "A starts at the default")
     st.key_idx = 4
     K.scale_changed("key")
-    eq(K.pending_key["{a}"].key_idx, 4)
+    st.scale_idx = 2
+    K.scale_changed("scale")
+    eq(K.pending_key["{a}"].key_idx, 4); eq(K.pending_key["{a}"].scale_idx, 2)
     eq(select_item("{b}", "tk_b"), false, "B is not analysed")
     eq(st.target_take_guid, "{b}")
-    eq(st.key_idx, C_KEY, "B shows the default, not A's pick"); eq(st.scale_idx, CHROMATIC)
+    eq(st.key_idx, C_KEY, "B shows the default, not A's pick"); eq(st.scale_idx, CHROMATIC, "nor A's scale")
     eq(K.pending_key["{b}"], nil, "nothing picked for B")
     select_item("{a}", "tk_a")
-    eq(st.key_idx, 4, "A keeps its pick")
+    eq(st.key_idx, 4, "A keeps its pick"); eq(st.scale_idx, 2)
   end)
 end) end)
 
@@ -8758,6 +8769,83 @@ test("hand_key_fallback_is_gone", function()
     st.target_take_guid, st.key_idx, st.scale_idx, st.session_takes["{h}"] = table.unpack(saved, 1, 4)
     if not ok then error(err, 0) end
     eq(writes.pitch_key_hand_idx, nil); eq(writes.pitch_scale_hand_idx, nil)
+  end)
+end)
+
+-- A stored item with a bad key index loads at the default; the bar never indexes a missing key or scale -----------
+
+-- The text a take stores for an analysed item "{bad}" whose key_idx / scale_idx are `key` / `scale` as stored
+local function stored_with_key(key, scale)
+  local t = JSON.decode(S.K.take_json({ guid = "{bad}", name = "Bad", results = { { time = 0, note = 60 } },
+    notes = {}, item_len = 1, sample_rate = 48000, key_idx = 5, scale_idx = 1, key_from_track = true,
+    key_source = "found" }))
+  t.key_idx, t.scale_idx = key, scale
+  return JSON.encode(t)
+end
+
+test("stored_bad_key_index_loads_at_the_default", function()
+  local cases = { { 0, 1 }, { 13, 1 }, { 5, 99 }, { "3", 1 }, { 2.5, 1 }, { 5, 0 }, { 5, "2" } }
+  for _, c in ipairs(cases) do
+    local what = tostring(c[1]) .. " / " .. tostring(c[2])
+    with_track_record(nil, function()
+      local data = S.load_take_data("tk_bad", stored_with_key(c[1], c[2]))
+      eq(type(data), "table", what .. ": still readable")
+      eq(data.key_idx, C_KEY, what .. ": C"); eq(data.scale_idx, CHROMATIC, what .. ": Chromatic")
+      eq(data.key_from_track, nil, what .. ": no track claim for a key it no longer has")
+      eq(data.key_source, nil, what .. ": no source for it")
+    end)
+    with_track_record({ st = {}, takes = {}, key_idx = 9, scale_idx = 2 }, function()
+      local data = S.load_take_data("tk_bad", stored_with_key(c[1], c[2]))
+      eq(data.key_idx, 9, what .. ": the track's key"); eq(data.scale_idx, 2)
+      eq(data.key_from_track, true, what .. ": seeded from the track")
+      eq(data.key_source, nil)
+    end)
+  end
+  -- a good pair is kept as stored, with what it says about it
+  with_track_record(nil, function()
+    local data = S.load_take_data("tk_bad", stored_with_key(4, 3))
+    eq(data.key_idx, 4); eq(data.scale_idx, 3); eq(data.key_from_track, true); eq(data.key_source, "found")
+  end)
+end)
+
+test("stored_bad_key_index_never_reaches_the_bar", function() t7_ext(function()
+  auto_world({ tracks = { tr2 = { items = { "it_a" }, freq = 440 } } }, function()
+    local st = S.state
+    rawset(reaper, "GetSetMediaItemTakeInfo_String", function(take, key)
+      if key == "GUID" then return true, take == "tk_a" and "{a}" or "" end
+      return true, take == "tk_a" and stored_with_key(13, 99) or ""
+    end)
+    st.target_take_guid = nil
+    S.switch_active_target("{a}", "tk_a")
+    eq(st.target_take_guid, "{a}")
+    eq(st.key_idx, C_KEY); eq(st.scale_idx, CHROMATIC)
+    eq(S.K.key_preview(st.key_idx), "C"); eq(S.K.scale_preview(st.scale_idx), "Chromatic")
+  end)
+end) end)
+
+test("bar_previews_never_index_nil", function()
+  local K = S.K
+  for _, bad in ipairs({ 0, 13, -1, 2.5, "3", false }) do
+    local ok, text = pcall(K.key_preview, bad)
+    eq(ok, true, "key_preview(" .. tostring(bad) .. ") raises: " .. tostring(text))
+    eq(text, "C", "the default key's name")
+    ok, text = pcall(K.scale_preview, bad)
+    eq(ok, true, "scale_preview(" .. tostring(bad) .. ") raises: " .. tostring(text))
+    eq(text, "Chromatic", "the default scale's name")
+  end
+  eq(K.key_preview(nil), "C"); eq(K.scale_preview(nil), "Chromatic")
+  eq(K.key_preview(2), "C#"); eq(K.scale_preview(1), "Major")
+end)
+
+test("reanalysis_keeps_a_stored_c_chromatic", function()
+  local K = S.K
+  with_track_record({ st = {}, takes = {}, key_idx = 9, scale_idx = 2 }, function()
+    local before = { guid = "{cc}", key_idx = C_KEY, scale_idx = CHROMATIC, key_source = "picked" }
+    local data = { guid = "{cc}", key_idx = 7, scale_idx = 1 }   -- the bar's mirrors while it was read
+    K.item_carry_key(data, before)
+    K.item_seed(data)
+    eq(data.key_idx, C_KEY, "its own C, not the track's key"); eq(data.scale_idx, CHROMATIC)
+    eq(data.key_source, "picked")
   end)
 end)
 

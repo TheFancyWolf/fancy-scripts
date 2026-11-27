@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.29.0
 -- @changelog
---   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; the key is found from the track unless you pick it; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu.
+--   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; a new item starts at C Chromatic (or its track's key), the key is found from the track when you leave it, and a key you change first is kept; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu.
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -561,9 +561,16 @@ K.KEY_UNSET_TOOLTIP = "Pick the key if you know it. Otherwise it is found from t
 K.SCALE_TOOLTIP = "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\n"
   .. "Right-click: apply Key and Scale to other items."
 
---- The Key combo's preview for key index `key_idx`: its short name ("C#").
+--- The Key combo's preview for key index `key_idx`: its short name ("C#"); an index that names no key gives the
+--- default key's, so the top bar never fails on one.
 K.key_preview = function(key_idx)
-  return SCALE_KEYS[key_idx].display
+  return (SCALE_KEYS[key_idx] or SCALE_KEYS[K.DEFAULT_KEY_IDX]).display
+end
+
+--- The Scale combo's preview for scale index `scale_idx`: its name; an index that names no scale gives the default
+--- scale's.
+K.scale_preview = function(scale_idx)
+  return (SCALE_DEFINITIONS[scale_idx] or SCALE_DEFINITIONS[K.DEFAULT_SCALE_IDX]).name
 end
 
 --- The key an item takes when nothing was picked for it (take `guid`): the key found on its track (its
@@ -4157,6 +4164,11 @@ local function load_take_data(take, raw)
   if readable then
     data.key_from_track = (data.key_from_track == true) or nil
     data.key_source = K.key_source_valid(data.key_source)
+    -- A key or scale index that names none drops the pair, with what it said about it: seeded afresh below (the
+    -- track's key, else the default)
+    if not (whole_in(data.key_idx, 1, #SCALE_KEYS) and whole_in(data.scale_idx, 1, #SCALE_DEFINITIONS)) then
+      data.key_idx, data.scale_idx, data.key_from_track, data.key_source = nil, nil, nil, nil
+    end
     K.item_seed(data)
     data.analysis = K.analysis_values(data.analysis)   -- a malformed record counts as not recorded
     data.name = K.live_take_name(take, data.name)   -- the name is REAPER's, not the one saved with the analysis
@@ -9952,7 +9964,7 @@ local function draw_graph(draw_ctx, w, h)
   -- Everything from here to the playhead is clipped to the note area: the note-name column and the two strips
   -- are drawn after it, and a block that runs past the window's edge must not reach them.
   local root_pc = (state.key_idx - 1) % 12
-  -- No key set (an item not analysed yet, e.g. while its analysis draws in): no scale yet, every row in key
+  -- Chromatic (also a new item's default, C Chromatic): every row in key
   local is_chromatic = SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic"
   reaper.ImGui_DrawList_PushClipRect(draw_list, px, py, px + w, py + h, true)
 
@@ -11733,7 +11745,7 @@ K.INFO_TERMS = "Reset reverts note edits · Clear discards analysis · Remove dr
 -- How the analysis finds the range and key: { label, sentence }, drawn under the Terms line in its style
 K.INFO_NOTES = {
   { "Auto", "Vocal Range on Auto hears the whole track once, before its first analysis, for the singer's lowest and highest notes." },
-  { "Key", "If you don't pick one, it is found from the whole track when you analyze; a key you pick is kept." },
+  { "Key", "A new item starts at C Chromatic, or its track's key. Leave it and it is found from the whole track when you analyze; a key you change first is kept." },
   { "Find Range and Key Again", "In the … menu, it hears the track afresh; items already analyzed keep theirs." },
 }
 
@@ -15617,8 +15629,10 @@ do
 
   local function hdr_draw_scale(hs)
     local s = hs.s
+    -- The preview is the scale's name; an index that names no scale previews the default's (K.scale_preview)
     local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, state.scale_idx, {
       w = s.scale_w,
+      placeholder = K.scale_preview(state.scale_idx),
       tooltip = K.SCALE_TOOLTIP,
     })
     if changed and new_idx ~= state.scale_idx then
@@ -17407,6 +17421,6 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
            clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session,
            start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS, reset_analysis_model = reset_analysis_model,
-           switch_active_target = switch_active_target }
+           switch_active_target = switch_active_target, load_take_data = load_take_data }
 end
 main()
