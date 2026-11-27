@@ -5,15 +5,14 @@ All notable changes to Fancy Scripts will be documented here.
 ## [Unreleased]
 
 - **Fancy Pitch Correct v2.29.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Auto Vocal Range and Key:
-  - **Vocal Range: Auto**: Vocal Range has a new first choice, Auto, the default on a fresh install. Before a track's first analysis the script listens through the whole track once to find the singer's lowest and highest notes, then analyses with that range. The item then shows the range it used, e.g. "Auto: E2–A4".
-  - **Key: Auto**: Key has a new first choice, Auto, for items not analysed yet (the default on a fresh install). The song's key (Major or Natural Minor) is found from the whole track. On a close call the status line and the Key tooltip name the other candidate.
-  - **Progress**: Analyze shows "Finding range and key… NN%" first, then the analysis itself. Cancel works in both stages.
+  - **Vocal Range: Auto**: Vocal Range has a new first choice, Auto, the default on a fresh install (a default range you saved is kept). Before a track's first analysis the script listens through the whole track once to find the singer's lowest and highest notes, then analyses with that range.
+  - **Key found for you**: a new item shows "–" for Key and Scale. Pick the key if you know it; otherwise it is found from the whole track when you analyze and selected in the list (Major or Minor). A key you pick first is never overridden and becomes the track's key.
+  - **Range in the top bar**: a small box after Scale shows the range in use, e.g. "A3–F4", the preset's name, or "Auto" before the analysis.
+  - **Analysis card**: every analysis (one item, a batch, or Find Range and Key Again) shows one card in the middle of the note window: the step, a progress bar, and the Vocal Range, Key and note count as they are found. Cancel works while it runs, and when it is done the card stays until you press OK. On a close call it offers the other key candidate.
   - **Remembered per track**: the range and key are found once and kept with the track in the project. Later items on the track reuse them and only new items are listened to. One Cmd+Z of the analysis undoes this too.
   - **Correcting the key**: correcting the key on an item whose key came from its track also corrects the track, so later items follow. Items analysed earlier keep theirs.
-  - **Find Key**: choosing Auto in Key on an analysed item gives it its track's key.
   - **Find Range and Key Again**: the "…" menu listens to the track afresh. Items already analysed keep theirs.
-  - **Min Freq and Max Freq**: with Vocal Range on Auto, they are shown in Advanced but not editable ("Found from the track").
-  - **Hand-picked settings**: with a hand-picked range and key, no extra listening pass runs.
+  - **Min Freq and Max Freq**: with Vocal Range on Auto, they are shown in Advanced but locked ("Found from the track").
 - **Fancy Pitch Correct v2.28.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Its own icon:
   - **Window header**: a white pitch line wobbles between two note lanes, rises and runs through a green corrected note, in place of the shared Fancy logo.
   - **Toolbar icon**: ReaPack installs `toolbar_fancy_pitch_correct.png` (100 %, 150 % and 200 %) into REAPER's toolbar icons, so you can pick it for the script's toolbar button. It lights up in the accent blue while the script runs. The SVG masters are in `toolbar_icons/svg/`.

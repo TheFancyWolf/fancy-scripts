@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.29.0
 -- @changelog
---   Auto Vocal Range and Key: Vocal Range and Key have a new first choice, Auto (the default on a fresh install); Analyze first listens through the whole track once to find the singer's lowest and highest notes and the song's key, remembered per track in the project (Find Range and Key Again in the ... menu), a corrected key follows the track, Cancel works in both stages, and a hand-picked range and key skips the extra listening.
+--   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; the key is found from the track unless you pick it; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu.
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -11741,7 +11741,8 @@ K.INFO_SECTIONS = {
 K.INFO_TERMS = "Reset reverts note edits · Clear discards analysis · Remove drops an item · Wipe removes all"
 -- How the analysis finds the range and key: { label, sentence }, drawn under the Terms line in its style
 K.INFO_NOTES = {
-  { "Auto", "Vocal Range and Key on Auto hear the whole track once, before its first analysis, for the singer's range and the song's key." },
+  { "Auto", "Vocal Range on Auto hears the whole track once, before its first analysis, for the singer's lowest and highest notes." },
+  { "Key", "If you don't pick one, it is found from the whole track when you analyze; a key you pick is kept." },
   { "Find Range and Key Again", "In the … menu, it hears the track afresh; items already analyzed keep theirs." },
 }
 

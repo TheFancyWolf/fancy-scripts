@@ -7218,11 +7218,12 @@ end)
 test("info_explains_auto_and_find_again", function()
   local K = S.K
   -- prose beside the Terms line, not rows of the shortcut tables
-  eq(#K.INFO_NOTES, 2, "two sentences")
+  eq(#K.INFO_NOTES, 3, "three sentences")
   local text = {}
   for _, note in ipairs(K.INFO_NOTES) do text[#text + 1] = note[1] .. " " .. note[2] end
   eq(text[1]:find("Auto", 1, true) ~= nil and text[1]:find("whole track", 1, true) ~= nil, true, "Auto")
-  eq(text[2]:find("Find Range and Key Again", 1, true) ~= nil and text[2]:find("keep theirs", 1, true) ~= nil, true,
+  eq(text[2]:find("Key", 1, true) ~= nil and text[2]:find("found from the whole track", 1, true) ~= nil, true, "Key")
+  eq(text[3]:find("Find Range and Key Again", 1, true) ~= nil and text[3]:find("keep theirs", 1, true) ~= nil, true,
     "Find Range and Key Again")
   for _, section in ipairs(K.INFO_SECTIONS) do
     for _, row in ipairs(section.rows) do
