@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.29.0
 -- @changelog
---   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; a new item starts at C Chromatic (or its track's key), the key is found from the track when you leave it, and a key you change first is kept; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu.
+--   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; a new item starts at C Chromatic (or its track's key), the key is found from the track when you leave it, and a key you change first is kept; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu; the Scale list adds Phrygian, Lydian, Mixolydian and Locrian, and the Key and Scale tooltips name a scale's relatives.
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -87,6 +87,11 @@ local SCALE_DEFINITIONS = {
   { name = "Pentatonic",       intervals = {0, 2, 4, 7, 9} },
   { name = "Minor Pentatonic", intervals = {0, 3, 5, 7, 10} },
   { name = "Chromatic",        intervals = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11} },
+  -- Items and track records store a scale's index: a new scale goes at the end (K.SCALE_ORDER is the list's order)
+  { name = "Phrygian",         intervals = {0, 1, 3, 5, 7, 8, 10} },
+  { name = "Lydian",           intervals = {0, 2, 4, 6, 7, 9, 11} },
+  { name = "Mixolydian",       intervals = {0, 2, 4, 5, 7, 9, 10} },
+  { name = "Locrian",          intervals = {0, 1, 3, 5, 6, 8, 10} },
 }
 
 -- Discover available pitch shift modes at startup
@@ -556,10 +561,85 @@ for i, scale in ipairs(SCALE_DEFINITIONS) do
   if scale.name == "Chromatic" then K.DEFAULT_SCALE_IDX = i end
 end
 
+-- The Scale list's rows in the order shown, as stored indices (found by name), and the scales in that order (the
+-- list Theme.combo draws). The bar, items and track records hold the stored index, never a row.
+K.SCALE_ORDER, K.SCALE_LIST, K.SCALE_ROW = {}, {}, {}
+do
+  local by_name = {}
+  for i, scale in ipairs(SCALE_DEFINITIONS) do by_name[scale.name] = i end
+  for _, name in ipairs({ "Major", "Natural Minor", "Dorian", "Phrygian", "Lydian", "Mixolydian", "Locrian",
+      "Pentatonic", "Minor Pentatonic", "Chromatic" }) do
+    local idx = by_name[name]
+    if idx then
+      K.SCALE_ORDER[#K.SCALE_ORDER + 1] = idx
+      K.SCALE_LIST[#K.SCALE_ORDER] = SCALE_DEFINITIONS[idx]
+      K.SCALE_ROW[idx] = #K.SCALE_ORDER
+    end
+  end
+end
+
+--- The row of the Scale list that shows stored scale `scale_idx`; 0 for an index that names no scale.
+K.scale_display_pos = function(scale_idx)
+  return K.SCALE_ROW[scale_idx] or 0
+end
+
+-- The modes of the major scale: the degree of the major scale each one starts on, and its ordinal in words
+K.MODE_DEGREES = { Dorian = 2, Phrygian = 3, Lydian = 4, Mixolydian = 5, Locrian = 7 }
+K.ORDINALS = { [2] = "2nd", [3] = "3rd", [4] = "4th", [5] = "5th", [7] = "7th" }
+
+--- The scale `scale_idx` in key `key_idx` and the scales with the same notes, in words ("D Dorian has the same notes
+--- as C Major and A Minor. It is the major scale started on its 2nd note."); "" for an unknown key or scale. The
+--- relatives come from the Major scale's intervals: its 6th degree is the relative minor, a mode's degree its offset.
+K.scale_relatives_text = function(key_idx, scale_idx)
+  local scale = SCALE_DEFINITIONS[scale_idx]
+  if not scale then return "" end
+  if scale.name == "Chromatic" then return "Chromatic has all twelve notes: nothing is out of key." end
+  local key = SCALE_KEYS[key_idx]
+  local major
+  for _, def in ipairs(SCALE_DEFINITIONS) do
+    if def.name == "Major" then major = def.intervals end
+  end
+  if not (key and major) then return "" end
+  local function key_at(semitones) return SCALE_KEYS[(key_idx - 1 + semitones) % 12 + 1].display end
+  local k, rel_minor, degree = key.display, major[6], K.MODE_DEGREES[scale.name]
+  if scale.name == "Major" then
+    return string.format("%s Major has the same notes as %s Minor.", k, key_at(rel_minor))
+  elseif scale.name == "Natural Minor" then
+    return string.format("%s Natural Minor has the same notes as %s Major.", k, key_at(-rel_minor))
+  elseif degree then
+    local up = major[degree]
+    return string.format("%s %s has the same notes as %s Major and %s Minor. It is the major scale started on its "
+      .. "%s note.", k, scale.name, key_at(-up), key_at(rel_minor - up), K.ORDINALS[degree])
+  elseif scale.name == "Pentatonic" then
+    return string.format("%s Pentatonic is five notes of %s Major: it leaves out the 4th and the 7th.", k, k)
+  elseif scale.name == "Minor Pentatonic" then
+    return string.format("%s Minor Pentatonic is five notes of %s Natural Minor: it leaves out the 2nd and the 6th.",
+      k, k)
+  end
+  return ""
+end
+
 K.DASH_TEXT = "\xE2\x80\x93"   -- a value not known: the Range box with no item, a batch row not heard yet (an en dash)
 K.KEY_UNSET_TOOLTIP = "Pick the key if you know it. Otherwise it is found from the whole track when you analyze."
 K.SCALE_TOOLTIP = "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\n"
   .. "Right-click: apply Key and Scale to other items."
+
+K.scale_tooltip_memo = {}
+
+--- The Scale combo's tooltip for key `key_idx` and scale `scale_idx`: K.SCALE_TOOLTIP, then the scale's relatives
+--- (K.scale_relatives_text). Kept per (key, scale), so the combo asks for it every frame without building a string.
+K.scale_tooltip = function(key_idx, scale_idx)
+  if key_idx == nil or scale_idx == nil then return K.SCALE_TOOLTIP end
+  local row = K.scale_tooltip_memo[key_idx]
+  if not row then row = {}; K.scale_tooltip_memo[key_idx] = row end
+  local tip = row[scale_idx]
+  if not tip then
+    local rel = K.scale_relatives_text(key_idx, scale_idx)
+    tip = rel ~= "" and (K.SCALE_TOOLTIP .. "\n\n" .. rel) or K.SCALE_TOOLTIP
+    row[scale_idx] = tip
+  end
+  return tip
+end
 
 --- The Key combo's preview for key index `key_idx`: its short name ("C#"); an index that names no key gives the
 --- default key's, so the top bar never fails on one.
@@ -688,14 +768,17 @@ end
 
 --- The Key combo's tooltip for the open item's model `data` (nil: not analysed), take `guid`: what Key is; on an item
 --- not analysed yet whose key is not set (K.new_item_key) how one is chosen; for a key found on the item's track where
---- from (K.key_found_text).
-K.key_tooltip = function(data, guid)
+--- from (K.key_found_text); last, the relatives of the bar's key `key_idx` and scale `scale_idx` when given
+--- (K.scale_relatives_text).
+K.key_tooltip = function(data, guid, key_idx, scale_idx)
   local found = K.key_found_text(data)
   local unset = not data and guid ~= nil and select(3, K.new_item_key(guid)) == "unset"
+  local rel = (key_idx ~= nil and scale_idx ~= nil) and K.scale_relatives_text(key_idx, scale_idx) or ""
   return "Key\n\nThe root note of the scale."
     .. (unset and ("\n\n" .. K.KEY_UNSET_TOOLTIP) or "")
     .. (found and ("\n\n" .. found) or "")
     .. "\n\nRight-click: apply Key and Scale to other items."
+    .. (rel ~= "" and ("\n\n" .. rel) or "")
 end
 
 --- The item's own value of `key`, or nil (Separation is stored beside the notes, the others in data.overrides).
@@ -5801,6 +5884,16 @@ end
 --- new scale: its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. On an
 --- analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the same
 --- undo point: later items on the track follow.
+--- Row `pos` of the Scale list was picked (K.SCALE_ORDER): the bar takes that row's stored index (K.scale_changed)
+--- when it is another scale.
+K.scale_pick = function(pos)
+  local idx = K.SCALE_ORDER[pos]
+  if idx and idx ~= state.scale_idx then
+    state.scale_idx = idx
+    K.scale_changed("scale")
+  end
+end
+
 K.scale_changed = function(what)
   local undo_label = (what == "scale") and "Set Scale" or "Set Key"
   local guid = state.target_take_guid
@@ -15623,22 +15716,21 @@ do
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       -- Built on hover only (K.key_tooltip: a found key names its track and the runner-up)
       Theme.tooltip(ctx, K.key_tooltip(state.target_take_guid and state.session_takes[state.target_take_guid],
-        hs.has_target and state.target_take_guid or nil))
+        hs.has_target and state.target_take_guid or nil, state.key_idx, state.scale_idx))
     end
   end
 
   local function hdr_draw_scale(hs)
     local s = hs.s
-    -- The preview is the scale's name; an index that names no scale previews the default's (K.scale_preview)
-    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, state.scale_idx, {
+    -- The list shows the scales in K.SCALE_ORDER: the combo works in rows, the bar holds the stored index. The
+    -- preview is the scale's name; an index that names no scale previews the default's (K.scale_preview). The
+    -- tooltip names the scale's relatives (K.scale_tooltip, kept per key and scale)
+    local new_pos, changed = Theme.combo(ctx, "##scale_selector", K.SCALE_LIST, K.scale_display_pos(state.scale_idx), {
       w = s.scale_w,
       placeholder = K.scale_preview(state.scale_idx),
-      tooltip = K.SCALE_TOOLTIP,
+      tooltip = K.scale_tooltip(state.key_idx, state.scale_idx),
     })
-    if changed and new_idx ~= state.scale_idx then
-      state.scale_idx = new_idx
-      K.scale_changed("scale")
-    end
+    if changed then K.scale_pick(new_pos) end
     hdr_key_menu("##ctx_scale")
   end
 

@@ -1581,7 +1581,7 @@ test("build_uses_the_takes_own_key_and_scale", function()
   local st = S.state
   local major
   for i, sc in ipairs(S.SCALE_DEFINITIONS) do if sc.name == "Major" then major = i end end
-  local chrom = #S.SCALE_DEFINITIONS
+  local chrom = CHROMATIC
   eq(S.SCALE_DEFINITIONS[chrom].name, "Chromatic")
   local saved = { st.target_take_guid, st.session_takes["{KS}"], st.key_idx, st.scale_idx }
   local function shift_with(take_scale, combo_key, combo_scale)
@@ -5433,7 +5433,7 @@ test("track_record_valid_rejects", function()
   end
   eq(K.track_record_valid("text"), nil, "string")
   bad(function(r) r.key_idx = 13 end, "key 13")
-  bad(function(r) r.scale_idx = 7 end, "scale 7")
+  bad(function(r) r.scale_idx = 11 end, "scale 11")
   bad(function(r) r.lo_st, r.hi_st = 61, 60 end, "lo > hi")
   bad(function(r) r.hi_st = nil end, "lo without hi")
   bad(function(r) r.st["52"] = "x" end, "st non-number")
@@ -7174,7 +7174,9 @@ test("track_record_holds_a_corrected_scale", function()
   local K = S.K
   local r = t7_record(5, 3)   -- E Dorian, chosen by hand on an item that follows its track
   eq(type(K.track_record_valid(r)), "table", "any scale of the bar")
-  eq(K.track_record_valid(t7_record(5, 7)), nil, "no scale 7")
+  eq(type(K.track_record_valid(t7_record(5, 7))), "table", "a mode (Phrygian) is a scale of the bar")
+  eq(type(K.track_record_valid(t7_record(5, 10))), "table", "Locrian, the last stored scale")
+  eq(K.track_record_valid(t7_record(5, 11)), nil, "no scale 11")
   eq(K.track_record_valid(t7_record(5, 3, { 2, 3 })), nil, "a runner-up is only ever Major or Minor")
 end)
 
@@ -8847,6 +8849,144 @@ test("reanalysis_keeps_a_stored_c_chromatic", function()
     eq(data.key_idx, C_KEY, "its own C, not the track's key"); eq(data.scale_idx, CHROMATIC)
     eq(data.key_source, "picked")
   end)
+end)
+
+-- Modes: four more scales, stored after the six first ones; the Scale list shows them next to Dorian ----------------
+
+local MODE_NAMES = { "Major", "Natural Minor", "Dorian", "Pentatonic", "Minor Pentatonic", "Chromatic",
+  "Phrygian", "Lydian", "Mixolydian", "Locrian" }
+local DISPLAY_NAMES = { "Major", "Natural Minor", "Dorian", "Phrygian", "Lydian", "Mixolydian", "Locrian",
+  "Pentatonic", "Minor Pentatonic", "Chromatic" }
+
+-- The pitch-class set { [0..11] = true } of the note names `names` (sharps, as SCALE_KEYS displays them)
+local function pcs_of(names)
+  local out = {}
+  for _, n in ipairs(names) do out[key_named(n) - 1] = true end
+  return out
+end
+
+local function same_pcs(a, b, msg)
+  for pc = 0, 11 do eq(a[pc] == true, b[pc] == true, msg .. " pc " .. pc) end
+end
+
+test("scale_positions_are_stable", function()
+  eq(#S.SCALE_DEFINITIONS, #MODE_NAMES)
+  for i, name in ipairs(MODE_NAMES) do eq(S.SCALE_DEFINITIONS[i].name, name, "stored scale " .. i) end
+  eq(S.SCALE_DEFINITIONS[S.K.DEFAULT_SCALE_IDX].name, "Chromatic")
+end)
+
+test("scale_display_order", function()
+  local order = S.K.SCALE_ORDER
+  eq(#order, #DISPLAY_NAMES)
+  local seen = {}
+  for pos, name in ipairs(DISPLAY_NAMES) do
+    local idx = order[pos]
+    eq(S.SCALE_DEFINITIONS[idx].name, name, "shown " .. pos)
+    eq(S.K.SCALE_LIST[pos], S.SCALE_DEFINITIONS[idx], "the list the combo draws, row " .. pos)
+    eq(S.K.scale_display_pos(idx), pos, "the row of stored " .. idx)
+    eq(seen[idx], nil, "stored " .. idx .. " once"); seen[idx] = true
+  end
+  for i = 1, #S.SCALE_DEFINITIONS do eq(seen[i], true, "stored " .. i .. " is shown") end
+  eq(S.K.scale_display_pos(99), 0, "a stored index that names no scale has no row")
+end)
+
+test("mode_pitch_classes", function()
+  local D = key_named("D")
+  local expect = {
+    Phrygian   = { "D", "D#", "F", "G", "A", "A#", "C" },
+    Lydian     = { "D", "E", "F#", "G#", "A", "B", "C#" },
+    Mixolydian = { "D", "E", "F#", "G", "A", "B", "C" },
+    Locrian    = { "D", "D#", "F", "G", "G#", "A#", "C" },
+  }
+  for name, notes in pairs(expect) do
+    local pcs = S.K.scale_pcs(D, scale_named(name))
+    same_pcs(pcs, pcs_of(notes), "D " .. name)
+    local n = 0
+    for _ in pairs(pcs) do n = n + 1 end
+    eq(n, 7, "D " .. name .. " has seven notes")
+  end
+end)
+
+test("modes_share_notes_with_their_relatives", function()
+  -- semitones from a mode's root down to its relative major
+  local down = { ["Natural Minor"] = 9, Dorian = 2, Phrygian = 4, Lydian = 5, Mixolydian = 7, Locrian = 11 }
+  local major = scale_named("Major")
+  for name, d in pairs(down) do
+    for k = 1, 12 do
+      local rel = (k - 1 - d) % 12 + 1
+      same_pcs(S.K.scale_pcs(k, scale_named(name)), S.K.scale_pcs(rel, major), name .. " on key " .. k)
+      local text = S.K.scale_relatives_text(k, scale_named(name))
+      eq(text:find("same notes as " .. S.COMBO_LABELS.keys[rel] .. " Major", 1, true) ~= nil, true,
+        name .. " on key " .. k .. " names its relative major: " .. text)
+    end
+  end
+end)
+
+test("scale_relatives_text_exact", function()
+  local f, k, sc = S.K.scale_relatives_text, key_named, scale_named
+  eq(f(k("E"), sc("Major")), "E Major has the same notes as C# Minor.")
+  eq(f(k("C"), sc("Natural Minor")), "C Natural Minor has the same notes as D# Major.")
+  local tail = " has the same notes as C Major and A Minor. It is the major scale started on its "
+  eq(f(k("D"), sc("Dorian")), "D Dorian" .. tail .. "2nd note.")
+  eq(f(k("E"), sc("Phrygian")), "E Phrygian" .. tail .. "3rd note.")
+  eq(f(k("F"), sc("Lydian")), "F Lydian" .. tail .. "4th note.")
+  eq(f(k("G"), sc("Mixolydian")), "G Mixolydian" .. tail .. "5th note.")
+  eq(f(k("B"), sc("Locrian")), "B Locrian" .. tail .. "7th note.")
+  eq(f(k("A"), sc("Pentatonic")), "A Pentatonic is five notes of A Major: it leaves out the 4th and the 7th.")
+  eq(f(k("A"), sc("Minor Pentatonic")),
+    "A Minor Pentatonic is five notes of A Natural Minor: it leaves out the 2nd and the 6th.")
+  eq(f(k("C"), sc("Chromatic")), "Chromatic has all twelve notes: nothing is out of key.")
+  eq(f(k("C"), 99), "", "an unknown scale")
+  eq(f(k("C"), nil), "", "no scale")
+end)
+
+test("scale_and_key_tooltips_name_the_relatives", function() with_pending(function()
+  local K = S.K
+  local D, dorian = key_named("D"), scale_named("Dorian")
+  local rel = K.scale_relatives_text(D, dorian)
+  eq(K.scale_tooltip(D, dorian), K.SCALE_TOOLTIP .. "\n\n" .. rel, "Scale: its own text, then the relatives")
+  eq(K.scale_tooltip_memo[D][dorian], K.scale_tooltip(D, dorian), "kept per key and scale")
+  eq(K.scale_tooltip(D, 99), K.SCALE_TOOLTIP, "no relatives for an unknown scale")
+  local tip = K.key_tooltip(nil, nil, D, dorian)
+  eq(tip:sub(-#rel - 2), "\n\n" .. rel, "Key: the relatives are its last paragraph")
+  eq(K.key_tooltip(nil, nil):find("same notes", 1, true), nil, "no pair given: no relatives")
+end) end)
+
+test("picking_a_mode_through_the_display_order", function() with_pending(function()
+  local K, st = S.K, S.state
+  local phrygian = scale_named("Phrygian")
+  eq(phrygian, 7)
+  local saved = { st.target_take_guid, st.session_takes["{pm}"], st.key_idx, st.scale_idx }
+  local ok, err = pcall(with_track_record, nil, function()
+    st.target_take_guid, st.session_takes["{pm}"] = "{pm}", nil
+    st.key_idx, st.scale_idx = key_named("D"), CHROMATIC
+    K.scale_pick(4)   -- the 4th row of the Scale list
+    eq(st.scale_idx, phrygian, "the bar holds Phrygian's stored index")
+    eq(K.pending_key["{pm}"].scale_idx, phrygian, "remembered for the item as the stored index")
+    same_pcs(st.scale_pc_set, K.scale_pcs(key_named("D"), phrygian), "the canvas marks D Phrygian")
+    eq(K.scale_preview(st.scale_idx), "Phrygian")
+    local data = S.load_take_data("tk_bad", stored_with_key(5, phrygian))
+    eq(data.scale_idx, phrygian, "an item stored with scale 7 keeps it")
+    eq(K.scale_preview(data.scale_idx), "Phrygian")
+    eq(S.load_take_data("tk_bad", stored_with_key(5, 10)).scale_idx, scale_named("Locrian"), "scale 10 is Locrian")
+    eq(S.load_take_data("tk_bad", stored_with_key(5, 11)).scale_idx, CHROMATIC, "scale 11 loads at the default")
+  end)
+  st.target_take_guid, st.session_takes["{pm}"], st.key_idx, st.scale_idx = table.unpack(saved, 1, 4)
+  if not ok then error(err, 0) end
+end) end)
+
+test("found_keys_are_still_major_or_minor", function()
+  local tallies = {
+    { [52]=300, [54]=100, [56]=180, [57]=120, [59]=250, [61]=100, [63]=60 },
+    { [57]=300, [59]=100, [60]=180, [62]=120, [64]=250, [65]=100, [67]=100 },
+    { [60]=100, [62]=100, [64]=100, [65]=100, [67]=100, [69]=100, [71]=100 },
+    { [62]=300, [64]=100, [65]=180, [67]=120, [69]=250, [71]=100, [72]=100 },   -- D Dorian sung
+  }
+  for i, notes in ipairs(tallies) do
+    local _, s, _, as = S.K.pre_key(tally_of(notes))
+    eq(s == 1 or s == 2, true, "tally " .. i .. " scale " .. tostring(s))
+    eq(as == nil or as == 1 or as == 2, true, "tally " .. i .. " runner-up " .. tostring(as))
+  end
 end)
 
 -- Tests appended by later tasks go above this line.
