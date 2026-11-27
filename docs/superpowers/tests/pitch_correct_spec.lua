@@ -4606,7 +4606,10 @@ test("reanalyze_without_confirm_says_the_values_went_back", function() with_writ
       at_analysis_end(st)
       K.analysis_tick()
       eq(st.is_analyzing, false, "the analysis ended")
-      return st.status.text
+      eq(st.status.text, "", "nothing in the status line: it is in the Analysis card")
+      local lines = table.concat(K.card and K.card.lines or {}, "|")
+      K.card = nil
+      return lines
     end
     eq(reanalyse(analysed_before("{a}")), "Re-analyzed: values back to the defaults (" .. MOD .. "+Z undoes).",
       "values that differed from the defaults: said")
@@ -7937,6 +7940,7 @@ test("card_text_builders", function()
   eq(K.card_title("single", "notes", "07_LeadVox copy.wav"), "Analyzing 07_LeadVox copy.wav")
   eq(K.card_title("batch", "notes", "Lead take 3.wav", 3, 12), "Analyzing 3 of 12: Lead take 3.wav")
   eq(K.card_title("batch", "listen", nil, 0, 12), "Analyzing 12 items", "the batch's listening pass, before item 1")
+  eq(K.card_title("batch", "listen", nil, 0, 2), "Analyzing 2 items")
   eq(K.card_title("again", "listen"), "Finding range and key")
   eq(K.card_title("single", "done", "x"), "Analysis done")
   eq(K.card_title("batch", "done", "x", 12, 12), "Analysis done")
@@ -8342,6 +8346,81 @@ test("range_box_texts", function()
   text, tip = K.range_box_text({ has_target = true, data = { analysis = auto_values(false) },
     values = auto_values(true), track_name = "Test" })
   eq(text, "Tenor"); eq(tip, "Vocal Range: Tenor (130\xE2\x80\x93500 Hz)")
+end)
+
+
+-- Fix round 1 of the Analysis card ----------------------------------------------------------------------------------
+
+test("card_closes_when_the_write_fails", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    K.write_take_envelope = function() return false end   -- the item's envelope cannot be written
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    eq(K.card, nil, "no 'Analysis done' for an item whose analysis was not saved")
+  end)
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    eq(K.card ~= nil and K.card.phase, "done", "written: the done card")
+  end)
+end)
+
+test("card_line_after_a_first_analysis_has_no_reanalyzed_note", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    K.reanalyze_status_guid = nil
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    local text = string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL)
+    for _, line in ipairs(K.card.lines) do eq(line ~= text, true, "a first analysis has nothing to go back") end
+    eq(K.card_lines({ reanalyzed = true })[1], text, "the existing sentence, as a card line")
+  end)
+end)
+
+test("card_batch_row_shows_a_picked_key", function()
+  local K = S.K
+  local row = K.card_batch_row("Lead Vox", nil, { auto_range = false, range = "Tenor",
+    item_key = { source = "picked", text = "D Major" } })
+  eq(row.value, "Tenor (your choice) \xC2\xB7 D Major (your choice)")
+  auto_world({ tracks = ONE_TRACK }, function()
+    local st = S.state
+    for _, g in ipairs({ "{a}", "{b}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
+    K.batch_start(one_track_entries(), auto_values(false))
+    card_run_out()
+    eq(K.card.phase, "done")
+    eq(K.card.rows[1].value, "Tenor (your choice) \xC2\xB7 D Major (your choice)", "the first written item's key")
+    eq(st.status.text, "")
+  end)
+end)
+
+test("card_closes_when_reset_drops_its_run", function()
+  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    K.analysis_tick()
+    eq(K.card ~= nil, true)
+    S.reset_analysis_model()   -- the open item removed, the session wiped
+    eq(K.card, nil, "closed at once"); eq(st.is_analyzing, false); eq(st.pre, nil)
+  end)
+end)
+
+test("card_center_on_the_canvas", function()
+  local K = S.K
+  local host = { x = 0, y = 0, w = 1000, h = 600 }
+  local cx, cy = K.card_center({ x = 0, y = 100, w = 800, h = 500 }, host, nil)
+  eq(cx, 400); eq(cy, 350)
+  cx, cy = K.card_center(nil, host, nil)
+  eq(cx, 500, "no canvas: the window's centre"); eq(cy, 300)
+  cx, cy = K.card_center({ x = 0, y = 100, w = 800, h = 500 }, host, { w = 420, h = 560 })
+  eq(cx, 400); eq(cy, 320, "held inside the window: a tall card moves up")
+  cx = K.card_center({ x = 0, y = 0, w = 300, h = 600 }, host, { w = 420, h = 200 })
+  eq(cx, 210, "held inside the window on the left")
 end)
 
 -- Tests appended by later tasks go above this line.

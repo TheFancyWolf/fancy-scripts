@@ -260,7 +260,7 @@ local K = {
   REASON_NO_TARGET = "Select an audio item",   -- why "..." entries that need the open item are disabled
   CANCELLED_TEXT = "Analysis cancelled.",
   -- A new analysis puts the item's values back to the defaults (only its Key and Scale stay): the Re-Analyze and
-  -- batch confirms say so, and with no confirm the status line says it once the analysis is written (HC4)
+  -- batch confirms say so, and with no confirm the Analysis card says it once the analysis is written (HC4)
   REANALYZE_VALUES_LINE = "Its values go back to the defaults; Key and Scale stay.",
   REANALYZE_VALUES_LINE_N = "Their values go back to the defaults; Key and Scale stay.",
   REANALYZED_DEFAULTS_TEXT = "Re-analyzed: values back to the defaults (%s+Z undoes).",
@@ -2925,7 +2925,7 @@ K.card_title = function(kind, phase, name, i, n)
   if kind == "again" then return "Finding range and key" end
   if kind == "batch" then
     n = n or 0
-    if not i or i < 1 then return n == 1 and "Analyzing 1 item" or string.format("Analyzing %d items", n) end
+    if not i or i < 1 then return string.format("Analyzing %d items", n) end
     return string.format("Analyzing %d of %d: %s", math.min(i, n), n, name or "")
   end
   return "Analyzing " .. (name or "")
@@ -2970,21 +2970,24 @@ K.card_notes_value = function(info)
 end
 
 --- The lines of a done card, in order: a batch's closing summary, the items of the track that could not be read,
---- and, after Find Range and Key Again, that analysed items keep their values. info = { summary = { text, ... },
---- skipped, total, track (its name), again }.
+--- after a re-analysis that its values went back to the defaults (HC4), and, after Find Range and Key Again, that
+--- analysed items keep their values. info = { summary = { text, ... }, skipped, total, track (its name), reanalyzed,
+--- again }.
 K.card_lines = function(info)
   local out = {}
   for _, line in ipairs(info.summary or {}) do out[#out + 1] = line end
   if (info.skipped or 0) > 0 then
     out[#out + 1] = string.format(K.SKIPPED_FMT, info.skipped, math.max(info.total or 0, info.skipped), info.track or "")
   end
+  if info.reanalyzed then out[#out + 1] = string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL) end
   if info.again then out[#out + 1] = "Items already analyzed keep theirs." end
   return out
 end
 
 --- A batch's row for the track named `track_name`: "<range> · <key>" from its `record` (nil: not heard yet, "–").
 --- opts = { auto_range (the batch's Vocal Range is Auto), range (the hand-picked range's name), want_key (an item of
---- the track had no key: one was to be found), kept (the key an item keeps when none could be told) }.
+--- the track had no key: one was to be found), kept (the key an item keeps when none could be told), item_key (the
+--- first written item's key, K.card_key_value info: shown when the record holds no key) }.
 K.card_batch_row = function(track_name, record, opts)
   opts = opts or {}
   local pending = false
@@ -2998,6 +3001,8 @@ K.card_batch_row = function(track_name, record, opts)
   end
   if record and record.key_idx then
     key = K.key_text(record.key_idx, record.scale_idx)
+  elseif opts.item_key then
+    key = K.card_key_value(opts.item_key)
   elseif record and opts.want_key then
     key = K.card_key_value({ source = "none", text = opts.kept })
   else
@@ -3093,7 +3098,17 @@ end
 
 --- The rows of a "batch" card: one per track that has an item in the batch (c.tracks, in batch order), from its
 --- record once heard (a track still waiting in the running listening pass shows "–").
-K.card_batch_rows = function(c)
+K.card_batch_rows = function(c, written)
+  -- Once done: the key of each track's first written item, for a track whose record holds none
+  local item_keys = {}
+  for _, entry in ipairs(written or {}) do
+    local track, data = K.take_track(entry.guid), entry.data
+    if track and data and not item_keys[track] then
+      local src = K.key_source_valid(data.key_source)
+      item_keys[track] = { source = src == "picked" and "picked" or (src == nil and "none" or "own"),
+        text = K.key_text(data.key_idx, data.scale_idx) }
+    end
+  end
   local rows = {}
   local pre = state.pre
   local values = c.values or {}
@@ -3110,8 +3125,10 @@ K.card_batch_rows = function(c)
       end
       if not waiting then rec = K.track_record(t.track) end
     end
+    local item_key = item_keys[t.track]
+    if item_key and item_key.source == "none" and not t.want_key then item_key.source = "own" end
     rows[#rows + 1] = K.card_batch_row(t.name, rec, { auto_range = values.auto_range == true, range = range,
-      want_key = t.want_key, kept = kept })
+      want_key = t.want_key, kept = kept, item_key = item_key })
   end
   return rows
 end
@@ -3158,15 +3175,15 @@ K.card_update = function()
 end
 
 --- The run of the open card finished with something to show: its done rows and lines from `result` (a "single"
---- card: { data, run }; "batch": { summary = the closing message }; "again": { rec, found_key, kept, total,
---- track_name }). It stays open until the user closes it, and holds no pointer from here on.
+--- card: { data, run, reanalyzed }; "batch": { summary = the closing message, written = its written entries };
+--- "again": { rec, found_key, kept, total, track_name }). It stays open until the user closes it, and holds no pointer from here on.
 K.card_done = function(result)
   local c = K.card
   if not c then return end
   c.phase, c.progress = "done", 1
   c.title = K.card_title(c.kind, "done")
   if c.kind == "batch" then
-    c.rows = K.card_batch_rows(c)
+    c.rows = K.card_batch_rows(c, result.written)
     c.lines = K.card_lines({ summary = { result.summary } })
     c.step = nil
   elseif c.kind == "again" then
@@ -3178,13 +3195,30 @@ K.card_done = function(result)
     c.rows = K.card_single_rows(c, "done", result)
     local run, rec = result.run, result.run and result.run.rec
     c.lines = K.card_lines({ skipped = (run and run.fresh and rec) and rec.skipped or 0, total = run and run.total,
-      track = c.track_name })
+      track = c.track_name, reanalyzed = result.reanalyzed })
     c.step = result.data and result.data.name or c.name
     local take = c.guid and resolve_take_by_guid(c.guid, true)
     local track = take and reaper.GetMediaItemTake_Track(take)
     c.track = track and reaper.GetTrackGUID(track) or nil
   end
   c.tracks, c.values, c.built = nil, nil, nil
+end
+
+--- Where the card's centre goes (screen): the middle of the note canvas `canvas` ({ x, y, w, h }; nil when none
+--- was drawn: the middle of the window `host`), held so that a card of `size` ({ w, h }, nil: not measured yet)
+--- stays inside `host`.
+K.card_center = function(canvas, host, size)
+  local r = canvas or host
+  local cx, cy = r.x + r.w / 2, r.y + r.h / 2
+  if size and host then
+    local function hold(v, lo, len, half)
+      if half * 2 >= len then return lo + len / 2 end
+      return math.max(lo + half, math.min(lo + len - half, v))
+    end
+    cx = hold(cx, host.x, host.w, size.w / 2)
+    cy = hold(cy, host.y, host.h, size.h / 2)
+  end
+  return cx, cy
 end
 
 --- The key candidates of the done card `c` (its Key row's), or nil.
@@ -4625,7 +4659,7 @@ K.batch_finish = function(cancelled)
     K.card = nil
     K.status_hold(summary)
   else
-    K.card_done({ summary = summary })
+    K.card_done({ summary = summary, written = written })
   end
 end
 
@@ -7270,12 +7304,14 @@ local function process_analysis_step()
       local run = K.auto_run
       if run and run.guid ~= state.target_take_guid then run = nil end
       if resolve_take_by_guid(state.target_take_guid, true) then
-        if apply_envelope_to_take("Analyze Pitch", true, (run ~= nil) or picked_track)
-            and K.reanalyze_status_guid == state.target_take_guid then
-          set_status(string.format(K.REANALYZED_DEFAULTS_TEXT, K.MOD_LABEL))
+        if apply_envelope_to_take("Analyze Pitch", true, (run ~= nil) or picked_track) then
+          -- What was found and used shows in the Analysis card, which stays open until the user closes it; an item
+          -- whose values went back to the defaults is told so there (K.request_analyze)
+          K.card_done({ data = take_data, run = run,
+            reanalyzed = K.reanalyze_status_guid == state.target_take_guid })
+        else
+          K.card_close(false)   -- not written: the status line says why
         end
-        -- What was found and used shows in the Analysis card, which stays open until the user closes it
-        K.card_done({ data = take_data, run = run })
       else
         state.missing_takes[state.target_take_guid] = true
         K.card_close(false)   -- the item went: nothing was stored on it
@@ -8628,6 +8664,7 @@ local function draw_graph(draw_ctx, w, h)
   local full_px = px
   local full_w = w
   local full_h = h
+  K.canvas_rect = { x = full_px, y = py, w = full_w, h = full_h }   -- the Analysis card is centred on it
   px = px + piano_w
   w = w - piano_w
 
@@ -13993,15 +14030,16 @@ local function draw_confirm_modal()
   K.confirm_draw(c, nil, function() if state.confirm == c then state.confirm = nil end end)
 end
 
---- The Analysis card (K.card) as a modal of the window: L.modal_sm wide, as tall as its content, centred on the
---- window when it appears, the scrim drawn by Theme.modal_scrim. It lays out what the card's model holds: the step
+--- The Analysis card (K.card) as a modal of the window, begun like the window's other modals: kept inside the
+--- window (K.fit_modal), L.modal_sm wide, as tall as its content, its centre on the note canvas every frame
+--- (K.card_center, so it stays centred as its height changes), the scrim drawn by Theme.modal_scrim. It lays out what the card's model holds: the step
 --- line, the progress bar while it runs, a batch's summary, the rows (label | value; the key candidates as radio
 --- rows), the lines, then Cancel (running) or OK (done) at the right. HC5: Esc cancels a running card and closes a
 --- done one; Enter is OK once done. Called every frame in the main window's scope; with no card it closes a popup
 --- left open (the card was closed elsewhere: a Cancel, an error, the run dropped).
 K.card_draw = function()
   local c = K.card
-  local flags = reaper.ImGui_WindowFlags_AlwaysAutoResize()
+  local flags = reaper.ImGui_WindowFlags_NoResize() | reaper.ImGui_WindowFlags_NoMove()
   if not c then
     if reaper.ImGui_IsPopupOpen(ctx, K.CARD_POPUP) then
       if reaper.ImGui_BeginPopupModal(ctx, K.CARD_POPUP, nil, flags) then
@@ -14020,9 +14058,26 @@ K.card_draw = function()
     reaper.ImGui_OpenPopup(ctx, name)
     c.open_pending = false
   end
-  Theme.center_next_window(ctx, L.modal_sm.w, 0, reaper.ImGui_Cond_Appearing())
+  -- Inside the window it opens from, as the other modals: capped to it (a dialog larger than the window would be
+  -- an OS window of its own), placed inside it, its width fixed and its height fitted to its content each frame
+  local host_x, host_y = reaper.ImGui_GetWindowPos(ctx)
+  local host_w, host_h = reaper.ImGui_GetWindowSize(ctx)
+  local max_w = K.fit_modal(ctx, host_w, host_h)
+  local host = { x = host_x or 0, y = host_y or 0, w = host_w or 0, h = host_h or 0 }
+  local cx, cy = K.card_center(K.canvas_rect, host, c.size)
+  reaper.ImGui_SetNextWindowPos(ctx, cx, cy, reaper.ImGui_Cond_Always(), 0.5, 0.5)
+  reaper.ImGui_SetNextWindowSize(ctx, math.min(L.modal_sm.w, max_w), 0)   -- 0: the height fits its content
   Theme.modal_scrim(ctx, K.CARD_POPUP)
-  if not reaper.ImGui_BeginPopupModal(ctx, name, nil, flags) then return end
+  -- Not measured yet: drawn see-through for that frame (the scrim as usual), then placed with its real size
+  local hidden = c.size == nil
+  if hidden then reaper.ImGui_PushStyleVar(ctx, reaper.ImGui_StyleVar_Alpha(), 0) end
+  local visible = reaper.ImGui_BeginPopupModal(ctx, name, nil, flags)
+  if not visible then
+    if hidden then reaper.ImGui_PopStyleVar(ctx, 1) end
+    return
+  end
+  local win_w, win_h = reaper.ImGui_GetWindowSize(ctx)
+  if win_w and win_h then c.size = { w = win_w, h = win_h } end
 
   local running = c.phase ~= "done"
   local cancel, close, confirm = false, false, false
@@ -14110,18 +14165,20 @@ K.card_draw = function()
     draw_lines()
   end
 
-  -- One button at a time: Cancel while it runs, then OK (the primary look), at the right
+  -- One button at a time, at the right: Cancel while it runs, then OK, both plain buttons as in the window's other
+  -- modals (their Cancel, and the confirm of one that loses nothing)
   reaper.ImGui_Dummy(ctx, 0, L.lg)
   local label = running and "Cancel" or "OK"
   local btn_w = ((reaper.ImGui_CalcTextSize(ctx, label)) or 0) + L.md * 2
   Theme.right_align(ctx, btn_w)
   if running then
     if reaper.ImGui_Button(ctx, "Cancel###card_cancel", btn_w, 0) then cancel = true end
-  elseif Theme.toggle_button(ctx, "card_ok", "OK", true, { w = btn_w }) then
+  elseif reaper.ImGui_Button(ctx, "OK###card_ok", btn_w, 0) then
     confirm = true
   end
   if cancel or close or confirm then reaper.ImGui_CloseCurrentPopup(ctx) end
   reaper.ImGui_EndPopup(ctx)
+  if hidden then reaper.ImGui_PopStyleVar(ctx, 1) end
 
   -- The action runs once the popup's stacks are balanced
   if cancel then
@@ -17100,6 +17157,7 @@ local function loop_body()
 
     -- Asked here, in the window's own ID scope, for the canvas form (drawn inside the body table, see K.child_dim)
     K.window_modal_now = K.window_modal_open()
+    K.canvas_rect = nil   -- set again by the canvas when it is drawn this frame (K.card_center)
     local split_drawn = false
     if total_h > 80 then
       if state.sidebar_open and sidebar_fits then
@@ -17363,6 +17421,6 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            get_effective = get_effective, get_override_level = get_override_level,
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
            clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session,
-           start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS }
+           start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS, reset_analysis_model = reset_analysis_model }
 end
 main()
