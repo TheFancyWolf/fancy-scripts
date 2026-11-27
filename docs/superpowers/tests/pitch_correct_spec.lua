@@ -2979,12 +2979,15 @@ test("first_analysis_of_a_new_item_uses_the_defaults", function()
     st.end_time, st.current_time, #st.session_order }
   local ok, err = pcall(function()
     st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{n}", S.DEFAULTS.separation, 4, 2
+    K.pending_key["{n}"] = { key_idx = 4, scale_idx = 2 }   -- picked in the bar before the first analysis
     at_analysis_end(st)
     K.analysis_tick()
     local data = st.session_takes["{n}"]
     check_defaults(data, "a new item")
-    eq(data.key_idx, 4, "the Key the bar shows"); eq(data.scale_idx, 2)
+    eq(data.key_idx, 4, "the Key picked"); eq(data.scale_idx, 2); eq(data.key_source, "picked")
+    eq(K.pending_key["{n}"], nil, "dropped once analysed")
   end)
+  K.pending_key["{n}"] = nil
   st.session_takes["{n}"], st.missing_takes["{n}"], st.stale_takes["{n}"] = nil, nil, nil
   while #st.session_order > saved[10] do table.remove(st.session_order) end
   st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.results, st.notes, st.sample_rate, st.end_time,
@@ -3044,12 +3047,11 @@ test("batch_stored_analysis_not_loaded_yet_keeps_only_its_key", function() with_
   if not ok then error(err, 0) end
 end) end)
 
-test("batch_first_analysis_takes_the_defaults_and_the_last_key", function() with_batch(function(rec)
+test("batch_first_analysis_takes_the_defaults_and_the_picked_key", function() with_batch(function(rec)
   local K, st = S.K, S.state
-  local NK = K.new_key
-  local saved = { st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx }
+  local saved = { st.separation, st.key_idx, st.scale_idx }
   local ok, err = pcall(function()
-    NK.key_idx, NK.scale_idx = 2, 4   -- the Key and Scale last chosen in the bar
+    K.pending_key["{a}"] = { key_idx = 2, scale_idx = 4 }   -- picked in the bar before its first analysis
     st.session_takes["{o}"] = analysed_before("{o}")   -- the open item, with values of its own
     st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{o}", 0.8, 5, 3
     K.batch_start(entries3())
@@ -3059,10 +3061,12 @@ test("batch_first_analysis_takes_the_defaults_and_the_last_key", function() with
     K.analysis_tick()
     local data = K.batch.done[1].data
     check_defaults(data, "a new item of a batch")
-    eq(data.key_idx, 2, "the last chosen Key"); eq(data.scale_idx, 4)
+    eq(data.key_idx, 2, "the picked Key"); eq(data.scale_idx, 4); eq(data.key_source, "picked")
+    eq(rec.begun[2].key_idx, 0, "an item with no key picked shows none while it is read")
   end)
+  K.pending_key["{a}"] = nil
   st.session_takes["{o}"] = nil
-  st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx = table.unpack(saved, 1, 5)
+  st.separation, st.key_idx, st.scale_idx = table.unpack(saved, 1, 3)
   st.analysis_params = nil
   if not ok then error(err, 0) end
 end) end)
@@ -3215,17 +3219,18 @@ test("item_seed_fills_all_with_the_defaults", function()
     if v == nil then error("missing " .. key) end
     eq(v, S.DEFAULTS[key], key)
   end
-  -- the last chosen, or (Auto, the fresh default) the real key it stands for: never Auto
-  local want_key, want_scale = K.key_resolve(K.new_key.key_idx, K.new_key.scale_idx, nil)
-  eq(data.key_idx, want_key, "key_idx: the last chosen")
-  eq(data.scale_idx, want_scale, "scale_idx: the last chosen")
+  -- no key: the real key not set (0) stands for, the hand key here (no track): never 0
+  local want_key, want_scale = K.key_resolve(0, nil, nil)
+  eq(data.key_idx, want_key, "key_idx: the hand key")
+  eq(data.scale_idx, want_scale, "scale_idx: the hand scale")
   eq(K.item_seed(data), false, "second seed fills nothing")
 end)
 
 test("new_item_ignores_old_starting_values_in_extstate", function()
   -- ExtState written by 2.22 builds before "Always defaults": the user's old starting values
   local old = { pitch_tighten = "0.85", pitch_slide_in = "0.5", pitch_tolerance = "12", pitch_start_separation = "1",
-    pitch_correct_mode = "1", pitch_retune_speed = "0.4", pitch_key_idx = "5", pitch_scale_idx = "3" }
+    pitch_correct_mode = "1", pitch_retune_speed = "0.4", pitch_key_idx = "5", pitch_scale_idx = "3",
+    pitch_key_hand_idx = "5", pitch_scale_hand_idx = "3" }
   for k in pairs(ext_asked) do ext_asked[k] = nil end
   local T = load_script(old)
   reaper.GetExtState = function() return "" end   -- the harness's own stub again
@@ -3236,11 +3241,13 @@ test("new_item_ignores_old_starting_values_in_extstate", function()
   end
   eq(T.global_defaults, nil, "no starting values")
   eq(st.separation, D.separation, "the window shows the default Separation")
-  eq(st.key_idx, 5, "the Key last chosen in the bar"); eq(st.scale_idx, 3)
+  eq(ext_asked.pitch_key_idx, nil, "the Key for new items is not read any more")
+  eq(ext_asked.pitch_scale_idx, nil)
+  eq(st.key_idx, 0, "nothing open: no key set"); eq(st.scale_idx, 1)
   local data = { notes = {}, results = {} }
   K.item_seed(data)
   for _, key in ipairs(K.ITEM_KEYS) do eq(K.item_value(data, key), D[key], "a new item's " .. key) end
-  eq(data.key_idx, 5); eq(data.scale_idx, 3)
+  eq(data.key_idx, 5, "no key found: the one last chosen by hand"); eq(data.scale_idx, 3)
   eq(T.get_effective(nil, "tighten"), D.tighten, "nothing open: the default")
 end)
 
@@ -3416,16 +3423,15 @@ test("sys_default_request_saves_on_confirm", function()
 end)
 
 test("unanalysed_take_takes_the_defaults", function()
-  local st, NK = S.state, S.K.new_key
-  local saved = { NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx }
-  NK.key_idx, NK.scale_idx = 4, 2
-  st.separation, st.key_idx, st.scale_idx = 0.1, 9, 1
+  local st = S.state
+  local saved = { st.separation, st.key_idx, st.scale_idx }
+  st.separation, st.key_idx, st.scale_idx = 0.1, 9, 3
   S.K.adopt_new_item_values()
   local got = { st.separation, st.key_idx, st.scale_idx }
-  NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx = table.unpack(saved)
+  st.separation, st.key_idx, st.scale_idx = table.unpack(saved)
   eq(got[1], S.DEFAULTS.separation, "separation")
-  eq(got[2], 4, "key_idx: the last chosen")
-  eq(got[3], 2, "scale_idx")
+  eq(got[2], 0, "key_idx: not set")
+  eq(got[3], 1, "scale_idx")
 end)
 
 -- Item values reach every note (value levels, Task 2) --------------------------------------------------------------
@@ -3631,30 +3637,6 @@ test("bar_write_note_zero", function()
     eq(n.controls.slide_in, 0, "Slide In 0 too")
     eq(S.state.session_takes["{IV}"].overrides.tighten, 0.4, "the item is untouched")
   end)
-end)
-
-test("scale_change_stores_the_key_for_new_items", function()
-  local st, K, NK = S.state, S.K, S.K.new_key
-  local writes = {}
-  local set_ext = reaper.SetExtState
-  reaper.SetExtState = function(_, key, value) writes[key] = value end
-  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.separation }
-  st.target_take_guid = nil
-  st.key_idx = (NK.key_idx or 1) % 12 + 1
-  local want = st.key_idx
-  local ok, err = pcall(function()
-    K.scale_changed("key")
-    eq(NK.key_idx, want, "the Key last chosen")
-    eq(writes.pitch_key_idx, tostring(want), "stored under pitch_key_idx")
-    -- the next new item takes it
-    st.key_idx = 1
-    K.adopt_new_item_values()
-    eq(st.key_idx, want, "a new item starts in that Key")
-  end)
-  reaper.SetExtState = set_ext
-  st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.separation = table.unpack(saved, 1, 6)
-  K.save_settings("key")   -- the stored mirror follows the put-back value
-  if not ok then error(err, 0) end
 end)
 
 test("star_mark_means_differs_from_the_default", function()
@@ -4472,24 +4454,23 @@ end) end)
 
 -- An open item that loses its analysis (Clear, Remove, Wipe, unreadable data cleared, the analysis undone away) is
 -- not analysed any more: it shows a new item's values, so its next analysis is a first one and splits at 50%
-local function open_analysed_at_70(st, NK)
+local function open_analysed_at_70(st)
   st.session_takes["{a}"] = { guid = "{a}", name = "A", separation = 0.7, key_idx = 5, scale_idx = 3,
     notes = {}, results = { { time = 0, note = 60 } }, item_len = 1, sample_rate = 48000 }
   st.session_order[#st.session_order + 1] = "{a}"
   st.target_take_guid, st.separation, st.key_idx, st.scale_idx = "{a}", 0.7, 5, 3   -- adopt_take_data's mirrors
-  NK.key_idx, NK.scale_idx = 2, 1
 end
 
 test("clearing_the_open_item_starts_it_at_a_new_items_values", function() with_write_stubs({}, function()
-  local K, st, NK = S.K, S.state, S.K.new_key
-  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+  local K, st = S.K, S.state
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx,
     K.open_accessor, st.results, st.notes, st.sample_rate, st.end_time, st.current_time }
   local ok, err = pcall(function()
-    open_analysed_at_70(st, NK)
+    open_analysed_at_70(st)
     reaper.GetMediaItemInfo_Value = function() return 1 end
     S.clear_take_analysis("{a}")
     eq(st.separation, S.DEFAULTS.separation, "Separation back to the default, not the cleared 70%")
-    eq(st.key_idx, 2, "the Key last chosen"); eq(st.scale_idx, 1)
+    eq(st.key_idx, 0, "no key set: a new item's"); eq(st.scale_idx, 1)
     reaper.GetMediaItemTake_Source = function() return "src" end
     reaper.GetMediaSourceSampleRate = function() return 48000 end
     K.open_accessor = function() return "acc" end
@@ -4497,33 +4478,33 @@ test("clearing_the_open_item_starts_it_at_a_new_items_values", function() with_w
     eq(st.separation, S.DEFAULTS.separation, "it splits at 50%")
   end)
   reaper.GetMediaItemInfo_Value, reaper.GetMediaItemTake_Source, reaper.GetMediaSourceSampleRate = nil, nil, nil
-  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, K.open_accessor,
-    st.results, st.notes, st.sample_rate, st.end_time, st.current_time = table.unpack(saved, 1, 12)
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, K.open_accessor,
+    st.results, st.notes, st.sample_rate, st.end_time, st.current_time = table.unpack(saved, 1, 10)
   st.is_analyzing, st.analysis_params, st.accessor = false, nil, nil
   if not ok then error(err, 0) end
 end) end)
 
 test("wiping_the_session_starts_the_open_item_at_a_new_items_values", function() with_write_stubs({}, function()
-  local st, NK = S.state, S.K.new_key
-  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+  local st = S.state
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx,
     st.session_order, st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes }
   local ok, err = pcall(function()
     st.session_order, st.session_takes = {}, {}
-    open_analysed_at_70(st, NK)
+    open_analysed_at_70(st)
     reaper.GetMediaItemInfo_Value = function() return 1 end
     reaper.CountAutomationItems = function() return 0 end
     eq(S.wipe_entire_session(), 1)
     eq(st.separation, S.DEFAULTS.separation, "Separation back to the default")
-    eq(st.key_idx, 2, "the Key last chosen")
+    eq(st.key_idx, 0, "no key set: a new item's")
   end)
   reaper.GetMediaItemInfo_Value, reaper.CountAutomationItems = nil, nil
-  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.session_order,
-    st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes = table.unpack(saved, 1, 11)
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.session_order,
+    st.session_takes, st.raw_cache, st.missing_takes, st.stale_takes = table.unpack(saved, 1, 9)
   if not ok then error(err, 0) end
 end) end)
 
 test("an_analysis_undone_away_starts_the_open_item_at_a_new_items_values", function()
-  local K, st, NK = S.K, S.state, S.K.new_key
+  local K, st = S.K, S.state
   local raw, changes = "", 2
   reaper.GetProjectStateChangeCount = function() return changes end
   reaper.GetMediaItemTakeByGUID = function(_, guid) return guid == "{a}" and "a" or nil end
@@ -4531,23 +4512,23 @@ test("an_analysis_undone_away_starts_the_open_item_at_a_new_items_values", funct
     if key == "GUID" then return true, "{a}" end
     return true, raw
   end
-  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx,
+  local saved = { st.target_take_guid, st.separation, st.key_idx, st.scale_idx,
     st.last_change_count, #st.session_order, st.results, st.notes }
   local ok, err = pcall(function()
-    open_analysed_at_70(st, NK)
+    open_analysed_at_70(st)
     st.raw_cache["{a}"] = K.take_json(st.session_takes["{a}"])
     K.drop_project_cache()
     st.last_change_count = 1
     S.sync_with_project()   -- Cmd+Z took the item's first analysis away
     eq(st.session_takes["{a}"], nil, "undone: not analysed")
     eq(st.separation, S.DEFAULTS.separation, "Separation back to the default")
-    eq(st.key_idx, 2, "the Key last chosen")
+    eq(st.key_idx, 0, "no key set: a new item's")
   end)
   reaper.GetProjectStateChangeCount, reaper.GetMediaItemTakeByGUID, reaper.GetSetMediaItemTakeInfo_String = nil, nil, nil
   st.session_takes["{a}"], st.raw_cache["{a}"], st.unreadable_takes["{a}"], st.undone_takes["{a}"] = nil, nil, nil, nil
-  while #st.session_order > saved[8] do table.remove(st.session_order) end
-  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, st.last_change_count,
-    st.results, st.notes = saved[1], saved[2], saved[3], saved[4], saved[5], saved[6], saved[7], saved[9], saved[10]
+  while #st.session_order > saved[6] do table.remove(st.session_order) end
+  st.target_take_guid, st.separation, st.key_idx, st.scale_idx, st.last_change_count,
+    st.results, st.notes = saved[1], saved[2], saved[3], saved[4], saved[5], saved[7], saved[8]
   K.drop_project_cache()
   if not ok then error(err, 0) end
 end)
@@ -6073,7 +6054,7 @@ test("analysis_begin_freezes_auto_range", function()
   if not ok then error(err, 0) end
 end)
 
--- Key "Auto" (auto range and key, Task 5) ---------------------------------------------------------------------------
+-- A key not set (0) and the key last chosen by hand ----------------------------------------------------------------
 -- Runs fn with K.take_track / K.track_record stubbed: every guid is on track "TR", whose record is `rec` (nil = none)
 local function with_track_record(rec, fn)
   local K = S.K
@@ -6085,21 +6066,19 @@ local function with_track_record(rec, fn)
   if not ok then error(err, 0) end
 end
 
-test("key_auto_is_fresh_default", function()
+test("key_unset_is_fresh_default", function()
   local T = load_script({})
   reaper.GetExtState = function() return "" end   -- the harness's own stub again
   local NK = T.K.new_key
-  eq(NK.key_idx, 0, "Auto on a fresh install"); eq(NK.scale_idx, 1)
   eq(NK.hand_key_idx, 1, "the hand key: C"); eq(NK.hand_scale_idx, 1, "the hand scale: Major")
-  eq(T.state.key_idx, 0, "the bar shows Auto before anything is open")
-  local T2 = load_script({ pitch_key_idx = "0", pitch_key_hand_idx = "7", pitch_scale_hand_idx = "2" })
+  eq(T.state.key_idx, 0, "no key set before anything is open"); eq(T.state.scale_idx, 1)
+  local T2 = load_script({ pitch_key_idx = "5", pitch_key_hand_idx = "7", pitch_scale_hand_idx = "2" })
   reaper.GetExtState = function() return "" end
-  eq(T2.K.new_key.key_idx, 0, "a stored Auto")
+  eq(T2.state.key_idx, 0, "a stored Key for new items is not used")
   eq(T2.K.new_key.hand_key_idx, 7); eq(T2.K.new_key.hand_scale_idx, 2)
-  local T3 = load_script({ pitch_key_idx = "13", pitch_key_hand_idx = "0", pitch_scale_hand_idx = "99" })
+  local T3 = load_script({ pitch_key_hand_idx = "0", pitch_scale_hand_idx = "99" })
   reaper.GetExtState = function() return "" end
-  eq(T3.K.new_key.key_idx, 12, "clamped to the last key")
-  eq(T3.K.new_key.hand_key_idx, 1, "the hand key is never Auto")
+  eq(T3.K.new_key.hand_key_idx, 1, "the hand key is never 0")
   eq(T3.K.new_key.hand_scale_idx, #T3.SCALE_DEFINITIONS, "clamped to the last scale")
 end)
 
@@ -6126,18 +6105,18 @@ test("key_resolve_falls_to_hand", function() with_track_record(nil, function()
   eq(k2, 3); eq(sc2, 2); eq(from2, false)
 end) end)
 
-test("item_seed_never_stores_auto", function()
+test("item_seed_never_stores_unset", function()
   local K, NK = S.K, S.K.new_key
-  local saved = { NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx }
+  local saved = { NK.hand_key_idx, NK.hand_scale_idx }
   local ok, err = pcall(function()
-    NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = 0, 1, 3, 2
+    NK.hand_key_idx, NK.hand_scale_idx = 3, 2
     with_track_record({ st = {}, takes = {}, key_idx = 5, scale_idx = 1 }, function()
       local data = { guid = "{s}" }
       K.item_seed(data)
       eq(data.key_idx, 5, "the track's key"); eq(data.scale_idx, 1); eq(data.key_from_track, true)
-      -- a finished analysis copies the bar's Auto (0) and its hidden scale into the model before seeding
+      -- a model holding no key set (0) and a scale
       data = { guid = "{s}", key_idx = 0, scale_idx = 4 }
-      eq(K.item_seed(data), true, "Auto resolved counts as filled")
+      eq(K.item_seed(data), true, "0 resolved counts as filled")
       eq(data.key_idx, 5); eq(data.scale_idx, 1, "the found scale, not the hidden one"); eq(data.key_from_track, true)
     end)
     with_track_record(nil, function()
@@ -6150,23 +6129,22 @@ test("item_seed_never_stores_auto", function()
       eq(data.key_idx, 8); eq(data.scale_idx, 3); eq(data.key_from_track, nil)
     end)
   end)
-  NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved, 1, 4)
+  NK.hand_key_idx, NK.hand_scale_idx = saved[1], saved[2]
   if not ok then error(err, 0) end
 end)
 
-test("scale_classes_with_auto", function()
-  local st, NK = S.state, S.K.new_key
-  local saved = { NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx, st.target_take_guid }
+test("scale_classes_with_no_key", function()
+  local st = S.state
+  local saved = { st.separation, st.key_idx, st.scale_idx, st.target_take_guid }
   local ok, err = pcall(function()
     st.target_take_guid = nil
-    NK.key_idx, NK.scale_idx = 0, 1
-    S.K.adopt_new_item_values()   -- the bar shows Auto and the scale classes follow
+    S.K.adopt_new_item_values()   -- the bar shows no key and the scale classes follow
     eq(st.key_idx, 0)
     for pc = 0, 11 do eq(st.scale_pc_set[pc], true, "pitch class " .. pc) end
     local pcs = S.K.scale_pcs(0, 1)
     for pc = 0, 11 do eq(pcs[pc], true, "scale_pcs " .. pc) end
   end)
-  NK.key_idx, NK.scale_idx, st.separation, st.key_idx, st.scale_idx, st.target_take_guid = table.unpack(saved, 1, 6)
+  st.separation, st.key_idx, st.scale_idx, st.target_take_guid = table.unpack(saved, 1, 4)
   S.K.adopt_new_item_values()
   if not ok then error(err, 0) end
 end)
@@ -6174,43 +6152,47 @@ end)
 test("hand_key_tracks_bar_choice", function()
   local st, K, NK = S.state, S.K, S.K.new_key
   local writes = {}
-  local set_ext = reaper.SetExtState
+  local set_ext, count_items = reaper.SetExtState, rawget(reaper, "CountMediaItems")
   reaper.SetExtState = function(_, key, value) writes[key] = value end
-  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, NK.hand_key_idx,
-    NK.hand_scale_idx, st.session_takes["{H}"] }
+  rawset(reaper, "CountMediaItems", function() return 0 end)   -- the take is not found: nothing is saved on it
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.hand_key_idx, NK.hand_scale_idx,
+    st.session_takes["{H}"], st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx }
   local ok, err = pcall(function()
-    st.target_take_guid = nil   -- an item not analysed yet
+    st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx = nil, nil
+    st.target_take_guid = nil   -- nothing open
     st.key_idx, st.scale_idx = 7, 2
     K.scale_changed("key")
-    eq(NK.key_idx, 7); eq(NK.hand_key_idx, 7, "a real key: the hand key follows"); eq(NK.hand_scale_idx, 2)
-    eq(writes.pitch_key_hand_idx, "7"); eq(writes.pitch_scale_hand_idx, "2")
+    eq(NK.hand_key_idx, 7, "a real key: the hand key follows"); eq(NK.hand_scale_idx, 1, "a first pick: Major")
+    eq(writes.pitch_key_hand_idx, "7"); eq(writes.pitch_scale_hand_idx, "1")
+    -- not set (0) is no choice: nothing changes
     st.key_idx = 0
     K.scale_changed("key")
-    eq(NK.key_idx, 0, "Auto for new items"); eq(writes.pitch_key_idx, "0")
-    eq(NK.hand_key_idx, 7, "Auto leaves the hand key"); eq(NK.hand_scale_idx, 2)
-    -- an analysed item never takes Auto (Find Key: here its track is unknown, so nothing changes)
+    eq(NK.hand_key_idx, 7, "0 leaves the hand key"); eq(NK.hand_scale_idx, 1)
+    -- an analysed item: an ordinary key change, and the hand key follows
     st.session_takes["{H}"] = { guid = "{H}", notes = {}, results = {}, key_idx = 4, scale_idx = 1 }
-    st.target_take_guid, st.key_idx, st.scale_idx = "{H}", 0, 1
+    st.target_take_guid, st.key_idx, st.scale_idx = "{H}", 9, 2
     K.scale_changed("key")
-    eq(st.key_idx, 4, "the bar keeps the item's key"); eq(st.session_takes["{H}"].key_idx, 4)
-    eq(NK.key_idx, 0, "the Key for new items is untouched"); eq(NK.hand_key_idx, 7)
+    eq(NK.hand_key_idx, 9); eq(NK.hand_scale_idx, 2); eq(writes.pitch_key_hand_idx, "9")
+    eq(writes.pitch_key_idx, nil, "the Key for new items is not written"); eq(writes.pitch_scale_idx, nil)
   end)
   reaper.SetExtState = set_ext
-  st.target_take_guid, st.key_idx, st.scale_idx, NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx,
-    st.session_takes["{H}"] = table.unpack(saved, 1, 8)
+  rawset(reaper, "CountMediaItems", count_items)
+  K.drop_project_cache()
+  st.target_take_guid, st.key_idx, st.scale_idx, NK.hand_key_idx, NK.hand_scale_idx,
+    st.session_takes["{H}"], st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx = table.unpack(saved, 1, 8)
   K.save_settings("key")   -- the stored mirror follows the put-back values
   if not ok then error(err, 0) end
 end)
 
-test("apply_source_never_gives_auto", function() with_track_record(nil, function()
+test("apply_source_never_gives_unset", function() with_track_record(nil, function()
   local st, NK = S.state, S.K.new_key
   local saved = { st.target_take_guid, st.key_idx, st.scale_idx, NK.hand_key_idx, NK.hand_scale_idx }
-  st.target_take_guid, st.key_idx, st.scale_idx = "{none}", 0, 1   -- not analysed, Key Auto
+  st.target_take_guid, st.key_idx, st.scale_idx = "{none}", 0, 1   -- not analysed, no key set
   NK.hand_key_idx, NK.hand_scale_idx = 6, 2
   local ok, src = pcall(S.K.apply_source, { "key_idx", "scale_idx" })
   st.target_take_guid, st.key_idx, st.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved, 1, 5)
   if not ok then error(src, 0) end
-  eq(src.key_idx, 6, "the key Auto stands for"); eq(src.scale_idx, 2)
+  eq(src.key_idx, 6, "the key not set stands for"); eq(src.scale_idx, 2)
 end) end)
 
 test("key_tooltip_names_the_track_and_runner_up", function()
@@ -6336,7 +6318,9 @@ local function auto_world(opts, fn)
   for _, k in ipairs(keys) do saved[k] = st[k] end
   local saved_status = { st.status.text, st.status.until_time, st.status.hold }
   local NK = K.new_key
-  local saved_nk = { NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx }
+  local saved_nk = { NK.hand_key_idx, NK.hand_scale_idx }
+  local saved_pending = K.pending_key
+  K.pending_key = {}
   local saved_order = #st.session_order
   local saved_reanalyze = K.reanalyze_status_guid
   st.is_analyzing, st.accessor, st.pre, st.analysis_params = false, nil, nil, nil
@@ -6350,7 +6334,8 @@ local function auto_world(opts, fn)
   K.pre_last_progress = saved_last_progress
   for _, k in ipairs(keys) do st[k] = saved[k] end
   st.status.text, st.status.until_time, st.status.hold = table.unpack(saved_status, 1, 3)
-  NK.key_idx, NK.scale_idx, NK.hand_key_idx, NK.hand_scale_idx = table.unpack(saved_nk, 1, 4)
+  NK.hand_key_idx, NK.hand_scale_idx = saved_nk[1], saved_nk[2]
+  K.pending_key = saved_pending
   for g in pairs(by_guid) do
     st.session_takes[g], st.raw_cache[g], st.stale_takes[g], st.missing_takes[g] = nil, nil, nil, nil
     st.undone_takes[g], st.stale_env[g], st.unreadable_takes[g] = nil, nil, nil
@@ -6387,18 +6372,24 @@ local ONE_TRACK = { tr = { items = { "it_a", "it_b" }, freq = 220 } }
 
 test("auto_needed_cases", function()
   local K, st = S.K, S.state
-  local saved = { st.key_idx, st.session_takes["{an}"] }
+  local saved = { st.session_takes["{an}"], K.pending_key }
   local ok, err = pcall(function()
-    st.key_idx = 5
-    eq(K.auto_needed(auto_values(true), "{new}"), true, "Vocal Range Auto")
-    eq(K.auto_needed(auto_values(false), "{new}"), false, "fixed range, key 5")
-    st.key_idx = 0
-    eq(K.auto_needed(auto_values(false), "{new}"), true, "fixed range, not analysed, Key Auto")
-    st.session_takes["{an}"] = { guid = "{an}", notes = {}, results = {}, key_idx = 4, scale_idx = 1 }
-    eq(K.auto_needed(auto_values(false), "{an}"), false, "fixed range, analysed item")
-    eq(K.auto_needed(auto_values(true), "{an}"), true, "Auto range, analysed item")
+    K.pending_key = {}
+    with_track_record(nil, function()
+      eq(K.auto_needed(auto_values(true), "{new}"), true, "Vocal Range Auto")
+      eq(K.auto_needed(auto_values(false), "{new}"), true, "fixed range, not analysed, no key")
+      K.pending_key["{new}"] = { key_idx = 5, scale_idx = 1 }
+      eq(K.auto_needed(auto_values(false), "{new}"), false, "fixed range, key 5 picked")
+      eq(K.auto_needed(auto_values(true), "{new}"), true, "Auto range, key picked")
+      st.session_takes["{an}"] = { guid = "{an}", notes = {}, results = {}, key_idx = 4, scale_idx = 1 }
+      eq(K.auto_needed(auto_values(false), "{an}"), false, "fixed range, analysed item")
+      eq(K.auto_needed(auto_values(true), "{an}"), true, "Auto range, analysed item")
+    end)
+    with_track_record({ st = {}, takes = {}, key_idx = 2, scale_idx = 1 }, function()
+      eq(K.auto_needed(auto_values(false), "{other}"), false, "fixed range, the track has a key")
+    end)
   end)
-  st.key_idx, st.session_takes["{an}"] = saved[1], saved[2]
+  st.session_takes["{an}"], K.pending_key = saved[1], saved[2]
   if not ok then error(err, 0) end
 end)
 
@@ -6478,7 +6469,7 @@ end)
 test("analyze_auto_then_stores", function()
   auto_world({ tracks = ONE_TRACK }, function(w)
     local K, st = S.K, S.state
-    st.target_take_guid, st.key_idx = "{a}", 0   -- not analysed, Key Auto
+    st.target_take_guid, st.key_idx = "{a}", 0   -- not analysed, no key set
     S.start_analysis(auto_values(true))
     eq(st.pre ~= nil, true, "stage 1 runs first")
     eq(st.is_analyzing, true)
@@ -6550,9 +6541,9 @@ test("analyze_auto_reuses_record", function()
     local data = st.session_takes["{a}"]
     local lo, hi = K.pre_range_hz(rec.lo_st, rec.hi_st)
     eq(data.analysis.min_freq, lo); eq(data.analysis.max_freq, hi)
-    eq(data.key_idx, rec.key_idx)
-    eq(st.status.text, string.format("Used V _ Main's range and key: %s, %s.", K.pre_range_text(rec.lo_st, rec.hi_st),
-      K.key_text(rec.key_idx, rec.scale_idx)))
+    eq(data.key_idx, rec.key_idx); eq(data.key_source, "track"); eq(data.key_from_track, true)
+    -- the key was the track's already (the bar showed it): only the range is news
+    eq(st.status.text, string.format("Used V _ Main's range: %s.", K.pre_range_text(rec.lo_st, rec.hi_st)))
   end)
 end)
 
@@ -6560,6 +6551,7 @@ test("analyze_fixed_range_fixed_key_no_pre", function()
   auto_world({ tracks = ONE_TRACK }, function(w)
     local K, st = S.K, S.state
     st.target_take_guid, st.key_idx, st.scale_idx = "{a}", 5, 1
+    K.pending_key["{a}"] = { key_idx = 5, scale_idx = 1 }   -- picked before analysing
     local seen_pre = false
     S.start_analysis(auto_values(false))
     for _ = 1, 100000 do
@@ -6683,7 +6675,8 @@ end
 test("batch_two_tracks_each_own_range", function()
   auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
     local K, st = S.K, S.state
-    K.new_key.key_idx = 3   -- a key chosen by hand: only the range is found
+    -- a key picked for each item: only the range is found
+    for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     K.batch_start(two_entries(), auto_values(true))
     eq(st.pre ~= nil, true, "stage 1 before the first item"); eq(st.pre.n_tracks, 2)
     K.analysis_tick()
@@ -6702,7 +6695,7 @@ test("batch_two_tracks_each_own_range", function()
     eq(a.analysis.min_freq, (K.pre_range_hz(recs.tr1.lo_st, recs.tr1.hi_st)), "a: its own track's range")
     eq(b.analysis.min_freq, (K.pre_range_hz(recs.tr2.lo_st, recs.tr2.hi_st)), "b: its own track's range")
     eq(a.analysis.min_freq ~= b.analysis.min_freq, true)
-    eq(a.key_idx, 3, "the hand key")
+    eq(a.key_idx, 3, "the picked key"); eq(a.key_source, "picked")
     local begins, starts, ends, at1, at2 = 0, nil, nil, index_of(w.log, "track:tr1"), index_of(w.log, "track:tr2")
     for i, s in ipairs(w.log) do
       if s == "begin" then begins = begins + 1; starts = i end
@@ -6720,7 +6713,7 @@ end)
 test("batch_cancel_after_stage_one_writes_no_record", function()
   auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
     local K, st = S.K, S.state
-    K.new_key.key_idx = 3
+    for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     K.batch_start(two_entries(), auto_values(true))
     while st.pre do K.analysis_tick() end
     eq(K.track_records_pending.tr1 ~= nil, true, "found, waiting for the batch's block")
@@ -6806,7 +6799,7 @@ end)
 test("failed_batch_write_drops_pending", function()
   auto_world({ tracks = THREE }, function(w)
     local K, st = S.K, S.state
-    K.new_key.key_idx = 3
+    for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     local real_write = K.batch_write
     K.batch_write = function() error("disk full") end
     K.batch_start({ entry_c() }, auto_values(true))
@@ -6835,7 +6828,7 @@ end)
 test("batch_start_drops_stale_pending", function()
   auto_world({ tracks = THREE }, function(w)
     local K = S.K
-    K.new_key.key_idx = 3
+    for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     K.track_records_pending["tr"] = K.track_record_build(K.pre_tally_new(), {}, nil)   -- left by something else
     K.batch_start({ entry_c() }, auto_values(true))
     auto_run_out()
@@ -6846,7 +6839,7 @@ end)
 test("batch_writes_only_records_of_written_tracks", function()
   auto_world({ tracks = TWO_TRACKS, step = 0.003 }, function(w)
     local K, st = S.K, S.state
-    K.new_key.key_idx = 3
+    for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     K.batch_start(two_entries(), auto_values(true))
     for _ = 1, 100000 do
       if K.batch and K.batch.index == 2 and st.is_analyzing then break end
@@ -6876,7 +6869,7 @@ test("item_gone_in_stage_one_says_so", function()
   end)
 end)
 
--- A corrected key follows the track; Key Auto on an analysed item; Find Range and Key Again ---------------------------
+-- A corrected key follows the track; Find Range and Key Again --------------------------------------------------------
 
 -- A stored record of track "tr" (ONE_TRACK) that covers both its takes: A3 heard, key `key_idx` / `scale_idx` (nil:
 -- no key), with a runner-up when alt is given
@@ -6923,7 +6916,7 @@ end
 test("key_fix_follows_track", function() t7_ext(function(ext, ext_sync)
   auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
     local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx, NK.hand_key_idx, NK.hand_scale_idx = 0, 9, 1
+    NK.hand_key_idx, NK.hand_scale_idx = 9, 1
     ext_sync()
     local data = t7_open(5, 1, true)
     st.key_idx = 3   -- D, chosen in the bar
@@ -6933,7 +6926,7 @@ test("key_fix_follows_track", function() t7_ext(function(ext, ext_sync)
     eq(rec.key_idx, 3); eq(rec.scale_idx, 1); eq(rec.alt_key_idx, nil); eq(rec.alt_scale_idx, nil)
     eq(rec.lo_st, 57, "the rest of the record is kept"); eq(rec.takes["{a}"], true)
     eq(data.key_idx, 3); eq(data.key_from_track, true, "the item still follows its track")
-    eq(NK.key_idx, 0, "Auto stays on for new items"); eq(NK.hand_key_idx, 3, "the hand key follows")
+    eq(NK.hand_key_idx, 3, "the hand key follows")
     eq(NK.hand_scale_idx, 1)
     eq(next(ext), nil, "no ExtState written")
     eq(next(K.track_records_pending), nil)
@@ -6946,7 +6939,6 @@ test("key_fix_follows_track_envelope_path", function() t7_ext(function(ext, ext_
   S.K.mode_note_count = function() return 2 end   -- the item has Classic / Hard notes: the envelope is rewritten
   local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
     local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx = 0
     ext_sync()
     local data = t7_open(5, 1, true)
     st.scale_idx = 2
@@ -6954,7 +6946,7 @@ test("key_fix_follows_track_envelope_path", function() t7_ext(function(ext, ext_
     eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale")
     local rec = t7_stored(w)
     eq(rec.key_idx, 5); eq(rec.scale_idx, 2)
-    eq(data.scale_idx, 2); eq(data.key_from_track, true); eq(NK.key_idx, 0); eq(NK.hand_scale_idx, 2)
+    eq(data.scale_idx, 2); eq(data.key_from_track, true); eq(NK.hand_scale_idx, 2)
     eq(next(ext), nil); eq(next(K.track_records_pending), nil)
     eq(st.status.text, "Key for V _ Main is now E Minor. New items on this track follow.",
       "this message replaces the Key changed one")
@@ -7013,7 +7005,7 @@ end) end)
 test("key_fix_other_item_as_before", function() t7_ext(function(ext, ext_sync)
   auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
     local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx = 0
+    NK.hand_key_idx = 9
     ext_sync()
     local data = t7_open(5, 1, false)   -- the key was chosen by hand
     st.key_idx = 3
@@ -7021,153 +7013,19 @@ test("key_fix_other_item_as_before", function() t7_ext(function(ext, ext_sync)
     eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "no track write")
     eq(t7_stored(w).key_idx, 5, "the track keeps its key")
     eq(data.key_idx, 3); eq(data.key_from_track, nil)
-    eq(NK.key_idx, 3, "the Key for new items follows, as today"); eq(ext.pitch_key_idx, "3")
+    eq(NK.hand_key_idx, 3, "the hand key follows"); eq(ext.pitch_key_hand_idx, "3")
+    eq(ext.pitch_key_idx, nil, "no Key for new items")
   end)
   -- from its track, but the track has no record (undone): as today too
   auto_world({ tracks = ONE_TRACK }, function(w)
     local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx = 0
     t7_open(5, 1, true)
     st.key_idx = 4
     K.scale_changed("key")
     eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key")
-    eq(NK.key_idx, 4); eq(next(K.track_records_pending), nil)
+    eq(NK.hand_key_idx, 4); eq(next(K.track_records_pending), nil)
   end)
 end) end)
-
-test("find_key_uses_record", function() t7_ext(function(ext, ext_sync)
-  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
-    local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx, NK.hand_key_idx = 0, 6
-    ext_sync()
-    local data = t7_open(3, 1, false)
-    st.key_idx = 0   -- Auto chosen in the bar
-    K.scale_changed("key")
-    eq(table.concat(w.log, ","), "begin,take:{a},end:Find Key: Lead Vox", "one undo point")
-    eq(data.key_idx, 10); eq(data.scale_idx, 2); eq(data.key_from_track, true)
-    eq(st.key_idx, 10, "the bar shows the real key"); eq(st.scale_idx, 2)
-    eq(NK.key_idx, 0); eq(NK.hand_key_idx, 6); eq(next(ext), nil)
-    eq(w.pre_calls, 0, "the record is there: nothing is heard")
-    eq(st.status.text, "Found A Minor. " .. MOD .. "+Z to undo.", "the plain save says what it found")
-  end)
-end) end)
-
-test("find_key_envelope_path_says_what_it_found", function()
-  local mode_count = S.K.mode_note_count
-  S.K.mode_note_count = function() return 2 end
-  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2, { 1, 1 })) } },
-    function(w)
-    local K, st = S.K, S.state
-    t7_open(3, 1, false)
-    st.key_idx = 0
-    K.scale_changed("key")
-    eq(table.concat(w.log, ","), "begin,take:{a},end:Find Key: Lead Vox")
-    eq(st.status.text, "Found A Minor (C Major also fits). " .. MOD .. "+Z to undo.", "not the Key changed text")
-  end)
-  S.K.mode_note_count = mode_count
-  if not ok then error(err, 0) end
-end)
-
-test("find_key_without_key_changes_nothing", function()
-  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(nil, nil)) } }, function(w)
-    local K, st = S.K, S.state
-    local data = t7_open(3, 1, true)
-    st.key_idx = 0
-    K.scale_changed("key")
-    eq(#w.log, 0, "no undo block, nothing written")
-    eq(data.key_idx, 3); eq(st.key_idx, 3, "the bar keeps the item's key")
-    eq(st.status.text, "Not enough singing to tell the key: kept D Major.")
-  end)
-end)
-
-test("find_key_already_the_tracks_key_is_a_no_op", function()
-  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
-    local K, st = S.K, S.state
-    t7_open(5, 1, true)
-    st.key_idx = 0
-    K.scale_changed("key")
-    eq(#w.log, 0, "no undo point"); eq(st.key_idx, 5)
-    eq(next(K.track_records_pending), nil)
-  end)
-end)
-
-test("find_key_refused_while_analysing", function()
-  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(10, 2)) } }, function(w)
-    local K, st = S.K, S.state
-    local data = t7_open(3, 1, false)
-    local was = st.is_analyzing
-    st.is_analyzing = true
-    local ok, err = pcall(function()
-      st.key_idx = 0
-      K.find_key_request()
-      eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 0, "find_key_request itself touches nothing")
-      st.key_idx = 0
-      K.scale_changed("key")
-      eq(#w.log, 0); eq(data.key_idx, 3); eq(st.key_idx, 3, "the bar shows the item's key again")
-      eq(w.pre_calls, 0)
-    end)
-    st.is_analyzing = was
-    if not ok then error(err, 0) end
-  end)
-end)
-
-test("find_key_hears_the_track_first", function() t7_ext(function(ext, ext_sync)
-  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
-    local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx = 0
-    ext_sync()
-    local data = t7_open(3, 1, false)
-    st.key_idx = 0
-    K.scale_changed("key")
-    eq(st.pre ~= nil, true, "stage 1 runs"); eq(st.is_analyzing, true)
-    eq(st.key_idx, 3, "the bar keeps the item's key meanwhile")
-    eq(K.locked_reason(), "Finding range and key\xE2\x80\xA6 0%")
-    K.analysis_tick(); K.analysis_tick()
-    local p = K.analysis_progress()
-    eq(p > 0 and p < 1, true, "progress: " .. p)
-    eq(#w.log, 0, "nothing written while the track is heard")
-    auto_run_out()
-    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Find Key: Lead Vox", "item and record, one block")
-    local rec = t7_stored(w)
-    eq(type(rec.key_idx), "number", "a key was found")
-    eq(data.key_idx, rec.key_idx); eq(data.scale_idx, rec.scale_idx); eq(data.key_from_track, true)
-    eq(st.key_idx, rec.key_idx)
-    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(st.is_analyzing, false)
-    eq(NK.key_idx, 0); eq(next(ext), nil)
-    local alt = rec.alt_key_idx and (" (" .. K.key_text(rec.alt_key_idx, rec.alt_scale_idx) .. " also fits)") or ""
-    eq(st.status.text, "Found " .. K.key_text(rec.key_idx, rec.scale_idx) .. alt .. ". " .. MOD .. "+Z to undo.")
-  end)
-end) end)
-
-test("find_key_nothing_heard_drops_the_fresh_record", function()
-  auto_world({ tracks = ONE_TRACK, unreadable = { tk_a = true, tk_b = true } }, function(w)
-    local K, st = S.K, S.state
-    local data = t7_open(3, 1, false)
-    st.key_idx = 0
-    K.scale_changed("key")
-    auto_run_out()
-    eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
-    eq(w.ext.tr[K.TRACK_SCAN_KEY], "", "the track holds no record")
-    eq(next(K.track_records_pending), nil, "the record found is dropped")
-    eq(data.key_idx, 3); eq(st.key_idx, 3)
-    eq(st.status.text, "Not enough singing to tell the key: kept D Major.")
-  end)
-end)
-
-test("find_key_cancel_in_stage_one_writes_nothing", function()
-  auto_world({ tracks = ONE_TRACK, step = 0.003 }, function(w)
-    local K, st = S.K, S.state
-    local data = t7_open(3, 1, false)
-    st.key_idx = 0
-    K.scale_changed("key")
-    K.analysis_tick()
-    eq(st.pre ~= nil, true)
-    eq(K.cancel_analysis(), true)
-    auto_run_out()
-    eq(#w.log, 0, "no undo point"); eq(next(K.track_records_pending), nil); eq(K.auto_run, nil)
-    eq(st.is_analyzing, false); eq(data.key_idx, 3); eq(st.status.text, K.CANCELLED_TEXT)
-  end)
-end)
 
 test("find_again_replaces_record", function() t7_ext(function(ext)
   local old = t7_record(7, 1)
@@ -7285,7 +7143,6 @@ end)
 test("key_fix_leaves_a_running_analysis_alone", function() t7_ext(function(_, ext_sync)
   auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
     local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx = 0
     ext_sync()
     t7_open(5, 1, true)
     -- an Auto analysis (or a batch) runs and its record waits for its own undo block
@@ -7299,7 +7156,7 @@ test("key_fix_leaves_a_running_analysis_alone", function() t7_ext(function(_, ex
       eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "no track write in the Set Key block")
       eq(rawequal(K.track_records_pending.tr, pending), true, "the run's record is still pending, the same object")
       eq(pending.key_idx, 5); eq(pending.alt_key_idx, 2, "and unchanged")
-      eq(NK.key_idx, 3, "an ordinary key change meanwhile")
+      eq(NK.hand_key_idx, 3, "an ordinary key change meanwhile")
     end)
     st.is_analyzing = was
     K.track_records_pending = {}
@@ -7461,23 +7318,6 @@ test("pre_external_change_survives_find_again", function()
   end
 end)
 
-test("pre_external_change_survives_find_key", function()
-  for _, bump in ipairs({ true, false }) do
-    auto_world(REAL_OPEN, function(w)
-      local st = S.state
-      t7_open(3, 1, false)
-      st.last_change_count = w.count
-      st.key_idx = 0
-      S.K.scale_changed("key")
-      S.K.analysis_tick()
-      if bump then w.count = w.count + 1 end
-      until_second_take()
-      auto_run_out()
-      if bump then eq(st.last_change_count, nil) else eq(st.last_change_count, w.count) end
-    end)
-  end
-end)
-
 test("pre_external_change_survives_cancel", function()
   for _, bump in ipairs({ true, false }) do
     auto_world(REAL_OPEN, function(w)
@@ -7575,24 +7415,11 @@ test("track_record_round_trips_what_it_builds", function()
   eq(type(K.track_record_valid(JSON.decode(JSON.encode(merged)))), "table", "a merged record")
 end)
 
--- F5: Auto on an item that has its track's key already says so, and writes nothing
-test("find_key_no_op_says_the_tracks_key", function() t7_ext(function(ext)
-  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
-    local K, st = S.K, S.state
-    t7_open(5, 1, true)
-    st.key_idx = 0
-    K.scale_changed("key")
-    eq(#w.log, 0, "no undo point"); eq(next(ext), nil, "no ExtState")
-    eq(st.status.text, "Used V _ Main's key: " .. K.key_text(5, 1) .. ".")
-    eq(next(K.track_records_pending), nil)
-  end)
-end) end)
-
 -- F6: an item whose track's record holds another key changes alone
 test("key_fix_track_holds_another_key_changes_the_item_only", function() t7_ext(function(ext, ext_sync)
   auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
     local K, st, NK = S.K, S.state, S.K.new_key
-    NK.key_idx = 0
+    NK.hand_key_idx = 9
     ext_sync()
     local data = t7_open(7, 1, true)   -- found on its track once; the track's record holds E now
     eq(K.key_found_text(data), nil, "no 'Found from' line")
@@ -7601,7 +7428,8 @@ test("key_fix_track_holds_another_key_changes_the_item_only", function() t7_ext(
     eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "no track write")
     eq(t7_stored(w).key_idx, 5, "the track keeps its key")
     eq(data.key_idx, 3)
-    eq(NK.key_idx, 3, "the Key for new items follows"); eq(ext.pitch_key_idx, "3")
+    eq(NK.hand_key_idx, 3, "the hand key follows"); eq(ext.pitch_key_hand_idx, "3")
+    eq(ext.pitch_key_idx, nil, "no Key for new items")
     eq(next(K.track_records_pending), nil)
   end)
 end) end)
@@ -7640,6 +7468,268 @@ test("pre_ignores_midi_and_empty_items", function()
     eq(n, 1, "only the audio take is listed")
     eq(rec.skipped, 0, "MIDI and empty items are not media offline")
   end)
+end)
+
+-- A key is found unless picked; no Auto in the Key list -------------------------------------------------------------
+
+-- Runs fn with K.pending_key empty and the hand key put back after
+local function with_pending(fn)
+  local K = S.K
+  local saved_pending, NK = K.pending_key, K.new_key
+  local saved_hand = { NK.hand_key_idx, NK.hand_scale_idx }
+  K.pending_key = {}
+  local ok, err = pcall(fn)
+  K.pending_key = saved_pending
+  NK.hand_key_idx, NK.hand_scale_idx = saved_hand[1], saved_hand[2]
+  if not ok then error(err, 0) end
+end
+
+test("key_list_has_twelve_keys", function()
+  local L = S.COMBO_LABELS
+  eq(#L.keys, 12, "twelve short names"); eq(#L.key_names, 12, "twelve long names")
+  for i = 1, 12 do
+    eq(L.keys[i] ~= "Auto" and L.key_names[i] ~= "Auto", true, "no Auto entry")
+  end
+  eq(L.keys[1], "C"); eq(L.key_names[2], "C# / Db")
+  eq(S.K.key_preview(0), "\xE2\x80\x93", "not set: an en dash")
+  eq(S.K.key_preview(2), "C#")
+end)
+
+test("new_item_key_sources", function() with_pending(function()
+  local K = S.K
+  with_track_record(nil, function()
+    local k, sc, src = K.new_item_key("{n}")
+    eq(k, 0); eq(sc, 1); eq(src, "unset")
+    k, sc, src = K.new_item_key(nil)
+    eq(k, 0); eq(sc, 1); eq(src, "unset", "no item")
+    K.pending_key["{n}"] = { key_idx = 4, scale_idx = 3 }
+    k, sc, src = K.new_item_key("{n}")
+    eq(k, 4); eq(sc, 3); eq(src, "picked")
+  end)
+  with_track_record({ st = {}, takes = {}, key_idx = 9, scale_idx = 2 }, function()
+    local k, sc, src = K.new_item_key("{n}")
+    eq(k, 4); eq(sc, 3); eq(src, "picked", "a picked key wins over the track's")
+    k, sc, src = K.new_item_key("{m}")
+    eq(k, 9); eq(sc, 2); eq(src, "track")
+  end)
+  with_track_record({ st = {}, takes = {} }, function()
+    local k, _, src = K.new_item_key("{m}")
+    eq(k, 0); eq(src, "unset", "a record without a key")
+  end)
+end) end)
+
+test("picked_key_does_not_leak", function() with_pending(function()
+  local K, st = S.K, S.state
+  local set_ext, by_guid = rawget(reaper, "SetExtState"), rawget(reaper, "GetMediaItemTakeByGUID")
+  rawset(reaper, "SetExtState", function() end)
+  rawset(reaper, "GetMediaItemTakeByGUID", function(_, guid) return "take" .. guid end)   -- both items exist
+  K.drop_project_cache()
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, st.separation }
+  local ok, err = pcall(with_track_record, nil, function()
+    st.target_take_guid = "{A}"
+    K.adopt_new_item_values()
+    eq(st.key_idx, 0, "A starts unset")
+    st.key_idx = 4   -- D# picked in the bar
+    K.scale_changed("key")
+    eq(K.pending_key["{A}"].key_idx, 4); eq(K.pending_key["{A}"].scale_idx, 1, "Major with a first pick")
+    eq(st.scale_idx, 1, "the bar shows Major")
+    st.target_take_guid = "{B}"
+    K.adopt_new_item_values()
+    eq(st.key_idx, 0, "B is unset"); eq(st.scale_idx, 1)
+    eq(K.pending_key["{B}"], nil)
+    st.target_take_guid = "{A}"
+    K.adopt_new_item_values()
+    eq(st.key_idx, 4, "A shows its picked key again")
+    -- A leaves the project: its key is forgotten the next time the open item changes
+    rawset(reaper, "GetMediaItemTakeByGUID", function(_, guid) if guid ~= "{A}" then return "take" .. guid end end)
+    K.drop_project_cache()
+    st.target_take_guid = "{B}"
+    K.adopt_new_item_values()
+    eq(K.pending_key["{A}"], nil, "gone with its item")
+  end)
+  rawset(reaper, "SetExtState", set_ext)
+  rawset(reaper, "GetMediaItemTakeByGUID", by_guid)
+  K.drop_project_cache()
+  st.target_take_guid, st.key_idx, st.scale_idx, st.separation = table.unpack(saved, 1, 4)
+  K.save_settings("key")
+  if not ok then error(err, 0) end
+end) end)
+
+test("picked_key_survives_analysis", function() with_pending(function()
+  local pre_key = S.K.pre_key
+  S.K.pre_key = function() return 5, 1, 10, 2 end   -- the listening pass would find E Major (A Minor also fits)
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid = "{a}"
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 2 }
+    K.adopt_new_item_values()
+    eq(st.key_idx, 3, "the bar shows the picked key"); eq(st.scale_idx, 2)
+    S.start_analysis(auto_values(true))
+    eq(st.pre ~= nil, true, "Vocal Range Auto: the track is heard")
+    auto_run_out()
+    local data = st.session_takes["{a}"]
+    eq(data.key_idx, 3, "the user's key"); eq(data.scale_idx, 2)
+    eq(data.key_source, "picked"); eq(data.key_from_track, true)
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 3, "the track takes the user's key"); eq(rec.scale_idx, 2)
+    eq(rec.alt_key_idx, nil); eq(rec.alt_scale_idx, nil)
+    local at, b, e = index_of(w.log, "track:tr"), index_of(w.log, "begin"), index_of(w.log, "end:Analyze Pitch")
+    eq(at ~= nil and b ~= nil and e ~= nil and b < at and at < e, true, "inside the block: " .. table.concat(w.log, ","))
+    eq(K.pending_key["{a}"], nil, "dropped once analysed")
+    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil)
+    eq(st.key_idx, 3)
+  end)
+  S.K.pre_key = pre_key
+  if not ok then error(err, 0) end
+end) end)
+
+test("picked_key_fixed_range_no_pass", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid = "{a}"
+    K.pending_key["{a}"] = { key_idx = 3, scale_idx = 2 }
+    K.adopt_new_item_values()
+    eq(K.auto_needed(auto_values(false), "{a}"), false, "nothing to find")
+    S.start_analysis(auto_values(false))
+    auto_run_out()
+    eq(w.pre_calls, 0, "no listening pass")
+    eq(index_of(w.log, "track:tr"), nil, "no track write: " .. table.concat(w.log, ","))
+    local data = st.session_takes["{a}"]
+    eq(data.key_idx, 3); eq(data.scale_idx, 2); eq(data.key_from_track, nil); eq(data.key_source, "picked")
+    eq(K.pending_key["{a}"], nil)
+  end)
+end) end)
+
+test("unset_key_is_found", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid = "{a}"
+    K.adopt_new_item_values()
+    eq(st.key_idx, 0, "unset")
+    eq(K.auto_needed(auto_values(false), "{a}"), true, "the key is to be found")
+    S.start_analysis(auto_values(false))
+    auto_run_out()
+    local rec = t7_stored(w)
+    eq(type(rec) == "table" and type(rec.key_idx) == "number", true, "a key was found")
+    local data = st.session_takes["{a}"]
+    eq(data.key_idx, rec.key_idx); eq(data.scale_idx, rec.scale_idx); eq(data.key_from_track, true)
+    eq(data.key_source, "found")
+    eq(st.key_idx, rec.key_idx, "the bar shows it")
+    eq(JSON.decode(K.take_json(data)).key_source, "found", "stored with the item")
+  end)
+end) end)
+
+test("reused_record_key_source_track", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid = "{a}"
+    K.adopt_new_item_values()
+    eq(st.key_idx, 5, "the track's key on the bar"); eq(st.scale_idx, 1)
+    eq(K.auto_needed(auto_values(false), "{a}"), false)
+    S.start_analysis(auto_values(false))
+    auto_run_out()
+    local data = st.session_takes["{a}"]
+    eq(data.key_idx, 5); eq(data.key_from_track, true); eq(data.key_source, "track")
+    eq(index_of(w.log, "track:tr"), nil, "the record is not written again")
+  end)
+end) end)
+
+test("picked_key_with_record_no_pass_updates_track", function() with_pending(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid = "{a}"
+    K.pending_key["{a}"] = { key_idx = 8, scale_idx = 2 }
+    K.adopt_new_item_values()
+    S.start_analysis(auto_values(false))
+    auto_run_out()
+    eq(w.pre_calls, 0, "no listening pass")
+    local rec = t7_stored(w)
+    eq(rec.key_idx, 8, "the track's record takes the picked key"); eq(rec.scale_idx, 2); eq(rec.alt_key_idx, nil)
+    eq(rec.lo_st, 57, "the rest of the record is kept")
+    local at, b, e = index_of(w.log, "track:tr"), index_of(w.log, "begin"), index_of(w.log, "end:Analyze Pitch")
+    eq(at ~= nil and b < at and at < e, true, "inside the analysis's block: " .. table.concat(w.log, ","))
+    local data = st.session_takes["{a}"]
+    eq(data.key_idx, 8); eq(data.key_from_track, true); eq(data.key_source, "picked")
+    eq(K.key_found_text(data), nil, "a picked key is not 'Found from'")
+    eq(next(K.track_records_pending), nil)
+  end)
+end) end)
+
+test("pending_key_dropped_on_project_switch_only", function() with_pending(function()
+  local K, st = S.K, S.state
+  local enum, change_count = rawget(reaper, "EnumProjects"), rawget(reaper, "GetProjectStateChangeCount")
+  local proj, n = "p1", 1
+  rawset(reaper, "EnumProjects", function() return proj end)
+  rawset(reaper, "GetProjectStateChangeCount", function() return n end)
+  local ok, err = pcall(function()
+    K.drop_project_cache()
+    K.refresh_project_cache()
+    K.pending_key["{q}"] = { key_idx = 2, scale_idx = 1 }
+    n = 2   -- an undo, an edit
+    K.refresh_project_cache()
+    eq(K.pending_key["{q}"] ~= nil, true, "kept through a project change")
+    proj = "p2"   -- another project tab
+    K.refresh_project_cache()
+    eq(K.pending_key["{q}"], nil, "dropped with the project left")
+  end)
+  rawset(reaper, "EnumProjects", enum)
+  rawset(reaper, "GetProjectStateChangeCount", change_count)
+  st.cache.count, st.cache.proj = nil, nil
+  K.drop_project_cache()
+  if not ok then error(err, 0) end
+end) end)
+
+test("key_source_loads_validated", function()
+  local K = S.K
+  for _, v in ipairs({ "picked", "track", "found" }) do eq(K.key_source_valid(v), v) end
+  eq(K.key_source_valid("auto"), nil); eq(K.key_source_valid(3), nil); eq(K.key_source_valid(nil), nil)
+end)
+
+test("scale_locked_while_unset", function()
+  local K = S.K
+  eq(K.SCALE_UNSET_REASON, "Pick a key first, or it is found when you analyze")
+  eq(K.KEY_UNSET_TOOLTIP, "Pick the key if you know it. Otherwise it is found from the whole track when you analyze.")
+  eq(K.key_tooltip(nil, 0):find(K.KEY_UNSET_TOOLTIP, 1, true) ~= nil, true, "Key while unset says it")
+  eq(K.key_tooltip(nil, 5):find(K.KEY_UNSET_TOOLTIP, 1, true), nil, "not once a key is set")
+  eq(K.key_tooltip(nil, 5):find("Auto", 1, true), nil, "no Auto in the Key tooltip")
+  eq(K.key_tooltip(nil, 0):find("Auto", 1, true), nil)
+end)
+
+test("new_key_extstate_not_written", function() with_pending(function()
+  local K, st = S.K, S.state
+  local writes, blocks = {}, 0
+  local set_ext, begin = rawget(reaper, "SetExtState"), rawget(reaper, "Undo_BeginBlock")
+  rawset(reaper, "SetExtState", function(_, key, value) writes[key] = value end)
+  rawset(reaper, "Undo_BeginBlock", function() blocks = blocks + 1 end)
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, st.stored.pitch_key_hand_idx,
+    st.stored.pitch_scale_hand_idx }
+  st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx = nil, nil   -- every save is seen
+  local ok, err = pcall(with_track_record, nil, function()
+    st.target_take_guid = "{n}"
+    st.key_idx, st.scale_idx = 4, 1
+    K.scale_changed("key")
+    eq(writes.pitch_key_idx, nil); eq(writes.pitch_scale_idx, nil)
+    eq(writes.pitch_key_hand_idx, "4", "the hand key follows"); eq(writes.pitch_scale_hand_idx, "1")
+    st.scale_idx = 3
+    K.scale_changed("scale")
+    eq(K.pending_key["{n}"].key_idx, 4); eq(K.pending_key["{n}"].scale_idx, 3, "the scale picked is kept")
+    eq(writes.pitch_scale_hand_idx, "3")
+    st.key_idx = 6
+    K.scale_changed("key")
+    eq(K.pending_key["{n}"].scale_idx, 3, "a scale picked already stays")
+    eq(writes.pitch_key_idx, nil); eq(writes.pitch_scale_idx, nil)
+    eq(blocks, 0, "no undo block")
+  end)
+  rawset(reaper, "SetExtState", set_ext)
+  rawset(reaper, "Undo_BeginBlock", begin)
+  st.target_take_guid, st.key_idx, st.scale_idx, st.stored.pitch_key_hand_idx, st.stored.pitch_scale_hand_idx =
+    table.unpack(saved, 1, 5)
+  if not ok then error(err, 0) end
+end) end)
+
+test("find_key_is_gone", function()
+  eq(S.K.find_key_request, nil); eq(S.K.find_key_finish, nil)
+  eq(S.K.new_key.key_idx, nil); eq(S.K.new_key.scale_idx, nil)
 end)
 
 -- Tests appended by later tasks go above this line.

@@ -162,10 +162,7 @@ do
     return out
   end
   COMBO_LABELS.keys = labels_of(SCALE_KEYS, "display")  -- the top bar's Key combo previews the short name ...
-  COMBO_LABELS.key_names = labels_of(SCALE_KEYS, "name") -- ... and lists the long one
-  -- ... both after its first choice, "Auto" (key index 0: the key is found from the track)
-  table.insert(COMBO_LABELS.keys, 1, "Auto")
-  table.insert(COMBO_LABELS.key_names, 1, "Auto")
+  COMBO_LABELS.key_names = labels_of(SCALE_KEYS, "name") -- ... and lists the long one (the twelve keys only)
   COMBO_LABELS.scales = labels_of(SCALE_DEFINITIONS, "name")
   COMBO_LABELS.pitchmodes = labels_of(PITCHMODE_FLAT, "name")
   COMBO_LABELS.ranges = labels_of(VOCAL_RANGES, "name")
@@ -544,13 +541,28 @@ end
 -- again, starts at the script's DEFAULTS for every one of them (K.new_item_values)
 K.ITEM_KEYS = { "separation", "correct_mode", "tighten", "tolerance", "retune_speed", "slide_in" }
 
--- The Key and Scale last chosen in the bar (K.scale_changed): a new item starts in them. Stored under pitch_key_idx /
--- pitch_scale_idx (K.PERSIST); an item analysed again keeps its own. key_idx 0 is "Auto": the item's key is its
--- track's (K.key_resolve), else the key last chosen by hand (hand_key_idx / hand_scale_idx: pitch_key_hand_idx /
--- pitch_scale_hand_idx, updated whenever a real key or a scale is chosen in the bar). 0 is never an item's key
-K.new_key = { key_idx = 0, scale_idx = 1, hand_key_idx = 1, hand_scale_idx = 1 }
+-- The key last chosen by hand in the bar (K.scale_changed): what an item's key falls back to when none can be found
+-- (K.key_resolve). Stored under pitch_key_hand_idx / pitch_scale_hand_idx (K.PERSIST). An item not analysed yet
+-- starts with no key (index 0, shown as "–") unless one was picked for it or its track has one (K.new_item_key);
+-- 0 is never an item's key
+K.new_key = { hand_key_idx = 1, hand_scale_idx = 1 }
 
---- The real key a key choice stands for: a real key (1..12) passes through; Auto (0) gives the key found on the
+-- The key picked in the bar on an item not analysed yet, before its first analysis: [take guid] = { key_idx,
+-- scale_idx }. In memory only: dropped when the item is analysed, when it leaves the project (K.pending_key_prune)
+-- and when another project is shown (K.refresh_project_cache)
+K.pending_key = {}
+
+K.KEY_UNSET_TEXT = "\xE2\x80\x93"   -- the Key and Scale combos' preview while no key is set (an en dash)
+K.KEY_UNSET_TOOLTIP = "Pick the key if you know it. Otherwise it is found from the whole track when you analyze."
+K.SCALE_UNSET_REASON = "Pick a key first, or it is found when you analyze"
+
+--- The Key combo's preview for key index `key_idx`: its short name ("C#"), or "–" while no key is set (0).
+K.key_preview = function(key_idx)
+  local key = SCALE_KEYS[key_idx]
+  return key and key.display or K.KEY_UNSET_TEXT
+end
+
+--- The real key a key choice stands for: a real key (1..12) passes through; not set (0) gives the key found on the
 --- track of the take `guid` (its K.track_record), else the key last chosen by hand. Returns key_idx, scale_idx and
 --- whether the key came from the track.
 K.key_resolve = function(key_idx, scale_idx, guid)
@@ -558,6 +570,71 @@ K.key_resolve = function(key_idx, scale_idx, guid)
   local rec = K.track_record(K.take_track(guid))
   if rec and rec.key_idx then return rec.key_idx, rec.scale_idx, true end
   return K.new_key.hand_key_idx, K.new_key.hand_scale_idx, false
+end
+
+--- The key an item not analysed yet (take `guid`) shows and is analysed with: the one picked for it
+--- (K.pending_key, "picked"), else its track's (its record, "track"), else none (0, 1, "unset": the analysis finds
+--- it). Returns key_idx, scale_idx, source.
+K.new_item_key = function(guid)
+  local picked = guid and K.pending_key[guid]
+  if picked then return picked.key_idx, picked.scale_idx, "picked" end
+  local rec = K.track_record(K.take_track(guid))
+  if rec and rec.key_idx then return rec.key_idx, rec.scale_idx, "track" end
+  return 0, 1, "unset"
+end
+
+--- `v` when it is a key source an item's model can hold ("picked", "track", "found"), else nil.
+K.key_source_valid = function(v)
+  if v == "picked" or v == "track" or v == "found" then return v end
+  return nil
+end
+
+--- Where the key of the new model `data` of an item analysed for the first time comes from: "picked" (the user
+--- picked it before analysing, K.pending_key), "found" (its track's record has a key that this analysis's own
+--- listening pass found: the record is pending and the stored one has no key), "track" (a record that held the key
+--- already), nil (no key anywhere: the key last chosen by hand).
+K.item_key_source = function(data)
+  local guid = data and data.guid
+  if not guid then return nil end
+  if K.pending_key[guid] then return "picked" end
+  local track = K.take_track(guid)
+  local rec = track and K.track_record(track)
+  if not (rec and rec.key_idx) then return nil end
+  local pending = K.track_records_pending[track]
+  if pending then
+    K.track_records_pending[track] = nil
+    local stored = K.track_record(track)
+    K.track_records_pending[track] = pending
+    if not (stored and stored.key_idx) then return "found" end
+  end
+  return "track"
+end
+
+--- Settle the key of the new model `data` of an item analysed for the first time (K.item_key_source, stored as
+--- data.key_source). A picked key is the item's; with `records` (a single analysis) and a record on the item's
+--- track (stored, or found by this analysis), that record takes the picked key and scale (its runner-up dropped),
+--- pending for the analysis's undo block, and the item follows its track. Any other key is the track's, else the
+--- key last chosen by hand (K.key_resolve). A model change only. Returns the track whose record was given the picked
+--- key, or nil.
+K.item_key_settle = function(data, records)
+  local source = K.item_key_source(data)
+  data.key_source = source
+  if source ~= "picked" then
+    local k, sc, from_track = K.key_resolve(0, nil, data.guid)
+    data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
+    return nil
+  end
+  local picked = K.pending_key[data.guid]
+  data.key_idx, data.scale_idx, data.key_from_track = picked.key_idx, picked.scale_idx, nil
+  local track = records and K.take_track(data.guid)
+  local rec = track and K.track_record(track)
+  if not rec then return nil end
+  local new = {}
+  for k, v in pairs(rec) do new[k] = v end
+  new.key_idx, new.scale_idx, new.alt_key_idx, new.alt_scale_idx = picked.key_idx, picked.scale_idx, nil, nil
+  K.track_records_pending[track] = new
+  data.key_from_track = true
+  return track
 end
 
 --- A found key in words: "E Major", "C# Minor" (the found scales are Major and Natural Minor).
@@ -586,8 +663,9 @@ end
 
 --- The Key combo's line for an analysed item `data` whose key was found on its track (and the track's record still
 --- holds it): "Found from V _ Main. C# Minor also fits." (with the runner-up), or "Found from V _ Main."; nil for a
---- key chosen by hand.
+--- key chosen by hand (also one picked before the first analysis that its track then took: data.key_source).
 K.key_found_text = function(data)
+  if data and data.key_source == "picked" then return nil end
   local track, rec = K.key_track_record(data, data and data.guid)
   if not track then return nil end
   local name = K.track_label(track)
@@ -595,6 +673,16 @@ K.key_found_text = function(data)
     return string.format("Found from %s. %s also fits.", name, K.key_text(rec.alt_key_idx, rec.alt_scale_idx))
   end
   return string.format("Found from %s.", name)
+end
+
+--- The Key combo's tooltip for the open item's model `data` (nil: not analysed) showing key index `key_idx`: what Key
+--- is; while no key is set (0) how one is chosen; for a key found on the item's track where from (K.key_found_text).
+K.key_tooltip = function(data, key_idx)
+  local found = K.key_found_text(data)
+  return "Key\n\nThe root note of the scale."
+    .. (key_idx == 0 and ("\n\n" .. K.KEY_UNSET_TOOLTIP) or "")
+    .. (found and ("\n\n" .. found) or "")
+    .. "\n\nRight-click: apply Key and Scale to other items."
 end
 
 --- The item's own value of `key`, or nil (Separation is stored beside the notes, the others in data.overrides).
@@ -605,11 +693,11 @@ K.item_value = function(data, key)
 end
 
 --- The values a new item `guid` starts with: its default of every value key (K.item_default: its track's, else the
---- System Default, else DEFAULTS), and the Key and Scale last chosen in the bar (K.new_key).
+--- System Default, else DEFAULTS), and its Key and Scale (K.new_item_key: picked, its track's, or not set).
 K.new_item_values = function(guid)
   local t = {}
   for _, key in ipairs(K.ITEM_KEYS) do t[key] = (K.item_default(key, guid)) end
-  t.key_idx, t.scale_idx = K.new_key.key_idx, K.new_key.scale_idx
+  t.key_idx, t.scale_idx = K.new_item_key(guid)
   return t
 end
 
@@ -629,15 +717,10 @@ K.item_seed = function(data)
       filled = true
     end
   end
-  -- No key, or Auto (a finished analysis copies the bar's Auto): the real key it stands for (K.key_resolve)
+  -- No key, or not set (0): the real key it stands for (K.key_resolve: the track's, else the one last chosen by hand)
   if data.key_idx == nil or data.key_idx == 0 then
-    local key = (data.key_idx == nil) and start.key_idx or 0
-    if key == 0 then
-      local k, sc, from_track = K.key_resolve(0, nil, data.guid)
-      data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
-    else
-      data.key_idx = key
-    end
+    local k, sc, from_track = K.key_resolve(0, nil, data.guid)
+    data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
     filled = true
   end
   if data.scale_idx == nil then data.scale_idx, filled = start.scale_idx, true end
@@ -649,7 +732,7 @@ end
 K.item_carry_key = function(data, before)
   if not before then return end
   if before.key_idx ~= nil and before.key_idx ~= 0 then
-    data.key_idx, data.key_from_track = before.key_idx, before.key_from_track
+    data.key_idx, data.key_from_track, data.key_source = before.key_idx, before.key_from_track, before.key_source
   end
   if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
 end
@@ -871,7 +954,7 @@ local function update_scale_pitch_classes()
   local scale = SCALE_DEFINITIONS[state.scale_idx]
   local root_pc = (state.key_idx - 1) % 12
   state.scale_pc_set = {}
-  if state.key_idx == 0 then   -- Auto (an item not analysed yet): every pitch class is in scale
+  if state.key_idx == 0 then   -- no key set (an item not analysed yet): every pitch class is in scale
     for pc = 0, 11 do state.scale_pc_set[pc] = true end
   elseif scale then
     for _, intv in ipairs(scale.intervals) do
@@ -933,16 +1016,14 @@ K.PERSIST = (function()
     end)
   end
 
-  -- The Key and Scale a new item starts in (K.new_key), saved when Key or Scale is changed in the bar
-  -- (whole numbers only: they index SCALE_KEYS / SCALE_DEFINITIONS; Auto is 0, never a key chosen by hand)
+  -- The key last chosen by hand (K.new_key), saved when Key or Scale is changed in the bar
+  -- (whole numbers only: they index SCALE_KEYS / SCALE_DEFINITIONS)
   local function whole(group, ext, tbl, key, lo, hi)
     add(group, ext, function() return string.format("%.14g", tbl[key]) end, function(raw)
       local n = finite(raw)
       if n and n % 1 == 0 then tbl[key] = math.max(lo, math.min(hi, n)) end
     end)
   end
-  whole("key", "pitch_key_idx", K.new_key, "key_idx", 0, #SCALE_KEYS)
-  whole("key", "pitch_scale_idx", K.new_key, "scale_idx", 1, #SCALE_DEFINITIONS)
   whole("key", "pitch_key_hand_idx", K.new_key, "hand_key_idx", 1, #SCALE_KEYS)
   whole("key", "pitch_scale_hand_idx", K.new_key, "hand_scale_idx", 1, #SCALE_DEFINITIONS)
 
@@ -1038,10 +1119,10 @@ do
   local saved_shortcuts = reaper.GetExtState("FancyScripts", "pitch_shortcuts_open")
   state.shortcuts_open = not (saved_shortcuts == "0" or saved_shortcuts == "false")
 
-  -- Restore the Key for new items, the engine settings, the layers and the panel width
+  -- Restore the key last chosen by hand, the engine settings, the layers and the panel width
   K.load_settings()
-  -- Nothing is open yet: the window shows a new item's values
-  state.key_idx, state.scale_idx, state.separation = K.new_key.key_idx, K.new_key.scale_idx, DEFAULTS.separation
+  -- Nothing is open yet: the window shows a new item's values (no key set)
+  state.key_idx, state.scale_idx, state.separation = 0, 1, DEFAULTS.separation
   update_scale_pitch_classes()
   -- A panel the user never resized takes its width from the Shortcuts list (see K.panel_fit_w), on the first frame
   state.sidebar_auto = not reaper.HasExtState("FancyScripts", "pitch_sidebar_w")
@@ -1069,11 +1150,13 @@ K.drop_project_cache = function()
 end
 
 --- Once per frame, before anything reads the cache: one GetProjectStateChangeCount call and one EnumProjects call;
---- the cache is dropped when either differs from the one it was filled for.
+--- the cache is dropped when either differs from the one it was filled for. Another project shown also drops the keys
+--- picked for items not analysed yet (K.pending_key: they belong to the project left); an undo keeps them.
 K.refresh_project_cache = function()
   local cache = state.cache
   local count = reaper.GetProjectStateChangeCount(0)
   local proj = reaper.EnumProjects(-1)
+  if cache.proj ~= nil and cache.proj ~= proj then K.pending_key = {} end
   if count == nil or cache.count ~= count or cache.proj ~= proj then
     K.drop_project_cache()
     cache.count, cache.proj = count, proj
@@ -1205,6 +1288,13 @@ K.take_track = function(guid)
   return track or nil
 end
 
+--- Forget the keys picked for items that are no longer in the project (checked when the open item changes).
+K.pending_key_prune = function()
+  for guid in pairs(K.pending_key) do
+    if not resolve_take_by_guid(guid, true) then K.pending_key[guid] = nil end
+  end
+end
+
 --- The Track Default of `track` ({ [key] = number }, only the keys set and valid; empty when none), cached per
 --- project state.
 K.track_defaults = function(track)
@@ -1334,7 +1424,7 @@ K.track_records_flush = function(keep)
 end
 
 --- Write the pending record of `track` alone and forget it (and the cache); the other tracks' records stay pending.
---- Opens NO undo block: the caller's is open (a key corrected on an item, Find Key, Find Range and Key Again).
+--- Opens NO undo block: the caller's is open (a key corrected on an item, Find Range and Key Again).
 K.track_record_flush_one = function(track)
   local rec = track and K.track_records_pending[track]
   if rec then
@@ -1571,7 +1661,7 @@ K.note_readout = function(cp, C)
   local cents = math.floor((cp - nearest) * 100 + 0.5)
   local pc = (nearest % 12 + 12) % 12
   local scale = SCALE_DEFINITIONS[state.scale_idx]
-  local chromatic = (not scale) or scale.name == "Chromatic" or state.key_idx == 0   -- Auto: no scale yet
+  local chromatic = (not scale) or scale.name == "Chromatic" or state.key_idx == 0   -- no key set: no scale yet
   local key_name = SCALE_KEYS[state.key_idx] and SCALE_KEYS[state.key_idx].display or ""
   local scale_name = chromatic and "" or (key_name .. " " .. scale.name)
   local name_col, scale_line = C.readout_name, nil
@@ -2703,22 +2793,24 @@ K.analysis_begin = function(take, item, opts)
   return true
 end
 
--- Auto range and key, wired into Analyze (docs/design/pitch-correct-auto-range-key.md): when Vocal Range or Key is
--- on Auto, the item's track is heard first (stage 1, K.pre_begin), then the item is analysed with the range found
--- (stage 2). The record found waits in K.track_records_pending and is written inside the analysis's own undo block;
--- every way an analysis ends without one drops it (K.auto_drop). K.auto_run carries a single analysis's stage-1
--- outcome to its end: { guid, track, rec, fresh, pre_ran, want_range, want_key, skipped, total }.
+-- Auto range and key, wired into Analyze (docs/design/pitch-correct-auto-range-key.md): when Vocal Range is on Auto,
+-- or an item not analysed yet has no key (K.auto_needed), the item's track is heard first (stage 1, K.pre_begin),
+-- then the item is analysed with the range found (stage 2). The record found waits in K.track_records_pending and
+-- is written inside the analysis's own undo block; every way an analysis ends without one drops it (K.auto_drop).
+-- K.auto_run carries a single analysis's stage-1 outcome to its end: { guid, track, rec, fresh, pre_ran, want_range,
+-- want_key, skipped, total }.
 K.auto_run = nil
 K.AUTO_UNREADABLE_TEXT = "Couldn't read this item's audio. Check that its media is online, then try again."
--- Shared by the Auto analysis, Find Key and Find Range and Key Again: the key kept, and items skipped of a track
+-- Shared by the Auto analysis and Find Range and Key Again: the key kept, and items skipped of a track
 K.NO_KEY_FMT = "Not enough singing to tell the key: kept %s."
 K.SKIPPED_FMT = "Couldn't read %d of %d items on %s (media offline). Used the rest."
 
 --- True when analysing the item `guid` with `values` needs its track's range or key: Vocal Range is Auto, or the
---- item is not analysed yet and the bar's Key is Auto (0).
+--- item is not analysed yet and has no key (none picked, none on its track: K.new_item_key).
 K.auto_needed = function(values, guid)
   if values and values.auto_range == true then return true end
-  return not (guid and state.session_takes[guid]) and state.key_idx == 0
+  if guid and state.session_takes[guid] then return false end
+  return select(3, K.new_item_key(guid)) == "unset"
 end
 
 --- A copy of `values` to analyse with. With Vocal Range Auto: the Hz of the range in `record` (K.pre_range_hz, its
@@ -3572,10 +3664,11 @@ K.take_json = function(data)
     sample_rate = data.sample_rate,
     results = data.results,
     notes = {},
-    -- (every model is seeded first, K.item_seed; the bar's Auto, 0, is never stored)
+    -- (every model is seeded first, K.item_seed; a key not set, 0, is never stored)
     key_idx = data.key_idx or (K.key_resolve(state.key_idx, state.scale_idx, data.guid)),
     scale_idx = data.scale_idx or state.scale_idx,
     key_from_track = data.key_from_track or nil,   -- the key was found on the item's track (the Key combo says so)
+    key_source = K.key_source_valid(data.key_source),   -- where its first analysis took the key (K.item_key_source)
     separation = data.separation,   -- the Separation the notes were split at (see K.follow_resplit_undo)
     overrides = data.overrides or nil,
     analysis = data.analysis,   -- the values the analysis ran with (K.analysis_values)
@@ -3611,8 +3704,8 @@ local function save_take_data(take, data, json)
 end
 
 --- Save the active Key/Scale as the open item's own (one named undo point, so Cmd+Z reverts it together with the
---- Key/Scale selection). An item not analysed yet keeps it in state.key_idx / state.scale_idx, and its first
---- analysis stores it. `undo_label`: "Set Key", "Set Scale" or "Find Key: <item>" (K.scale_changed, K.find_key_finish).
+--- Key/Scale selection). An item not analysed yet keeps it in K.pending_key (K.scale_changed), and its first
+--- analysis stores it. `undo_label`: "Set Key" or "Set Scale" (K.scale_changed).
 --- flush (optional): the pending track record that goes into the same block (K.records_flush). Returns true when it
 --- wrote (one undo point).
 local function save_current_scale_settings(undo_label, flush)
@@ -3678,6 +3771,7 @@ local function load_take_data(take, raw)
   if guid then state.unreadable_takes[guid] = (not readable) or nil end
   if readable then
     data.key_from_track = (data.key_from_track == true) or nil
+    data.key_source = K.key_source_valid(data.key_source)
     K.item_seed(data)
     data.analysis = K.analysis_values(data.analysis)   -- a malformed record counts as not recorded
     data.name = K.live_take_name(take, data.name)   -- the name is REAPER's, not the one saved with the analysis
@@ -4097,6 +4191,7 @@ K.batch_write = function(done)
       if not listed then table.insert(state.session_order, guid) end
       state.stale_takes[guid], state.stale_env[guid], state.missing_takes[guid] = nil, nil, nil
       state.undone_takes[guid] = nil
+      K.pending_key[guid] = nil   -- analysed: its key is its own now
       written[#written + 1] = r.entry
     end
   end
@@ -4194,8 +4289,9 @@ K.batch_next = function()
       reset_analysis_model()
       state.target_take_guid, state.target_take_name = entry.guid, entry.name
       -- It is split at the default Separation and keeps its own Key and Scale (an item analysed for the first time:
-      -- the ones last chosen), never those of the item that was open. An analysis stored on the item that the window
-      -- has not loaded (pasted later) counts too: it is read here and kept on the entry for K.batch_item_done
+      -- its new item's key, K.new_item_key), never those of the item that was open. An analysis stored on the item
+      -- that the window has not loaded (pasted later) counts too: it is read here and kept on the entry for
+      -- K.batch_item_done
       local before, start = state.session_takes[entry.guid], K.new_item_values(entry.guid)
       if not before then before = load_take_data(take) end
       entry.before = before
@@ -4281,12 +4377,13 @@ K.batch_start = function(entries, values)
 end
 
 --- The distinct tracks of `entries` (a batch's) whose items need the range or key found first: every item's when
---- Vocal Range is Auto in `values`, else an item not analysed yet while the Key for new items is Auto.
+--- Vocal Range is Auto in `values`, else an item not analysed yet that has no key (K.new_item_key).
 K.batch_auto_tracks = function(entries, values)
   local seen, out = {}, {}
   for _, entry in ipairs(entries) do
     local need = values.auto_range == true
-      or (K.new_key.key_idx == 0 and not state.session_takes[entry.guid] and not entry.has_notes)
+      or (not state.session_takes[entry.guid] and not entry.has_notes
+        and select(3, K.new_item_key(entry.guid)) == "unset")
     if need and entry.take and reaper.ValidatePtr2(0, entry.take, "MediaItem_Take*") then
       local track = reaper.GetMediaItemTake_Track(entry.take)
       if track and not seen[track] then
@@ -4301,7 +4398,7 @@ end
 --- How far the running analysis is, 0 .. 1: the whole batch when one runs, else the item.
 K.analysis_progress = function()
   -- Stage 1 of an Auto analysis is the first K.PRE.SHARE of the whole; the analysis after it the rest
-  -- (a pre-analysis on its own, Find Key / Find Range and Key Again, is the whole)
+  -- (a pre-analysis on its own, Find Range and Key Again, is the whole)
   if state.pre then return (state.pre.alone and 1 or K.PRE.SHARE) * K.pre_progress() end
   local p, pre_ran
   if K.batch then
@@ -4313,8 +4410,11 @@ K.analysis_progress = function()
   return p
 end
 
---- The open item has no stored data: Separation is its default (K.item_default), Key and Scale the ones last chosen.
+--- The open item has no stored data: Separation is its default (K.item_default), Key and Scale its new item's key
+--- (K.new_item_key: picked for it, its track's, or not set). Keys picked for items gone from the project are
+--- forgotten first.
 K.adopt_new_item_values = function()
+  K.pending_key_prune()
   local start = K.new_item_values(state.target_take_guid)
   state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
   update_scale_pitch_classes()
@@ -4497,6 +4597,11 @@ local function sync_with_project()
         end
       end
     end
+  end
+  -- An open item still not analysed shows its key as the project holds it now (an undo may take its track's away)
+  if target_guid and not state.session_takes[target_guid] then
+    state.key_idx, state.scale_idx = K.new_item_key(target_guid)
+    update_scale_pitch_classes()
   end
   if analyses_changed then K.status_release() end
   if state.target_take_guid then K.form_sync(state.target_take_guid, state.session_takes[state.target_take_guid]) end
@@ -5175,7 +5280,7 @@ end
 --- Returns true when the envelope and the model were written (one undo point); false when they were not, after
 --- saying why in the status line (so a caller must not then claim an undo point). flush_records: true (an Auto
 --- analysis) writes every track record it found inside the same block, a track (a key corrected on an item that
---- follows its track, Find Key) only that track's (K.records_flush).
+--- follows its track, a picked key given to the track by an analysis) only that track's (K.records_flush).
 local function apply_envelope_to_take(undo_desc, keep_pitch_mode, flush_records)
   -- A pending arrow-key nudge is committed as its own undo point first
   if state.nudge_burst then flush_nudge_burst() end
@@ -5226,27 +5331,35 @@ K.key_follow_track = function(data)
   return K.key_track_record(data, data and (data.guid or state.target_take_guid))
 end
 
---- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). With no
---- Classic or Hard note in the open item this is the plain save; otherwise the item's notes follow the new scale:
---- its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. `what` = "key" or
---- "scale": what changed, which names the undo point ("Set Key" / "Set Scale").
---- On an analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the
---- same undo point, and the Key for new items stays as it is (Auto): later items on the track follow. Auto chosen on
---- an analysed item finds its key on its track (K.find_key_request).
+--- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). `what` =
+--- "key" or "scale": what changed, which names the undo point ("Set Key" / "Set Scale"). The key chosen is the key
+--- last chosen by hand (K.new_key, what a key that cannot be found falls back to).
+--- On an item not analysed yet the choice is only remembered for it (K.pending_key: its first analysis uses it); a
+--- key picked while none was set comes with Major. Nothing is written to REAPER and no undo point is made.
+--- On an analysed item with no Classic or Hard note this is the plain save; otherwise the item's notes follow the
+--- new scale: its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. On an
+--- analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the same
+--- undo point: later items on the track follow.
 K.scale_changed = function(what)
   local undo_label = (what == "scale") and "Set Scale" or "Set Key"
-  local data = state.target_take_guid and state.session_takes[state.target_take_guid]
-  if state.key_idx == 0 and data then
-    -- An analysed item never shows Auto: the bar keeps the item's key until its track's is found
-    state.key_idx = data.key_idx or K.new_key.hand_key_idx
+  local guid = state.target_take_guid
+  local data = guid and state.session_takes[guid]
+  if state.key_idx == 0 then   -- no key set: nothing was chosen (Scale is locked while Key shows "–")
     update_scale_pitch_classes()
-    K.find_key_request()
+    return
+  end
+  if not data then
+    if what == "key" and select(3, K.new_item_key(guid)) == "unset" then state.scale_idx = 1 end
+    if guid then K.pending_key[guid] = { key_idx = state.key_idx, scale_idx = state.scale_idx } end
+    update_scale_pitch_classes()
+    K.new_key.hand_key_idx, K.new_key.hand_scale_idx = state.key_idx, state.scale_idx
+    K.save_settings("key")
     return
   end
   update_scale_pitch_classes()
-  -- A real key or a scale chosen is the key last chosen by hand (what Auto falls back to). On the from-track path
-  -- below it changes in memory only: it is saved with the next "key" settings save
-  if state.key_idx ~= 0 then K.new_key.hand_key_idx, K.new_key.hand_scale_idx = state.key_idx, state.scale_idx end
+  -- On the from-track path below the key last chosen by hand changes in memory only: it is saved with the next
+  -- "key" settings save
+  K.new_key.hand_key_idx, K.new_key.hand_scale_idx = state.key_idx, state.scale_idx
   -- While an analysis, a batch or a pre-analysis runs its pending records are its own: the key changes as on any item
   local follow, rec = nil, nil
   if not (state.is_analyzing or K.batch or state.pre) then follow, rec = K.key_follow_track(data) end
@@ -5257,11 +5370,9 @@ K.scale_changed = function(what)
     new.key_idx, new.scale_idx, new.alt_key_idx, new.alt_scale_idx = state.key_idx, state.scale_idx, nil, nil
     K.track_records_pending[follow] = new
   else
-    -- The next new item starts in this Key and Scale (ExtState: a preference, not part of the item's undo point)
-    K.new_key.key_idx, K.new_key.scale_idx = state.key_idx, state.scale_idx
-    K.save_settings("key")
+    K.save_settings("key")   -- ExtState: a preference, not part of the item's undo point
   end
-  local count = data and K.mode_note_count(state.notes or {}) or 0
+  local count = K.mode_note_count(state.notes or {})
   local wrote
   if count == 0 then
     wrote = save_current_scale_settings(undo_label, follow)
@@ -5277,69 +5388,6 @@ K.scale_changed = function(what)
       set_status(string.format("Key for %s is now %s. New items on this track follow.", K.track_label(follow),
         K.key_text(state.key_idx, state.scale_idx)))
     end
-  end
-end
-
---- Key "Auto" chosen on the analysed open item: it takes its track's key (K.find_key_finish). A track with no record
---- is heard first (K.pre_begin; the record found is written with the item, or dropped). Never while an analysis, a
---- batch or a pre-analysis runs.
-K.find_key_request = function()
-  if state.is_analyzing or K.batch or state.pre then return end
-  local guid = state.target_take_guid
-  if not (guid and state.session_takes[guid]) then return end
-  local track = K.take_track(guid)
-  if not track then return end
-  local rec = K.track_record(track)
-  if rec then
-    K.find_key_finish(guid, track, rec)
-    return
-  end
-  if K.pre_begin({ track }, { on_done = function(results, external)
-    K.find_key_finish(guid, track, results[track])
-    if external then state.last_change_count = nil end   -- K.pre_note_external: after its own write
-  end }) then
-    state.pre.alone = true
-  end
-end
-
---- The track's record `rec` (nil: the track went) is known: the open item `guid` takes its key and scale (one undo
---- point "Find Key: <item>", the envelope rewritten when it has Classic / Hard notes, a record just found written in
---- the same block). No key in the record, or the item has it already: nothing is written. Nothing stays pending.
-K.find_key_finish = function(guid, track, rec)
-  local data = state.session_takes[guid]
-  local take = resolve_take_by_guid(guid, true)
-  if not (data and take and state.target_take_guid == guid) then
-    K.track_records_pending[track] = nil
-    return
-  end
-  if not (rec and rec.key_idx) then
-    K.track_records_pending[track] = nil
-    set_status(string.format(K.NO_KEY_FMT, K.key_text(data.key_idx, data.scale_idx)))
-    return
-  end
-  if data.key_idx == rec.key_idx and data.scale_idx == rec.scale_idx and data.key_from_track then
-    -- The item has its track's key already: nothing is written, the status says whose key it is
-    K.track_records_pending[track] = nil
-    set_status((K.auto_status({ fresh = false, want_key = true, track = K.track_label(track),
-      key_text = K.key_text(rec.key_idx, rec.scale_idx) })))
-    return
-  end
-  data.key_idx, data.scale_idx, data.key_from_track = rec.key_idx, rec.scale_idx, true
-  state.key_idx, state.scale_idx = rec.key_idx, rec.scale_idx
-  update_scale_pitch_classes()
-  local label = "Find Key: " .. (data.name or state.target_take_name or "this item")
-  local wrote
-  if K.mode_note_count(state.notes or {}) == 0 then
-    wrote = save_current_scale_settings(label, track)
-  else
-    wrote = apply_envelope_to_take(label, nil, track)
-  end
-  K.track_records_pending[track] = nil   -- written inside the block above, or never
-  if wrote then
-    -- What was found, as an Auto analysis says it with only the key on Auto: "Found E Major. Cmd+Z to undo."
-    set_status((K.auto_status({ fresh = true, want_key = true, track = K.track_label(track),
-      key_text = K.key_text(rec.key_idx, rec.scale_idx),
-      alt_text = rec.alt_key_idx and K.key_text(rec.alt_key_idx, rec.alt_scale_idx) or nil })))
   end
 end
 
@@ -5408,6 +5456,11 @@ K.find_again_finish = function(track, prev, rec, total, guid)
   reaper.Undo_EndBlock("Find Range and Key: " .. name, -1)
   state.undo_open = false
   note_own_write()
+  -- An open item not analysed yet that had no key now shows its track's (K.new_item_key)
+  if state.target_take_guid and not state.session_takes[state.target_take_guid] then
+    state.key_idx, state.scale_idx = K.new_item_key(state.target_take_guid)
+    update_scale_pitch_classes()
+  end
   if (rec.skipped or 0) > 0 then
     set_status(string.format(K.SKIPPED_FMT, rec.skipped,
       math.max(total or 0, rec.skipped), name))
@@ -6759,8 +6812,20 @@ local function process_analysis_step()
       }
       -- Every new analysis starts at the defaults (K.item_seed); its Separation, Key and Scale are the state mirrors
       -- above (K.analysis_begin or, in a batch, K.batch_next put the default Separation; the Key and Scale are the
-      -- item's own, or for a new item the ones last chosen: Auto (0) becomes a real key here)
-      if not K.batch then K.item_carry_key(take_data, state.session_takes[state.target_take_guid]) end
+      -- item's own). An item analysed for the first time settles its key here (K.item_key_settle: the one picked
+      -- for it, else its track's, which this analysis may just have found); in a single analysis a picked key also
+      -- becomes its track's record's, written in the analysis's undo block below
+      local before = state.session_takes[state.target_take_guid]
+      if K.batch and not before then
+        local entry = K.batch.queue[K.batch.index]
+        before = entry and entry.guid == state.target_take_guid and entry.before or nil
+      end
+      local picked_track = nil
+      if before then
+        if not K.batch then K.item_carry_key(take_data, before) end
+      else
+        picked_track = K.item_key_settle(take_data, not K.batch)
+      end
       K.item_seed(take_data)
       if K.batch then
         -- A batch holds the model and writes every item in one undo block when it ends; this starts its next item.
@@ -6775,7 +6840,8 @@ local function process_analysis_step()
       end
       state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       state.session_takes[state.target_take_guid] = take_data
-      -- The bar shows the analysed item's real key (Auto, 0, only while an item is not analysed)
+      K.pending_key[state.target_take_guid] = nil   -- analysed: its key is its own now
+      -- The bar shows the analysed item's real key (not set, 0, only while an item is not analysed)
       state.key_idx, state.scale_idx = take_data.key_idx, take_data.scale_idx
       update_scale_pitch_classes()
       -- The form follows: it now shows the values the item was analysed with ("as analyzed before"), so a later
@@ -6791,12 +6857,12 @@ local function process_analysis_step()
       -- Re-apply the envelope from the fresh (untouched) notes: this clears every stale point left by
       -- a previous analysis and writes the new model to the take inside the same "Analyze Pitch" block.
       -- The take's pitch mode is left alone, as for any analysis.
-      -- An Auto analysis's track record is written inside the same block (K.track_records_flush); one that is not
-      -- written with it is dropped below
+      -- An Auto analysis's track record, and a record given the picked key, is written inside the same block
+      -- (K.records_flush); one that is not written with it is dropped below
       local run = K.auto_run
       if run and run.guid ~= state.target_take_guid then run = nil end
       if resolve_take_by_guid(state.target_take_guid, true) then
-        if apply_envelope_to_take("Analyze Pitch", true, run ~= nil) then
+        if apply_envelope_to_take("Analyze Pitch", true, (run ~= nil) or picked_track) then
           local reanalyzed = K.reanalyze_status_guid == state.target_take_guid
           local msg, kind = nil, nil
           if run and run.track then msg, kind = K.auto_run_status(run, take_data) end
@@ -9452,7 +9518,7 @@ local function draw_graph(draw_ctx, w, h)
   -- Everything from here to the playhead is clipped to the note area: the note-name column and the two strips
   -- are drawn after it, and a block that runs past the window's edge must not reach them.
   local root_pc = (state.key_idx - 1) % 12
-  -- Key Auto (an item not analysed yet, e.g. while its analysis draws in): no scale yet, every row in key
+  -- No key set (an item not analysed yet, e.g. while its analysis draws in): no scale yet, every row in key
   local is_chromatic = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic") or state.key_idx == 0
   reaper.ImGui_DrawList_PushClipRect(draw_list, px, py, px + w, py + h, true)
 
@@ -14153,7 +14219,7 @@ K.apply_source = function(keys)
     end
     src[key] = v
   end
-  -- Key Auto on an item not analysed yet: the real key it stands for (Auto is never given to an item)
+  -- No key set on an item not analysed yet: the real key it stands for (0 is never given to an item)
   if src.key_idx == 0 then
     local k, sc = K.key_resolve(0, nil, state.target_take_guid)
     src.key_idx = k
@@ -14335,7 +14401,7 @@ K.apply_item_model = function(data, row)
   for key, v in pairs(row.set) do
     if key == "separation" or key == "key_idx" or key == "scale_idx" then
       new[key] = v
-      if key ~= "separation" then new.key_from_track = nil end   -- a key given, not found on the track
+      if key ~= "separation" then new.key_from_track, new.key_source = nil, nil end   -- a key given, not found
     else
       new.overrides[key] = v
     end
@@ -14926,17 +14992,10 @@ do
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),        P.btn)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),  P.btn_a)
-    -- Key index 0 is "Auto" (only while the item is not analysed: an analysed item always shows its real key)
-    local key_info = SCALE_KEYS[state.key_idx]
-    local key_open = reaper.ImGui_BeginCombo(ctx, "##key_selector", key_info and key_info.display or "Auto")
+    -- Key index 0 is not set, "–" (only while the item is not analysed: an analysed item always shows its real key)
+    local key_open = reaper.ImGui_BeginCombo(ctx, "##key_selector", K.key_preview(state.key_idx))
     reaper.ImGui_PopStyleColor(ctx, 3)
     if key_open then
-      local auto_sel = (state.key_idx == 0)
-      if Theme.selectable(ctx, "Auto##key_0", auto_sel, nil, s.key_list_w) and not auto_sel then
-        state.key_idx = 0
-        K.scale_changed("key")   -- an analysed item takes its track's key (K.find_key_request)
-      end
-      if auto_sel then reaper.ImGui_SetItemDefaultFocus(ctx) end
       for i, k_info in ipairs(SCALE_KEYS) do
         local is_sel = (state.key_idx == i)
         if Theme.selectable(ctx, k_info.name .. "##key_" .. i, is_sel, nil, s.key_list_w) and not is_sel then
@@ -14949,25 +15008,22 @@ do
     end
     hdr_key_menu("##ctx_key")   -- right after the combo: it asks about the last item
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
-      -- An item whose key was found on its track says so, with the runner-up (K.key_found_text); built on hover only
-      local found = K.key_found_text(state.target_take_guid and state.session_takes[state.target_take_guid])
-      Theme.tooltip(ctx, "Key\n\nThe root note of the scale."
-        .. (found and ("\n\n" .. found) or "")
-        .. "\n\nAuto\n\nFinds the song's key from the whole track the first time one of its items is analyzed."
-        .. "\n\nRight-click: apply Key and Scale to other items.")
+      -- Built on hover only (K.key_tooltip: a found key names its track and the runner-up)
+      Theme.tooltip(ctx, K.key_tooltip(state.target_take_guid and state.session_takes[state.target_take_guid],
+        state.key_idx))
     end
   end
 
   local function hdr_draw_scale(hs)
     local s = hs.s
-    -- While Key is Auto (an item not analysed yet) the scale is found with the key: "Auto", disabled with its reason
-    -- (Theme.combo's tooltip shows on a disabled combo too)
-    local auto = (state.key_idx == 0)
-    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, auto and 0 or state.scale_idx, {
+    -- While no key is set (an item not analysed yet) the scale is "–", disabled with its reason (Theme.combo's
+    -- tooltip shows on a disabled combo too)
+    local unset = (state.key_idx == 0)
+    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, unset and 0 or state.scale_idx, {
       w = s.scale_w,
-      disabled = auto,
-      placeholder = "Auto",
-      tooltip = auto and "Found with the key"
+      disabled = unset,
+      placeholder = K.KEY_UNSET_TEXT,
+      tooltip = unset and K.SCALE_UNSET_REASON
         or "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\nRight-click: apply Key and Scale to other items.",
     })
     if changed and new_idx ~= state.scale_idx then
@@ -16741,6 +16797,6 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            get_effective = get_effective, get_override_level = get_override_level,
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
            clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session,
-           start_analysis = start_analysis }
+           start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS }
 end
 main()
