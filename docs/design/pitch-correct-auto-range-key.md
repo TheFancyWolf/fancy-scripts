@@ -1,195 +1,234 @@
 # Design: Fancy Pitch Correct — Auto Vocal Range and Key (pre-analysis)
 
 Target file(s): `Pitch/Fancy_Pitch Correct.lua`
-Archetype(s): main window → Editor / canvas (unchanged); the "Analysis Settings" form on the empty canvas and the top bar's Key / Scale → part of the main window (Editor / canvas); the existing analysis modal (Re-Analyze, Analyze Selected Items) → the window's modal family (Editor / canvas)
+Archetype(s): main window → Editor / canvas (unchanged); the "Analysis Settings" form on the empty canvas and the top bar's Key / Scale / Range → part of the main window (Editor / canvas); the Analysis card (progress and result) and the existing analysis modal (Re-Analyze, Analyze Selected Items) → the window's modal family (Editor / canvas)
 Status: Approved
-Date: 2026-11-25
-Approver: TheFancyWolf (in chat, 2026-11-25)
+Date: 2026-11-27
+Approver: TheFancyWolf (in chat, 2026-11-27; revision 1 approved 2026-11-25)
 
 ## Summary
 
-Today the user guesses the Vocal Range and picks the Key and Scale by hand before analysing. This design makes finding them the first stage of Analyze: a quick, coarse pass over the whole track (the "pre-analysis") works out the singer's lowest and highest notes and the song's key, then the normal analysis carries on with them. On screen it costs **no new row, button or modal**: Vocal Range gains the choice "Auto" and the top bar's Key gains the choice "Auto". The result is remembered on the track, so the pre-analysis runs once per track and later items only add what it has not heard yet. The window's primary display (the note canvas) and the empty canvas's primary action (Analyze) do not change.
+Analyze first listens through the whole track (the "pre-analysis") to find the singer's range and the song's key, then finds the notes. This revision (2) follows the user's test of revision 1 in real REAPER on 2026-11-27. Three things change: the Key list has **no "Auto" choice** — a new item's key is simply found and selected, unless the user picked one first; the range in use is **always shown** in the top bar; and all progress and results appear in **one card in the middle of the note window**, which stays open while the analysis runs, fills in what it finds, and is closed by the user when it is done. The corner status message, the progress line in the settings form and the percentage on the "…" button are no longer used for analysis. The window's primary display (the note canvas) and the empty canvas's primary action (Analyze) do not change.
 
-Replaces the earlier draft "Scan Track" (a separate scan row, button and result modal), dropped on 2026-11-25 in favour of this approach.
+Revision 1 (approved 2026-11-25) is built on branch `pitch-correct-auto-range-key`; this revision changes its interface, not its listening pass, track record or undo behaviour.
 
 ## Feature inventory
 
 | Feature / action | REAPER state read | REAPER state written | Persistence (ExtState / JSON / file / none) | One Ctrl/Cmd+Z fully restores it incl. script state (Y/N, why) |
 |---|---|---|---|---|
-| Vocal Range → "Auto" (new first choice in the form, the analysis modal and Settings → Analysis Defaults; the factory default) | Settings defaults, the item's stored analysis settings | nothing (a form value, as the other choices today) | none in the form; ExtState when saved as the default (existing Save as Default / Settings path) | n/a in the form; Settings / Save as Default unchanged (N, already confirmed by the existing modal) |
-| Key → "Auto" (new first choice in the top bar's Key list) on an unanalysed item: new items start with the key found on their track | the "Key for new items" (existing) | the "Key for new items" | ExtState (existing key, existing behaviour: the bar's choice for new items is not undoable today) | N: unchanged existing behaviour; nothing destructive, no confirm |
-| Analyze / Analyze All Selected Items with Vocal Range or Key on Auto, track not heard yet: pre-analysis of every audio item on the track, then the analysis | every audio item on the track (active takes, media online), read coarsely; then the item's audio as today | the track's record (the tally of pitches heard, which items it covers, lowest / highest note, key, scale, the runner-up key) in the track's `P_EXT`; then the item's notes, analysis settings and Key / Scale as today | track and take data inside the analysis's one undo block | Y: one undo block on project objects; the model reloads on `GetProjectStateChangeCount`; no ExtState is written by the pre-analysis |
-| The same on a track already heard | the track's record; only items the record does not cover are read | the record grows by those items (the range can widen; the key stays) | as above | Y: same block |
-| Cancel during the pre-analysis (the existing Cancel) | nothing | nothing | none | n/a: nothing was written |
-| Key or Scale changed in the top bar on an analysed item whose key came from its track: the item changes as today, and the track's key changes with it, so later items on the track follow | the item, the track's record | the item's Key / Scale and envelope as today; the track's record | take and track data inside the existing key-change undo block | Y: one undo block, model reload. In this case the "Key for new items" ExtState is left on Auto |
-| Key → "Auto" on an analysed item: the item takes its track's key (the track is heard first if it has no record) | the track's record or its audio | the item's Key / Scale and envelope; the record if new | take and track data inside one undo block | Y |
-| "…" → Find Range and Key Again: hear the whole track afresh and replace its record; analysed items are not changed | every audio item on the target item's track | the track's record | track data inside one undo block | Y: one undo block, model reload, nothing else persisted → no confirm (HC4); status message posted |
-| What an item was analysed with (existing tooltip and modal) now reads "Auto: E2–A4" | the item's stored analysis settings | nothing | none | n/a |
+| Vocal Range → "Auto" (first choice in the form, the analysis modal and Settings → Analysis Defaults; the factory default) — unchanged from revision 1 | Settings defaults, the item's stored analysis settings | nothing (a form value) | none in the form; ExtState when saved as the default (existing path) | n/a in the form; Settings / Save as Default unchanged |
+| Key and Scale of an item not analysed yet: shown as "–" (not set) unless its track already has a key, which is then shown. The user may pick a key before analysing | the track's record | nothing until Analyze | none (an in-memory choice for that item; the "Key for new items" ExtState of revision 1 is no longer used) | n/a: nothing is written |
+| Analyze with the key not set: the key and scale are found from the track and selected | every audio item on the track not heard yet; then the item's audio | the track's record; the item's notes, analysis settings, Key / Scale | track and take data inside the analysis's one undo block | Y: one undo block, model reload, no ExtState |
+| Analyze with a key picked by the user first: that key is used; when a listening pass runs anyway (Vocal Range on Auto) the track's record takes the user's key | as above | as above | as above | Y |
+| Analysis card: opens in the middle of the note window when any analysis starts (single, batch, Find Range and Key Again), shows the step and overall progress, fills in the range and key as they are found, then the note count; Cancel while running; OK when done | the running analysis | nothing | none | n/a |
+| Analysis card, done, key was a close call: the two candidates are offered; picking the other one and pressing OK changes the item's key and the track's (an ordinary key change) | the item, the track's record | the item's Key / Scale and envelope, the track's record | take and track data inside one undo block ("Set Key") | Y: its own undo point after the analysis's |
+| Range box in the top bar (read-only, after Scale): the range the open item uses ("A3–F4", "Tenor", or "Auto" before analysis) | the item's stored analysis settings, the form | nothing | none | n/a |
+| Cancel in the card while running (either stage) | nothing | nothing | none | n/a: nothing was written |
+| Key or Scale changed on an analysed item whose key came from its track: the track's key changes with it — unchanged from revision 1 | the item, the track's record | the item, the track's record | inside the existing key-change undo block | Y |
+| "…" → Find Range and Key Again — unchanged from revision 1, but its progress and result are shown in the Analysis card | every audio item on the track | the track's record | track data inside one undo block | Y |
+| Removed from revision 1: Key → "Auto" as a list choice; "Auto" on an analysed item (Find Key); the status-line messages "Found …" / "Used …"; "Finding range and key… NN%" in the form, the status line and on the "…" button | — | — | — | — |
 
 ## References
 
-- Native REAPER analogues: **Dynamic Split** and **Render to File** (the settings sit above the action and show the values it will use); the "Auto" entries follow REAPER's own lists that lead with an automatic choice (item pitch shift mode "Project default", render sample rate / channels "Auto"). Conventions matched (CN6): discrete choices as combos, notes as note names with octave (the script's existing naming), Hz with units in tooltips, no Alt / Shift repurposing. dB and pan do not appear.
-- Redesigns only: baseline capture: the user's screenshot of the empty canvas, 2026-11-25 (`/private/tmp/claude-501/-Users-macstudio-Development-fancy-scripts/3a5a9677-13b1-4d63-856d-2c923d42d844/images/1.webp`: docked, 1 item selected, top bar Key `E` / Scale `Major`, Analysis Settings form with three rows, Advanced, Analyze Item); no further live capture taken. `ds-lint.py` summary: not available (see Open questions).
+- Native REAPER analogues: **Render to File** (after Render the dialog stays open, shows a progress bar and what it is doing, and ends with a summary the user closes; Cancel while running); **Dynamic Split** (settings above the action). Conventions matched (CN6): notes as note names with octave (the script's existing naming), Hz with units in tooltips, discrete choices as combos and radio rows, Cancel / Esc while running, no Alt / Shift repurposing. dB and pan do not appear.
+- Redesigns only: baseline captures: revision 1 running in real REAPER, 2026-11-25 and 2026-11-27 (empty canvas with Key "Auto" / Scale "Auto"; "Finding range and key… 4%" in the form and in the bottom-left corner; "Analyzing … 83%" in the bottom-left corner; "Used Test's range and key: A3–F4, C Minor." in the bottom-left corner; Re-Analyze modal with "Auto: B2–A4"), kept in the session scratchpad. `ds-lint.py` summary: not available (see Open questions).
 
 ## Context and job stories
 
-Confirmed in chat on 2026-11-25: lives in the existing Analysis Settings form and top bar; used on every first analysis of a track; mostly mouse; playback may be running. Decisions: find the range and key as a pre-analysis inside Analyze, taking up little or no space; the pre-analysis hears the whole track once and remembers it. Given up with the earlier draft: a pause to review the result before it is used, and an offer to push the key onto items analysed earlier.
+Confirmed in chat on 2026-11-27 after the user tried revision 1: "It shouldn't have an option for auto, it should just select what we think is best in the list"; "don't lock it, someone might know their key from the start"; "it doesn't tell me what it selected as the vocal range anywhere… we should have that listed somewhere"; "scanning and analyzing should always take place in the main note window, not in any corner"; the pop-up "stays the whole time during analysis giving the user progress updates on what it's finding and then when it's done they get the option to close it". Lives in the existing window; used on every analysis; mostly mouse; playback may be running.
 
-1. When a new singer's track lands in the session, I want Analyze to work out their range and the song's key by itself, so my first analysis is right without guessing.
-2. When I batch-analyse a stack of takes (docked under the arrange, playback looping), I want every item on a track to get the same range and key, so the takes agree.
-3. When the key was a close call, I want to be told the other candidate, so I can switch in one move.
-4. When I correct a wrong key once, I want the rest of the track to follow, so I do not correct it again per item.
-5. When I know better (a bass, a song in Dorian), I want to pick the range or key myself, so Auto never overrules me.
-6. When I come back days later, I want to see that a value came from Auto, so I know why it is what it is.
+1. When I analyse a new singer's item, I want the key and range found and simply selected, so I never have to ask for it.
+2. When I already know the key, I want to pick it before analysing, so nothing overrides me.
+3. When an analysis runs, I want to watch it in the middle of the note window and see what it finds as it goes, so I am never hunting for a message in a corner.
+4. When it is done, I want the result to stay on screen until I close it, so I cannot miss it.
+5. When I look at an item later, I want its range shown next to its key, so I know what it was analysed with.
+6. When the key was a close call, I want to pick the other candidate right there, so fixing it is one click.
 
 ## Priority tiers
 
 | Tier | Features | Why (frequency × importance) |
 |---|---|---|
-| 1 always visible | "Auto" as the shown Vocal Range and Key choice; the pre-analysis stage in the analysis progress; the found values after analysis ("Auto: E2–A4" in what the item was analysed with; the key in the top bar); the status line naming what was found | Every first analysis; a wrong range is the commonest reason an analysis fails |
-| 2 one disclosure away | The other Vocal Range and Key choices (the open combos); "…" → Find Range and Key Again; the Key combo's tooltip naming the runner-up | Occasional correction |
-| 3 Settings | Vocal Range "Auto" as the default in Analysis Defaults (the existing row) | Set once |
+| 1 always visible | Key, Scale and the Range box in the top bar; Vocal Range "Auto" in the form; the Analysis card while an analysis runs and until it is closed | Every analysis |
+| 2 one disclosure away | The other key candidate (in the card, when there is one); "…" → Find Range and Key Again; the Range box's tooltip (which track, Hz) | Occasional |
+| 3 Settings | Vocal Range "Auto" as the default in Analysis Defaults | Set once |
 
 ## Information architecture
 
-No region is added. Changes inside existing regions:
+1. **Top bar** (existing): Key, Scale, then the new read-only **Range box**. Key's list holds the twelve keys only. On an item not analysed yet, Key shows "–" until the user picks one or the analysis finds it; while Key is "–", Scale shows "–" and is disabled with the reason "Pick a key first, or it is found when you analyze".
+2. **Analysis Settings form** (existing): unchanged from revision 1 (Vocal Range "Auto"; Min / Max Freq locked with "Found from the track"). It no longer shows a progress line; while an analysis runs it is covered by the card.
+3. **Analysis card** (new; one modal, centred on the note canvas): title, one progress bar with the current step, three result rows (Vocal Range, Key, Notes; a batch shows a track list and an item counter), then Cancel (running) or OK (done).
+4. **"…" menu**: Find Range and Key Again (unchanged). While anything runs, the menu's Cancel item stays, without a percentage.
+5. **Status line**: no longer used for analysis progress or results.
 
-1. **Analysis Settings form** (empty canvas, analysis modal, Settings → Analysis Defaults): the Vocal Range combo's first entry is "Auto". With Auto chosen the Advanced rows Min Freq and Max Freq are disabled with the reason "Found from the track" (they stay in place, EP5).
-2. **Top bar Key / Scale**: the Key combo's first entry is "Auto". While Key is Auto (only possible on an item not analysed yet) the Scale combo shows "Auto" and is disabled with the reason "Found with the key". An analysed item always shows its real key and scale (ST4).
-3. **Analysis progress** (existing: the pitch line drawing in, "…" → Cancel NN%): gains a first stage, shown where the form's locked reason already sits: "Finding range and key… 42%".
-4. **Status line** (existing): reports what was found.
-5. **"…" menu**: one new item, "Find Range and Key Again".
-
-Primary display: the note canvas. Primary action of the empty canvas: Analyze. Disclosure: unchanged (form → Advanced; "…" menu), at most 2 levels (IA2).
+Primary display: the note canvas. Primary action of the empty canvas: Analyze. While the card is open its primary action is Cancel, then OK. Disclosure: one level (the card); IA2 OK.
 
 ## Wireframes
 
-### Default floating / wide docked, empty canvas (new item, nothing heard yet)
+### Top bar and empty canvas, item not analysed
 
 ```
-[V _ Main E251 - 79.wav] [Auto ▾] [Auto      ▾] │ This item │ Separation 50% │ …
-                                     ↑ Scale: disabled, "Found with the key"
+[07_LeadVox copy.wav] [– ▾] [–         ▾] [Auto] │ This item │ Separation 50% │ …
+                        ↑ Key: pick one, or it is found      ↑ Range box (read-only)
 
-              1 item selected: V _ Main E251 - 79.wav
+              1 item selected: 07_LeadVox copy.wav
         ┌──────────────────────────────────────────────┐
         │ ANALYSIS SETTINGS                            │
-        │ ──────────────────────────────────────────── │
-        │ Vocal Range     [Auto               ▾] [Reset]│  ← Reset disabled: "Already the default"
+        │ Vocal Range     [Auto               ▾] [Reset]│
         │ Detection Mode  [Clean / Strict     ▾] [Reset]│
         │ Quality / CPU   [Standard (Realtime)▾] [Reset]│
-        │ ▸ Advanced                    Save as Default│
+        │ ▸ Advanced                                   │
         └──────────────────────────────────────────────┘
-        ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
-        ┃                 Analyze Item                 ┃
-        ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+        ┏━━━━━━━━━━━━━━━━ Analyze Item ━━━━━━━━━━━━━━━━┓
 ```
 
-The form is the same size as today.
-
-### Analyze pressed, stage 1 (pre-analysis)
+### Analysis card, step 1 (listening to the track)
 
 ```
-        │ ANALYSIS SETTINGS                            │
-        │ Finding range and key… 42%                   │  ← the existing locked-reason line
-        │ Vocal Range     [Auto               ▾] [Reset]│  ← rows disabled as during any analysis
-        …
-        ┃           Analyze Item (disabled)            ┃
+              ┌ Analyzing 07_LeadVox copy.wav ───────────┐
+              │ Listening to track "Test"…               │
+              │ ████████░░░░░░░░░░░░░░░░░░░░░░░░░░  24%  │
+              │                                          │
+              │ Vocal Range   listening…                 │
+              │ Key           listening…                 │
+              │ Notes         waiting                    │
+              │                                          │
+              │                               [Cancel]   │
+              └──────────────────────────────────────────┘
 ```
 
-"…" → "Cancel 42%" as today. When stage 1 ends the analysis starts by itself and the pitch line draws in as today.
-
-### After the analysis
+### Analysis card, step 2 (finding notes; range and key already shown)
 
 ```
-[V _ Main E251 - 79.wav] [E ▾] [Major     ▾] │ This item │ …
-┌ canvas: the notes ───────────────────────────────────────────────┐
-│ …                                                                │
-└──────────────────────────────────────────────────────────────────┘
- Found E2–A4, E Major (C# Minor also fits). Cmd+Z to undo.            ← status line
+              ┌ Analyzing 07_LeadVox copy.wav ───────────┐
+              │ Finding notes…                           │
+              │ ██████████████████████░░░░░░░░░░░░  65%  │
+              │                                          │
+              │ Vocal Range   A3 – F4                    │
+              │ Key           C Minor                    │
+              │ Notes         finding…                   │
+              │                                          │
+              │                               [Cancel]   │
+              └──────────────────────────────────────────┘
 ```
 
-Re-Analyze… (the existing modal) shows `Vocal Range [Auto: E2–A4 ▾]`. A later new item on the same track: the top bar shows `[Auto ▾]` until analysed, the pre-analysis stage is skipped or lasts only as long as the items it has not heard.
+The pitch line still draws in on the canvas behind the card.
 
-### Narrow docker (~260 px): the form's stacked layout
-
-```
-┌ ANALYSIS SETTINGS ───────┐
-│ Vocal Range              │
-│ [Auto                 ▾] │
-│ Detection Mode           │
-│ [Clean / Strict       ▾] │
-│ …                        │
-│ [     Analyze Item     ] │
-```
-
-Unchanged except the combo's entry. The stage-1 line wraps under the heading. The top bar behaves as today; the Key combo is as wide as its longest short name, now "Auto" (LG3). Long track names in the status line are truncated with the full text in a tooltip.
-
-### Wide short strip (e.g. 1200×150): the form's summary layout
+### Analysis card, done (close call on the key)
 
 ```
-Analysis Settings: Auto · Clean / Strict · Standard   Change…   [ Analyze Item ]
+              ┌ Analysis done ───────────────────────────┐
+              │ 07_LeadVox copy.wav                      │
+              │                                          │
+              │ Vocal Range   A3 – F4                    │
+              │ Key           (•) C Minor                │
+              │               ( ) D# Major               │
+              │               These two fit equally well.│
+              │ Notes         31                         │
+              │                                          │
+              │                                   [OK]   │
+              └──────────────────────────────────────────┘
 ```
 
-While stage 1 runs the summary reads "Finding range and key… 42%".
+Variants of the result rows: a clear key is one line ("C Minor"); a key the user picked reads "D Major (your choice)"; a hand-picked range reads "Tenor (your choice)"; a track heard earlier reads "A3 – F4 (from track "Test")". Problems are stated on the row they belong to: "No singing found: used Generic Vocal", "Not enough singing to tell: kept E Major", and under the rows "Couldn't read 2 of 12 items on "Test" (media offline). Used the rest." No pitched note: "Notes   none found. Try another Vocal Range or Detection Mode."
+
+After OK the top bar reads `[C ▾] [Natural Minor ▾] [A3–F4]`.
+
+### Analysis card, batch
+
+```
+              ┌ Analyzing 3 of 12: Lead take 3.wav ──────┐
+              │ Finding notes…                           │
+              │ ████████████░░░░░░░░░░░░░░░░░░░░░░  31%  │
+              │                                          │
+              │ Lead Vox      B2 – A4 · E Major          │
+              │ Harmony       C3 – E4 · E Major          │
+              │                                          │
+              │                               [Cancel]   │
+              └──────────────────────────────────────────┘
+```
+
+Done: the title reads "Analysis done", the existing batch summary line ("12 items analyzed…") sits above the track rows, the list scrolls after six tracks, and OK closes it. Key candidates are not offered in a batch.
+
+### Find Range and Key Again
+
+The same card with the title "Finding range and key", step 1 only; done: "Vocal Range   B2 – A4", "Key   E Major", and the line "Items already analyzed keep theirs."
+
+### Narrow docker (~260 px)
+
+The card is the window's small modal size, wider than a 260 px docker, so it opens as its own OS window, undimmed, exactly as the window's existing modals do there (RB9, see Open questions). Its rows wrap: the label on one line, the value under it. In the top bar the Range box is the first thing to go when the bar runs out of width (the existing header rule for what hides first); the range stays readable in the Re-Analyze dialog.
+
+### Wide short strip (e.g. 1200×150)
+
+The summary layout of the form is unchanged ("Analysis Settings: Auto · Clean / Strict · Standard   Change…   [Analyze Item]"). The card is centred on the window and may cover the whole strip; if the strip is shorter than the card, the card opens as its own OS window (RB9).
 
 ## State inventory
 
 | Region | State | What the user sees | Rule |
 |---|---|---|---|
-| Form, top bar | empty (no target item) | Unchanged: "Select an audio item in REAPER to analyze it."; controls disabled with that reason | ST6, EP2 |
-| Form | working, stage 1 | "Finding range and key… 42%" in the locked-reason line; with several tracks "Finding range and key: V _ Main… 42%"; time-sliced with the existing per-frame budget constant; Cancel as today | ST3 |
-| Form | working, stage 2 | Unchanged analysis progress | ST3 |
-| Status line | found | "Found E2–A4, E Major. Cmd+Z to undo." | ST2 |
-| Status line | close call on the key | "Found E2–A4, E Major (C# Minor also fits). Cmd+Z to undo." The runner-up is also in the Key combo's tooltip for that item | ST4 |
-| Status line | track already heard | "Used V _ Main's range and key: E2–A4, E Major." | ST2, ST4 |
-| Status line | error: no singing found on the track | "Couldn't find a range on V _ Main: used Generic Vocal." The item's stored settings read "Auto: Generic Vocal (nothing found)" | ST4, ST7 |
-| Status line | error: too little singing for a key | "Not enough singing to tell the key: kept E Major." (the key last chosen by hand) | ST4, ST7 |
-| Status line | error: some media unreadable | "Couldn't read 2 of 12 items on V _ Main (media offline). Used the rest." None readable: the existing "Couldn't read this item's audio…" message, nothing written | ST7 |
-| Status line | cancelled | The existing cancelled message; nothing was written | ST2 |
-| Advanced: Min Freq, Max Freq | disabled with reason while Vocal Range is Auto | Disabled, "Found from the track" inline beside the first of them and as each one's tooltip | EP2, EP5 |
-| Scale combo | disabled with reason while Key is Auto | Shows "Auto"; tooltip "Found with the key" | EP2 |
-| "…" → Find Range and Key Again | disabled with reason | No target item, or an analysis is running: disabled with the menu's existing reason pattern | EP2 |
-| Status line, modal | overflow / long names | Track names truncated to the width with the full text in a tooltip | LG4 |
+| Key / Scale | empty (item not analysed, no key on the track) | Key "–" (enabled); Scale "–" disabled with "Pick a key first, or it is found when you analyze" | ST6, EP2 |
+| Key / Scale | item not analysed, track has a key | The track's key and scale, changeable | ST4 |
+| Range box | item not analysed | The Vocal Range choice of the form ("Auto", "Tenor", …) | ST4 |
+| Range box | analysed | "A3–F4" (Auto) or the preset's name; tooltip: track and Hz | ST1, ST4 |
+| Range box | no target item | "–" | ST6 |
+| Analysis card | working, step 1 | "Listening to track "<name>"…", the bar, "listening…" on Vocal Range and Key; with several tracks the step line names the one being heard | ST3 |
+| Analysis card | working, step 2 | "Finding notes…", the bar across both steps, range and key filled in | ST3 |
+| Analysis card | done | Title "Analysis done", the results, OK | ST2 |
+| Analysis card | cancelled | The card closes; status line: the existing cancelled message; nothing was written | ST2 |
+| Analysis card | error: no singing found on the track | Vocal Range row: "No singing found: used Generic Vocal" | ST4, ST7 |
+| Analysis card | error: key not told | Key row: "Not enough singing to tell: kept E Major" (the key last chosen by hand) | ST4, ST7 |
+| Analysis card | error: some media unreadable | A line under the rows: "Couldn't read 2 of 12 items on "<track>" (media offline). Used the rest." | ST7 |
+| Analysis card | error: nothing could be read / the item is gone | The card closes and the existing message shows in the status line (nothing was analysed) | ST7 |
+| Analysis card | no pitched notes | Notes row: "none found. Try another Vocal Range or Detection Mode." | ST6, ST7 |
+| Analysis card | overflow / long names | Item and track names truncated to the card's width with the full name in a tooltip; the batch track list scrolls after six | LG4 |
+| Scale combo | disabled with reason | see first row | EP2 |
+| Advanced: Min / Max Freq | disabled with reason while Vocal Range is Auto | Unchanged from revision 1: "Found from the track" | EP2, EP5 |
 | All | missing dependency | None new | HI7 |
-| All | Fancy Dark / Match Theme | No new colour is used | CL4 |
+| All | Fancy Dark / Match Theme | The card uses the popup surface and palette keys only | CL4 |
 
 ## Interaction spec
 
 | Control | Gestures (HC2, HC3, wheel EF1, context menu) | Default | Units / format / precision (RC2, CN6) | Clamp / scale (EP3) | Undo label (UC1) | Destructive policy (HC4) |
 |---|---|---|---|---|---|---|
-| Vocal Range combo, entry "Auto" | Click; the row's existing Reset and right-click menu. HC2 / HC3 n/a: discrete | "Auto" (factory default) | On an analysed item "Auto: E2–A4" (note names); the tooltip gives Hz | The found notes with a safety margin below and above, held inside the Min / Max Freq limits | None (form value); part of the analysis's undo point when used | n/a |
-| Key combo, entry "Auto" | Click. HC2 / HC3 n/a: discrete | "Auto" on a fresh install; otherwise the stored "Key for new items" | Short name "Auto" in the bar | Only Major and Natural Minor are found | Unanalysed item: none (as today). Analysed item: "Find Key: <item>" | n/a |
-| Scale combo while Key is Auto | Disabled | "Auto" | n/a | n/a | n/a | n/a |
-| Key / Scale changed on an analysed item whose key came from its track | As today | n/a | As today | As today | The existing key-change label | None: one undo block covers the item and the track's record. Status: "Key for V _ Main is now C# Minor. New items on this track follow." |
-| Analyze Item / Analyze All Selected Items / Re-Analyze | As today | n/a | n/a | n/a | The existing analysis labels (the track's record rides in the same undo point) | As today |
-| Cancel during stage 1 | As today ("…" → Cancel NN%) | n/a | Whole percent across both stages | n/a | None | None: nothing was written |
-| "…" → Find Range and Key Again | Click | n/a | n/a | n/a | "Find Range and Key: <track>" | No confirm: one undo point, nothing outside the project written. Status: "Found E2–A4, E Major on V _ Main. Items already analyzed keep theirs. Cmd+Z to undo." |
+| Key combo | Click. HC2 / HC3 n/a: discrete | "–" on a new item (or its track's key) | Twelve keys, as today | n/a | Not analysed: none. Analysed: the existing "Set Key" | n/a |
+| Scale combo | Click; disabled while Key is "–" | "–", then Major when a key is picked by hand | As today | n/a | As today | n/a |
+| Range box | Hover: tooltip. No click. HC2 / HC3 n/a: read-only | n/a | Note names; Hz in the tooltip | n/a | n/a | n/a |
+| Vocal Range combo "Auto" | Unchanged from revision 1 | "Auto" | "Auto: E2–A4" on an analysed item | As revision 1 | None (form value) | n/a |
+| Card: Cancel | Click; Esc | n/a | n/a | n/a | None | None: nothing was written |
+| Card: key candidates (done, close call) | Click (radio). HC2 / HC3 n/a: discrete | The better-fitting one | Key name + "Major" / "Minor" | Two choices only | "Set Key" when the other one is confirmed with OK | No confirm: one undo point, item and track together; nothing outside the project |
+| Card: OK | Click; Enter; Esc | n/a | n/a | n/a | None (unless the other key was picked) | n/a |
+| Analyze Item / Analyze All Selected Items / Re-Analyze | As today; opens the card | n/a | n/a | n/a | The existing analysis labels (the track's record rides in the same undo point) | As today |
+| "…" → Find Range and Key Again | Click; opens the card | n/a | n/a | n/a | "Find Range and Key: <track>" | As revision 1 |
 
-Keyboard map: no new shortcut and no change to Esc (HC5) or Space (HC6). A running pre-analysis is cancelled the same way as a running analysis. The Info modal's text on analysis gains one sentence on Auto (HP1); there is no hidden gesture.
+Keyboard map: no new shortcut. Esc per HC5: the card is a modal, so Esc goes to it first — Cancel while running, close when done; nothing else changes. Enter closes the card when done (no key-repeat, EP6). Space per HC6 is not forwarded while the card is open (a modal is open). The Info modal's two sentences on Auto and on Find Range and Key Again are reworded to match (HP1).
 
 ## Copy deck
 
 | Where | String |
 |---|---|
-| labels | "Auto" (Vocal Range entry; Key entry; Scale preview while Key is Auto) · "Auto: E2–A4" (an analysed item's Vocal Range) · "Auto: Generic Vocal (nothing found)" · "Find Range and Key Again" ("…" menu) |
-| tooltips | Vocal Range "Auto": "Auto\n\nListens through the whole track first to find the singer's lowest and highest notes. Done once per track." · Key "Auto": "Auto\n\nFinds the song's key from the whole track the first time one of its items is analyzed." · Key combo on an item whose key was found: "Found from V _ Main. C# Minor also fits." / "Found from V _ Main." · "Auto: E2–A4": "82–440 Hz, with a little room either side" · disabled Min / Max Freq: "Found from the track" · disabled Scale: "Found with the key" |
-| empty / error / confirm | "Finding range and key… 42%" · "Finding range and key: V _ Main… 42%" |
-| status messages | "Found E2–A4, E Major. Cmd+Z to undo." · "Found E2–A4, E Major (C# Minor also fits). Cmd+Z to undo." · "Used V _ Main's range and key: E2–A4, E Major." · "Couldn't find a range on V _ Main: used Generic Vocal." · "Not enough singing to tell the key: kept E Major." · "Couldn't read 2 of 12 items on V _ Main (media offline). Used the rest." · "Key for V _ Main is now C# Minor. New items on this track follow." · "Found E2–A4, E Major on V _ Main. Items already analyzed keep theirs. Cmd+Z to undo." |
-| undo labels | The existing analysis labels · "Find Key: <item>" · "Find Range and Key: V _ Main" |
+| labels | "–" (Key and Scale not set; Range box with no item) · "Auto" (Vocal Range entry; Range box before analysis) · "Auto: E2–A4" (an analysed item's Vocal Range in the form) · "Find Range and Key Again" · card titles: "Analyzing 07_LeadVox copy.wav" · "Analyzing 3 of 12: Lead take 3.wav" · "Finding range and key" · "Analysis done" · rows: "Vocal Range" · "Key" · "Notes" · buttons: "Cancel" · "OK" |
+| card step lines | "Listening to track "Test"…" · "Finding notes…" |
+| card row values | "listening…" · "waiting" · "finding…" · "A3 – F4" · "A3 – F4 (from track "Test")" · "Tenor (your choice)" · "C Minor" · "D Major (your choice)" · "31" · "none found. Try another Vocal Range or Detection Mode." · "These two fit equally well." · "No singing found: used Generic Vocal" · "Not enough singing to tell: kept E Major" · "Couldn't read 2 of 12 items on "Test" (media offline). Used the rest." · "Items already analyzed keep theirs." · batch row: "Lead Vox   B2 – A4 · E Major" |
+| tooltips | Vocal Range "Auto": "Auto: Listens through the whole track first to find the singer's lowest and highest notes. Done once per track." · Key while "–": "Pick the key if you know it. Otherwise it is found from the whole track when you analyze." · Scale while disabled: "Pick a key first, or it is found when you analyze" · Key on an item whose key was found: "Found from Test. D# Major also fits." / "Found from Test." · Range box: "Vocal range found on Test: 208–370 Hz, with a little room either side" / "Vocal Range: Tenor (130–500 Hz)" / "The range is found from the whole track when you analyze" · disabled Min / Max Freq: "Found from the track" |
+| status messages | "Key for Test is now D Major. New items on this track follow." (unchanged) · the existing cancelled, unreadable-audio and item-gone messages |
+| undo labels | The existing analysis labels · "Set Key" · "Find Range and Key: Test" |
 
-"Cmd" reads "Ctrl" on Windows and Linux (the script's existing modifier label). With only the range on Auto the messages leave the key out ("Found E2–A4."), and the other way round ("Found E Major.").
+"Minor" stands for Natural Minor in the card and tooltips, as in revision 1.
 
 ## Theme mapping
 
 | Element | `Theme.*` helper | Tokens (keys only) |
 |---|---|---|
-| Vocal Range "Auto" entry | `Theme.combo` (the existing row; one more entry in its list) | n/a |
-| Key "Auto" entry, Scale "Auto" preview | `Theme.combo` (the existing top bar combos; width from the longest label) | n/a |
-| Stage-1 progress line | the form's existing locked-reason text | `P.text_dim` |
-| Disabled reasons (Min / Max Freq, Scale, menu item) | inline text; `Theme.tooltip` behind `HoveredFlags_ForTooltip | HoveredFlags_AllowWhenDisabled` | `P.text_dim` |
-| Entry and combo tooltips | the combos' existing per-choice tooltip option | n/a |
-| "…" menu item | `Theme.selectable` in the existing menu | n/a |
-| Status messages | the window's existing status line | `P.text_dim` |
+| Key "–" preview, Scale "–" | `Theme.combo` with its placeholder option (existing top bar combos) | n/a |
+| Range box | `Theme.badge` (read-only) + `Theme.tooltip` behind `HoveredFlags_ForTooltip` | palette keys of the badge preset; width from its text |
+| Analysis card | pending flag → `OpenPopup` once → `Theme.center_next_window` (on the canvas's centre) → `Theme.modal_scrim` → `BeginPopupModal`, height from its content | `L.modal_sm` |
+| Step line | `Theme.align` + text | `P.text` |
+| Progress bar | `Theme.progress_bar` with the percentage as its label | its preset; `L.sm` above and below |
+| Row labels ("Vocal Range", "Key", "Notes"; batch track names) | `Theme.align` + text in a two-column table | `P.text_dim`; `L.md` column gap |
+| Row values | text | `P.text`; waiting / listening values `P.text_dim` |
+| Problem lines | text | `P.text_dim` (no red: nothing failed that the user must fix) |
+| Key candidates | `reaper.ImGui_RadioButton` | `L.xs` between rows |
+| Cancel / OK | `Theme.right_align` + `reaper.ImGui_Button`; OK with the window's existing primary button preset | `L.md`, `L.sm` |
+| Disabled Scale reason, Min / Max Freq reason | `Theme.tooltip` behind `HoveredFlags_ForTooltip | HoveredFlags_AllowWhenDisabled` | `P.text_dim` |
 
 ## Library proposals
 
@@ -197,76 +236,78 @@ None.
 
 ## Acceptance criteria
 
-- ST1: the Vocal Range and Key in effect are shown at rest ("Auto" before, the found values after).
-- ST2: every path (found, track already heard, nothing found, key unclear, media unreadable, cancelled) posts a status message.
-- ST3: the pre-analysis is time-sliced with the existing per-frame budget constant, shows a percentage, and is cancellable at any moment.
-- ST4: an analysed item never shows "Auto" as its key; a fallback range and a kept key are labelled as such; the runner-up key is named.
+- ST1: the Key, Scale and Range in effect are shown at rest in the top bar ("–" / "Auto" before analysis, the real values after).
+- ST2: every path (found, track already heard, nothing found, key unclear, media unreadable, cancelled) is reported in the Analysis card or, when the card closes without a result, in the status line.
+- ST3: both steps are time-sliced with the existing per-frame budget constant; the card shows the step, a progress bar and Cancel at every moment.
+- ST4: an analysed item always shows a real key; where a value came from (found, from the track, your choice) and any fallback are stated in the card; the runner-up key is offered.
 - ST5: n/a: no lifecycle change.
 - ST6: no new region; the existing empty states are unchanged.
 - ST7: failures are reported in the window, in user terms, with what was used instead.
-- UC1: the track's record rides in the analysis's undo point; no undo point when cancelled; "Find Key" and "Find Range and Key" are one point each, labelled in user terms.
+- UC1: the track's record rides in the analysis's undo point; no undo point when cancelled; "Find Range and Key" and the card's "Set Key" are one point each, labelled in user terms.
 - UC2: see HC5.
 - UC3: the record and the item data are written inside the same undo block; the model reloads on project state change; the pre-analysis writes no ExtState.
 - UC4: the item and track selection are never changed.
 - UC5: Vocal Range Reset returns to the default (Auto from the factory); no new value control.
 - EP1: n/a: nothing destructive is added (see HC4).
-- EP2: Min / Max Freq, Scale and the menu item show their reason when disabled, also with tooltips off (inline for Min / Max Freq).
+- EP2: Min / Max Freq, Scale and the menu item show their reason when disabled (inline for Min / Max Freq).
 - EP3: the found range is held inside the Min / Max Freq limits.
 - EP4: the track's record names tracks and takes by GUID.
 - EP5: no row is added, hidden or moved by state; Min / Max Freq and Scale are disabled in place.
-- EP6: n/a: no new shortcut.
+- EP6: Enter and Esc in the card are routed through `Shortcut()`, no repeat.
 - CN1: only existing `Theme.*` helpers.
-- CN2: tokens only; no new modal.
+- CN2: tokens only; `Theme.modal_scrim` before the card; `L.modal_sm`.
 - CN3: every helper and token named in Theme mapping exists.
-- CN4: "Auto" is the one word for the choice; "Found" for a result; "Analyze" stays the name of the whole action.
+- CN4: "Auto" is the one word for the Vocal Range choice; "Listening" for step 1 and "Finding notes" for step 2; "Analyze" stays the name of the whole action; Close is always "OK".
 - CN5: the Info modal and CHANGELOG describe Auto as built.
 - CN6: combos for discrete choices; note names and Hz with units; no Alt / Shift use.
 - RC1: no icon-only control is added.
 - RC2: notes as names, Hz with units, no internal keys.
-- HP1: the Info modal explains Auto and Find Range and Key Again.
+- HP1: the Info modal explains Auto, that the key is found when not picked, and Find Range and Key Again.
 - EF1: n/a: no new value control.
 - EF2: see HC6.
 - EF3: n/a: the canvas timeline is unchanged.
 - IA1: tiers as listed.
 - IA2: no new disclosure level.
-- IA3: Analyze stays the one primary action; no new type size or accent.
+- IA3: Analyze stays the one primary action of the canvas; the card has one primary button at a time (Cancel, then OK); no new type size.
 - IA4: no developer toggle; nothing that does nothing.
-- LG1: n/a: no new group.
+- LG1: in the card the gap between the progress group, the result rows and the buttons is at least twice the gap between rows.
 - LG2: the inline reason uses `Theme.align`; no nudges.
-- LG3: the Key combo's width comes from its longest label, now "Auto".
-- LG4: full, stacked and summary layouts as wireframed; long track names truncated with a tooltip.
-- MT1: n/a: no new target.
+- LG3: the Key combo's width comes from its longest label; the Range box's from its text.
+- LG4: the form's layouts are unchanged; the Range box hides first when the top bar is narrow; long item and track names in the card are truncated with a tooltip; the batch list scrolls.
+- MT1: Cancel and OK are at least the form's button height.
 - MT2: n/a: no custom DrawList control.
 - CL1: see HC1.
-- CL2: n/a: no colour-coded state is added.
+- CL2: the selected key candidate is a radio mark, not colour alone.
 - CL3: no red is used.
 - CL4: no new colour; checked in Fancy Dark and Match Theme.
 - DV1: n/a: excluded for this archetype.
-- HI1: n/a: no new window or child.
-- HI2: n/a: no new window.
+- HI1: the card follows the Begin / End modal recipe.
+- HI2: the card opens with `Cond_Appearing`.
 - HI3: n/a: no toolbar or close change.
-- HI4: the record is written once per analysis, never per frame.
+- HI4: the record is written once per analysis, never per frame; the card persists nothing.
 - HI5: whether a track has a record is cached per project state-change count; nothing is enumerated per frame.
 - HI6: the combos keep stable IDs although their previews change.
 - HI7: n/a: no new dependency.
 - AR (Editor / canvas): canvas objects and their gestures are untouched.
-- HC1: n/a: no new text colour or surface; the disabled controls are exempt.
+- HC1: `P.text` and `P.text_dim` on the popup surface measure at least 4.5:1 in both theme modes.
 - HC2: n/a: no new parameter value control.
 - HC3: n/a: no new parameter value control.
-- HC4: Find Range and Key Again and Find Key need no confirm (one undo block, model reload, no ExtState / JSON / file / cache change) and each posts a status message.
-- HC5: unchanged.
-- HC6: unchanged.
+- HC4: Find Range and Key Again and the card's key change need no confirm (one undo block each, model reload, no ExtState / JSON / file / cache change); their result is shown in the card.
+- HC5: Esc goes to the card first (Cancel while running, close when done); nothing else changes.
+- HC6: Space is not forwarded while the card is open; otherwise unchanged.
 
 ## Open questions / assumptions
 
-- **Assumption (my call): "Auto" is the factory default for both Vocal Range and Key.** A user who already saved a default range or last chose a key keeps theirs until they pick Auto.
-- **Assumption (my call): a result is used at once, with no pause to review it.** The status line and the Key tooltip name the runner-up key; the user corrects in the top bar.
-- **Assumption (my call): correcting the key on an item whose key came from its track also corrects the track**, so later items follow. Items analysed earlier keep their own key.
-- **Assumption (my call): the key is found once per track and then stays** (until the user corrects it or runs Find Range and Key Again); the range may widen as new items are heard.
-- **Assumption (my call): only Major and Natural Minor are found.** Dorian and the pentatonic scales cannot be told apart reliably from a melody.
-- **Assumption (my call): the key is remembered per track.** Two tracks of one song are each heard separately and may be given different keys; there is no project-wide key.
-- **Assumption (my call): with a hand-picked Vocal Range and a hand-picked Key no pre-analysis runs at all.**
-- **Speed is not measured.** The pre-analysis is expected to take a few seconds per track (coarser steps, lower sample rate). This is an estimate; it must be timed in real REAPER on real vocal tracks before the plan fixes how coarse it is. The UI holds either way (progress and Cancel).
-- **Accuracy is not measured.** How often the found key and range are right must be checked on the singer test set before release.
-- `ds-lint.py` baseline: not available. Run on 2026-11-25, the linter stops with "theme.lua palette drifted from ds-lint's port of build_palette" (a tooling issue, also recorded in the 2026-11-24 design doc).
+- **Assumption (my call): the card is shown for every analysis**, including when the track was heard earlier and when range and key were both picked by hand, so progress is always in the same place. In those cases it shows where the values came from ("from track …", "your choice").
+- **Assumption (my call): the card stays until OK, Enter or Esc**, also after a short analysis. It never closes by itself.
+- **Assumption (my call): picking the other key candidate in the finished card is a second undo point** ("Set Key"), because the analysis has already been written when the card offers it.
+- **Assumption (my call): while Key is "–", Scale is locked** with its reason; picking a key by hand sets Scale to Major and unlocks it.
+- **Assumption (my call): every new item starts at "–"** (or its track's key). The key last chosen for another item is no longer carried to new items; it is only the fallback when no key can be found.
+- **Assumption (my call): a key picked by the user before the first analysis becomes the track's key** when a listening pass runs, so later items on that track follow it.
+- **Assumption (my call): "Auto" on an analysed item (Find Key) is removed** with the Auto entry. To find a key again: Find Range and Key Again, then pick it, or correct the key by hand.
+- **Assumption (my call): a batch offers no key candidates** in its finished card; a close call is corrected per item afterwards.
+- Carried from revision 1: only Major and Natural Minor are found; the key is remembered per track; the key is found once per track and then stays; a result written by a cancelled or failed analysis never survives.
+- **Measured in real REAPER (2026-11-25):** the listening pass took 16.4 s for a track of 101 takes (19 minutes of audio), 0.85 s per minute. **Accuracy is not measured** beyond two tracks (E Major and C Minor found; the user has not yet confirmed C Minor).
+- **RB9:** in a docker narrower or shorter than the card, it opens as its own OS window, undimmed, like the window's existing modals.
+- `ds-lint.py` baseline: not available. The linter stops with "theme.lua palette drifted from ds-lint's port of build_palette" (a tooling issue, recorded since 2026-11-24).
 - HC6 conflicts: None.
