@@ -541,55 +541,47 @@ end
 -- again, starts at the script's DEFAULTS for every one of them (K.new_item_values)
 K.ITEM_KEYS = { "separation", "correct_mode", "tighten", "tolerance", "retune_speed", "slide_in" }
 
--- The key last chosen by hand in the bar (K.scale_changed): what an item's key falls back to when none can be found
--- (K.key_resolve). Stored under pitch_key_hand_idx / pitch_scale_hand_idx (K.PERSIST). An item not analysed yet
--- starts with no key (index 0, shown as "–") unless one was picked for it or its track has one (K.new_item_key);
--- 0 is never an item's key
-K.new_key = { hand_key_idx = 1, hand_scale_idx = 1 }
-
 -- The key picked in the bar on an item not analysed yet, before its first analysis: [take guid] = { key_idx,
--- scale_idx }. In memory only: dropped when the item is analysed, when it leaves the project (K.pending_key_prune)
--- and when another project is shown (K.refresh_project_cache)
+-- scale_idx }. Its absence is "not set": the item shows its track's key, else the default (K.new_item_key), and its
+-- analysis finds the key. In memory only: dropped when the item is analysed, when it leaves the project
+-- (K.pending_key_prune) and when another project is shown (K.refresh_project_cache)
 K.pending_key = {}
 
-K.KEY_UNSET_TEXT = "\xE2\x80\x93"   -- the Key and Scale combos' preview while no key is set (an en dash)
+-- The key a new item shows while none is set, and keeps when none can be found: C Chromatic
+K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX = 1, 1
+for i, key in ipairs(SCALE_KEYS) do
+  if key.name == "C" then K.DEFAULT_KEY_IDX = i end
+end
+for i, scale in ipairs(SCALE_DEFINITIONS) do
+  if scale.name == "Chromatic" then K.DEFAULT_SCALE_IDX = i end
+end
+
+K.DASH_TEXT = "\xE2\x80\x93"   -- a value not known: the Range box with no item, a batch row not heard yet (an en dash)
 K.KEY_UNSET_TOOLTIP = "Pick the key if you know it. Otherwise it is found from the whole track when you analyze."
-K.SCALE_UNSET_REASON = "Pick a key first, or it is found when you analyze"
+K.SCALE_TOOLTIP = "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\n"
+  .. "Right-click: apply Key and Scale to other items."
 
---- How the Scale combo is drawn for the bar's `key_idx` / `scale_idx`: disabled, the selected row (0: none), the
---- preview with no row ("–") and the tooltip (while no key is set: why it is locked).
-K.scale_combo_state = function(key_idx, scale_idx)
-  if key_idx == 0 then return true, 0, K.KEY_UNSET_TEXT, K.SCALE_UNSET_REASON end
-  return false, scale_idx, K.KEY_UNSET_TEXT,
-    "Scale\n\nMarks the in-scale rows on the canvas and sets the scale Quantize (Q) snaps to.\n\n"
-    .. "Right-click: apply Key and Scale to other items."
-end
-
---- The Key combo's preview for key index `key_idx`: its short name ("C#"), or "–" while no key is set (0).
+--- The Key combo's preview for key index `key_idx`: its short name ("C#").
 K.key_preview = function(key_idx)
-  local key = SCALE_KEYS[key_idx]
-  return key and key.display or K.KEY_UNSET_TEXT
+  return SCALE_KEYS[key_idx].display
 end
 
---- The real key a key choice stands for: a real key (1..12) passes through; not set (0) gives the key found on the
---- track of the take `guid` (its K.track_record), else the key last chosen by hand. Returns key_idx, scale_idx and
---- whether the key came from the track.
-K.key_resolve = function(key_idx, scale_idx, guid)
-  if key_idx ~= 0 then return key_idx, scale_idx, false end
+--- The key an item takes when nothing was picked for it (take `guid`): the key found on its track (its
+--- K.track_record), else the default C Chromatic. Returns key_idx, scale_idx and whether the key came from the track.
+K.key_resolve = function(guid)
   local rec = K.track_record(K.take_track(guid))
   if rec and rec.key_idx then return rec.key_idx, rec.scale_idx, true end
-  return K.new_key.hand_key_idx, K.new_key.hand_scale_idx, false
+  return K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX, false
 end
 
 --- The key an item not analysed yet (take `guid`) shows and is analysed with: the one picked for it
---- (K.pending_key, "picked"), else its track's (its record, "track"), else none (0, 1, "unset": the analysis finds
---- it). Returns key_idx, scale_idx, source.
+--- (K.pending_key, "picked"), else its track's (its record, "track"), else the default C Chromatic ("unset": the
+--- analysis finds the key). Returns key_idx, scale_idx, source.
 K.new_item_key = function(guid)
   local picked = guid and K.pending_key[guid]
   if picked then return picked.key_idx, picked.scale_idx, "picked" end
-  local rec = K.track_record(K.take_track(guid))
-  if rec and rec.key_idx then return rec.key_idx, rec.scale_idx, "track" end
-  return 0, 1, "unset"
+  local k, sc, from_track = K.key_resolve(guid)
+  return k, sc, from_track and "track" or "unset"
 end
 
 --- `v` when it is a key source an item's model can hold ("picked", "track", "found"), else nil.
@@ -601,7 +593,7 @@ end
 --- Where the key of the new model `data` of an item analysed for the first time comes from: "picked" (the user
 --- picked it before analysing, K.pending_key), "found" (its track's record has a key that this analysis's own
 --- listening pass found: the record is pending and the stored one has no key), "track" (a record that held the key
---- already), nil (no key anywhere: the key last chosen by hand).
+--- already), nil (no key anywhere: the default C Chromatic, K.key_resolve).
 K.item_key_source = function(data)
   local guid = data and data.guid
   if not guid then return nil end
@@ -622,14 +614,14 @@ end
 --- data.key_source). A picked key is the item's; with `records` (a single analysis) and a record on the item's
 --- track (stored, or found by this analysis), that record takes the picked key and scale (its runner-up dropped),
 --- pending for the analysis's undo block, and the item follows its track. In a batch (no `records`) the track's
---- record was given its first pick already (K.batch_lead_keys); the item follows it when it holds the same key. Any other key is the track's, else the
---- key last chosen by hand (K.key_resolve). A model change only. Returns the track whose record was given the picked
---- key, or nil.
+--- record was given its first pick already (K.batch_lead_keys); the item follows it when it holds the same key. Any
+--- other key is the track's, else the default C Chromatic (K.key_resolve). A model change only. Returns the track
+--- whose record was given the picked key, or nil.
 K.item_key_settle = function(data, records)
   local source = K.item_key_source(data)
   data.key_source = source
   if source ~= "picked" then
-    local k, sc, from_track = K.key_resolve(0, nil, data.guid)
+    local k, sc, from_track = K.key_resolve(data.guid)
     data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
     return nil
   end
@@ -649,7 +641,7 @@ K.item_key_settle = function(data, records)
   return track
 end
 
---- A found key in words: "E Major", "C# Minor" (the found scales are Major and Natural Minor).
+--- A key in words: its short name and its scale's ("E Major", "C Chromatic"); Natural Minor prints as Minor.
 K.key_text = function(key_idx, scale_idx)
   local key, scale = SCALE_KEYS[key_idx], SCALE_DEFINITIONS[scale_idx]
   if not (key and scale) then return "" end
@@ -687,12 +679,14 @@ K.key_found_text = function(data)
   return string.format("Found from %s.", name)
 end
 
---- The Key combo's tooltip for the open item's model `data` (nil: not analysed) showing key index `key_idx`: what Key
---- is; while no key is set (0) how one is chosen; for a key found on the item's track where from (K.key_found_text).
-K.key_tooltip = function(data, key_idx)
+--- The Key combo's tooltip for the open item's model `data` (nil: not analysed), take `guid`: what Key is; on an item
+--- not analysed yet whose key is not set (K.new_item_key) how one is chosen; for a key found on the item's track where
+--- from (K.key_found_text).
+K.key_tooltip = function(data, guid)
   local found = K.key_found_text(data)
+  local unset = not data and guid ~= nil and select(3, K.new_item_key(guid)) == "unset"
   return "Key\n\nThe root note of the scale."
-    .. (key_idx == 0 and ("\n\n" .. K.KEY_UNSET_TOOLTIP) or "")
+    .. (unset and ("\n\n" .. K.KEY_UNSET_TOOLTIP) or "")
     .. (found and ("\n\n" .. found) or "")
     .. "\n\nRight-click: apply Key and Scale to other items."
 end
@@ -705,7 +699,7 @@ K.item_value = function(data, key)
 end
 
 --- The values a new item `guid` starts with: its default of every value key (K.item_default: its track's, else the
---- System Default, else DEFAULTS), and its Key and Scale (K.new_item_key: picked, its track's, or not set).
+--- System Default, else DEFAULTS), and its Key and Scale (K.new_item_key: picked, its track's, or the default).
 K.new_item_values = function(guid)
   local t = {}
   for _, key in ipairs(K.ITEM_KEYS) do t[key] = (K.item_default(key, guid)) end
@@ -729,9 +723,9 @@ K.item_seed = function(data)
       filled = true
     end
   end
-  -- No key, or not set (0): the real key it stands for (K.key_resolve: the track's, else the one last chosen by hand)
-  if data.key_idx == nil or data.key_idx == 0 then
-    local k, sc, from_track = K.key_resolve(0, nil, data.guid)
+  -- No key: its track's, else the default (K.key_resolve)
+  if data.key_idx == nil then
+    local k, sc, from_track = K.key_resolve(data.guid)
     data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
     filled = true
   end
@@ -743,7 +737,7 @@ end
 --- (they describe the song, not the analysis); its values start at the defaults (K.item_seed). A model change only.
 K.item_carry_key = function(data, before)
   if not before then return end
-  if before.key_idx ~= nil and before.key_idx ~= 0 then
+  if before.key_idx ~= nil then
     data.key_idx, data.key_from_track, data.key_source = before.key_idx, before.key_from_track, before.key_source
   end
   if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
@@ -966,9 +960,7 @@ local function update_scale_pitch_classes()
   local scale = SCALE_DEFINITIONS[state.scale_idx]
   local root_pc = (state.key_idx - 1) % 12
   state.scale_pc_set = {}
-  if state.key_idx == 0 then   -- no key set (an item not analysed yet): every pitch class is in scale
-    for pc = 0, 11 do state.scale_pc_set[pc] = true end
-  elseif scale then
+  if scale then
     for _, intv in ipairs(scale.intervals) do
       local pc = (root_pc + intv) % 12
       state.scale_pc_set[pc] = true
@@ -1027,17 +1019,6 @@ K.PERSIST = (function()
       if raw == "1" then tbl[key] = true elseif raw == "0" then tbl[key] = false end
     end)
   end
-
-  -- The key last chosen by hand (K.new_key), saved when Key or Scale is changed in the bar
-  -- (whole numbers only: they index SCALE_KEYS / SCALE_DEFINITIONS)
-  local function whole(group, ext, tbl, key, lo, hi)
-    add(group, ext, function() return string.format("%.14g", tbl[key]) end, function(raw)
-      local n = finite(raw)
-      if n and n % 1 == 0 then tbl[key] = math.max(lo, math.min(hi, n)) end
-    end)
-  end
-  whole("key", "pitch_key_hand_idx", K.new_key, "hand_key_idx", 1, #SCALE_KEYS)
-  whole("key", "pitch_scale_hand_idx", K.new_key, "hand_scale_idx", 1, #SCALE_DEFINITIONS)
 
   -- Settings: the engine and the pitch algorithm, saved when a control changes or is committed or reset
   choice("engine", "pitch_block_size", state, "block_size", BLOCK_SIZES)
@@ -1131,10 +1112,10 @@ do
   local saved_shortcuts = reaper.GetExtState("FancyScripts", "pitch_shortcuts_open")
   state.shortcuts_open = not (saved_shortcuts == "0" or saved_shortcuts == "false")
 
-  -- Restore the key last chosen by hand, the engine settings, the layers and the panel width
+  -- Restore the engine settings, the layers and the panel width
   K.load_settings()
-  -- Nothing is open yet: the window shows a new item's values (no key set)
-  state.key_idx, state.scale_idx, state.separation = 0, 1, DEFAULTS.separation
+  -- Nothing is open yet: the window shows a new item's values (the default key, C Chromatic)
+  state.key_idx, state.scale_idx, state.separation = K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX, DEFAULTS.separation
   update_scale_pitch_classes()
   -- A panel the user never resized takes its width from the Shortcuts list (see K.panel_fit_w), on the first frame
   state.sidebar_auto = not reaper.HasExtState("FancyScripts", "pitch_sidebar_w")
@@ -1688,7 +1669,7 @@ K.note_readout = function(cp, C)
   local cents = math.floor((cp - nearest) * 100 + 0.5)
   local pc = (nearest % 12 + 12) % 12
   local scale = SCALE_DEFINITIONS[state.scale_idx]
-  local chromatic = (not scale) or scale.name == "Chromatic" or state.key_idx == 0   -- no key set: no scale yet
+  local chromatic = (not scale) or scale.name == "Chromatic"
   local key_name = SCALE_KEYS[state.key_idx] and SCALE_KEYS[state.key_idx].display or ""
   local scale_name = chromatic and "" or (key_name .. " " .. scale.name)
   local name_col, scale_line = C.readout_name, nil
@@ -2567,7 +2548,7 @@ end
 --- notes found ("A3–F4") or the range's name. Builds both strings: the box calls K.range_box_text every frame and
 --- this only for its tooltip, on hover.
 K.range_box_build = function(t)
-  if not t.has_target then return K.KEY_UNSET_TEXT, nil end
+  if not t.has_target then return K.DASH_TEXT, nil end
   local function hz(st) return 440 * 2 ^ ((st - 69) / 12) end
   local function named(values, name)
     return name, string.format("Vocal Range: %s (%.0f\xE2\x80\x93%.0f Hz)", name, values.min_freq, values.max_freq)
@@ -2575,7 +2556,7 @@ K.range_box_build = function(t)
   local data = t.data
   if data then
     local values = K.analysis_values(data.analysis)
-    if not values then return K.KEY_UNSET_TEXT, nil end
+    if not values then return K.DASH_TEXT, nil end
     if values.auto_range == true then
       local lo, hi = values.auto_lo_st, values.auto_hi_st
       if type(lo) == "number" and type(hi) == "number" then
@@ -2598,7 +2579,7 @@ end
 K.range_box_memo = {}
 K.range_box_args = {}   -- the box's arguments, refilled every frame (no table per frame)
 K.range_box_text = function(t)
-  if not t.has_target then return K.KEY_UNSET_TEXT end
+  if not t.has_target then return K.DASH_TEXT end
   local m, data = K.range_box_memo, t.data
   local analysis, auto, lo, hi = nil, nil, nil, nil
   if data then
@@ -3017,7 +2998,7 @@ K.card_batch_row = function(track_name, record, opts)
   if not opts.auto_range then
     range = K.card_range_value({ source = "picked", name = opts.range })
   elseif not record then
-    range, pending = K.KEY_UNSET_TEXT, true
+    range, pending = K.DASH_TEXT, true
   else
     range = K.card_range_value({ source = record.lo_st and "found" or "none", lo_st = record.lo_st, hi_st = record.hi_st })
   end
@@ -3028,7 +3009,7 @@ K.card_batch_row = function(track_name, record, opts)
   elseif record and opts.want_key then
     key = K.card_key_value({ source = "none", text = opts.kept })
   else
-    key = K.KEY_UNSET_TEXT
+    key = K.DASH_TEXT
     if opts.want_key and not record then pending = true end
   end
   return { label = track_name, value = range .. " \xC2\xB7 " .. key, dim = pending or nil }
@@ -3073,10 +3054,10 @@ K.card_single_rows = function(c, phase, result)
     elseif phase == "listen" and not source then
       key = { pending = true }
     elseif source then
-      local k, sc = K.key_resolve(0, nil, c.guid)
+      local k, sc = K.key_resolve(c.guid)
       key = { source = source, text = K.key_text(k, sc), track = c.track_name }
     else
-      key = { source = "none", text = K.key_text(K.new_key.hand_key_idx, K.new_key.hand_scale_idx) }
+      key = { source = "none", text = K.key_text(K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX) }
     end
   end
   local key_row = { label = "Key", value = K.card_key_value(key), dim = key.pending or nil }
@@ -3136,7 +3117,7 @@ K.card_batch_rows = function(c, written)
   local rows = {}
   local pre = state.pre
   local values = c.values or {}
-  local kept = K.key_text(K.new_key.hand_key_idx, K.new_key.hand_scale_idx)
+  local kept = K.key_text(K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX)
   local range = values.auto_range ~= true and K.range_name(values) or nil
   for _, t in ipairs(c.tracks or {}) do
     local rec = nil
@@ -4069,8 +4050,7 @@ K.take_json = function(data)
     sample_rate = data.sample_rate,
     results = data.results,
     notes = {},
-    -- (every model is seeded first, K.item_seed; a key not set, 0, is never stored)
-    key_idx = data.key_idx or (K.key_resolve(state.key_idx, state.scale_idx, data.guid)),
+    key_idx = data.key_idx or state.key_idx,   -- (every model is seeded first, K.item_seed)
     scale_idx = data.scale_idx or state.scale_idx,
     key_from_track = data.key_from_track or nil,   -- the key was found on the item's track (the Key combo says so)
     key_source = K.key_source_valid(data.key_source),   -- where its first analysis took the key (K.item_key_source)
@@ -5445,12 +5425,11 @@ K.scale_pcs = function(key_idx, scale_idx)
   local scale = SCALE_DEFINITIONS[scale_idx]
   if not scale or type(key_idx) ~= "number" then return nil end
   local root = (key_idx - 1) % 12
-  local mk = (key_idx == 0) and "auto" or (root .. ":" .. scale_idx)
+  local mk = root .. ":" .. scale_idx
   local pcs = K.scale_pcs_memo[mk]
   if pcs then return pcs end
   pcs = {}
-  -- Auto (an item not analysed yet): every pitch class is in scale
-  for _, intv in ipairs(key_idx == 0 and SCALE_DEFINITIONS[#SCALE_DEFINITIONS].intervals or scale.intervals) do
+  for _, intv in ipairs(scale.intervals) do
     pcs[(root + intv) % 12] = true
   end
   K.scale_pcs_memo[mk] = pcs
@@ -5803,10 +5782,9 @@ K.key_follow_track = function(data)
 end
 
 --- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). `what` =
---- "key" or "scale": what changed, which names the undo point ("Set Key" / "Set Scale"). The key chosen is the key
---- last chosen by hand (K.new_key, what a key that cannot be found falls back to).
---- On an item not analysed yet the choice is only remembered for it (K.pending_key: its first analysis uses it); a
---- key picked while none was set comes with Major. Nothing is written to REAPER and no undo point is made.
+--- "key" or "scale": what changed, which names the undo point ("Set Key" / "Set Scale").
+--- On an item not analysed yet the choice is only remembered for it (K.pending_key: the pair now shown, which its
+--- first analysis uses and no found key replaces). Nothing is written to REAPER and no undo point is made.
 --- On an analysed item with no Classic or Hard note this is the plain save; otherwise the item's notes follow the
 --- new scale: its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. On an
 --- analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the same
@@ -5815,22 +5793,12 @@ K.scale_changed = function(what)
   local undo_label = (what == "scale") and "Set Scale" or "Set Key"
   local guid = state.target_take_guid
   local data = guid and state.session_takes[guid]
-  if state.key_idx == 0 then   -- no key set: nothing was chosen (Scale is locked while Key shows "–")
-    update_scale_pitch_classes()
-    return
-  end
   if not data then
-    if what == "key" and select(3, K.new_item_key(guid)) == "unset" then state.scale_idx = 1 end
     if guid then K.pending_key[guid] = { key_idx = state.key_idx, scale_idx = state.scale_idx } end
     update_scale_pitch_classes()
-    K.new_key.hand_key_idx, K.new_key.hand_scale_idx = state.key_idx, state.scale_idx
-    K.save_settings("key")
     return
   end
   update_scale_pitch_classes()
-  -- On the from-track path below the key last chosen by hand changes in memory only: it is saved with the next
-  -- "key" settings save
-  K.new_key.hand_key_idx, K.new_key.hand_scale_idx = state.key_idx, state.scale_idx
   -- While an analysis, a batch or a pre-analysis runs its pending records are its own: the key changes as on any item
   local follow, rec = nil, nil
   if not (state.is_analyzing or K.batch or state.pre) then follow, rec = K.key_follow_track(data) end
@@ -5838,8 +5806,6 @@ K.scale_changed = function(what)
   if follow then
     -- The track's record takes the key (its runner-up no longer applies); written inside the item's undo block
     K.track_records_pending[follow] = K.track_record_with_key(rec, state.key_idx, state.scale_idx)
-  else
-    K.save_settings("key")   -- ExtState: a preference, not part of the item's undo point
   end
   local count = K.mode_note_count(state.notes or {})
   local wrote
@@ -5908,12 +5874,8 @@ K.find_again_finish = function(track, prev, rec, total, guid, track_name)
       set_status(K.AUTO_UNREADABLE_TEXT)
       return
     end
-    local k, sc
-    if prev and prev.key_idx then
-      k, sc = prev.key_idx, prev.scale_idx
-    else
-      k, sc = K.key_resolve(state.key_idx, state.scale_idx, state.target_take_guid)
-    end
+    local k, sc = state.key_idx, state.scale_idx
+    if prev and prev.key_idx then k, sc = prev.key_idx, prev.scale_idx end
     set_status(string.format(K.NO_KEY_FMT, K.key_text(k, sc)))
     return
   end
@@ -5927,7 +5889,7 @@ K.find_again_finish = function(track, prev, rec, total, guid, track_name)
   if rec.key_idx then
     kept = K.key_text(rec.key_idx, rec.scale_idx)
   else
-    kept = K.key_text(K.key_resolve(state.key_idx, state.scale_idx, state.target_take_guid))
+    kept = K.key_text(state.key_idx, state.scale_idx)
   end
   local name = K.track_label(track)
   K.track_records_pending[track] = rec
@@ -5937,7 +5899,7 @@ K.find_again_finish = function(track, prev, rec, total, guid, track_name)
   reaper.Undo_EndBlock("Find Range and Key: " .. name, -1)
   state.undo_open = false
   note_own_write()
-  -- An open item not analysed yet that had no key now shows its track's (K.new_item_key)
+  -- An open item not analysed yet with no key picked now shows its track's (K.new_item_key)
   if state.target_take_guid and not state.session_takes[state.target_take_guid] then
     state.key_idx, state.scale_idx = K.new_item_key(state.target_take_guid)
     update_scale_pitch_classes()
@@ -7312,7 +7274,7 @@ local function process_analysis_step()
       state.stale_takes[state.target_take_guid] = nil   -- a fresh analysis has no stale envelope
       state.session_takes[state.target_take_guid] = take_data
       K.pending_key[state.target_take_guid] = nil   -- analysed: its key is its own now
-      -- The bar shows the analysed item's real key (not set, 0, only while an item is not analysed)
+      -- The bar shows the analysed item's key
       state.key_idx, state.scale_idx = take_data.key_idx, take_data.scale_idx
       update_scale_pitch_classes()
       -- The form follows: it now shows the values the item was analysed with ("as analyzed before"), so a later
@@ -9991,7 +9953,7 @@ local function draw_graph(draw_ctx, w, h)
   -- are drawn after it, and a block that runs past the window's edge must not reach them.
   local root_pc = (state.key_idx - 1) % 12
   -- No key set (an item not analysed yet, e.g. while its analysis draws in): no scale yet, every row in key
-  local is_chromatic = (SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic") or state.key_idx == 0
+  local is_chromatic = SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic"
   reaper.ImGui_DrawList_PushClipRect(draw_list, px, py, px + w, py + h, true)
 
   for n = math.floor(min_note), math.ceil(max_note) do
@@ -14850,12 +14812,6 @@ K.apply_source = function(keys)
     end
     src[key] = v
   end
-  -- No key set on an item not analysed yet: the real key it stands for (0 is never given to an item)
-  if src.key_idx == 0 then
-    local k, sc = K.key_resolve(0, nil, state.target_take_guid)
-    src.key_idx = k
-    if src.scale_idx ~= nil then src.scale_idx = sc end
-  end
   return src
 end
 
@@ -15416,7 +15372,7 @@ do
     s.more_w = hdr_text_w(HDR_ELLIPSIS) + s.pad_x
     -- The Range box, as wide as the longest text it can show (LG3): "Auto", a range's name, "Custom", or two note
     -- names of the widest the listening pass can find ("G#4–G#4")
-    local range_texts = { K.KEY_UNSET_TEXT, K.CUSTOM_PRESET }
+    local range_texts = { K.DASH_TEXT, K.CUSTOM_PRESET }
     for _, r in ipairs(VOCAL_RANGES) do range_texts[#range_texts + 1] = r.name end
     local lo_st = math.floor(freq_to_note(K.PRE.MIN_HZ))
     local widest = lo_st
@@ -15638,7 +15594,6 @@ do
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBg(),        P.btn)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgHovered(), P.btn_h)
     reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_FrameBgActive(),  P.btn_a)
-    -- Key index 0 is not set, "–" (only while the item is not analysed: an analysed item always shows its real key)
     local key_open = reaper.ImGui_BeginCombo(ctx, "##key_selector", K.key_preview(state.key_idx))
     reaper.ImGui_PopStyleColor(ctx, 3)
     if key_open then
@@ -15656,20 +15611,15 @@ do
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       -- Built on hover only (K.key_tooltip: a found key names its track and the runner-up)
       Theme.tooltip(ctx, K.key_tooltip(state.target_take_guid and state.session_takes[state.target_take_guid],
-        state.key_idx))
+        hs.has_target and state.target_take_guid or nil))
     end
   end
 
   local function hdr_draw_scale(hs)
     local s = hs.s
-    -- While no key is set (an item not analysed yet) the scale is "–", disabled with its reason (Theme.combo's
-    -- tooltip shows on a disabled combo too)
-    local disabled, idx, placeholder, tooltip = K.scale_combo_state(state.key_idx, state.scale_idx)
-    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, idx, {
+    local new_idx, changed = Theme.combo(ctx, "##scale_selector", SCALE_DEFINITIONS, state.scale_idx, {
       w = s.scale_w,
-      disabled = disabled,
-      placeholder = placeholder,
-      tooltip = tooltip,
+      tooltip = K.SCALE_TOOLTIP,
     })
     if changed and new_idx ~= state.scale_idx then
       state.scale_idx = new_idx
