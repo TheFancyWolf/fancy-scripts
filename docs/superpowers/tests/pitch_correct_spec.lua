@@ -5564,7 +5564,7 @@ test("pre_runs_to_a_record", function()
     local calls, got = 0, nil
     eq(K.pre_begin({ "tr" }, { on_done = function(results) calls = calls + 1; got = results end }), true)
     eq(st.is_analyzing, true, "the pre-analysis counts as analysing")
-    eq(st.pre.n_tracks, 1)
+    eq(#st.pre.queue, 1); eq(st.pre.n_tracks, nil, "no count of its own"); eq(st.pre.track_idx, nil)
     eq(type(st.pre.track_name), "string")
     pre_run_out()
     eq(calls, 1, "on_done once")
@@ -6579,7 +6579,7 @@ test("auto_progress_spans_both_stages", function()
     S.start_analysis(auto_values(true))
     while st.pre do K.analysis_tick() end
     eq(st.is_analyzing, true, "stage 2 started by itself")
-    eq(K.locked_reason(), K.LOCKED_REASON, "stage 2: the usual locked line")
+    eq(select(2, K.canvas_form(true, false)), K.LOCKED_REASON, "stage 2: the usual locked line")
     st.progress = 0.5
     near(K.analysis_progress(), K.PRE.SHARE + (1 - K.PRE.SHARE) * 0.5, 1e-12)
     K.card_update()
@@ -6668,7 +6668,7 @@ test("batch_two_tracks_each_own_range", function()
     -- a key picked for each item: only the range is found, and each track takes its item's key
     for _, g in ipairs({ "{a}", "{b}", "{c}" }) do K.pending_key[g] = { key_idx = 3, scale_idx = 1 } end
     K.batch_start(two_entries(), auto_values(true))
-    eq(st.pre ~= nil, true, "stage 1 before the first item"); eq(st.pre.n_tracks, 2)
+    eq(st.pre ~= nil, true, "stage 1 before the first item"); eq(#st.pre.queue, 2)
     K.analysis_tick()
     K.card_update()
     eq(K.card.step, "Listening to track \"Low\"\xE2\x80\xA6", "two tracks: the one being heard is named")
@@ -7514,41 +7514,133 @@ test("new_item_key_sources", function() with_pending(function()
   end)
 end) end)
 
+-- What REAPER's selection moving to the item `guid` (take `take`) does, in the order loop_body and the script's
+-- start do it: the switch first, then the caller makes the item the target when it was not analysed
+local function select_item(guid, take)
+  local switched = S.switch_active_target(guid, take)
+  if not switched then S.state.target_take_guid = guid end
+  return switched
+end
+
 test("picked_key_does_not_leak", function() with_pending(function()
   local K, st = S.K, S.state
   local set_ext, by_guid = rawget(reaper, "SetExtState"), rawget(reaper, "GetMediaItemTakeByGUID")
   rawset(reaper, "SetExtState", function() end)
   rawset(reaper, "GetMediaItemTakeByGUID", function(_, guid) return "take" .. guid end)   -- both items exist
   K.drop_project_cache()
-  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, st.separation }
+  local saved = { st.target_take_guid, st.key_idx, st.scale_idx, st.separation, st.analysis_form }
   local ok, err = pcall(with_track_record, nil, function()
-    st.target_take_guid = "{A}"
-    K.adopt_new_item_values()
+    st.target_take_guid = nil
+    select_item("{A}")
     eq(st.key_idx, 0, "A starts unset")
     st.key_idx = 4   -- D# picked in the bar
     K.scale_changed("key")
     eq(K.pending_key["{A}"].key_idx, 4); eq(K.pending_key["{A}"].scale_idx, 1, "Major with a first pick")
     eq(st.scale_idx, 1, "the bar shows Major")
-    st.target_take_guid = "{B}"
-    K.adopt_new_item_values()
+    select_item("{B}")
     eq(st.key_idx, 0, "B is unset"); eq(st.scale_idx, 1)
     eq(K.pending_key["{B}"], nil)
-    st.target_take_guid = "{A}"
-    K.adopt_new_item_values()
+    select_item("{A}")
     eq(st.key_idx, 4, "A shows its picked key again")
     -- A leaves the project: its key is forgotten the next time the open item changes
     rawset(reaper, "GetMediaItemTakeByGUID", function(_, guid) if guid ~= "{A}" then return "take" .. guid end end)
     K.drop_project_cache()
-    st.target_take_guid = "{B}"
-    K.adopt_new_item_values()
+    select_item("{B}")
     eq(K.pending_key["{A}"], nil, "gone with its item")
   end)
   rawset(reaper, "SetExtState", set_ext)
   rawset(reaper, "GetMediaItemTakeByGUID", by_guid)
   K.drop_project_cache()
-  st.target_take_guid, st.key_idx, st.scale_idx, st.separation = table.unpack(saved, 1, 4)
+  st.target_take_guid, st.key_idx, st.scale_idx, st.separation, st.analysis_form = table.unpack(saved, 1, 5)
   K.save_settings("key")
   if not ok then error(err, 0) end
+end) end)
+
+-- A on a track whose record has key 5 (tr), B on a track without a record (tr2)
+local KEY_AND_NONE = { tr = { items = { "it_a" }, freq = 220 }, tr2 = { items = { "it_b" }, freq = 440, name = "Other" } }
+
+test("switch_pick_does_not_follow_to_the_next_item", function() t7_ext(function()
+  auto_world({ tracks = { tr2 = { items = { "it_a", "it_b" }, freq = 440 } } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid = nil
+    select_item("{a}", "tk_a")
+    eq(st.target_take_guid, "{a}"); eq(st.key_idx, 0, "A starts unset")
+    st.key_idx = 4
+    K.scale_changed("key")
+    eq(K.pending_key["{a}"].key_idx, 4)
+    eq(select_item("{b}", "tk_b"), false, "B is not analysed")
+    eq(st.target_take_guid, "{b}")
+    eq(st.key_idx, 0, "B shows no key, not A's pick"); eq(st.scale_idx, 1)
+    eq(K.scale_combo_state(st.key_idx, st.scale_idx), true, "Scale is locked on B")
+    eq(K.pending_key["{b}"], nil, "nothing picked for B")
+    select_item("{a}", "tk_a")
+    eq(st.key_idx, 4, "A keeps its pick")
+  end)
+end) end)
+
+test("switch_shows_the_new_items_track_key", function() t7_ext(function()
+  auto_world({ tracks = KEY_AND_NONE, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local st = S.state
+    st.target_take_guid = nil
+    select_item("{a}", "tk_a")
+    eq(st.key_idx, 5, "A shows its track's key")
+    select_item("{b}", "tk_b")
+    eq(st.key_idx, 0, "B's track has no key: B shows none, not A's track's")
+    eq(S.K.scale_combo_state(st.key_idx, st.scale_idx), true, "Scale is locked on B")
+    select_item("{a}", "tk_a")
+    eq(st.key_idx, 5, "back on A: its track's key"); eq(st.scale_idx, 1)
+    eq(S.K.scale_combo_state(st.key_idx, st.scale_idx), false, "Scale is open on A")
+  end)
+end) end)
+
+test("switch_at_script_start_shows_the_track_key", function() t7_ext(function()
+  auto_world({ tracks = KEY_AND_NONE, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local st = S.state
+    st.target_take_guid = nil   -- nothing open yet: the script's start
+    st.key_idx = 0
+    select_item("{a}", "tk_a")
+    eq(st.key_idx, 5, "the first item opened shows its track's key"); eq(st.scale_idx, 1)
+  end)
+end) end)
+
+test("switch_shows_the_new_items_track_separation", function() t7_ext(function()
+  auto_world({ tracks = KEY_AND_NONE }, function(w)
+    local K, st = S.K, S.state
+    w.ext.tr[K.TRACK_DEFAULT_KEY] = JSON.encode({ separation = 0.8 })
+    K.drop_project_cache()
+    local other = K.item_default("separation", "{b}")
+    eq(other ~= 0.8, true, "B's track has no Separation default of its own")
+    st.target_take_guid = nil
+    select_item("{a}", "tk_a")
+    eq(st.separation, 0.8, "A: its track's default")
+    select_item("{b}", "tk_b")
+    eq(st.separation, other, "B: not A's track's default")
+    select_item("{a}", "tk_a")
+    eq(st.separation, 0.8)
+  end)
+end) end)
+
+test("batch_cancel_back_to_an_unanalysed_item_shows_its_key", function() t7_ext(function()
+  auto_world({ tracks = KEY_AND_NONE, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid = nil
+    select_item("{a}", "tk_a")
+    eq(st.key_idx, 5)
+    K.pending_key["{b}"] = { key_idx = 3, scale_idx = 2 }
+    K.batch_start({ { guid = "{b}", take = "tk_b", item = "it_b", name = "B", len = 6, sample_rate = 8000 } },
+      auto_values(false))
+    eq(st.target_take_guid, "{b}", "the batch opens its item")
+    K.batch_finish(true)
+    eq(st.target_take_guid, "{a}", "back to A")
+    eq(st.key_idx, 5, "A's track's key, not B's pick"); eq(st.scale_idx, 1)
+    -- nothing was open before the batch: nothing is shown after it, not the batch's item's key
+    st.target_take_guid, st.target_take_name = nil, nil
+    K.batch_start({ { guid = "{b}", take = "tk_b", item = "it_b", name = "B", len = 6, sample_rate = 8000 } },
+      auto_values(false))
+    eq(st.target_take_guid, "{b}")
+    K.batch_finish(true)
+    eq(st.target_take_guid, nil); eq(st.key_idx, 0, "no item: no key")
+  end)
 end) end)
 
 test("picked_key_survives_analysis", function() with_pending(function()
@@ -7857,14 +7949,17 @@ test("hand_key_on_analysed_item_is_picked", function() t7_ext(function()
     K.scale_changed("key")
     eq(data.key_source, "picked", "a key set by hand")
     eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key", "written with the item in one block")
-    -- the item follows its track: its source stays
+    -- the item follows its track: the track takes the key, and the item's key is still the user's
     w.log = {}
     data = t7_open(5, 1, true)
     data.key_source = "found"
+    eq(K.key_found_text(data), "Found from V _ Main.", "found before the change")
     st.key_idx = 7
     K.scale_changed("key")
-    eq(data.key_source, "found", "follows the track: unchanged")
+    eq(data.key_source, "picked", "follows the track: picked by hand all the same")
     eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Key")
+    eq(K.key_found_text(data), nil, "no 'Found from' for a key the user set")
+    eq(K.key_tooltip(data, st.key_idx):find("Found from", 1, true), nil, "nor in the Key tooltip")
   end)
 end) end)
 
@@ -8284,13 +8379,19 @@ test("card_not_opened_when_nothing_starts", function()
 end)
 
 test("frame_error_closes_the_card", function()
-  local K = S.K
-  K.card = { kind = "single", phase = "notes", rows = {}, lines = {}, picked = 1 }
-  local ok, err = pcall(K.recover_after_error)
-  local left = K.card
-  K.card, K.track_records_pending, K.auto_run = nil, {}, nil
-  if not ok then error(err, 0) end
-  eq(left, nil)
+  auto_world({ tracks = ONE_TRACK }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    while st.pre do K.analysis_tick() end   -- the track is heard: its record waits for the analysis's block
+    K.card_update()
+    eq(K.card ~= nil, true, "the card is open"); eq(st.is_analyzing, true, "the notes are being found")
+    eq(next(K.track_records_pending) ~= nil, true, "a record is pending"); eq(K.auto_run ~= nil, true)
+    K.recover_after_error()
+    eq(K.card, nil, "the card closes")
+    eq(next(K.track_records_pending), nil, "nothing pending"); eq(K.auto_run, nil)
+    eq(st.is_analyzing, false)
+  end)
 end)
 
 test("card_counts_as_a_window_modal", function()
@@ -8315,11 +8416,12 @@ test("locked_reason_has_no_progress", function()
     K.batch_start(two_entries(), auto_values(true))
     K.analysis_tick()
     eq(st.pre ~= nil, true)
-    eq(K.locked_reason(), K.LOCKED_REASON, "no progress in the form")
+    eq(K.locked_reason, nil, "the constant is used as it is")
+    eq(K.LOCKED_REASON, "Locked while analyzing", "no progress in the form")
     eq(K.status_line(false), "", "no progress in the status line")
     while st.pre do K.analysis_tick() end
     K.analysis_tick()
-    eq(K.locked_reason(), K.LOCKED_REASON); eq(K.status_line(false), "")
+    eq(select(2, K.canvas_form(true, false)), K.LOCKED_REASON); eq(K.status_line(false), "")
   end)
 end)
 
@@ -8333,22 +8435,117 @@ end)
 
 test("range_box_texts", function()
   local K = S.K
-  local text, tip = K.range_box_text({ has_target = false })
+  local function both(t) return K.range_box_text(t), K.range_box_tip(t) end
+  local text, tip = both({ has_target = false })
   eq(text, "\xE2\x80\x93"); eq(tip, nil)
-  text, tip = K.range_box_text({ has_target = true, values = auto_values(true), track_name = "Test" })
+  text, tip = both({ has_target = true, values = auto_values(true), track_name = "Test" })
   eq(text, "Auto"); eq(tip, "The range is found from the whole track when you analyze")
-  text, tip = K.range_box_text({ has_target = true, values = auto_values(false), track_name = "Test" })
+  text, tip = both({ has_target = true, values = auto_values(false), track_name = "Test" })
   eq(text, "Tenor"); eq(tip, "Vocal Range: Tenor (130\xE2\x80\x93500 Hz)")
   local found = K.auto_values(auto_values(true), { st = {}, takes = {}, lo_st = 57, hi_st = 65 })
-  text, tip = K.range_box_text({ has_target = true, data = { analysis = found }, values = auto_values(false),
+  text, tip = both({ has_target = true, data = { analysis = found }, values = auto_values(false),
     track_name = "Test" })
   eq(text, "A3\xE2\x80\x93F4", "analysed: the range found, not the form's")
   eq(tip, "Vocal range found on Test: 220\xE2\x80\x93349 Hz, with a little room either side")
-  text, tip = K.range_box_text({ has_target = true, data = { analysis = auto_values(false) },
+  text, tip = both({ has_target = true, data = { analysis = auto_values(false) },
     values = auto_values(true), track_name = "Test" })
   eq(text, "Tenor"); eq(tip, "Vocal Range: Tenor (130\xE2\x80\x93500 Hz)")
+  local none = auto_values(true)
+  none.auto_none = true
+  text, tip = both({ has_target = true, data = { analysis = none } })
+  eq(text, "Generic Vocal"); eq(tip:find("^Vocal Range: Generic Vocal %(") ~= nil, true)
+  eq(both({ has_target = true, data = { analysis = { bad = true } } }), "\xE2\x80\x93", "unreadable: none")
+  eq(K.range_box_tip({ has_target = true, data = { analysis = { bad = true } } }), nil)
 end)
 
+test("range_box_text_is_cheap_per_frame", function()
+  local K = S.K
+  local real_values, calls = K.analysis_values, 0
+  K.analysis_values = function(...) calls = calls + 1; return real_values(...) end
+  local ok, err = pcall(function()
+    local found = K.auto_values(auto_values(true), { st = {}, takes = {}, lo_st = 57, hi_st = 65 })
+    local t = { has_target = true, data = { analysis = found }, track_name = "Test" }
+    eq(K.range_box_text(t), "A3\xE2\x80\x93F4")
+    local first = calls
+    for _ = 1, 5 do eq(K.range_box_text(t), "A3\xE2\x80\x93F4") end
+    eq(calls, first, "the same analysis is not read again every frame")
+    -- a new analysis (a re-analysis, an undo) is a new table: read again
+    t.data = { analysis = K.auto_values(auto_values(true), { st = {}, takes = {}, lo_st = 60, hi_st = 64 }) }
+    eq(K.range_box_text(t), "C4\xE2\x80\x93E4")
+    -- the form of an item not analysed yet, changed in place: the text follows it
+    local values = auto_values(true)
+    t = { has_target = true, values = values }
+    eq(K.range_box_text(t), "Auto")
+    values.auto_range, values.min_freq, values.max_freq = false, 130, 500
+    eq(K.range_box_text(t), "Tenor")
+    eq(K.range_box_text({ has_target = false }), "\xE2\x80\x93")
+  end)
+  K.analysis_values = real_values
+  if not ok then error(err, 0) end
+end)
+
+-- Final review fixes: the Analysis card -----------------------------------------------------------------------------
+
+test("card_reanalysis_keeps_the_picked_source", function()
+  local K = S.K
+  local c = { guid = "{zz}", before = true, values = auto_values(false), track_name = "Test" }
+  local function key_value(source)
+    local data = { guid = "{zz}", key_idx = 3, scale_idx = 1, key_source = source, notes = {},
+      analysis = auto_values(false) }
+    return K.card_single_rows(c, "done", { data = data })[2].value
+  end
+  eq(key_value("picked"), "D Major (your choice)", "a key the user chose says so on a re-analysis")
+  eq(key_value("track"), "D Major", "the track's: bare on a re-analysis")
+  eq(key_value("found"), "D Major")
+  eq(key_value(nil), "D Major", "no source: bare")
+end)
+
+test("card_real_reanalysis_shows_your_choice", function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1)) } }, function()
+    local K, st = S.K, S.state
+    local data = t7_open(3, 1, false)
+    data.key_source = "picked"
+    data.analysis = auto_values(false)
+    S.start_analysis(auto_values(false))
+    eq(K.card ~= nil and K.card.before, true, "a re-analysis")
+    card_run_out()
+    eq(K.card.phase, "done")
+    eq(card_row("Key").value, "D Major (your choice)")
+    eq(st.session_takes["{a}"].key_source, "picked", "carried")
+  end)
+end)
+
+test("card_other_key_with_another_item_open_writes_nothing", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    eq(#card_row("Key").choices, 2)
+    st.target_take_guid, st.target_take_name = "{b}", "tk_b"   -- another item is open now
+    w.log = {}
+    K.card.picked = 2
+    K.card_close(true)
+    eq(K.card, nil, "the card closes"); eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(st.session_takes["{a}"].key_idx, 5, "A keeps its key"); eq(t7_stored(w).key_idx, 5, "so does the track")
+  end)
+end) end)
+
+test("card_other_key_after_the_analysis_was_undone_writes_nothing", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(5, 1, { 2, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name, st.key_idx = "{a}", "tk_a", 0
+    S.start_analysis(auto_values(true))
+    card_run_out()
+    eq(#card_row("Key").choices, 2)
+    st.session_takes["{a}"] = nil   -- Cmd+Z took the analysis away (sync_with_project drops the model)
+    w.log = {}
+    K.card.picked = 2
+    K.card_close(true)
+    eq(K.card, nil); eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(t7_stored(w).key_idx, 5, "the track keeps its key")
+  end)
+end) end)
 
 -- Fix round 1 of the Analysis card ----------------------------------------------------------------------------------
 

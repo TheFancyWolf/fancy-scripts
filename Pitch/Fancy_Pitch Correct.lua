@@ -2093,8 +2093,7 @@ K.pre_begin = function(tracks, opts)
   end
   state.pre = {
     queue = queue, qi = 1, ti = 1, t = 0, accessor = nil, buffer = reaper.new_array(K.PRE.BLOCK),
-    results = results, on_done = opts.on_done, total_s = total, done_s = 0, n_tracks = #queue, track_idx = 1,
-    track_name = "",
+    results = results, on_done = opts.on_done, total_s = total, done_s = 0, track_name = "",
   }
   K.pre_name_track()
   state.is_analyzing = true
@@ -2149,7 +2148,6 @@ K.pre_next_track = function(pre)
     if not state.accessor and not state.pre then state.is_analyzing = false end
     return true
   end
-  pre.track_idx = pre.qi
   if reaper.ValidatePtr2(0, pre.queue[pre.qi].track, "MediaTrack*") then K.pre_name_track() end
   return false
 end
@@ -2566,8 +2564,9 @@ end
 --- The top bar's read-only Range box: its text and tooltip (nil: none). t = { has_target, data (the open item's
 --- model, nil: not analysed), values (the analysis form's values, for an item not analysed yet), track_name }. No
 --- item: "–". Not analysed: the form's Vocal Range ("Auto", "Tenor"). Analysed: the range it was analysed with, the
---- notes found ("A3–F4") or the range's name.
-K.range_box_text = function(t)
+--- notes found ("A3–F4") or the range's name. Builds both strings: the box calls K.range_box_text every frame and
+--- this only for its tooltip, on hover.
+K.range_box_build = function(t)
   if not t.has_target then return K.KEY_UNSET_TEXT, nil end
   local function hz(st) return 440 * 2 ^ ((st - 69) / 12) end
   local function named(values, name)
@@ -2591,6 +2590,34 @@ K.range_box_text = function(t)
   local values = t.values or K.analysis_defaults()
   if values.auto_range == true then return K.range_name(values), "The range is found from the whole track when you analyze" end
   return named(values, K.range_name(values))
+end
+
+--- The Range box's text (K.range_box_build), held while what it is built from stays: an analysed item's stored
+--- analysis (a re-analysis or an undo gives a new table, as K.form_sync compares it), or the Vocal Range of the form
+--- of an item not analysed yet (its Auto flag and Hz, edited in place). Nothing is built while they stay.
+K.range_box_memo = {}
+K.range_box_args = {}   -- the box's arguments, refilled every frame (no table per frame)
+K.range_box_text = function(t)
+  if not t.has_target then return K.KEY_UNSET_TEXT end
+  local m, data = K.range_box_memo, t.data
+  local analysis, auto, lo, hi = nil, nil, nil, nil
+  if data then
+    analysis = data.analysis
+  else
+    local values = t.values or state   -- no form: the Settings' values (K.analysis_defaults reads them from state)
+    auto, lo, hi = values.auto_range == true, values.min_freq, values.max_freq
+  end
+  if m.text == nil or m.item ~= (data ~= nil) or m.analysis ~= analysis or m.auto ~= auto or m.lo ~= lo
+      or m.hi ~= hi then
+    m.text = (K.range_box_build(t))
+    m.item, m.analysis, m.auto, m.lo, m.hi = data ~= nil, analysis, auto, lo, hi
+  end
+  return m.text
+end
+
+--- The Range box's tooltip, or nil (K.range_box_build): built only while the box is hovered.
+K.range_box_tip = function(t)
+  return select(2, K.range_box_build(t))
 end
 
 --- Why Min Freq and Max Freq are disabled for `values`: nil, or "Found from the track" while Vocal Range is Auto.
@@ -2894,11 +2921,6 @@ K.auto_values = function(values, record)
   return out, true
 end
 
---- Why the analysis controls are disabled while something runs (its progress is in the Analysis card).
-K.locked_reason = function()
-  return K.LOCKED_REASON
-end
-
 -- The Analysis card (docs/design/pitch-correct-auto-range-key.md): every analysis (Analyze, Re-Analyze, a batch,
 -- Find Range and Key Again) shows its progress and what it finds in one modal of the window, open from its start
 -- until the user closes it. K.card (nil: closed) = { kind = "single" | "batch" | "again", phase = "listen" | "notes"
@@ -3037,7 +3059,9 @@ K.card_single_rows = function(c, phase, result)
   local source = nil
   local before = c.before and (data or state.session_takes[c.guid]) or nil
   if before then
-    key = { source = "own", text = K.key_text(before.key_idx, before.scale_idx) }
+    -- A key the user chose stays theirs and says so; the track's or a found key shows bare
+    key = { source = K.key_source_valid(before.key_source) == "picked" and "picked" or "own",
+      text = K.key_text(before.key_idx, before.scale_idx) }
   elseif data then
     source = K.key_source_valid(data.key_source)
     key = { source = source or "none", text = K.key_text(data.key_idx, data.scale_idx), track = c.track_name }
@@ -4633,8 +4657,9 @@ K.batch_finish = function(cancelled)
   else
     -- Nothing written and the item that was open has no analysis: back to it, not analysed (a new item's values)
     reset_analysis_model()
-    K.adopt_new_item_values()
+    -- The target first (it named the batch's last item): with nothing open before, nil is adopted, not that item
     state.target_take_guid, state.target_take_name = batch.prev_guid, batch.prev_name
+    K.adopt_new_item_values(batch.prev_guid)
     local take = batch.prev_guid and resolve_take_by_guid(batch.prev_guid, true) or nil
     local item = take and K.take_item(take) or nil
     state.start_time = 0
@@ -4851,12 +4876,14 @@ K.analysis_progress = function()
   return p
 end
 
---- The open item has no stored data: Separation is its default (K.item_default), Key and Scale its new item's key
---- (K.new_item_key: picked for it, its track's, or not set). Keys picked for items gone from the project are
---- forgotten first.
-K.adopt_new_item_values = function()
+--- The item `guid` (omitted: the open item) has no stored data and is the one the bar shows: Separation is its
+--- default (K.item_default), Key and Scale its new item's key (K.new_item_key: picked for it, its track's, or not
+--- set). Keys picked for items gone from the project are forgotten first. A caller switching to `guid` passes it:
+--- state.target_take_guid may still name the item being left.
+K.adopt_new_item_values = function(guid)
+  if guid == nil then guid = state.target_take_guid end
   K.pending_key_prune()
-  local start = K.new_item_values(state.target_take_guid)
+  local start = K.new_item_values(guid)
   state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
   update_scale_pitch_classes()
 end
@@ -4882,7 +4909,9 @@ local function switch_active_target(guid, take_obj)
     K.form_sync(guid, data)
     return true
   end
-  K.adopt_new_item_values()   -- not analysed yet: it shows, and its first analysis uses, a new item's values
+  -- Not analysed yet: it shows, and its first analysis uses, its own new item's values (the caller makes it the
+  -- target after this returns)
+  K.adopt_new_item_values(guid)
   K.form_sync(guid, nil)
   return false
 end
@@ -5805,11 +5834,11 @@ K.scale_changed = function(what)
   -- While an analysis, a batch or a pre-analysis runs its pending records are its own: the key changes as on any item
   local follow, rec = nil, nil
   if not (state.is_analyzing or K.batch or state.pre) then follow, rec = K.key_follow_track(data) end
+  data.key_source = "picked"   -- set by hand now, also when its track follows: written with the item below
   if follow then
     -- The track's record takes the key (its runner-up no longer applies); written inside the item's undo block
     K.track_records_pending[follow] = K.track_record_with_key(rec, state.key_idx, state.scale_idx)
   else
-    data.key_source = "picked"   -- set by hand now: written with the item below
     K.save_settings("key")   -- ExtState: a preference, not part of the item's undo point
   end
   local count = K.mode_note_count(state.notes or {})
@@ -8832,7 +8861,7 @@ local function draw_graph(draw_ctx, w, h)
       if text_w < L.xxxl then text_w = 0 end   -- no room for a readable part of it: Change… still says where it is
       local row_w = (text_w > 0 and text_w + L.md or 0) + m.change_w + L.md + btn_w
       local x0 = cx - row_w * 0.5
-      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.locked_reason() or reason,
+      local used = K.form_summary_draw(form, x0, y, text_w, analyze_h, state.is_analyzing and K.LOCKED_REASON or reason,
         is_batch)
       btn_cx = x0 + used + L.md + btn_w * 0.5
     else
@@ -12813,7 +12842,7 @@ K.form_rows_draw = function(section, b, opts)
     if reason then reaper.ImGui_PopStyleColor(ctx, 1) end
     reaper.ImGui_EndDisabled(ctx)
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip() | reaper.ImGui_HoveredFlags_AllowWhenDisabled()) then
-      Theme.tooltip(ctx, locked and K.locked_reason() or reason or hint)
+      Theme.tooltip(ctx, locked and K.LOCKED_REASON or reason or hint)
     end
     return clicked and not locked
   end
@@ -13109,7 +13138,7 @@ K.form_canvas_draw = function(form, x, y, w, layout, reason, max_h)
   local P = Theme.get_palette()
   local m = K.form_canvas_metrics()
   local locked = state.is_analyzing == true
-  local why = locked and K.locked_reason() or reason
+  local why = locked and K.LOCKED_REASON or reason
   local disabled = why ~= nil
   local stacked = layout == "stacked"
   local h = 0
@@ -13230,7 +13259,7 @@ K.canvas_form = function(has_target, is_batch)
       for _, key in ipairs(K.ANALYSIS_KEYS) do running.values[key] = params[key] end
       K.canvas_running_form = running
     end
-    return running, K.locked_reason()
+    return running, K.LOCKED_REASON
   end
   K.canvas_running_form = nil
   local form = state.analysis_form
@@ -13412,7 +13441,7 @@ local function draw_settings_modal()
     Theme.section_divider(ctx, engine.title, { color = P.yellow })
     if locked then
       Theme.align(ctx)
-      reaper.ImGui_TextColored(ctx, P.text_dim, K.locked_reason())
+      reaper.ImGui_TextColored(ctx, P.text_dim, K.LOCKED_REASON)
     end
     draw_form(engine)
 
@@ -15653,12 +15682,17 @@ do
   local function hdr_draw_range(hs)
     local s = hs.s
     local guid = hs.has_target and state.target_take_guid or nil
-    local track = guid and K.take_track(guid)
     local form = K.target_form()
-    local text, tip = K.range_box_text({ has_target = hs.has_target, data = guid and state.session_takes[guid],
-      values = form and form.values or nil, track_name = track and K.track_label(track) or nil })
-    Theme.badge(ctx, hdr_fit_text(text, s.range_w - s.pad_x), { id = "range", w = s.range_w })
-    if tip and reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then Theme.tooltip(ctx, tip) end
+    local box = K.range_box_args
+    box.has_target, box.data, box.values = hs.has_target, guid and state.session_takes[guid] or nil, form and form.values or nil
+    box.track_name = nil
+    Theme.badge(ctx, hdr_fit_text(K.range_box_text(box), s.range_w - s.pad_x), { id = "range", w = s.range_w })
+    if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+      local track = guid and K.take_track(guid)
+      box.track_name = track and K.track_label(track) or nil
+      local tip = K.range_box_tip(box)
+      if tip then Theme.tooltip(ctx, tip) end
+    end
   end
 
   --- The Layers submenu of More: each layer shows how it looks on the canvas, a swatch from the same canvas
@@ -17422,6 +17456,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            get_effective = get_effective, get_override_level = get_override_level,
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
            clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session,
-           start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS, reset_analysis_model = reset_analysis_model }
+           start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS, reset_analysis_model = reset_analysis_model,
+           switch_active_target = switch_active_target }
 end
 main()
