@@ -2,9 +2,9 @@
 
 Target file(s): `Pitch/Fancy_Pitch Correct.lua`
 Archetype(s): main window → Editor / canvas (the note-name column of the note canvas and the top bar's Scale combo)
-Status: Draft
+Status: Approved
 Date: 2026-11-27
-Approver:
+Approver: TheFancyWolf (in chat, 2026-11-27)
 
 ## Summary
 
