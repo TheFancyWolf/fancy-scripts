@@ -588,7 +588,8 @@ K.MODE_DEGREES = { Dorian = 2, Phrygian = 3, Lydian = 4, Mixolydian = 5, Locrian
 K.ORDINALS = { [2] = "2nd", [3] = "3rd", [4] = "4th", [5] = "5th", [7] = "7th" }
 
 --- The scale `scale_idx` in key `key_idx` and the scales with the same notes, in words ("D Dorian has the same notes
---- as C Major and A Minor. It is the major scale started on its 2nd note."); "" for an unknown key or scale. The
+--- as C Major and A Minor. It is the major scale started on its 2nd note."); a black key is named both ways ("D# / Eb").
+--- "" for an unknown key or scale. The
 --- relatives come from the Major scale's intervals: its 6th degree is the relative minor, a mode's degree its offset.
 K.scale_relatives_text = function(key_idx, scale_idx)
   local scale = SCALE_DEFINITIONS[scale_idx]
@@ -600,8 +601,8 @@ K.scale_relatives_text = function(key_idx, scale_idx)
     if def.name == "Major" then major = def.intervals end
   end
   if not (key and major) then return "" end
-  local function key_at(semitones) return SCALE_KEYS[(key_idx - 1 + semitones) % 12 + 1].display end
-  local k, rel_minor, degree = key.display, major[6], K.MODE_DEGREES[scale.name]
+  local function key_at(semitones) return SCALE_KEYS[(key_idx - 1 + semitones) % 12 + 1].name end
+  local k, rel_minor, degree = key.name, major[6], K.MODE_DEGREES[scale.name]
   if scale.name == "Major" then
     return string.format("%s Major has the same notes as %s Minor.", k, key_at(rel_minor))
   elseif scale.name == "Natural Minor" then

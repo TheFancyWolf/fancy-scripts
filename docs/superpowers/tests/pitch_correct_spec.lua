@@ -8916,7 +8916,7 @@ test("modes_share_notes_with_their_relatives", function()
       local rel = (k - 1 - d) % 12 + 1
       same_pcs(S.K.scale_pcs(k, scale_named(name)), S.K.scale_pcs(rel, major), name .. " on key " .. k)
       local text = S.K.scale_relatives_text(k, scale_named(name))
-      eq(text:find("same notes as " .. S.COMBO_LABELS.keys[rel] .. " Major", 1, true) ~= nil, true,
+      eq(text:find("same notes as " .. S.COMBO_LABELS.key_names[rel] .. " Major", 1, true) ~= nil, true,
         name .. " on key " .. k .. " names its relative major: " .. text)
     end
   end
@@ -8924,14 +8924,18 @@ end)
 
 test("scale_relatives_text_exact", function()
   local f, k, sc = S.K.scale_relatives_text, key_named, scale_named
-  eq(f(k("E"), sc("Major")), "E Major has the same notes as C# Minor.")
-  eq(f(k("C"), sc("Natural Minor")), "C Natural Minor has the same notes as D# Major.")
+  eq(f(k("E"), sc("Major")), "E Major has the same notes as C# / Db Minor.")
+  eq(f(k("C"), sc("Natural Minor")), "C Natural Minor has the same notes as D# / Eb Major.")
   local tail = " has the same notes as C Major and A Minor. It is the major scale started on its "
   eq(f(k("D"), sc("Dorian")), "D Dorian" .. tail .. "2nd note.")
   eq(f(k("E"), sc("Phrygian")), "E Phrygian" .. tail .. "3rd note.")
   eq(f(k("F"), sc("Lydian")), "F Lydian" .. tail .. "4th note.")
   eq(f(k("G"), sc("Mixolydian")), "G Mixolydian" .. tail .. "5th note.")
   eq(f(k("B"), sc("Locrian")), "B Locrian" .. tail .. "7th note.")
+  eq(f(index_of(S.COMBO_LABELS.key_names, "D# / Eb"), sc("Dorian")),
+    "D# / Eb Dorian has the same notes as C# / Db Major and A# / Bb Minor. It is the major scale started on its 2nd note.")
+  eq(f(index_of(S.COMBO_LABELS.key_names, "F# / Gb"), sc("Pentatonic")),
+    "F# / Gb Pentatonic is five notes of F# / Gb Major: it leaves out the 4th and the 7th.")
   eq(f(k("A"), sc("Pentatonic")), "A Pentatonic is five notes of A Major: it leaves out the 4th and the 7th.")
   eq(f(k("A"), sc("Minor Pentatonic")),
     "A Minor Pentatonic is five notes of A Natural Minor: it leaves out the 2nd and the 6th.")
