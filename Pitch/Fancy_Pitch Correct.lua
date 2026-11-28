@@ -6008,6 +6008,10 @@ local function apply_envelope_to_take(undo_desc, keep_pitch_mode, flush_records,
   if not K.write_take_envelope(guid, data or { notes = state.notes }, keep_pitch_mode, take, item) then
     set_status("Couldn't show the pitch envelope on this item. Check that the item is an audio item on an unlocked track, then try again.")
     if strict then
+      -- The failed write built the correction for the change (note.frame_shifts): the canvas builds it again for the
+      -- model the caller puts back
+      state.draw_cache.corr = nil
+      K.frame_view_memo.frame = nil
       reaper.Undo_EndBlock(undo_desc or "Apply Pitch Correction", -1)
       state.undo_open = false
       note_own_write()
@@ -6042,19 +6046,6 @@ K.key_follow_track = function(data)
   return K.key_track_record(data, data and (data.guid or state.target_take_guid))
 end
 
---- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). `what` =
---- "key" or "scale": what changed, which names the undo point ("Set Key" / "Set Scale").
---- On an item not analysed yet the choice is only remembered for it (K.pending_key: the pair now shown, which its
---- first analysis uses and no found key replaces). Nothing is written to REAPER and no undo point is made.
---- On an analysed item with no Classic or Hard note this is the plain save; otherwise the item's notes follow the
---- new scale: its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. On an
---- analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the same
---- undo point: later items on the track follow. A key change keeps the item's user set (state.scale_user: its steps
---- move with the key, and the track's record takes it too); a scale pick has removed it (K.scale_pick). When nothing
---- can be written (the item is gone, its envelope cannot be written) the item and the bar go back to what they were
---- (K.key_restore) and the track's record is not written.
---- Row `pos` of the Scale list was picked (K.SCALE_ORDER): the bar takes that row's stored index (K.scale_changed)
---- when it is another scale, or any scale while a user set is in use (the pick removes the set).
 --- What a Key, Scale or note-name change sets on the item's model `data`, as it is now (K.key_restore).
 K.key_snapshot = function(data)
   return { key_idx = data.key_idx, scale_idx = data.scale_idx, scale_user = data.scale_user,
@@ -6072,6 +6063,8 @@ K.key_restore = function(data, snap)
   end
 end
 
+--- Row `pos` of the Scale list was picked (K.SCALE_ORDER): the bar takes that row's stored index (K.scale_changed)
+--- when it is another scale, or any scale while a user set is in use (the pick removes the set).
 K.scale_pick = function(pos)
   local idx = K.SCALE_ORDER[pos]
   if idx and (idx ~= state.scale_idx or state.scale_user) then
@@ -6080,6 +6073,17 @@ K.scale_pick = function(pos)
   end
 end
 
+--- Key or Scale was changed in the top bar (state.key_idx / state.scale_idx already hold the new values). `what` =
+--- "key" or "scale": what changed, which names the undo point ("Set Key" / "Set Scale").
+--- On an item not analysed yet the choice is only remembered for it (K.pending_key: the pair now shown, which its
+--- first analysis uses and no found key replaces). Nothing is written to REAPER and no undo point is made.
+--- On an analysed item with no Classic or Hard note this is the plain save; otherwise the item's notes follow the
+--- new scale: its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. On an
+--- analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the same
+--- undo point: later items on the track follow. A key change keeps the item's user set (state.scale_user: its steps
+--- move with the key, and the track's record takes it too); a scale pick has removed it (K.scale_pick). When nothing
+--- can be written (the item is gone, its envelope cannot be written) the item and the bar go back to what they were
+--- (K.key_restore) and the track's record is not written.
 K.scale_changed = function(what)
   local undo_label = (what == "scale") and "Set Scale" or "Set Key"
   local guid = state.target_take_guid

@@ -9612,6 +9612,37 @@ test("note_tip_and_toggle_agree", function()
   end
 end)
 
+test("failed_write_leaves_the_canvas_correction_as_before", function()
+  -- The real envelope writer and correction build run; only REAPER gives no Pitch envelope
+  local real_write, real_correction = S.K.write_take_envelope, S.K.take_correction
+  local major, lydian = scale_named("Major"), scale_named("Lydian")
+  local function attempt(change)
+    auto_world({ tracks = ONE_TRACK }, function(w)
+      local K, st = S.K, S.state
+      K.write_take_envelope, K.take_correction = real_write, real_correction
+      rawset(reaper, "GetTakeEnvelopeByName", function() return nil end)
+      local data = user_open(1, major, nil, false)
+      st.notes = { hard_note(0.5, 65.4) }   -- F: in C Major, out of C Lydian and of the set without F
+      data.notes = st.notes
+      st.draw_cache.corr = nil
+      local before = K.correction_view(st.notes, nil)
+      local shift = st.notes[1].frame_shifts[1]
+      near(shift, 65 - 65.4, 1e-9, "C Major holds F")
+      eq(change(K), false, "nothing could be written")
+      eq(index_of(w.log, "track:tr"), nil); eq(data.scale_user, nil); eq(data.scale_idx, major)
+      local after = K.correction_view(st.notes, nil)
+      near(st.notes[1].frame_shifts[1], shift, 1e-9, "the notes' shifts are the ones the canvas shows")
+      eq(after.gen, before.gen + 1, "the canvas correction is built again for the scale in effect")
+      st.draw_cache.corr = nil
+    end)
+  end
+  attempt(function(K) return K.user_scale_toggle(5) end)   -- F out of the scale
+  attempt(function(K)
+    K.scale_pick(K.scale_display_pos(lydian))
+    return S.state.session_takes["{a}"].scale_idx == lydian
+  end)
+end)
+
 -- Tests appended by later tasks go above this line.
 local failed = false
 for _, t in ipairs(tests) do
