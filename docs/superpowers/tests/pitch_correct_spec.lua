@@ -6310,7 +6310,7 @@ local function auto_world(opts, fn)
   local keys = { "target_take_guid", "target_take_name", "key_idx", "scale_idx", "separation", "results", "notes",
     "split_points", "analysis_empty", "progress", "is_analyzing", "accessor", "buffer", "analysis_params",
     "sample_rate", "item_len", "start_time", "end_time", "current_time", "analysis_form", "last_change_count",
-    "last_seen_sel_guid", "scale_pc_set", "pre" }
+    "last_seen_sel_guid", "scale_pc_set", "pre", "scale_user" }
   local saved = {}
   for _, k in ipairs(keys) do saved[k] = st[k] end
   local saved_status = { st.status.text, st.status.until_time, st.status.hold }
@@ -6851,7 +6851,7 @@ local function t7_open(key_idx, scale_idx, from_track)
     key_from_track = from_track or nil }
   st.session_takes["{a}"] = data
   st.target_take_guid, st.target_take_name, st.notes = "{a}", "Lead Vox", {}
-  st.key_idx, st.scale_idx = key_idx, scale_idx
+  st.key_idx, st.scale_idx, st.scale_user = key_idx, scale_idx, nil
   return data
 end
 
@@ -8991,6 +8991,442 @@ test("found_keys_are_still_major_or_minor", function()
     eq(s == 1 or s == 2, true, "tally " .. i .. " scale " .. tostring(s))
     eq(as == nil or as == 1 or as == 2, true, "tally " .. i .. " runner-up " .. tostring(as))
   end
+end)
+
+-- User scale notes (docs/design/pitch-correct-user-scale.md) ------------------------------------------------------
+
+local function steps_text(t) return t and table.concat(t, ",") or "nil" end
+
+-- The text a take stores for the analysed item "{bad}" in E Major (5 / 1) whose user set is `user` as stored
+local function stored_with_user(user)
+  local t = JSON.decode(stored_with_key(5, 1))
+  t.scale_user = user
+  return JSON.encode(t)
+end
+
+-- The analysed item "{a}" open in key `key_idx`, scale `scale_idx` with the user set `user` (nil: none)
+local function user_open(key_idx, scale_idx, user, from_track)
+  local data = t7_open(key_idx, scale_idx, from_track)
+  data.scale_user = user
+  S.state.scale_user = user
+  S.update_scale_pitch_classes()
+  return data
+end
+
+test("scale_steps_user_wins", function()
+  local K, st = S.K, S.state
+  local major, D = scale_named("Major"), key_named("D")
+  local u = { 0, 2, 7 }
+  eq(K.scale_steps(major, u), u, "a user set wins")
+  eq(K.scale_steps(major, nil), S.SCALE_DEFINITIONS[major].intervals, "else the listed scale's")
+  eq(K.scale_steps(99, nil), nil, "an unknown scale")
+  same_pcs(K.scale_pcs(D, major, u), pcs_of({ "D", "E", "A" }), "D + {0, 2, 7}")
+  eq(K.scale_pcs(D, major, { 0, 2, 7 }), K.scale_pcs(D, major, u), "memoised per set")
+  same_pcs(K.scale_pcs(D, major), pcs_of({ "D", "E", "F#", "G", "A", "B", "C#" }), "no set: D Major")
+  eq(K.scale_is_chromatic(CHROMATIC, nil), true)
+  eq(K.scale_is_chromatic(CHROMATIC, { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }), false, "a user set is never Chromatic")
+  -- the bar's mirror: the canvas rows and the correction read the set
+  local saved = { st.key_idx, st.scale_idx, st.scale_user, st.target_take_guid }
+  local ok, err = pcall(function()
+    st.target_take_guid = nil
+    st.key_idx, st.scale_idx, st.scale_user = D, CHROMATIC, u
+    S.update_scale_pitch_classes()
+    same_pcs(st.scale_pc_set, pcs_of({ "D", "E", "A" }), "the rows")
+    same_pcs(K.item_scale_pcs(), pcs_of({ "D", "E", "A" }), "the correction (no item: the bar's)")
+  end)
+  st.key_idx, st.scale_idx, st.scale_user, st.target_take_guid = table.unpack(saved, 1, 4)
+  S.update_scale_pitch_classes()
+  if not ok then error(err, 0) end
+end)
+
+test("user_scale_validation", function()
+  local K = S.K
+  eq(steps_text(K.scale_user_valid({ 7, 0, 2 })), "0,2,7", "kept, sorted")
+  eq(#K.scale_user_valid({ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }), 12, "all twelve")
+  eq(K.scale_user_valid({ [1] = 0, [3] = 2 }), nil, "not a list")
+  eq(K.scale_user_valid({ 0, x = 2 }), nil, "not a list")
+  local bad = { {}, { 12 }, { -1 }, { 1.5 }, { 0, 0 }, "0,2", { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 5 }, { 0, "2" },
+    { 0 / 0 } }
+  for i, u in ipairs(bad) do
+    eq(K.scale_user_valid(u), nil, "bad set " .. i)
+    with_track_record(nil, function()
+      local data = S.load_take_data("tk_bad", stored_with_user(u))
+      eq(type(data), "table", "bad set " .. i .. ": the item still loads")
+      eq(data.scale_user, nil, "bad set " .. i .. ": dropped on the item")
+      eq(data.key_idx, 5); eq(data.scale_idx, 1, "bad set " .. i .. ": the item falls back to its scale")
+    end)
+    local r = t7_record(5, 1)
+    r.scale_user = u
+    local v = K.track_record_valid(r)
+    eq(type(v), "table", "bad set " .. i .. ": the record is kept")
+    eq(v.scale_user, nil, "bad set " .. i .. ": dropped in the record")
+    eq(v.key_idx, 5); eq(v.lo_st, 57)
+  end
+  with_track_record(nil, function()
+    eq(steps_text(S.load_take_data("tk_bad", stored_with_user({ 0, 3, 7 })).scale_user), "0,3,7", "a valid set loads")
+  end)
+  local r = t7_record(5, 1)
+  r.scale_user = { 0, 3, 7 }
+  eq(steps_text(K.track_record_valid(JSON.decode(JSON.encode(r))).scale_user), "0,3,7", "a record round-trips it")
+  r = t7_record(nil, nil)
+  r.scale_user = { 0, 3, 7 }
+  eq(K.track_record_valid(r).scale_user, nil, "no key in the record: no set")
+end)
+
+test("user_scale_moves_with_the_key", function() t7_ext(function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    local data = user_open(key_named("C"), scale_named("Major"), { 0, 2, 4, 7, 9 }, false)
+    st.key_idx = key_named("D")
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},end:Set Key")
+    eq(steps_text(data.scale_user), "0,2,4,7,9", "the steps are kept"); eq(steps_text(st.scale_user), "0,2,4,7,9")
+    same_pcs(st.scale_pc_set, pcs_of({ "D", "E", "F#", "A", "B" }), "the notes move with the key")
+    eq(K.scale_preview(st.scale_idx, st.scale_user), "User", "still User")
+    eq(data.key_idx, key_named("D"))
+  end)
+end) end)
+
+test("toggle_out_writes_item_and_track_once", function() t7_ext(function(ext, ext_sync)
+  local major = scale_named("Major")
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(1, major, { 10, 2 })) } }, function(w)
+    local K, st = S.K, S.state
+    ext_sync()
+    local data = user_open(1, major, nil, false)   -- C Major, chosen by hand: the item does not follow its track
+    eq(K.user_scale_toggle(10), true, "A# goes in")
+    eq(steps_text(data.scale_user), "0,2,4,5,7,9,10,11"); eq(steps_text(st.scale_user), "0,2,4,5,7,9,10,11")
+    eq(data.key_source, "picked"); eq(data.key_from_track, true, "the item now equals its track")
+    eq(st.scale_pc_set[10], true, "the canvas marks A#")
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale Notes", "one block: the item and the track")
+    local rec = t7_stored(w)
+    eq(steps_text(rec.scale_user), "0,2,4,5,7,9,10,11"); eq(rec.key_idx, 1); eq(rec.scale_idx, major)
+    eq(rec.alt_key_idx, nil); eq(rec.alt_scale_idx, nil, "no runner-up")
+    eq(rec.lo_st, 57, "the rest of the record is kept"); eq(rec.takes["{a}"], true)
+    eq(st.status.text, "User scale: A# is in. " .. MOD .. "+Z to undo.")
+    eq(next(K.track_records_pending), nil); eq(next(ext), nil, "no ExtState")
+    w.log = {}
+    eq(K.user_scale_toggle(4), true, "E goes out")
+    eq(steps_text(data.scale_user), "0,2,5,7,9,10,11")
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale Notes")
+    eq(steps_text(t7_stored(w).scale_user), "0,2,5,7,9,10,11")
+    eq(st.status.text, "User scale: E is out. " .. MOD .. "+Z to undo.")
+    -- with Classic / Hard notes the envelope is rewritten in the same block
+    local mode_count = K.mode_note_count
+    local ok, err = pcall(function()
+      K.mode_note_count = function() return 3 end
+      w.log = {}
+      eq(K.user_scale_toggle(64), true, "E (any octave) goes in again")
+      eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale Notes")
+      eq(st.status.text, "User scale: E is in. 3 Classic / Hard notes follow. " .. MOD .. "+Z to undo.")
+      K.mode_note_count = function() return 1 end
+      eq(K.user_scale_toggle(10), true, "A# goes out")
+      eq(st.status.text, "User scale: A# is out. 1 Classic / Hard note follows. " .. MOD .. "+Z to undo.")
+      eq(steps_text(t7_stored(w).scale_user), "0,2,4,5,7,9,11")
+    end)
+    K.mode_note_count = mode_count
+    if not ok then error(err, 0) end
+    eq(next(K.track_records_pending), nil); eq(next(ext), nil)
+  end)
+end) end)
+
+test("toggle_creates_a_track_record", function() t7_ext(function(ext)
+  local major = scale_named("Major")
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    user_open(1, major, nil, false)
+    eq(K.user_scale_toggle(10), true)
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale Notes", "the record is made in the block")
+    local rec = t7_stored(w)
+    eq(type(rec), "table", "a valid record")
+    eq(rec.key_idx, 1); eq(rec.scale_idx, major); eq(steps_text(rec.scale_user), "0,2,4,5,7,9,10,11")
+    eq(next(rec.takes), nil, "no take heard"); eq(next(rec.st), nil, "no tally"); eq(rec.lo_st, nil, "no range")
+    K.drop_project_cache()
+    eq(steps_text(K.track_record("tr").scale_user), "0,2,4,5,7,9,10,11", "the track's record")
+    -- another new item on the track shows the track's key with Scale reading User
+    st.target_take_guid, st.target_take_name = "{b}", "tk_b"
+    K.adopt_new_item_values("{b}")
+    eq(st.key_idx, 1); eq(steps_text(st.scale_user), "0,2,4,5,7,9,10,11")
+    eq(K.scale_preview(st.scale_idx, st.scale_user), "User")
+    same_pcs(st.scale_pc_set, K.scale_pcs(1, major, st.scale_user), "the rows follow it")
+    -- its Auto analysis still hears the track (nothing was heard for the record), and keeps the key
+    w.log = {}
+    S.start_analysis(auto_values(true))
+    eq(st.pre ~= nil, true, "the listening pass runs")
+    auto_run_out()
+    rec = t7_stored(w)
+    eq(rec.lo_st, 57, "the range is filled in"); eq(rec.takes["{a}"], true); eq(rec.takes["{b}"], true)
+    eq(rec.key_idx, 1, "the key is kept"); eq(rec.scale_idx, major)
+    eq(steps_text(rec.scale_user), "0,2,4,5,7,9,10,11", "the user set is kept")
+    local b = st.session_takes["{b}"]
+    eq(steps_text(b.scale_user), "0,2,4,5,7,9,10,11", "the new item starts with it")
+    eq(b.key_source, "track"); eq(b.key_from_track, true)
+    eq(next(K.track_records_pending), nil); eq(K.auto_run, nil); eq(next(ext), nil)
+  end)
+end) end)
+
+test("key_change_on_a_toggle_made_record", function() t7_ext(function(ext)
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    local data = user_open(1, scale_named("Major"), nil, false)
+    K.user_scale_toggle(10)   -- the track had no record: one is made, with no tally
+    w.log = {}
+    st.key_idx = key_named("D")
+    K.scale_changed("key")
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Key", "the item follows its track")
+    local rec = t7_stored(w)
+    eq(type(rec), "table", "still a valid record"); eq(next(rec.st), nil)
+    eq(rec.key_idx, key_named("D")); eq(steps_text(rec.scale_user), "0,2,4,5,7,9,10,11", "the set goes along")
+    eq(data.key_from_track, true)
+    eq(st.status.text, "Key for V _ Main is now D User. New items on this track follow.")
+    eq(next(K.track_records_pending), nil); eq(next(ext), nil)
+  end)
+end) end)
+
+test("toggle_last_note_refused", function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    local data = user_open(1, scale_named("Major"), { 4 }, false)
+    st.status.text = "before"
+    eq(K.user_scale_toggle(4), false, "the only note left stays")
+    eq(#w.log, 0, "no undo point: " .. table.concat(w.log, ","))
+    eq(st.status.text, "before", "no status change")
+    eq(steps_text(data.scale_user), "4"); eq(data.key_source, nil)
+    eq(next(K.track_records_pending), nil)
+    eq(K.user_scale_note_tip(1, data.scale_user, 4), "The scale needs at least one note")
+  end)
+end)
+
+test("toggle_refused_while_analysing", function()
+  auto_world({ tracks = ONE_TRACK }, function(w)
+    local K, st = S.K, S.state
+    local data = user_open(1, scale_named("Major"), nil, false)
+    st.is_analyzing = true
+    eq(K.user_scale_toggle(10), false, "an analysis runs")
+    st.is_analyzing = false
+    K.batch = {}
+    eq(K.user_scale_toggle(10), false, "a batch runs")
+    K.batch = nil
+    eq(data.scale_user, nil); eq(#w.log, 0)
+    -- no analysed item open
+    st.target_take_guid = "{b}"
+    eq(K.user_scale_toggle(10), false, "an item not analysed yet")
+    st.target_take_guid = nil
+    eq(K.user_scale_toggle(10), false, "no item")
+    eq(#w.log, 0); eq(next(K.track_records_pending), nil)
+  end)
+end)
+
+test("toggle_failed_write_leaves_nothing_pending", function()
+  local mode_count, count_items = S.K.mode_note_count, rawget(reaper, "CountMediaItems")
+  S.K.mode_note_count = function() return 2 end
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(t7_record(1, 1)) } }, function(w)
+    local K, st = S.K, S.state
+    -- the envelope cannot be written: the block closes, nothing stays pending, no User message
+    K.write_take_envelope = function() return false end
+    local data = user_open(1, 1, nil, false)
+    eq(K.user_scale_toggle(10), false)
+    local b, e = index_of(w.log, "begin"), index_of(w.log, "end:Apply Pitch Correction")
+    eq(b ~= nil and e ~= nil and b < e, true, "the block is closed: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil)
+    eq(st.status.text:find("User scale", 1, true), nil, "the envelope message stays: " .. st.status.text)
+    -- the item is gone: no block, nothing written, nothing pending, the item unchanged
+    w.log = {}
+    K.write_take_envelope = function() return true end
+    data.scale_user, st.scale_user = nil, nil
+    rawset(reaper, "CountMediaItems", function() return 0 end)
+    w.dead["tk_a"] = true
+    K.drop_project_cache()
+    eq(K.user_scale_toggle(10), false)
+    eq(#w.log, 0, "nothing written: " .. table.concat(w.log, ","))
+    eq(next(K.track_records_pending), nil)
+    eq(st.status.text, "This item is no longer in the project")
+    eq(data.scale_user, nil, "the model is unchanged"); eq(st.scale_user, nil)
+  end)
+  rawset(reaper, "CountMediaItems", count_items)
+  S.K.mode_note_count = mode_count
+  if not ok then error(err, 0) end
+end)
+
+test("picking_a_scale_removes_the_user_set", function() t7_ext(function()
+  local major = scale_named("Major")
+  local rec0 = t7_record(1, major)
+  rec0.scale_user = { 0, 2, 4, 7, 9 }
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(rec0) } }, function(w)
+    local K, st = S.K, S.state
+    local data = user_open(1, major, { 0, 2, 4, 7, 9 }, true)
+    eq(K.scale_display_pos(st.scale_idx, st.scale_user), 0, "no row is selected while User shows")
+    K.scale_pick(K.scale_display_pos(major))   -- the very scale the set was started from
+    eq(table.concat(w.log, ","), "begin,take:{a},track:tr,end:Set Scale")
+    eq(data.scale_user, nil); eq(st.scale_user, nil); eq(data.scale_idx, major)
+    local rec = t7_stored(w)
+    eq(rec.scale_user, nil, "the track loses it too"); eq(rec.scale_idx, major)
+    eq(K.scale_preview(st.scale_idx, st.scale_user), "Major")
+    eq(st.status.text, "Key for V _ Main is now C Major. New items on this track follow.")
+    eq(next(K.track_records_pending), nil)
+  end)
+end) end)
+
+test("user_scale_survives_reanalysis", function()
+  local K = S.K
+  local data = { guid = "{r}", key_idx = 1, scale_idx = 1, scale_user = { 0, 5, 9 } }   -- seeded from a track's set
+  K.item_carry_key(data, { key_idx = 3, scale_idx = 2, scale_user = { 0, 3 } })
+  eq(data.key_idx, 3); eq(data.scale_idx, 2); eq(steps_text(data.scale_user), "0,3", "the item's own set")
+  K.item_carry_key(data, { key_idx = 3, scale_idx = 2 })
+  eq(data.scale_user, nil, "an item without one keeps none")
+  auto_world({ tracks = ONE_TRACK }, function()
+    local st = S.state
+    user_open(key_named("D"), scale_named("Major"), { 0, 2, 7 }, false)
+    S.start_analysis(auto_values(false))
+    auto_run_out()
+    local a = st.session_takes["{a}"]
+    eq(a.key_idx, key_named("D")); eq(steps_text(a.scale_user), "0,2,7", "kept by the new analysis")
+    eq(steps_text(st.scale_user), "0,2,7", "the bar shows it")
+  end)
+end)
+
+test("new_item_gets_the_tracks_user_scale", function()
+  local rec0 = t7_record(key_named("D"), scale_named("Major"))
+  rec0.scale_user = { 0, 2, 7 }
+  auto_world({ tracks = ONE_TRACK, ext = { tr = JSON.encode(rec0) } }, function()
+    local K, st = S.K, S.state
+    st.target_take_guid, st.target_take_name = "{a}", "tk_a"
+    K.adopt_new_item_values("{a}")
+    eq(st.key_idx, key_named("D")); eq(steps_text(st.scale_user), "0,2,7")
+    eq(K.scale_preview(st.scale_idx, st.scale_user), "User", "the bar of the unanalysed item reads User")
+    local k, sc, src, user = K.new_item_key("{a}")
+    eq(k, key_named("D")); eq(sc, scale_named("Major")); eq(src, "track"); eq(steps_text(user), "0,2,7")
+    S.start_analysis(auto_values(false))
+    auto_run_out()
+    local a = st.session_takes["{a}"]
+    eq(steps_text(a.scale_user), "0,2,7", "seeded at analysis"); eq(a.key_source, "track"); eq(a.key_from_track, true)
+    eq(K.key_text(a.key_idx, a.scale_idx, a.scale_user), "D User")
+  end)
+  -- a batch item seeded from the record gets it too
+  auto_world({ tracks = ONE_TRACK, step = 0.003, ext = { tr = JSON.encode(rec0) } }, function()
+    local K, st = S.K, S.state
+    K.batch_start(two_entries(), auto_values(false))
+    auto_run_out()
+    for _, g in ipairs({ "{a}", "{b}" }) do
+      eq(steps_text(st.session_takes[g].scale_user), "0,2,7", g .. " in a batch")
+    end
+    eq(next(K.track_records_pending), nil)
+  end)
+end)
+
+test("apply_carries_the_user_scale", function()
+  local K, st = S.K, S.state
+  local major = scale_named("Major")
+  local saved = { st.target_take_guid, st.session_takes["{src}"], st.key_idx, st.scale_idx, st.scale_user }
+  local ok, err = pcall(function()
+    st.session_takes["{src}"] = { guid = "{src}", key_idx = 1, scale_idx = major, scale_user = { 0, 2, 7 }, notes = {} }
+    st.target_take_guid, st.key_idx, st.scale_idx, st.scale_user = "{src}", 1, major, { 0, 2, 7 }
+    local keys = { "key_idx", "scale_idx" }
+    local src = K.apply_source(keys)
+    eq(steps_text(src.scale_user), "0,2,7", "the source gives its set")
+    eq(K.apply_values_line(src, keys), "Key C User", "the confirm names it")
+    local function target(user)
+      local data = { guid = "{t}", name = "t", key_idx = 1, scale_idx = major, scale_user = user, notes = {},
+        key_from_track = true, key_source = "track" }
+      return { guid = "{t}", take = "t", name = "t", data = data }
+    end
+    local plan = K.apply_plan(src, { target(nil) }, keys, false)
+    eq(plan.items[1].key_change, true, "same key and scale, the set differs"); eq(plan.changed, 1)
+    local given = K.apply_item_model(target(nil).data, plan.items[1])
+    eq(steps_text(given.scale_user), "0,2,7", "the target gets the set"); eq(given.key_source, nil)
+    plan = K.apply_plan(src, { target({ 0, 2, 7 }) }, keys, false)
+    eq(plan.changed, 0, "the same set: nothing changes")
+    -- a source without a set removes the target's
+    st.session_takes["{src}"].scale_user, st.scale_user = nil, nil
+    src = K.apply_source(keys)
+    eq(src.scale_user, nil)
+    plan = K.apply_plan(src, { target({ 0, 2, 7 }) }, keys, false)
+    eq(plan.changed, 1)
+    eq(K.apply_item_model(target({ 0, 2, 7 }).data, plan.items[1]).scale_user, nil, "the target's set is removed")
+    eq(K.apply_plan(src, { target({ 0, 2, 7 }) }, { "tolerance" }, false).items[1].set.scale_user, nil,
+      "only with Key and Scale")
+  end)
+  st.target_take_guid, st.session_takes["{src}"], st.key_idx, st.scale_idx, st.scale_user = table.unpack(saved, 1, 5)
+  if not ok then error(err, 0) end
+end)
+
+test("find_again_drops_the_user_set", function()
+  local old = t7_record(7, 1)
+  old.scale_user = { 0, 4, 7 }
+  auto_world({ tracks = ONE_TRACK, step = 0.003, ext = { tr = JSON.encode(old) } }, function(w)
+    local K = S.K
+    local data = user_open(7, 1, { 0, 4, 7 }, true)
+    K.find_again_request()
+    auto_run_out()
+    eq(table.concat(w.log, ","), "begin,track:tr,end:Find Range and Key: V _ Main")
+    local rec = t7_stored(w)
+    eq(rec.key_idx ~= nil, true, "a key was found"); eq(rec.scale_user, nil, "the fresh record has no set")
+    eq(steps_text(data.scale_user), "0,4,7", "the item keeps its own")
+  end)
+end)
+
+test("find_again_range_only_keeps_it", function()
+  local min_frames = S.K.PRE.KEY_MIN_FRAMES
+  S.K.PRE.KEY_MIN_FRAMES = math.huge   -- a range is heard, too little for a key
+  local old = t7_record(7, 2)
+  old.scale_user = { 0, 3, 7 }
+  local ok, err = pcall(auto_world, { tracks = ONE_TRACK, ext = { tr = JSON.encode(old) } }, function(w)
+    local K = S.K
+    t7_open(3, 1, false)
+    K.find_again_request()
+    auto_run_out()
+    local rec = t7_stored(w)
+    eq(rec.lo_st, 57); eq(rec.key_idx, 7, "the previous key is carried"); eq(rec.scale_idx, 2)
+    eq(steps_text(rec.scale_user), "0,3,7", "and its user set")
+    eq(K.card.rows[2].value, "Not enough singing to tell: kept F# User")
+  end)
+  S.K.PRE.KEY_MIN_FRAMES = min_frames
+  if not ok then error(err, 0) end
+end)
+
+test("scale_box_reads_user", function() with_pending(function()
+  local K = S.K
+  local C, major = key_named("C"), scale_named("Major")
+  local u = { 0, 2, 4, 7, 9 }
+  eq(K.scale_preview(major, u), "User", "the box's text")
+  eq(K.scale_preview(major, nil), "Major")
+  eq(K.scale_display_pos(major, u), 0, "no row selected"); eq(K.scale_display_pos(major, nil), K.SCALE_ROW[major])
+  eq(#K.SCALE_LIST, #DISPLAY_NAMES, "the list is the ten scales")
+  for pos, name in ipairs(DISPLAY_NAMES) do eq(K.SCALE_LIST[pos].name, name, "row " .. pos) end
+  for _, name in ipairs(S.COMBO_LABELS.scales) do eq(name ~= "User", true, "User is never a list row") end
+  local sentence = "User scale: C D E G A. Pick a scale to replace it."
+  eq(K.user_scale_text(C, u), sentence)
+  eq(K.scale_tooltip(C, major, u), K.SCALE_TOOLTIP .. "\n\n" .. sentence, "in place of the relatives")
+  eq(K.scale_tooltip(C, major, { 0, 2, 4, 7, 9 }), K.scale_tooltip(C, major, u), "kept per set")
+  local tip = K.key_tooltip(nil, nil, C, major, u)
+  eq(tip:sub(-#sentence - 2), "\n\n" .. sentence, "Key: the sentence is its last paragraph")
+  eq(tip:find("same notes", 1, true), nil, "no relatives")
+  eq(K.key_text(C, major, u), "C User"); eq(K.key_text(C, major), "C Major")
+  eq(K.user_scale_text(key_named("D"), { 0, 4, 7 }), "User scale: D F# A. Pick a scale to replace it.")
+  -- the notes equal a listed scale: still User
+  eq(K.scale_preview(major, { 0, 2, 4, 5, 7, 9, 11 }), "User")
+end) end)
+
+test("note_tooltip_texts", function()
+  local K = S.K
+  local major = S.SCALE_DEFINITIONS[scale_named("Major")].intervals
+  eq(K.user_scale_note_tip(1, major, 10), "Click to put A# in the scale")
+  eq(K.user_scale_note_tip(1, major, 1), "Click to put C# in the scale")
+  eq(K.user_scale_note_tip(1, major, 9), "Click to take A out of the scale")
+  eq(K.user_scale_note_tip(key_named("A#"), { 0 }, 10), "The scale needs at least one note")
+  eq(K.user_scale_note_tip(key_named("A#"), { 0, 2 }, 10), "Click to take A# out of the scale")
+end)
+
+test("info_lists_the_note_name_gesture", function()
+  local found = false
+  for _, section in ipairs(S.K.INFO_SECTIONS) do
+    for _, row in ipairs(section.rows) do
+      if row[1] == "Click a note name" then
+        eq(row[1] .. ": " .. row[2]:lower(), "Click a note name: in or out of the scale")
+        found = true
+      end
+    end
+  end
+  eq(found, true, "the gesture is listed")
 end)
 
 -- Tests appended by later tasks go above this line.

@@ -2,7 +2,7 @@
 -- @author Fancy Scripts
 -- @version 2.29.0
 -- @changelog
---   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; a new item starts at C Chromatic (or its track's key), the key is found from the track when you leave it, and a key you change first is kept; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu; the Scale list adds Phrygian, Lydian, Mixolydian and Locrian, and the Key and Scale tooltips name a scale's relatives.
+--   Auto Vocal Range and Key: Vocal Range has a new first choice, Auto, that hears the whole track once for the singer's range; a new item starts at C Chromatic (or its track's key), the key is found from the track when you leave it, and a key you change first is kept; every analysis shows one card with its progress and results in the note window; range and key are remembered per track, a corrected key follows the track, and Find Range and Key Again is in the ... menu; the Scale list adds Phrygian, Lydian, Mixolydian and Locrian, and the Key and Scale tooltips name a scale's relatives; click a note name to switch it in or out of the scale (the Scale box reads "User" and the track follows).
 -- @about
 --   Native Lua pitch correction and tracking.
 --   Requirements: REAPER 7.0+, ReaImGui
@@ -524,7 +524,9 @@ local state = {
   -- Key & Scale state
   key_idx = 1,       -- 1..12 (1 = C)
   scale_idx = 1,     -- 1..6 (1 = Major)
-  scale_pc_set = {}  -- pitch class lookup set [0..11] = true/false
+  scale_user = nil,  -- the open item's own set of notes (steps from the key note), nil: its listed scale's
+  scale_pc_set = {}, -- pitch class lookup set [0..11] = true/false
+  names_hot = false, -- a row of the note-name column held the hover last frame (the wheel still scrolls there)
 }
 
 --- The canvas shows the whole item and the pitch range fitted to its notes again; a drag on a strip is dropped.
@@ -578,9 +580,68 @@ do
   end
 end
 
---- The row of the Scale list that shows stored scale `scale_idx`; 0 for an index that names no scale.
-K.scale_display_pos = function(scale_idx)
+--- The row of the Scale list that shows stored scale `scale_idx`; 0 for an index that names no scale, and while the
+--- user's own set `scale_user` is in use (no row is selected: the box reads "User").
+K.scale_display_pos = function(scale_idx, scale_user)
+  if scale_user then return 0 end
   return K.SCALE_ROW[scale_idx] or 0
+end
+
+-- The user's own set of notes (docs/design/pitch-correct-user-scale.md): an item, and its track's record, may hold
+-- scale_user beside key_idx / scale_idx, as steps from the key note ({ 0, 2, 3, 7 }: sorted, unique, 0..11, at least
+-- one). It wins over scale_idx wherever a scale becomes notes; scale_idx keeps the listed scale it was started from.
+-- The Scale box, the Analysis card and messages name it "User"
+K.USER_SCALE_NAME = "User"
+K.USER_SCALE_UNDO = "Set Scale Notes"
+
+--- The steps from the key note of the notes in effect: the user set `scale_user` when there is one, else the
+--- intervals of listed scale `scale_idx` (nil for an unknown scale). The one place a scale becomes steps.
+K.scale_steps = function(scale_idx, scale_user)
+  if scale_user then return scale_user end
+  local scale = SCALE_DEFINITIONS[scale_idx]
+  return scale and scale.intervals or nil
+end
+
+--- True when scale `scale_idx` is Chromatic and no user set is in use (every row is in key); a user set never is.
+K.scale_is_chromatic = function(scale_idx, scale_user)
+  if scale_user then return false end
+  local scale = SCALE_DEFINITIONS[scale_idx]
+  return scale ~= nil and scale.name == "Chromatic"
+end
+
+--- True when the user sets `a` and `b` hold the same steps (nil and nil: both have none).
+K.scale_user_same = function(a, b)
+  if a == nil or b == nil then return a == b end
+  if #a ~= #b then return false end
+  for i = 1, #a do
+    if a[i] ~= b[i] then return false end
+  end
+  return true
+end
+
+--- The Scale and Key tooltips' sentence for the user set `steps` in key `key_idx`: "User scale: C D E G A. Pick a
+--- scale to replace it." (the notes ascending from the key note, short names).
+K.user_scale_text = function(key_idx, steps)
+  local names = {}
+  for i, s in ipairs(steps or {}) do names[i] = SCALE_KEYS[((key_idx or 1) - 1 + s) % 12 + 1].display end
+  return string.format("User scale: %s. Pick a scale to replace it.", table.concat(names, " "))
+end
+
+--- The tooltip of the note-name row of pitch class `pc` (0 = C) while the notes in effect are `steps` (from the key
+--- note of `key_idx`): what a click does ("Click to take A# out of the scale" / "Click to put C# in the scale"), or
+--- why it does nothing on the only note left.
+K.user_scale_note_tip = function(key_idx, steps, pc)
+  pc = (math.floor(pc + 0.5) % 12 + 12) % 12
+  local name = SCALE_KEYS[pc + 1].display
+  local step = (pc - ((key_idx or 1) - 1)) % 12
+  local is_in, n = false, 0
+  for _, s in ipairs(steps or {}) do
+    n = n + 1
+    if s == step then is_in = true end
+  end
+  if is_in and n <= 1 then return "The scale needs at least one note" end
+  if is_in then return string.format("Click to take %s out of the scale", name) end
+  return string.format("Click to put %s in the scale", name)
 end
 
 -- The modes of the major scale: the degree of the major scale each one starts on, and its ordinal in words
@@ -626,11 +687,22 @@ K.SCALE_TOOLTIP = "Scale\n\nMarks the in-scale rows on the canvas and sets the s
   .. "Right-click: apply Key and Scale to other items."
 
 K.scale_tooltip_memo = {}
+K.user_tooltip_memo = {}
 
 --- The Scale combo's tooltip for key `key_idx` and scale `scale_idx`: K.SCALE_TOOLTIP, then the scale's relatives
---- (K.scale_relatives_text). Kept per (key, scale), so the combo asks for it every frame without building a string.
-K.scale_tooltip = function(key_idx, scale_idx)
+--- (K.scale_relatives_text), or, with the user set `scale_user`, its notes (K.user_scale_text). Kept per (key, scale)
+--- and per (key, set), so the combo asks for it every frame without building a string.
+K.scale_tooltip = function(key_idx, scale_idx, scale_user)
   if key_idx == nil or scale_idx == nil then return K.SCALE_TOOLTIP end
+  if scale_user then
+    local mk = key_idx .. ":" .. table.concat(scale_user, ",")
+    local tip = K.user_tooltip_memo[mk]
+    if not tip then
+      tip = K.SCALE_TOOLTIP .. "\n\n" .. K.user_scale_text(key_idx, scale_user)
+      K.user_tooltip_memo[mk] = tip
+    end
+    return tip
+  end
   local row = K.scale_tooltip_memo[key_idx]
   if not row then row = {}; K.scale_tooltip_memo[key_idx] = row end
   local tip = row[scale_idx]
@@ -648,28 +720,30 @@ K.key_preview = function(key_idx)
   return (SCALE_KEYS[key_idx] or SCALE_KEYS[K.DEFAULT_KEY_IDX]).display
 end
 
---- The Scale combo's preview for scale index `scale_idx`: its name; an index that names no scale gives the default
---- scale's.
-K.scale_preview = function(scale_idx)
+--- The Scale combo's preview for scale index `scale_idx`: its name ("User" while the user set `scale_user` is in
+--- use, also when its notes equal a listed scale); an index that names no scale gives the default scale's.
+K.scale_preview = function(scale_idx, scale_user)
+  if scale_user then return K.USER_SCALE_NAME end
   return (SCALE_DEFINITIONS[scale_idx] or SCALE_DEFINITIONS[K.DEFAULT_SCALE_IDX]).name
 end
 
 --- The key an item takes when nothing was picked for it (take `guid`): the key found on its track (its
---- K.track_record), else the default C Chromatic. Returns key_idx, scale_idx and whether the key came from the track.
+--- K.track_record), else the default C Chromatic. Returns key_idx, scale_idx, whether the key came from the track,
+--- and the track's user set (nil: none).
 K.key_resolve = function(guid)
   local rec = K.track_record(K.take_track(guid))
-  if rec and rec.key_idx then return rec.key_idx, rec.scale_idx, true end
-  return K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX, false
+  if rec and rec.key_idx then return rec.key_idx, rec.scale_idx, true, rec.scale_user end
+  return K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX, false, nil
 end
 
 --- The key an item not analysed yet (take `guid`) shows and is analysed with: the one picked for it
 --- (K.pending_key, "picked"), else its track's (its record, "track"), else the default C Chromatic ("unset": the
---- analysis finds the key). Returns key_idx, scale_idx, source.
+--- analysis finds the key). Returns key_idx, scale_idx, source and the track's user set (a picked key has none).
 K.new_item_key = function(guid)
   local picked = guid and K.pending_key[guid]
-  if picked then return picked.key_idx, picked.scale_idx, "picked" end
-  local k, sc, from_track = K.key_resolve(guid)
-  return k, sc, from_track and "track" or "unset"
+  if picked then return picked.key_idx, picked.scale_idx, "picked", nil end
+  local k, sc, from_track, user = K.key_resolve(guid)
+  return k, sc, from_track and "track" or "unset", user
 end
 
 --- `v` when it is a key source an item's model can hold ("picked", "track", "found"), else nil.
@@ -709,19 +783,21 @@ K.item_key_settle = function(data, records)
   local source = K.item_key_source(data)
   data.key_source = source
   if source ~= "picked" then
-    local k, sc, from_track = K.key_resolve(data.guid)
-    data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
+    local k, sc, from_track, user = K.key_resolve(data.guid)
+    data.key_idx, data.scale_idx, data.key_from_track, data.scale_user = k, sc, from_track or nil, user
     return nil
   end
   local picked = K.pending_key[data.guid]
-  data.key_idx, data.scale_idx, data.key_from_track = picked.key_idx, picked.scale_idx, nil
+  data.key_idx, data.scale_idx, data.key_from_track, data.scale_user = picked.key_idx, picked.scale_idx, nil, nil
   local track = K.take_track(data.guid)
   local rec = track and K.track_record(track)
   if not rec then return nil end
   if not records then
     -- A batch gave each track its first pick before any item was read (K.batch_lead_keys): the item follows its
     -- track when the track holds its key; another pick on that track is the item's alone
-    if rec.key_idx == picked.key_idx and rec.scale_idx == picked.scale_idx then data.key_from_track = true end
+    if rec.key_idx == picked.key_idx and rec.scale_idx == picked.scale_idx and not rec.scale_user then
+      data.key_from_track = true
+    end
     return nil
   end
   K.track_records_pending[track] = K.track_record_with_key(rec, picked.key_idx, picked.scale_idx)
@@ -729,10 +805,12 @@ K.item_key_settle = function(data, records)
   return track
 end
 
---- A key in words: its short name and its scale's ("E Major", "C Chromatic"); Natural Minor prints as Minor.
-K.key_text = function(key_idx, scale_idx)
+--- A key in words: its short name and its scale's ("E Major", "C Chromatic"); Natural Minor prints as Minor, and a
+--- key with the user set `scale_user` as "C User".
+K.key_text = function(key_idx, scale_idx, scale_user)
   local key, scale = SCALE_KEYS[key_idx], SCALE_DEFINITIONS[scale_idx]
   if not (key and scale) then return "" end
+  if scale_user then return key.display .. " " .. K.USER_SCALE_NAME end
   return key.display .. " " .. (scale_idx == 2 and "Minor" or scale.name)
 end
 
@@ -744,12 +822,15 @@ end
 
 --- The track of an analysed item `data` (its take `guid`) and the track's record, when the item's key was found on
 --- the track (data.key_from_track) and the record still holds that key and scale; nil otherwise (no record, the item
---- moved to another track, the track's key changed since).
+--- moved to another track, the track's key changed since). The user sets must match too (K.scale_user_same).
 K.key_track_record = function(data, guid)
   if not (data and data.key_from_track) then return nil end
   local track = K.take_track(guid)
   local rec = track and K.track_record(track)
-  if not (rec and rec.key_idx == data.key_idx and rec.scale_idx == data.scale_idx) then return nil end
+  if not (rec and rec.key_idx == data.key_idx and rec.scale_idx == data.scale_idx
+      and K.scale_user_same(rec.scale_user, data.scale_user)) then
+    return nil
+  end
   return track, rec
 end
 
@@ -770,11 +851,16 @@ end
 --- The Key combo's tooltip for the open item's model `data` (nil: not analysed), take `guid`: what Key is; on an item
 --- not analysed yet whose key is not set (K.new_item_key) how one is chosen; for a key found on the item's track where
 --- from (K.key_found_text); last, the relatives of the bar's key `key_idx` and scale `scale_idx` when given
---- (K.scale_relatives_text).
-K.key_tooltip = function(data, guid, key_idx, scale_idx)
+--- (K.scale_relatives_text), or, with the user set `scale_user`, its notes (K.user_scale_text).
+K.key_tooltip = function(data, guid, key_idx, scale_idx, scale_user)
   local found = K.key_found_text(data)
   local unset = not data and guid ~= nil and select(3, K.new_item_key(guid)) == "unset"
-  local rel = (key_idx ~= nil and scale_idx ~= nil) and K.scale_relatives_text(key_idx, scale_idx) or ""
+  local rel = ""
+  if key_idx ~= nil and scale_user then
+    rel = K.user_scale_text(key_idx, scale_user)
+  elseif key_idx ~= nil and scale_idx ~= nil then
+    rel = K.scale_relatives_text(key_idx, scale_idx)
+  end
   return "Key\n\nThe root note of the scale."
     .. (unset and ("\n\n" .. K.KEY_UNSET_TOOLTIP) or "")
     .. (found and ("\n\n" .. found) or "")
@@ -794,7 +880,8 @@ end
 K.new_item_values = function(guid)
   local t = {}
   for _, key in ipairs(K.ITEM_KEYS) do t[key] = (K.item_default(key, guid)) end
-  t.key_idx, t.scale_idx = K.new_item_key(guid)
+  local _
+  t.key_idx, t.scale_idx, _, t.scale_user = K.new_item_key(guid)
   return t
 end
 
@@ -816,8 +903,8 @@ K.item_seed = function(data)
   end
   -- No key: its track's, else the default (K.key_resolve)
   if data.key_idx == nil then
-    local k, sc, from_track = K.key_resolve(data.guid)
-    data.key_idx, data.scale_idx, data.key_from_track = k, sc, from_track or nil
+    local k, sc, from_track, user = K.key_resolve(data.guid)
+    data.key_idx, data.scale_idx, data.key_from_track, data.scale_user = k, sc, from_track or nil, user
     filled = true
   end
   if data.scale_idx == nil then data.scale_idx, filled = start.scale_idx, true end
@@ -825,13 +912,14 @@ K.item_seed = function(data)
 end
 
 --- A new analysis of an item analysed before (`before`, its previous model) keeps only the item's Key and Scale
---- (they describe the song, not the analysis); its values start at the defaults (K.item_seed). A model change only.
+--- (they describe the song, not the analysis), its user set with them; its values start at the defaults
+--- (K.item_seed). A model change only.
 K.item_carry_key = function(data, before)
   if not before then return end
   if before.key_idx ~= nil then
     data.key_idx, data.key_from_track, data.key_source = before.key_idx, before.key_from_track, before.key_source
   end
-  if before.scale_idx ~= nil then data.scale_idx = before.scale_idx end
+  if before.scale_idx ~= nil then data.scale_idx, data.scale_user = before.scale_idx, before.scale_user end
 end
 
 --- How many of the item's values (K.ITEM_KEYS) differ from its defaults (K.item_default, by data.guid). A missing
@@ -1048,11 +1136,11 @@ K.confirm_tick_all = function(c, on)
 end
 
 local function update_scale_pitch_classes()
-  local scale = SCALE_DEFINITIONS[state.scale_idx]
+  local steps = K.scale_steps(state.scale_idx, state.scale_user)
   local root_pc = (state.key_idx - 1) % 12
   state.scale_pc_set = {}
-  if scale then
-    for _, intv in ipairs(scale.intervals) do
+  if steps then
+    for _, intv in ipairs(steps) do
       local pc = (root_pc + intv) % 12
       state.scale_pc_set[pc] = true
     end
@@ -1406,8 +1494,9 @@ end
 --- `t` when it is a valid track record, else nil. Shape: { st = { ["52"] = frames }, takes = { [take_guid] = true },
 --- lo_st, hi_st (both or neither: nil = nothing sung found), key_idx + scale_idx (both or neither: nil = key not
 --- told; a found scale is Major or Natural Minor, a key corrected in the bar may be any scale), alt_key_idx +
---- alt_scale_idx (both or neither, only with a key; Major or Natural Minor), skipped (optional, a whole number >= 0) }.
---- Every number is finite: anything else is no record.
+--- alt_scale_idx (both or neither, only with a key; Major or Natural Minor), skipped (optional, a whole number >= 0),
+--- scale_user (optional, with a key: the user's own set, K.scale_user_valid; a record a note-name click made holds
+--- no tally, no takes and no range) }. Every number is finite: anything else is no record.
 K.track_record_valid = function(t)
   if type(t) ~= "table" or type(t.st) ~= "table" or type(t.takes) ~= "table" then return nil end
   -- st: a whole MIDI note 0..127 written in digits (as K.track_record_build writes it) -> a finite count >= 0
@@ -1432,7 +1521,28 @@ K.track_record_valid = function(t)
     if t.key_idx == nil or not whole_in(t.alt_key_idx, 1, 12) or not whole_in(t.alt_scale_idx, 1, 2) then return nil end
   end
   if t.skipped ~= nil and not (whole_in(t.skipped, 0, math.huge) and t.skipped < math.huge) then return nil end
+  -- A user set that is not one (K.scale_user_valid), or one without a key, is dropped: the rest of the record stays
+  if t.scale_user ~= nil then t.scale_user = t.key_idx ~= nil and K.scale_user_valid(t.scale_user) or nil end
   return t
+end
+
+--- A sorted copy of `t` when it is a user set (a list of 1 to 12 unique whole numbers 0..11), else nil.
+K.scale_user_valid = function(t)
+  if type(t) ~= "table" then return nil end
+  local n = #t
+  if n < 1 or n > 12 then return nil end
+  local count = 0
+  for _ in pairs(t) do count = count + 1 end
+  if count ~= n then return nil end
+  local seen, out = {}, {}
+  for i = 1, n do
+    local v = t[i]
+    if not whole_in(v, 0, 11) or seen[v] then return nil end
+    seen[v] = true
+    out[i] = v
+  end
+  table.sort(out)
+  return out
 end
 
 --- The pre-analysis record of `track` (nil: none or not valid), cached per project state. A record found but not
@@ -1461,11 +1571,13 @@ K.track_record_stored = function(track)
   return rec or nil
 end
 
---- A copy of the record `rec` that holds the key `key_idx` / `scale_idx` (a key chosen by hand: no runner-up).
-K.track_record_with_key = function(rec, key_idx, scale_idx)
+--- A copy of the record `rec` that holds the key `key_idx` / `scale_idx` and the user set `scale_user` (nil: none; a
+--- key chosen by hand: no runner-up).
+K.track_record_with_key = function(rec, key_idx, scale_idx, scale_user)
   local new = {}
   for k, v in pairs(rec) do new[k] = v end
   new.key_idx, new.scale_idx, new.alt_key_idx, new.alt_scale_idx = key_idx, scale_idx, nil, nil
+  new.scale_user = scale_user
   return new
 end
 
@@ -1484,7 +1596,7 @@ end
 
 --- A record from `tally` (this scan's frames) and `takes` ({ [take_guid] = true } it covered). With `prev` (the
 --- record already on the track) its frames and takes are merged in, the range is recomputed from the merged tally
---- and its key fields are kept; without a key on `prev` the key is found from the merged tally.
+--- and its key fields (its user set too) are kept; without a key on `prev` the key is found from the merged tally.
 K.track_record_build = function(tally, takes, prev)
   local merged = K.pre_tally_new()
   K.pre_tally_merge(merged, tally)
@@ -1498,7 +1610,7 @@ K.track_record_build = function(tally, takes, prev)
   for midi, c in pairs(merged.st) do rec.st[tostring(midi)] = c end
   rec.lo_st, rec.hi_st = K.pre_range(merged)
   if prev and prev.key_idx ~= nil then
-    rec.key_idx, rec.scale_idx = prev.key_idx, prev.scale_idx
+    rec.key_idx, rec.scale_idx, rec.scale_user = prev.key_idx, prev.scale_idx, prev.scale_user
     rec.alt_key_idx, rec.alt_scale_idx = prev.alt_key_idx, prev.alt_scale_idx
   else
     rec.key_idx, rec.scale_idx, rec.alt_key_idx, rec.alt_scale_idx = K.pre_key(merged)
@@ -1760,12 +1872,14 @@ K.note_readout = function(cp, C)
   local cents = math.floor((cp - nearest) * 100 + 0.5)
   local pc = (nearest % 12 + 12) % 12
   local scale = SCALE_DEFINITIONS[state.scale_idx]
-  local chromatic = (not scale) or scale.name == "Chromatic"
+  local chromatic = (not scale) or K.scale_is_chromatic(state.scale_idx, state.scale_user)
   local key_name = SCALE_KEYS[state.key_idx] and SCALE_KEYS[state.key_idx].display or ""
-  local scale_name = chromatic and "" or (key_name .. " " .. scale.name)
+  local scale_name = chromatic and ""
+    or (key_name .. " " .. (state.scale_user and K.USER_SCALE_NAME or scale.name))
   local name_col, scale_line = C.readout_name, nil
   if not chromatic then
-    if pc == (state.key_idx - 1) % 12 then
+    -- (a user set may leave the key note out: it is then named as out of the scale)
+    if pc == (state.key_idx - 1) % 12 and is_pitch_in_scale(pc) then
       name_col = C.readout_name_tonic
       scale_line = string.format("%s is the root of the scale (%s), set by Key.", name, scale_name)
     elseif is_pitch_in_scale(pc) then
@@ -3094,7 +3208,7 @@ K.card_batch_row = function(track_name, record, opts)
     range = K.card_range_value({ source = record.lo_st and "found" or "none", lo_st = record.lo_st, hi_st = record.hi_st })
   end
   if record and record.key_idx then
-    key = K.key_text(record.key_idx, record.scale_idx)
+    key = K.key_text(record.key_idx, record.scale_idx, record.scale_user)
   elseif opts.item_key then
     key = K.card_key_value(opts.item_key)
   elseif record and opts.want_key then
@@ -3133,10 +3247,11 @@ K.card_single_rows = function(c, phase, result)
   if before then
     -- A key the user chose stays theirs and says so; the track's or a found key shows bare
     key = { source = K.key_source_valid(before.key_source) == "picked" and "picked" or "own",
-      text = K.key_text(before.key_idx, before.scale_idx) }
+      text = K.key_text(before.key_idx, before.scale_idx, before.scale_user) }
   elseif data then
     source = K.key_source_valid(data.key_source)
-    key = { source = source or "none", text = K.key_text(data.key_idx, data.scale_idx), track = c.track_name }
+    key = { source = source or "none", text = K.key_text(data.key_idx, data.scale_idx, data.scale_user),
+      track = c.track_name }
   else
     local picked = K.pending_key[c.guid]
     source = K.item_key_source({ guid = c.guid })
@@ -3145,8 +3260,8 @@ K.card_single_rows = function(c, phase, result)
     elseif phase == "listen" and not source then
       key = { pending = true }
     elseif source then
-      local k, sc = K.key_resolve(c.guid)
-      key = { source = source, text = K.key_text(k, sc), track = c.track_name }
+      local k, sc, _, user = K.key_resolve(c.guid)
+      key = { source = source, text = K.key_text(k, sc, user), track = c.track_name }
     else
       key = { source = "none", text = K.key_text(K.DEFAULT_KEY_IDX, K.DEFAULT_SCALE_IDX) }
     end
@@ -3181,7 +3296,7 @@ K.card_again_rows = function(result)
   local rec = result.rec
   local key
   if result.found_key then
-    key = { source = "found", text = K.key_text(rec.key_idx, rec.scale_idx) }
+    key = { source = "found", text = K.key_text(rec.key_idx, rec.scale_idx, rec.scale_user) }
   else
     key = { source = "none", text = result.kept }
   end
@@ -3202,7 +3317,7 @@ K.card_batch_rows = function(c, written)
     if track and data and not item_keys[track] then
       local src = K.key_source_valid(data.key_source)
       item_keys[track] = { source = src == "picked" and "picked" or (src == nil and "none" or "own"),
-        text = K.key_text(data.key_idx, data.scale_idx) }
+        text = K.key_text(data.key_idx, data.scale_idx, data.scale_user) }
     end
   end
   local rows = {}
@@ -3345,7 +3460,8 @@ K.card_close = function(confirm)
     end
   end
   if state.target_take_guid ~= c.guid or not state.session_takes[c.guid] then return end
-  state.key_idx, state.scale_idx = choice.key_idx, choice.scale_idx
+  -- A candidate names a key and a scale: it replaces a user set
+  state.key_idx, state.scale_idx, state.scale_user = choice.key_idx, choice.scale_idx, nil
   K.scale_changed("key")
 end
 
@@ -4143,6 +4259,7 @@ K.take_json = function(data)
     notes = {},
     key_idx = data.key_idx or state.key_idx,   -- (every model is seeded first, K.item_seed)
     scale_idx = data.scale_idx or state.scale_idx,
+    scale_user = data.scale_user,   -- the user's own set (steps from the key note), when it has one
     key_from_track = data.key_from_track or nil,   -- the key was found on the item's track (the Key combo says so)
     key_source = K.key_source_valid(data.key_source),   -- where its first analysis took the key (K.item_key_source)
     separation = data.separation,   -- the Separation the notes were split at (see K.follow_resplit_undo)
@@ -4189,6 +4306,7 @@ local function save_current_scale_settings(undo_label, flush)
     local data = state.session_takes[state.target_take_guid]
     data.key_idx = state.key_idx
     data.scale_idx = state.scale_idx
+    data.scale_user = state.scale_user
     local take = resolve_take_by_guid(state.target_take_guid)
     if take then
       reaper.Undo_BeginBlock()
@@ -4253,6 +4371,8 @@ local function load_take_data(take, raw)
     if not (whole_in(data.key_idx, 1, #SCALE_KEYS) and whole_in(data.scale_idx, 1, #SCALE_DEFINITIONS)) then
       data.key_idx, data.scale_idx, data.key_from_track, data.key_source = nil, nil, nil, nil
     end
+    -- A user set that is not one is dropped: the item's listed scale is in effect
+    data.scale_user = data.key_idx ~= nil and K.scale_user_valid(data.scale_user) or nil
     K.item_seed(data)
     data.analysis = K.analysis_values(data.analysis)   -- a malformed record counts as not recorded
     data.name = K.live_take_name(take, data.name)   -- the name is REAPER's, not the one saved with the analysis
@@ -4357,6 +4477,7 @@ local function adopt_take_data(guid, data)
   if data.separation then state.separation = data.separation end
   if data.key_idx then state.key_idx = data.key_idx end
   if data.scale_idx then state.scale_idx = data.scale_idx end
+  state.scale_user = data.scale_user
   update_scale_pitch_classes()
 end
 
@@ -4792,6 +4913,7 @@ K.batch_next = function()
       state.separation = start.separation
       state.key_idx = before and before.key_idx or start.key_idx
       state.scale_idx = before and before.scale_idx or start.scale_idx
+      if before then state.scale_user = before.scale_user else state.scale_user = start.scale_user end
       update_scale_pitch_classes()
       -- Vocal Range Auto: the range found on the item's own track (K.auto_values; a fixed range as it is)
       local track = reaper.GetMediaItemTake_Track(take)
@@ -4961,6 +5083,7 @@ K.adopt_new_item_values = function(guid)
   K.pending_key_prune()
   local start = K.new_item_values(guid)
   state.separation, state.key_idx, state.scale_idx = start.separation, start.key_idx, start.scale_idx
+  state.scale_user = start.scale_user
   update_scale_pitch_classes()
 end
 
@@ -5147,7 +5270,8 @@ local function sync_with_project()
   end
   -- An open item still not analysed shows its key as the project holds it now (an undo may take its track's away)
   if target_guid and not state.session_takes[target_guid] then
-    state.key_idx, state.scale_idx = K.new_item_key(target_guid)
+    local _
+    state.key_idx, state.scale_idx, _, state.scale_user = K.new_item_key(target_guid)
     update_scale_pitch_classes()
   end
   if analyses_changed then K.status_release() end
@@ -5514,30 +5638,34 @@ end
 
 K.scale_pcs_memo = {}
 
---- The pitch classes ({ [0..11] = true }) of scale `scale_idx` in key `key_idx` (1 = C); nil for an unknown scale.
---- Memoised: the same (key, scale) always returns the same table, so K.mode_line's cache can compare it by identity.
---- The returned set is shared: callers must not modify it.
-K.scale_pcs = function(key_idx, scale_idx)
-  local scale = SCALE_DEFINITIONS[scale_idx]
-  if not scale or type(key_idx) ~= "number" then return nil end
+--- The pitch classes ({ [0..11] = true }) of scale `scale_idx` in key `key_idx` (1 = C), or of the user set
+--- `scale_user` when given (K.scale_steps); nil for an unknown scale.
+--- Memoised: the same (key, scale, set) always returns the same table, so K.mode_line's cache can compare it by
+--- identity. The returned set is shared: callers must not modify it.
+K.scale_pcs = function(key_idx, scale_idx, scale_user)
+  local steps = K.scale_steps(scale_idx, scale_user)
+  if not steps or type(key_idx) ~= "number" then return nil end
   local root = (key_idx - 1) % 12
-  local mk = root .. ":" .. scale_idx
+  local mk = scale_user and (root .. ":u" .. table.concat(scale_user, ",")) or (root .. ":" .. scale_idx)
   local pcs = K.scale_pcs_memo[mk]
   if pcs then return pcs end
   pcs = {}
-  for _, intv in ipairs(scale.intervals) do
+  for _, intv in ipairs(steps) do
     pcs[(root + intv) % 12] = true
   end
   K.scale_pcs_memo[mk] = pcs
   return pcs
 end
 
---- Key and Scale of the take the build is for (its stored ones), each falling back to the combos' value.
+--- Key and Scale of the take the build is for (its stored ones), each falling back to the combos' value, and the
+--- user set that goes with that scale (nil: none).
 K.item_scale = function()
   local td = state.target_take_guid and state.session_takes and state.session_takes[state.target_take_guid]
   local key_idx = td and td.key_idx or state.key_idx
   local scale_idx = td and td.scale_idx or state.scale_idx
-  return key_idx, scale_idx
+  local scale_user
+  if td and td.scale_idx then scale_user = td.scale_user else scale_user = state.scale_user end
+  return key_idx, scale_idx, scale_user
 end
 
 K.item_scale_pcs = function()
@@ -5863,7 +5991,7 @@ end
 --- The status line after a key change rewrote `count` Classic / Hard notes of the open item.
 K.key_changed_status = function(count)
   local key_name = SCALE_KEYS[state.key_idx].display
-  local scale_name = SCALE_DEFINITIONS[state.scale_idx].name
+  local scale_name = state.scale_user and K.USER_SCALE_NAME or SCALE_DEFINITIONS[state.scale_idx].name
   if count == 1 then
     set_status(string.format("Key changed: 1 Classic / Hard note follows %s %s", key_name, scale_name))
   else
@@ -5884,13 +6012,14 @@ end
 --- On an analysed item with no Classic or Hard note this is the plain save; otherwise the item's notes follow the
 --- new scale: its take data takes the new Key and Scale and the envelope is rewritten, all in one undo point. On an
 --- analysed item whose key came from its track (K.key_follow_track) the track's key changes with it, in the same
---- undo point: later items on the track follow.
+--- undo point: later items on the track follow. A key change keeps the item's user set (state.scale_user: its steps
+--- move with the key, and the track's record takes it too); a scale pick has removed it (K.scale_pick).
 --- Row `pos` of the Scale list was picked (K.SCALE_ORDER): the bar takes that row's stored index (K.scale_changed)
---- when it is another scale.
+--- when it is another scale, or any scale while a user set is in use (the pick removes the set).
 K.scale_pick = function(pos)
   local idx = K.SCALE_ORDER[pos]
-  if idx and idx ~= state.scale_idx then
-    state.scale_idx = idx
+  if idx and (idx ~= state.scale_idx or state.scale_user) then
+    state.scale_idx, state.scale_user = idx, nil
     K.scale_changed("scale")
   end
 end
@@ -5900,7 +6029,9 @@ K.scale_changed = function(what)
   local guid = state.target_take_guid
   local data = guid and state.session_takes[guid]
   if not data then
+    -- A key picked before the first analysis holds no user set (an item's set is made on its notes)
     if guid then K.pending_key[guid] = { key_idx = state.key_idx, scale_idx = state.scale_idx } end
+    state.scale_user = nil
     update_scale_pitch_classes()
     return
   end
@@ -5911,7 +6042,7 @@ K.scale_changed = function(what)
   data.key_source = "picked"   -- set by hand now, also when its track follows: written with the item below
   if follow then
     -- The track's record takes the key (its runner-up no longer applies); written inside the item's undo block
-    K.track_records_pending[follow] = K.track_record_with_key(rec, state.key_idx, state.scale_idx)
+    K.track_records_pending[follow] = K.track_record_with_key(rec, state.key_idx, state.scale_idx, state.scale_user)
   end
   local count = K.mode_note_count(state.notes or {})
   local wrote
@@ -5920,6 +6051,7 @@ K.scale_changed = function(what)
   else
     data.key_idx = state.key_idx
     data.scale_idx = state.scale_idx
+    data.scale_user = state.scale_user   -- a key change keeps the set (its steps move with the key), a pick drops it
     wrote = apply_envelope_to_take(undo_label, nil, follow)
     if wrote and not follow then K.key_changed_status(count) end
   end
@@ -5927,9 +6059,75 @@ K.scale_changed = function(what)
     K.track_records_pending[follow] = nil   -- written inside the block above, or never
     if wrote then
       set_status(string.format("Key for %s is now %s. New items on this track follow.", K.track_label(follow),
-        K.key_text(state.key_idx, state.scale_idx)))
+        K.key_text(state.key_idx, state.scale_idx, state.scale_user)))
     end
   end
+end
+
+--- The status line after a note-name click switched `name` ("A#") in (`is_in`) or out of the user set, with `count`
+--- Classic / Hard notes following it.
+K.user_scale_status = function(name, is_in, count)
+  local follow = ""
+  if count == 1 then
+    follow = " 1 Classic / Hard note follows."
+  elseif count > 1 then
+    follow = string.format(" %d Classic / Hard notes follow.", count)
+  end
+  return string.format("User scale: %s is %s.%s %s+Z to undo.", name, is_in and "in" or "out", follow, K.MOD_LABEL)
+end
+
+--- A click on the note-name row of pitch class `pitch_class` (any MIDI note: its class counts): that note, in every
+--- octave, goes in or out of the open analysed item's notes in effect (its user set, else its listed scale's notes),
+--- as a step from its key note. The item takes the new user set (key_source "picked") and, its Classic / Hard notes
+--- following, its envelope is rewritten; its track's record takes the item's key, scale and set (no runner-up),
+--- made when the track has none: all in one undo block (K.USER_SCALE_UNDO). The item then equals its track
+--- (key_from_track). Refused, with nothing written and no undo point, while something runs, with no analysed item
+--- open, and for the only note left. Nothing stays pending. Returns true when it wrote.
+K.user_scale_toggle = function(pitch_class)
+  if state.is_analyzing or K.batch or state.pre or type(pitch_class) ~= "number" then return false end
+  local guid = state.target_take_guid
+  local data = guid and state.session_takes[guid]
+  if not data then return false end
+  local key_idx, scale_idx = data.key_idx or state.key_idx, data.scale_idx or state.scale_idx
+  local steps = K.scale_steps(scale_idx, data.scale_user)
+  if not (steps and SCALE_KEYS[key_idx]) then return false end
+  local pc = (math.floor(pitch_class + 0.5) % 12 + 12) % 12
+  local step = (pc - (key_idx - 1)) % 12
+  local on, n = {}, 0
+  for _, s in ipairs(steps) do
+    if not on[s] then on[s], n = true, n + 1 end
+  end
+  local is_in = not on[step]
+  if not is_in and n <= 1 then return false end   -- the scale needs at least one note
+  on[step] = is_in or nil
+  local user = {}
+  for s = 0, 11 do
+    if on[s] then user[#user + 1] = s end
+  end
+  if state.nudge_burst then flush_nudge_burst() end   -- a pending arrow-key nudge is its own undo point first
+  local take = resolve_take_by_guid(guid)
+  local track = take and reaper.GetMediaItemTake_Track(take)
+  if not (take and track) then
+    set_status("This item is no longer in the project")
+    return false
+  end
+  data.key_idx, data.scale_idx, data.scale_user = key_idx, scale_idx, user
+  data.key_source, data.key_from_track = "picked", true
+  state.key_idx, state.scale_idx, state.scale_user = key_idx, scale_idx, user
+  update_scale_pitch_classes()
+  -- The track's record (an empty one when it has none) takes the set; written inside the item's undo block
+  local rec = K.track_record(track) or { st = {}, takes = {} }
+  K.track_records_pending[track] = K.track_record_with_key(rec, key_idx, scale_idx, user)
+  local count = K.mode_note_count(state.notes or {})
+  local wrote
+  if count == 0 then
+    wrote = save_current_scale_settings(K.USER_SCALE_UNDO, track)
+  else
+    wrote = apply_envelope_to_take(K.USER_SCALE_UNDO, nil, track)
+  end
+  K.track_records_pending[track] = nil   -- written inside the block above, or never
+  if wrote then set_status(K.user_scale_status(SCALE_KEYS[pc + 1].display, is_in, count)) end
+  return wrote == true
 end
 
 --- Why "..." > Find Range and Key Again is disabled, or nil: no item to take the track from, or something runs.
@@ -5980,22 +6178,23 @@ K.find_again_finish = function(track, prev, rec, total, guid, track_name)
       set_status(K.AUTO_UNREADABLE_TEXT)
       return
     end
-    local k, sc = state.key_idx, state.scale_idx
-    if prev and prev.key_idx then k, sc = prev.key_idx, prev.scale_idx end
-    set_status(string.format(K.NO_KEY_FMT, K.key_text(k, sc)))
+    local k, sc, user = state.key_idx, state.scale_idx, state.scale_user
+    if prev and prev.key_idx then k, sc, user = prev.key_idx, prev.scale_idx, prev.scale_user end
+    set_status(string.format(K.NO_KEY_FMT, K.key_text(k, sc, user)))
     return
   end
   local found_key = rec.key_idx ~= nil
+  -- (a key found afresh has no user set: the record is the track's as heard now)
   if not found_key and prev and prev.key_idx then
-    rec.key_idx, rec.scale_idx = prev.key_idx, prev.scale_idx
+    rec.key_idx, rec.scale_idx, rec.scale_user = prev.key_idx, prev.scale_idx, prev.scale_user
     rec.alt_key_idx, rec.alt_scale_idx = prev.alt_key_idx, prev.alt_scale_idx
   end
   -- The key kept when none was told: the track's, else the bar's
   local kept
   if rec.key_idx then
-    kept = K.key_text(rec.key_idx, rec.scale_idx)
+    kept = K.key_text(rec.key_idx, rec.scale_idx, rec.scale_user)
   else
-    kept = K.key_text(state.key_idx, state.scale_idx)
+    kept = K.key_text(state.key_idx, state.scale_idx, state.scale_user)
   end
   local name = K.track_label(track)
   K.track_records_pending[track] = rec
@@ -6007,7 +6206,8 @@ K.find_again_finish = function(track, prev, rec, total, guid, track_name)
   note_own_write()
   -- An open item not analysed yet with no key picked now shows its track's (K.new_item_key)
   if state.target_take_guid and not state.session_takes[state.target_take_guid] then
-    state.key_idx, state.scale_idx = K.new_item_key(state.target_take_guid)
+    local _
+    state.key_idx, state.scale_idx, _, state.scale_user = K.new_item_key(state.target_take_guid)
     update_scale_pitch_classes()
   end
   K.card_done({ rec = rec, found_key = found_key, kept = kept, total = total, track_name = track_name or name })
@@ -7346,6 +7546,7 @@ local function process_analysis_step()
         notes = state.notes,
         key_idx = state.key_idx,
         scale_idx = state.scale_idx,
+        scale_user = state.scale_user,
         separation = state.separation,
         analysis = params,   -- the frozen snapshot: the values this analysis ran with (K.ANALYSIS_KEYS)
       }
@@ -7381,7 +7582,7 @@ local function process_analysis_step()
       state.session_takes[state.target_take_guid] = take_data
       K.pending_key[state.target_take_guid] = nil   -- analysed: its key is its own now
       -- The bar shows the analysed item's key
-      state.key_idx, state.scale_idx = take_data.key_idx, take_data.scale_idx
+      state.key_idx, state.scale_idx, state.scale_user = take_data.key_idx, take_data.scale_idx, take_data.scale_user
       update_scale_pitch_classes()
       -- The form follows: it now shows the values the item was analysed with ("as analyzed before"), so a later
       -- undo, which takes them away again, reseeds it from what the item holds then
@@ -7982,10 +8183,11 @@ K.correction_view = function(notes, item)
     changed = set(sig, k + 1, K.mode_value(n)) or changed
     k = k + 1
   end
-  local key_idx, scale_idx = K.item_scale()
+  local key_idx, scale_idx, scale_user = K.item_scale()
   changed = set(sig, k + 1, key_idx) or changed
   changed = set(sig, k + 2, scale_idx) or changed
-  k = k + 2
+  changed = set(sig, k + 3, scale_user and table.concat(scale_user, ",") or false) or changed
+  k = k + 3
   if cv.n ~= k then
     cv.n = k
     changed = true
@@ -9079,8 +9281,15 @@ local function draw_graph(draw_ctx, w, h)
   local on_ruler = is_canvas_hovered and mx >= px and mx <= px + w and my >= py and my <= py + ruler_h
   local on_overview = is_canvas_hovered and my > py + h
   local on_pstrip = is_canvas_hovered and mx > px + w and my <= py + h
+  -- The note-name column left of the note area: each of its rows is a button of its own (DRAW NOTE-NAME COLUMN), so a
+  -- press there never reaches a note, the marquee or the edit cursor. A row takes the hover from the canvas from the
+  -- frame after the pointer reaches it (the overlap above); the wheel over the column still scrolls the canvas then
+  -- (state.names_hot: a row held the hover last frame)
+  local in_names = mx >= full_px and mx < px and my >= py and my <= py + h
+  local on_names = is_canvas_hovered and in_names
+  local names_wheel = state.names_hot and in_names and reaper.ImGui_IsWindowHovered(draw_ctx)
 
-  if is_canvas_hovered and not gesture and not state.view_drag then
+  if (is_canvas_hovered or names_wheel) and not gesture and not state.view_drag then
     -- Scrolling follows the axis the device sends: a vertical wheel scrolls the pitch axis, a horizontal one
     -- (trackpad, tilt wheel, a mouse's own horizontal-scroll button) scrolls the timeline (a no-op while the
     -- whole item is visible). Shift + wheel scrolls the timeline too: macOS already sends it as a horizontal
@@ -9224,7 +9433,7 @@ local function draw_graph(draw_ctx, w, h)
     end
   end
   -- Nothing on a note is hovered, clicked or dragged from the ruler or a strip, nor while a strip is dragged
-  local off_notes = on_ruler or on_overview or on_pstrip or state.view_drag ~= nil
+  local off_notes = on_ruler or on_overview or on_pstrip or on_names or state.view_drag ~= nil
 
   -- Text on a small panel-coloured pill (C.pill_bg), so it stays readable over any canvas surface (HC1): the text tokens
   -- (C.pill_text, C.marquee_text) are fitted to >= 4.5:1 on the pill over every row and every note fill. The pill
@@ -9989,7 +10198,7 @@ local function draw_graph(draw_ctx, w, h)
 
   -- Double-click: a pitch point back to 0, a point added on the add-square, else on the pitch zone: Snap to nearest
   -- semitone (single or batch). With Shift held the points are left alone, as for a press.
-  if is_canvas_hovered and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
+  if is_canvas_hovered and not on_names and reaper.ImGui_IsMouseDoubleClicked(draw_ctx, 0) then
     local dc_shift = ((reaper.ImGui_GetKeyMods(draw_ctx) or 0) & reaper.ImGui_Mod_Shift()) ~= 0
     local hp = not dc_shift and state.hovered_point
     local hp_note = hp and state.notes and state.notes[hp.note_idx]
@@ -10058,8 +10267,8 @@ local function draw_graph(draw_ctx, w, h)
   -- Everything from here to the playhead is clipped to the note area: the note-name column and the two strips
   -- are drawn after it, and a block that runs past the window's edge must not reach them.
   local root_pc = (state.key_idx - 1) % 12
-  -- Chromatic (also a new item's default, C Chromatic): every row in key
-  local is_chromatic = SCALE_DEFINITIONS[state.scale_idx].name == "Chromatic"
+  -- Chromatic (also a new item's default, C Chromatic): every row in key (a user set never is: K.scale_is_chromatic)
+  local is_chromatic = K.scale_is_chromatic(state.scale_idx, state.scale_user)
   reaper.ImGui_DrawList_PushClipRect(draw_list, px, py, px + w, py + h, true)
 
   for n = math.floor(min_note), math.ceil(max_note) do
@@ -10660,14 +10869,22 @@ local function draw_graph(draw_ctx, w, h)
   ---------------------------------------------------------------------------
   -- DRAW NOTE-NAME COLUMN (a flat strip left of the rows; the root row carries an accent strip and an accent name)
   ---------------------------------------------------------------------------
+  -- On an analysed item each visible row is also a button (an InvisibleButton over the row, clipped to the note
+  -- area's height, its id from the MIDI note): a click puts that note, in every octave, in or out of the scale
+  -- (K.user_scale_toggle, after the column is drawn). Hovered: an outline in the canvas's hover colour, a hand cursor
+  -- and a tooltip that says what a click does. Not under the bypass scrim, and not while an analysis runs
+  local names_live = not is_bypassed and not state.is_analyzing and state.target_take_guid ~= nil
+    and state.session_takes[state.target_take_guid] ~= nil
+  local name_steps = names_live and K.scale_steps(state.scale_idx, state.scale_user) or nil
+  local names_hot, name_click = false, nil
   reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, py, px, py + full_h, C.gutter_bg)
   reaper.ImGui_DrawList_PushClipRect(draw_list, full_px, py, px, py + h, true)
   for n = math.floor(min_note), math.ceil(max_note) do
     local key_top = py + h - ((n + 0.5 - min_note) / note_range) * h
     local key_bot = py + h - ((n - 0.5 - min_note) / note_range) * h
     local pc = (n % 12 + 12) % 12
-    local is_root = (not is_chromatic) and pc == root_pc
     local in_scale = is_chromatic or is_pitch_in_scale(pc)
+    local is_root = (not is_chromatic) and pc == root_pc and in_scale   -- a user set may leave the key note out
     -- An out-of-scale row's name sits on a darker cell, as its row does
     if not in_scale then
       reaper.ImGui_DrawList_AddRectFilled(draw_list, full_px, key_top, px, key_bot, C.gutter_bg_dim)
@@ -10675,6 +10892,21 @@ local function draw_graph(draw_ctx, w, h)
     reaper.ImGui_DrawList_AddLine(draw_list, full_px, key_bot, px, key_bot, C.grid)
     if is_root then
       reaper.ImGui_DrawList_AddRectFilled(draw_list, px - L.xs - L.border, key_top, px, key_bot, C.gutter_strip)
+    end
+    local hit_top, hit_bot = math.max(py, key_top), math.min(py + h, key_bot)
+    if name_steps and hit_bot - hit_top >= 1 then
+      reaper.ImGui_SetCursorScreenPos(draw_ctx, full_px, hit_top)
+      if reaper.ImGui_InvisibleButton(draw_ctx, "##note_name_" .. n, piano_w, hit_bot - hit_top) then name_click = n end
+      buttons_used = true
+      if reaper.ImGui_IsItemHovered(draw_ctx) then
+        names_hot = true
+        reaper.ImGui_SetMouseCursor(draw_ctx, reaper.ImGui_MouseCursor_Hand())
+        reaper.ImGui_DrawList_AddRect(draw_list, full_px + L.border, hit_top + L.border, px - L.border, hit_bot - L.border,
+          C.handle_hover)
+      end
+      if reaper.ImGui_IsItemHovered(draw_ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
+        Theme.tooltip(draw_ctx, K.user_scale_note_tip(state.key_idx, name_steps, pc))
+      end
     end
     -- Every row is named while a row is at least a text line tall; below that only the C rows are, so the names
     -- never overlap. Out-of-scale rows are named in the dimmer colour (3:1 on their darker cell, the rest >= 4.5:1).
@@ -10690,6 +10922,9 @@ local function draw_graph(draw_ctx, w, h)
   end
   reaper.ImGui_DrawList_PopClipRect(draw_list)
   reaper.ImGui_DrawList_AddLine(draw_list, px, py, px, py + h, P.border)
+  state.names_hot = names_hot
+  -- After the whole column is drawn, so every row of this frame shows the same scale; the next frame shows the new one
+  if name_click then K.user_scale_toggle(name_click) end
 
   ---------------------------------------------------------------------------
   -- DRAW PITCH STRIP (right of the note area) and OVERVIEW STRIP (below it): track, thumb, end grips
@@ -11791,6 +12026,7 @@ K.INFO_SECTIONS = {
     { "Double-click the pitch line", "Add a pitch point" },
     { "Right-click a pitch point", "Point menu: type a value, Reset, Remove" },
     { "Click the time ruler", "Move the edit cursor (playback follows)" },
+    { "Click a note name", "In or out of the scale" },
     { K.MOD_LABEL .. " + Wheel", "Zoom the timeline", panel = { "View", 3, "Zoom time" } },
     { "Wheel", "Scroll the pitch axis" },
     { "Alt + Wheel", "Zoom the pitch axis", panel = { "View", 5, "Zoom pitch" } },
@@ -14405,7 +14641,8 @@ K.note_action = function(id, note_idx)
       set_status("Already in scale")
     elseif written then
       set_status(string.format("Quantized %d %s to %s %s.%s", n, plural(n, "note", "notes"),
-        SCALE_KEYS[state.key_idx].display, SCALE_DEFINITIONS[state.scale_idx].name, undo_hint))
+        SCALE_KEYS[state.key_idx].display,
+        state.scale_user and K.USER_SCALE_NAME or SCALE_DEFINITIONS[state.scale_idx].name, undo_hint))
     end
   end
 end
@@ -14761,6 +14998,7 @@ K.reset_item_all = function()
     if data.separation ~= nil then state.separation = data.separation end
     if data.key_idx ~= nil then state.key_idx = data.key_idx end
     if data.scale_idx ~= nil then state.scale_idx = data.scale_idx end
+    state.scale_user = data.scale_user
     update_scale_pitch_classes()
   end
 
@@ -14907,7 +15145,8 @@ K.apply_item_get = function(data, key)
   return K.item_value(data, key)
 end
 
---- The open item's values for `keys` (what Apply gives): its own, else what the window shows for it.
+--- The open item's values for `keys` (what Apply gives): its own, else what the window shows for it. With Scale
+--- given, src.scale_user is the user set that goes with it (nil: none, which removes a target's).
 K.apply_source = function(keys)
   local data = state.target_take_guid and state.session_takes[state.target_take_guid]
   local src = {}
@@ -14917,6 +15156,9 @@ K.apply_source = function(keys)
       if key == "separation" or key == "key_idx" or key == "scale_idx" then v = state[key] else v = get_effective(nil, key) end
     end
     src[key] = v
+    if key == "scale_idx" then
+      if data and data.scale_idx ~= nil then src.scale_user = data.scale_user else src.scale_user = state.scale_user end
+    end
   end
   return src
 end
@@ -15051,6 +15293,11 @@ K.apply_plan = function(src, entries, keys, keep)
             if n.controls and n.controls[key] ~= nil then row.clear_note_keys[#row.clear_note_keys + 1] = key break end
           end
         end
+        -- The user set goes with the scale: the source's, or none (false: the target's is removed)
+        if key == "scale_idx" and not K.scale_user_same(src.scale_user, data.scale_user) then
+          row.set.scale_user = src.scale_user or false
+          row.key_change = true
+        end
       end
       -- The notes that lose a value of their own (each note once)
       local cleared = 0
@@ -15092,7 +15339,10 @@ K.apply_item_model = function(data, row)
   new.overrides = {}
   for k, v in pairs(data.overrides or {}) do new.overrides[k] = v end
   for key, v in pairs(row.set) do
-    if key == "separation" or key == "key_idx" or key == "scale_idx" then
+    if key == "scale_user" then
+      new.scale_user = v or nil
+      new.key_from_track, new.key_source = nil, nil
+    elseif key == "separation" or key == "key_idx" or key == "scale_idx" then
       new[key] = v
       if key ~= "separation" then new.key_from_track, new.key_source = nil, nil end   -- a key given, not found
     else
@@ -15717,7 +15967,7 @@ do
     if reaper.ImGui_IsItemHovered(ctx, reaper.ImGui_HoveredFlags_ForTooltip()) then
       -- Built on hover only (K.key_tooltip: a found key names its track and the runner-up)
       Theme.tooltip(ctx, K.key_tooltip(state.target_take_guid and state.session_takes[state.target_take_guid],
-        hs.has_target and state.target_take_guid or nil, state.key_idx, state.scale_idx))
+        hs.has_target and state.target_take_guid or nil, state.key_idx, state.scale_idx, state.scale_user))
     end
   end
 
@@ -15725,11 +15975,13 @@ do
     local s = hs.s
     -- The list shows the scales in K.SCALE_ORDER: the combo works in rows, the bar holds the stored index. The
     -- preview is the scale's name; an index that names no scale previews the default's (K.scale_preview). The
-    -- tooltip names the scale's relatives (K.scale_tooltip, kept per key and scale)
-    local new_pos, changed = Theme.combo(ctx, "##scale_selector", K.SCALE_LIST, K.scale_display_pos(state.scale_idx), {
+    -- tooltip names the scale's relatives (K.scale_tooltip, kept per key and scale). While the item's user set is in
+    -- use no row is selected and the box reads "User" (never a row of the list); picking any row removes the set
+    local new_pos, changed = Theme.combo(ctx, "##scale_selector", K.SCALE_LIST,
+      K.scale_display_pos(state.scale_idx, state.scale_user), {
       w = s.scale_w,
-      placeholder = K.scale_preview(state.scale_idx),
-      tooltip = K.scale_tooltip(state.key_idx, state.scale_idx),
+      placeholder = K.scale_preview(state.scale_idx, state.scale_user),
+      tooltip = K.scale_tooltip(state.key_idx, state.scale_idx, state.scale_user),
     })
     if changed then K.scale_pick(new_pos) end
     hdr_key_menu("##ctx_scale")
@@ -16266,7 +16518,9 @@ do
     local parts = {}
     if given.key_idx or given.scale_idx then
       local key_info, scale_info = SCALE_KEYS[src.key_idx], SCALE_DEFINITIONS[src.scale_idx]
-      if key_info and scale_info then parts[#parts + 1] = "Key " .. key_info.display .. " " .. scale_info.name end
+      if key_info and scale_info then
+        parts[#parts + 1] = "Key " .. key_info.display .. " " .. (src.scale_user and K.USER_SCALE_NAME or scale_info.name)
+      end
     end
     for _, id in ipairs({ "sep", "mode", "tight", "tol", "strength", "slide" }) do
       if id == "mode" then
@@ -17514,6 +17768,7 @@ if FANCY_PITCH_TEST then   -- luacheck: ignore 113 (set by docs/superpowers/test
            measure_header_static = measure_header_static, hdr_min_content_w = hdr_min_content_w,
            clear_take_analysis = clear_take_analysis, wipe_entire_session = wipe_entire_session,
            start_analysis = start_analysis, COMBO_LABELS = COMBO_LABELS, reset_analysis_model = reset_analysis_model,
-           switch_active_target = switch_active_target, load_take_data = load_take_data }
+           switch_active_target = switch_active_target, load_take_data = load_take_data,
+           update_scale_pitch_classes = update_scale_pitch_classes }
 end
 main()
