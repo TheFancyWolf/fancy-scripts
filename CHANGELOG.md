@@ -14,7 +14,7 @@ All notable changes to Fancy Scripts will be documented here.
   - **Find Range and Key Again**: the "…" menu listens to the track afresh. Items already analysed keep theirs.
   - **Min Freq and Max Freq**: with Vocal Range on Auto, they are shown in Advanced but locked ("Found from the track").
   - **Modes**: the Scale list adds Phrygian, Lydian, Mixolydian and Locrian next to Dorian. The Key and Scale tooltips name the scale's relatives, e.g. D Dorian has the same notes as C Major and A Minor. Key finding still picks Major or Minor; a mode is your choice, kept and followed by the track like any other scale.
-  - **Your own scale**: click a note name at the left of the note window to switch that note in or out of the scale; the Scale box reads "User" until you pick a scale from the list; it becomes the track's scale, so later items start with it.
+  - **User scale**: click a note name at the left of the note window to switch that note in or out of the scale; the Scale box reads "User" until you pick a scale from the list; it becomes the track's scale, so later items start with it.
 - **Fancy Pitch Correct v2.28.0 (`Pitch/Fancy_Pitch Correct.lua`)** — Its own icon:
   - **Window header**: a white pitch line wobbles between two note lanes, rises and runs through a green corrected note, in place of the shared Fancy logo.
   - **Toolbar icon**: ReaPack installs `toolbar_fancy_pitch_correct.png` (100 %, 150 % and 200 %) into REAPER's toolbar icons, so you can pick it for the script's toolbar button. It lights up in the accent blue while the script runs. The SVG masters are in `toolbar_icons/svg/`.
